@@ -1,0 +1,62 @@
+# --- Secrets (never commit) ----------------------------------------------------
+.secrets/
+.env
+.env.*
+!.env.example
+*.secret
+*.key
+*.pem
+*-pypi.txt
+
+# --- Python --------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+wheels/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- uv / virtualenv -----------------------------------------------------------
+.venv/
+
+# --- IDE / editors -------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# --- Phantom runtime data (when developing locally) ----------------------------
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# --- Test outputs (emulator runs, E2E artifacts) -------------------------------
+tests/output/
+tests/.tmp/
+e2e-results/
+emulator-state/
+
+# --- Logs and editor / merge transients ----------------------------------------
+*.log
+*.bak
+*.orig
+
+# --- Local agent / editor working state (not version-controlled) --------------
+.agent/
+.claude/
+

@@ -1,0 +1,15 @@
+# Phase 3 — phantom-emulator build-context filter.
+# Build context root is the repository root; this file scopes what is
+# copied via `COPY src/phantom-emulator/ ./phantom-emulator/`.
+
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+dist
+build
+*.egg-info
+.git

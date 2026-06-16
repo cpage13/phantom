@@ -1,0 +1,62 @@
+# Example docker-compose pairing the phantom-emulator with a phantom
+# service, for local end-to-end experimentation. NOT for production.
+#
+# This mirrors the proven pairing in tests/e2e/docker-compose.e2e.yml,
+# corrected to the env/CLI the real services actually read:
+#
+#   * The emulator boots on its built-in defaults (its `-c` config flag is
+#     optional); only EMULATOR_SIGNING_KEY (the HS256 shared secret named
+#     by AuthCfg.signing.hs256_secret_env) is required.
+#   * The phantom service requires `-c <config-path>` (python -m phantom
+#     has no default config), so it runs the real entrypoint args and
+#     mounts a config. The service has NO PHANTOM_UPSTREAM_URL or
+#     PHANTOM_AD_AUTHORITY env var; upstream targeting lives in the mounted
+#     YAML under `instances[].routes`/`host_prefixes`, overridable only via
+#     the nested PHANTOM_<SECTION>__<FIELD> form (e.g. PHANTOM_SERVER__BIND_TCP).
+#
+# Run from the repository root:
+#
+#   docker compose -f src/phantom-emulator/src/phantom_emulator/docker/compose.example.yml up --build
+#
+# Then drive the phantom intake at http://127.0.0.1:8080 (the one listener:
+# intake + admin + health); it forwards upstream to the emulator service.
+
+services:
+  emulator:
+    build:
+      # Context is the repo root so the emulator Dockerfile can COPY its
+      # package source.
+      context: ../../../../../
+      dockerfile: src/phantom-emulator/src/phantom_emulator/docker/Dockerfile
+    ports:
+      - "9000:8000"        # emulator listens on 8000 (ServerCfg.port default)
+    environment:
+      EMULATOR_SIGNING_KEY: "phantom-emulator-example-secret"
+
+  phantom:
+    build:
+      context: ../../../../../
+      dockerfile: src/phantom-deploy/Dockerfile
+    # The container listener binds 0.0.0.0 so docker's port-forward reaches
+    # it (a loopback bind inside the container is unreachable through the
+    # forward); the host side maps 127.0.0.1 only, keeping the port
+    # loopback-only on the machine.
+    environment:
+      PHANTOM_SERVER__BIND_TCP: "0.0.0.0:8080"
+    ports:
+      - "127.0.0.1:8080:8080"   # one listener (intake + admin + health), loopback-only on the host
+    volumes:
+      # The E2E config targets the `emulator` service hostname under
+      # instances[].host_prefixes/routes, so the phantom service routes
+      # uploads to the emulator above. It carries no ad_mint block, so no
+      # AD client-secret env is needed to boot.
+      - ../../../../../tests/e2e/phantom-config.yml:/etc/phantom/phantom.yaml:ro
+      - phantom-data:/var/lib/phantom
+    # python -m phantom (the image ENTRYPOINT) requires -c; append it here.
+    command: ["-c", "/etc/phantom/phantom.yaml"]
+    depends_on:
+      - emulator
+
+volumes:
+  phantom-data:
+    driver: local

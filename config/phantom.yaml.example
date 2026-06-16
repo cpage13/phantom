@@ -1,0 +1,364 @@
+# Phantom — operator-facing example configuration
+#
+# This file is the reference for the post-Phase-1 ``Settings`` schema.
+# Every operator-tunable knob is enumerated below; sensible values
+# are shown commented out. To validate a config without binding the
+# server, run:
+#
+#     uv run python -c \
+#       "import yaml; from phantom.config.settings import Settings; \
+#        Settings.model_validate(yaml.safe_load(open('phantom.yaml')))"
+#
+# Authority hierarchy: ADRs > docs/architecture-intent.md > this file.
+#
+# YAML migration from pre-release deployments — see
+# ``docs/operator-playbook.md`` ("Migration from pre-release YAML").
+# The Phase 1 refactor renamed / removed several keys; trying to start
+# with an unmigrated YAML will fail Pydantic validation at startup.
+#
+# Smart defaults from a host probe
+# --------------------------------
+#
+# Phantom reads psutil + shutil at startup to derive sensible defaults
+# for saturation caps, RAM-tier ceiling, and worker pool size. Any
+# field set to ``null`` (or simply omitted) in this file is filled by
+# the probe. Operator-supplied values always win. The resolved set is
+# logged at startup and surfaced via ``GET /v1/admin/status``.
+
+
+# ---------------------------------------------------------------------------
+# server — HTTP bind address for the single listener
+# ---------------------------------------------------------------------------
+#
+# The deployment is same-machine-only: Phantom runs on the SAME box as its
+# producer and is reached over loopback, so ONE listener serves intake
+# (POST /v1/send), the admin surface (/v1/admin/*), and the liveness/
+# readiness probes (GET /v1/healthz, GET /v1/readyz) on one socket. The
+# admin API carries NO authentication (ADR-004); the loopback default bind
+# IS the access control. The bind knobs are restart-required (changing them
+# needs a process restart, not a hot reload).
+
+server:
+  bind_tcp: "127.0.0.1:8080"                # single listener, loopback by default (host:port)
+  # WARNING: a non-loopback bind_tcp host (e.g. "0.0.0.0:8080") exposes the
+  # WHOLE surface - including the UNAUTHENTICATED admin API - beyond the
+  # host. Phantom logs a warning and keeps serving; you MUST front it with
+  # an authenticating reverse proxy.
+  # bind_uds: "/var/run/phantom/phantom.sock"   # alternative to TCP — operator picks one
+
+
+# ---------------------------------------------------------------------------
+# storage — data directory, two-tier body store, codec, SQLite, integrity
+# ---------------------------------------------------------------------------
+#
+# Phantom keeps two SQLite files per instance:
+# ``<data_dir>/<instance.data_dir>/uploads.db`` (uploads + idempotency
+# index) and ``token_cache.db`` beside it (the persistent token cache;
+# its own DB file keeps token traffic off the hot uploads writer).
+# Body bytes live in RAM, on disk, or in a hybrid of the two depending
+# on ``body_store.mode`` below.
+
+storage:
+  data_dir: "/var/lib/phantom"              # root of the per-instance filesystem layout
+  max_buffered_bytes: 2147483648            # 2 GiB — per-upload stream cap. The H2 audit
+                                            # fix enforces this both as a Content-Length
+                                            # precheck (413 ``body_too_large``) and as a
+                                            # streaming abort if the cap is breached
+                                            # mid-write. Operators can raise this on hosts
+                                            # with bigger RAM + disk budgets.
+
+  # body_store — the deployment mode + RAM-tier ceiling + linger cadence.
+  body_store:
+    # mode selects the BodyStore binding. All three are first-class
+    # production modes (strategy §3):
+    #
+    #   hybrid     — production default. RamBodyStore writes first;
+    #                PersistController migrates rows to FileBodyStore on
+    #                retry-linger or RAM-pressure breach. Best for the
+    #                "happy path stays in RAM, fail-over to disk on retry"
+    #                shape that Pi-class producers need. See
+    #                ``docs/operator-playbook.md`` mode-selection guide.
+    #   all_ram    — RAM-only; rows + bodies are lost on restart by
+    #                design (the recovery sweep quarantines stale
+    #                ``body_location='file'`` rows). Useful for ephemeral
+    #                test deployments where durability is not required.
+    #   all_disk   — every admission writes the body directly to disk;
+    #                no PersistController spawned. Maximum durability;
+    #                pays an fsync per admission. Pick this for producers
+    #                where you want zero RAM-resident bodies.
+    mode: "hybrid"
+
+    # ram_ceiling_bytes — RamBodyStore size ceiling. ``null`` (default)
+    # asks the probe to fill from a hardware-aware fraction of total
+    # RAM. Pin to an explicit byte count to override; 0 means "no RAM
+    # bodies" (effectively forces hybrid into all_disk-like behavior).
+    # Ignored in all_disk mode (no RAM body store to bound).
+    # ram_ceiling_bytes: 536870912              # 512 MiB pin example
+
+    ram_pressure_poll_seconds: 1.0          # ram_pressure watcher cadence
+                                            # (how often to recheck
+                                            # RamBodyStore.total_bytes() against
+                                            # the ceiling). Default 1 s is
+                                            # responsive without burning CPU.
+
+    linger_seconds: 90                      # PersistController retry-linger
+                                            # threshold. A RAM body whose row
+                                            # has not reached a terminal state
+                                            # within this many seconds migrates
+                                            # to disk. Pi producers typically keep
+                                            # the 90 s default; higher tolerates
+                                            # longer transient outages without
+                                            # touching the SD card.
+
+    body_orphan_sweep_seconds: 3600         # BodyOrphanJanitor sweep cadence.
+                                            # Janitor walks ``FileBodyStore``
+                                            # for body files whose chain_id
+                                            # is absent from the uploads DB
+                                            # (orphans after crash mid-INSERT)
+                                            # and deletes them. Once an hour
+                                            # is plenty.
+
+    invariant_audit_period_seconds: 300     # InvariantAuditor cadence (Phase 3).
+                                            # Walks live rows + counters
+                                            # invariant violations against the
+                                            # seven §0.5 invariants. Low
+                                            # frequency by design; CI fails the
+                                            # next build on any non-zero
+                                            # ``invariant_violation_total``
+                                            # label. See ADR-017 for the
+                                            # actively-asserted vs counter-
+                                            # monitored breakdown.
+
+  # persist_trigger — narrowed in Phase 1 to ONE size-aware bypass knob.
+  # The previous ``after_attempts`` knob is GONE (use ``mode: all_disk``
+  # if you want every admission on disk). ``after_seconds`` is GONE
+  # (the persist controller's ``linger_seconds`` covers it).
+  #
+  # Uncomment the block AND the field to pin a value; leaving both
+  # commented lets the host probe fill ``body_size_threshold_bytes``
+  # from the RAM axis. In hybrid mode, admission enqueues against the
+  # persist controller immediately (skipping linger) for bodies whose
+  # stored size (post-codec) is at or above the threshold. Ignored in
+  # all_ram + all_disk modes. Pin to 0 to disable size-aware
+  # persistence entirely (size never triggers migration; only linger
+  # + pressure do).
+  # persist_trigger:
+  #   body_size_threshold_bytes: 104857600    # 100 MiB pin example
+
+  shard_prefix_chars: 2                     # number of leading chain_id hex chars
+                                            # used as directory shard under
+                                            # ``bodies/<shard>/<chain_id>/``.
+                                            # 2 is reasonable for ext4/NTFS;
+                                            # raise to 3 on >10M-row deployments.
+
+  # compression — always-encode; one configured codec per process.
+  # No size short-circuit, no Content-Encoding pass-through; bytes go
+  # in via the codec, get hashed twice (raw + stored), and round-trip
+  # under dual-hash verification (ADR-014).
+  compression:
+    mode: "always"                          # only ``always`` is supported
+    algorithm: "zstd"                       # original | zstd | gzip
+                                            # ``original`` selects PassthroughCodec
+                                            # (identity; pays zero codec overhead
+                                            # at the cost of no compression).
+    level: 3                                # zstd 1..22 / gzip 1..9. Default 3
+                                            # balances throughput vs. ratio for
+                                            # typical producer artifacts.
+
+  # sqlite — pragma-level knobs for the single persistent SQLite.
+  # ``auto_vacuum`` is hardcoded NONE in code per the SD-card-wear hard
+  # rule (plan § 0.3); no operator knob.
+  sqlite:
+    vacuum_cron: "0 3 * * 0"                # Sunday 03:00. VACUUM only fires
+                                            # when in_flight == 0 (per
+                                            # VacuumScheduler.fire conditions).
+    journal_mode: "WAL"                     # Literal — only WAL supported.
+                                            # WAL is load-bearing for crash
+                                            # recovery on consumer flash.
+    synchronous: "NORMAL"                   # NORMAL | FULL | EXTRA.
+                                            # Default flipped from FULL → NORMAL
+                                            # in Phase 1 per T1 research:
+                                            # WAL-corruption-safe on consumer
+                                            # flash and significantly less SD wear.
+                                            # Rack-server deployments with
+                                            # battery-backed write cache may
+                                            # prefer ``"FULL"``.
+    journal_size_limit_bytes: 16777216      # 16 MiB. T2 research recommendation —
+                                            # bounds WAL growth between
+                                            # checkpoints without forcing
+                                            # frequent flushes.
+    busy_timeout_ms: 1000                   # SQLite busy_timeout (ms). Every
+                                            # writer serializes through one
+                                            # asyncio lock, so this only governs
+                                            # EXTERNAL cross-process contention
+                                            # (R9-V6-1). 1000 ms rides out brief
+                                            # blips but fails fast under a
+                                            # sustained external hold so a
+                                            # contended write returns a clean
+                                            # 503 storage_unavailable instead of
+                                            # amplifying an admission burst into
+                                            # HTTP timeouts.
+
+  # db_integrity — Phase 4 corruption-resilience knobs.
+  db_integrity:
+    fail_open: true                         # strategy §3 default: on detected
+                                            # corruption, move the bad SQLite +
+                                            # body store aside to FLAT timestamped
+                                            # siblings in the instance data root
+                                            # (uploads.corrupted.<stamp>.db +
+                                            # bodies.quarantine.<stamp>/), then
+                                            # start with fresh empty state.
+                                            # Pin ``false`` to abort startup
+                                            # after quarantining (operator
+                                            # intervention required).
+    backup_enabled: false                   # opt-in periodic SQLite
+                                            # online-backup snapshots to
+                                            # ``<data_dir>/backups/``.
+    backup_period_seconds: 86400            # daily when enabled
+    backup_rotate_n: 3                      # keep last N snapshots
+
+
+# ---------------------------------------------------------------------------
+# saturation — in-flight caps applied at ingress
+# ---------------------------------------------------------------------------
+#
+# Every cap defaults to ``null`` so the host probe fills hardware-aware
+# values. Pin individual caps to override; the override is read literally.
+
+# saturation:
+#   max_in_flight: 64                       # row-count cap across all in-flight uploads
+#   max_in_flight_bytes: 536870912          # byte cap across all in-flight uploads
+#   max_disk_bytes: 21474836480             # hard ceiling on disk usage (80% free at probe)
+#   large_body_threshold_bytes: 134217728   # bodies >= this count against max_large_in_flight
+#   max_large_in_flight: 2                  # max concurrent large bodies (0 = refuse all)
+
+
+# ---------------------------------------------------------------------------
+# retention — per-terminal-state retention windows (seconds)
+# ---------------------------------------------------------------------------
+#
+# Reaped by ``workers/reaper.py`` on each sweep. ``-1`` means "never
+# expire automatically." Metadata vs. body retention are independent
+# per state — admin lookup may retain metadata long after the body
+# has been swept.
+
+# retention:
+#   succeeded_metadata_seconds: 180         # 3 min — captured upstream IDs queryable
+#   succeeded_body_seconds: 0               # drop body on success (default)
+#   failed_metadata_seconds: 2592000        # 30 d
+#   failed_body_seconds: 2592000            # 30 d
+#   cancelled_metadata_seconds: 604800      # 7 d
+#   cancelled_body_seconds: 604800          # 7 d
+#   corrupted_metadata_seconds: 2592000     # 30 d — body-verification failures
+#   corrupted_body_seconds: 2592000         # 30 d — preserve bad bytes for inspection
+#   stored_metadata_seconds: -1             # forever (capture-expiry park)
+#   stored_body_seconds: 15552000           # 6 mo
+#   auth_expired_metadata_seconds: -1       # forever (holding state)
+#   auth_expired_body_seconds: 15552000     # 6 mo
+#   reaper_interval_seconds: 60             # reaper sweep cadence
+#   max_rows: -1                            # -1 = unbounded (time-only). When >=0,
+#                                           # the reaper caps the uploads table:
+#                                           # over the cap it evicts oldest-DONE-first
+#                                           # (terminal rows only — never in-flight or
+#                                           # auth_expired). A size backstop, not a
+#                                           # substitute for the time windows above.
+
+
+# ---------------------------------------------------------------------------
+# retry — sender worker pool + default retry strategy
+# ---------------------------------------------------------------------------
+
+retry:
+  # worker_count: 4                         # null = probe-filled (min(8,max(2,cpu_count)))
+  poll_interval_ms: 250                     # sender poll cadence; lower = lower latency, more CPU
+  default_strategy:
+    type: "exponential_backoff"             # exponential_backoff | fixed_intervals
+    base_seconds: 5.0                       # first retry delay
+    factor: 4.0                             # backoff factor
+    cap_seconds: 1800.0                     # max per-attempt delay (30 min)
+    jitter: 0.2                             # uniform jitter fraction
+    max_attempts: -1                        # -1 = unbounded; bounded by max_duration_seconds
+    max_duration_seconds: 86400             # 24 h ceiling → row → ``stored``
+    # intervals_seconds: [5, 30, 300]       # only when type == "fixed_intervals"
+
+
+# ---------------------------------------------------------------------------
+# observability — logging
+# ---------------------------------------------------------------------------
+#
+# Phantom emits structured logs only (no metrics surface beyond the
+# in-process MetricsRegistry exposed at ``GET /v1/admin/observability/*``).
+
+observability:
+  log_level: "INFO"                         # DEBUG | INFO | WARNING | ERROR
+  log_to_stdout: true                       # stream to stdout (default)
+  # log_to_file: "/var/log/phantom/phantom.log"   # optional secondary file sink
+
+
+# ---------------------------------------------------------------------------
+# instances — per-upstream-target configuration (ADR-006)
+# ---------------------------------------------------------------------------
+#
+# One Phantom process can host N instances; each has its own ID, data
+# subdirectory, and optional AdMintConfig. Inbound requests dispatch by
+# URL prefix to the matching instance. Unmatched targets are rejected
+# (421 invalid_target / instance_unknown — see ADR-017).
+#
+# An empty ``instances:`` list is permitted but Phantom will warn at
+# startup and reject every proxy request.
+
+instances:
+  - id: "upstream"
+    host_prefixes:
+      - "files.upstream.example"
+      - "files-dev.upstream.example"
+      - "files-stage.upstream.example"
+      - "*.amazonaws.com"
+    data_dir: "upstream"                    # subdir under storage.data_dir
+    capture_reexecution: false              # ADR-011 — re-execute on capture-TTL expiry
+
+    # ad_mint — when set, Phantom autonomously mints Azure AD
+    # client-credentials tokens via its own app registration and writes
+    # them to the (endpoint, uid) token cache. When unset (default),
+    # Phantom waits for the producer to push tokens via the Authorization
+    # header on ingress. See ADR-001.
+    # ad_mint:
+    #   tenant_id: "00000000-0000-0000-0000-000000000000"
+    #   client_id: "11111111-1111-1111-1111-111111111111"
+    #   primary_client_secret_env: "PHANTOM_UPSTREAM_CLIENT_SECRET"
+    #   secondary_client_secret_env: "PHANTOM_UPSTREAM_CLIENT_SECRET_2"  # rotation
+    #   authority_url: "https://login.microsoftonline.com"
+    #   scope: "api://files.upstream.example/.default"
+    #   refresh_seconds_before_expiry: 12
+    #   refresh_jitter_seconds: 0.5
+    #   ad_outage_retry_seconds: [1, 2, 4, 8, 30]
+    #   endpoint: "files.upstream.example"
+    #   uid: "upstream-sp"
+
+    # admin_lookup - binding for GET /v1/admin/uploads/by-captured-id.
+    # Where the upstream-assigned identifier lives inside a row's
+    # captured values is upstream-specific, so the deployment supplies
+    # it here; an instance WITHOUT this block answers that endpoint
+    # with lookup_not_configured (HTTP 400) instead of guessing.
+    # capture_name is the capturing step's key under the row's
+    # captured-values steps map; json_path is the dotted path within
+    # that step's values down to the identifier (capture name first,
+    # then keys inside the captured object).
+    # admin_lookup:
+    #   capture_name: "create_file"
+    #   json_path: "file_information.id"
+
+    routes:
+      - name: "upstream-files"
+        hosts:
+          - "files.upstream.example"
+          - "files-dev.upstream.example"
+          - "files-stage.upstream.example"
+        auth_mode: "phantom_bearer"         # Phantom injects Authorization from cache
+        # timeout_seconds: 30               # per-route HTTP timeout override
+      - name: "upstream-s3"
+        hosts:
+          - "*.s3.amazonaws.com"
+          - "*.amazonaws.com"
+        auth_mode: "none"                   # presigned-URL signature is the auth
+        # timeout_seconds: 600              # raise for big-tar S3 PUTs

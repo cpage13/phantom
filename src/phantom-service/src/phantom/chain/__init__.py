@@ -1,0 +1,62 @@
+"""Chain module — JSONPath wrapper, parser, executor.
+
+Modules:
+
+* :mod:`phantom.chain.jsonpath` — JSONPath compile/extract/scan helpers.
+* :mod:`phantom.chain.parser` — envelope+body_refs parser.
+* :mod:`phantom.chain.executor` — one-step execution primitive.
+"""
+
+from __future__ import annotations
+
+from phantom.chain.executor import (
+    CaptureExpiredRewind,
+    CaptureExpiredStored,
+    CaptureIncomplete,
+    ChainExecutor,
+    ExecuteStepResult,
+    Failed4xx,
+    Failed5xx,
+    FailedAuth,
+    FailedNetwork,
+    Succeeded,
+    TemplateUnresolved,
+    default_clock,
+)
+from phantom.chain.jsonpath import (
+    extract,
+    find_placeholders,
+    substitute,
+    validate_path,
+)
+from phantom.chain.parser import (
+    ENVELOPE_MAX_BYTES,
+    ParserError,
+    envelope_from_persistence_json,
+    parse_json_request,
+    parse_multipart_request,
+)
+
+__all__ = [
+    "ENVELOPE_MAX_BYTES",
+    "CaptureExpiredRewind",
+    "CaptureExpiredStored",
+    "CaptureIncomplete",
+    "ChainExecutor",
+    "ExecuteStepResult",
+    "Failed4xx",
+    "Failed5xx",
+    "FailedAuth",
+    "FailedNetwork",
+    "ParserError",
+    "Succeeded",
+    "TemplateUnresolved",
+    "default_clock",
+    "envelope_from_persistence_json",
+    "extract",
+    "find_placeholders",
+    "parse_json_request",
+    "parse_multipart_request",
+    "substitute",
+    "validate_path",
+]

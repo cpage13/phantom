@@ -1,0 +1,63 @@
+# phantom-emulator config used by the E2E suite (both inprocess and
+# docker modes). Pins every knob that varies between runs so the
+# suite is deterministic.
+#
+# Authority hierarchy: ADRs > config/phantom.yaml.example > this file.
+# Where this file disagrees with a default, the comment above the
+# override explains why.
+
+server:
+  # Inprocess mode overrides `port: 0` at runtime (see helpers/stack.py)
+  # for ephemeral-port allocation. Docker mode honors this value.
+  host: "0.0.0.0"
+  port: 8000
+
+auth:
+  # `oauth_client_credentials` so Phantom's `ad_client_credentials`
+  # strategy can mint live JWTs against `/oauth/token`. Tests that
+  # exercise the v0 path (static-token) override per-test via the
+  # emulator's `/control/auth/mode` surface.
+  default_mode: "oauth_client_credentials"
+  signing:
+    # HS256 because the shared secret round-trips through env vars
+    # without any RSA-keypair plumbing. The matching env var
+    # (`EMULATOR_SIGNING_KEY`) is set in conftest.py for inprocess
+    # mode and in docker-compose.e2e.yml for docker mode.
+    mode: "HS256"
+    hs256_secret_env: "EMULATOR_SIGNING_KEY"
+  # The issuer is rewritten to the live URL at runtime when the
+  # emulator boots; this default is the docker-mode value. Inprocess
+  # mode doesn't validate the iss claim against this string.
+  issuer: "http://emulator:8000"
+  audience: "api://emulator/.default"
+  default_expires_in_seconds: 3600
+  clock_skew_seconds: 300
+  tenant_id: "00000000-0000-0000-0000-000000000000"
+  clients:
+    # Matches Phantom's `ad_client_credentials.client_id` /
+    # `PHANTOM_AD_PRIMARY` env var below.
+    - client_id: "test-client"
+      client_secret: "e2e-test-secret"
+
+upstream:
+  # 1-hour TTL on minted presigned URLs is plenty for the happy path
+  # and the metadata-down / S3-down retry scenarios. Tests that
+  # specifically exercise capture-TTL expiry (E2E-6a, E2E-6b) call
+  # `Server.set_presigned_ttl(1)` per-test.
+  presigned_ttl_seconds: 3600
+  body_max_bytes: 2147483648
+  idempotency_dedup_window_seconds: 3600
+
+failure_injection: {}
+  # No declared defaults — every failure scenario installs its policy at
+  # test start via `/control/inject-failure`.
+
+control:
+  # `all` so docker-mode tests can drive `/control/*` from outside
+  # the container. Inprocess mode uses the Server's typed control
+  # surface directly (not the HTTP path), but this keeps both modes
+  # uniform.
+  bind: "all"
+
+logging:
+  level: "INFO"

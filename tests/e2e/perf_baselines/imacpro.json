@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "machine_key": "imacpro",
+  "captured_at": "2026-06-11T17:53:44.389021Z",
+  "facts": {
+    "os_name": "Darwin",
+    "os_release": "24.6.0",
+    "cpu_arch": "x86_64",
+    "cpu_count": 16,
+    "total_ram_bytes": 34359738368,
+    "python_version": "3.14.5"
+  },
+  "metrics": {
+    "delivered_throughput_uploads_per_second": 17.87139848886819,
+    "admin_read_p95_seconds": 0.24797343905083835,
+    "admin_read_count": 91,
+    "uploads_total": 48
+  }
+}

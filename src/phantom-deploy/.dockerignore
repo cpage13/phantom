@@ -1,0 +1,10 @@
+# phantom-deploy/.dockerignore — minimize build context.
+#
+# The build stage COPY src/phantom-service/ ./phantom/ — every other path is
+# noise that bloats the layer cache and slows the build.
+
+# Everything except the phantom package source.
+**
+
+# Re-include the phantom package source the build needs.
+!src/phantom-service/**

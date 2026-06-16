@@ -1,0 +1,127 @@
+# Workspace root for Phantom.
+# This file declares the uv workspace and the shared tooling config (ruff,
+# mypy, pytest). Per-package pyproject.toml files live under
+# src/<package>/pyproject.toml and contain their own dependencies and build
+# config.
+
+[project]
+name = "phantom-workspace"
+version = "0.0.0"
+description = "Workspace root for Phantom and its companion packages"
+readme = "README.md"
+requires-python = ">=3.14"
+
+[tool.uv]
+package = false  # workspace root is a coordinator, not itself a buildable package
+
+[tool.uv.workspace]
+members = [
+  "src/phantom-service",
+  "src/phantom-client",
+  "src/phantom-emulator",
+]
+# NB: src/phantom-deploy is intentionally NOT a workspace member — per
+# ADR-020 (Phase 6) it ships the container image + reference compose
+# only, not a Python package. The directory carries Dockerfile +
+# docker-compose.yml + README.md.
+
+# Internal workspace deps — declare a package name in any member's dependencies
+# and uv will resolve it from the workspace instead of PyPI.
+[tool.uv.sources]
+phantom = { workspace = true }
+phantom-client = { workspace = true }
+phantom-emulator = { workspace = true }
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "pytest-mock>=3.14",
+  "ruff>=0.7",
+  "mypy>=1.13",
+  "hatchling>=1.25",
+  "pre-commit>=3.7",
+]
+
+# ---------------------------------------------------------------------------
+# Shared tooling config (applies to every package in the workspace)
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle errors
+  "F",    # pyflakes
+  "W",    # pycodestyle warnings
+  "I",    # isort
+  "N",    # pep8-naming
+  "UP",   # pyupgrade
+  "B",    # bugbear
+  "A",    # builtins shadowing
+  "C4",   # comprehensions
+  "T20",  # no print()
+  "SIM",  # simplify
+  "RUF",  # ruff-specific
+]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# Falsifiability-tooling scripts under scripts/ legitimately use print()
+# for CLI output and need to swallow arbitrary module-import exceptions.
+"scripts/**/*.py" = ["T201", "BLE001"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+# Type-check each package's production source. Tests are excluded here so the
+# per-package `tests/unit/__init__.py` files don't collide on the "unit" module
+# name when mypy walks all of src/ at once; per-package mypy runs can target
+# tests explicitly.
+files = ["src/*/src"]
+explicit_package_bases = true
+namespace_packages = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = [
+  "src/phantom-service/tests",
+  "src/phantom-client/tests",
+  "src/phantom-emulator/tests",
+  # phantom-deploy carries no Python tests post-Phase-6 (ADR-020).
+  "tests",
+]
+# Only the repo root is on sys.path, so the e2e suite's `from tests.e2e...`
+# imports resolve against the repo-root tests/ package.
+pythonpath = ["."]
+python_files = ["test_*.py", "*_test.py"]
+# Load tests live under tests/e2e/test_e2e_2[1234]_*.py and carry the
+# `load` marker. They take minutes (test_e2e_23 alone runs 15 minutes
+# wall-clock) so the default suite filters them out. Explicit
+# `pytest -m load tests/e2e/` runs them.
+#
+# `perf` tests assert the tight synthetic-return budget
+# (SYNTHETIC_RETURN_BUDGET_SECONDS, 0.1-0.25s) on the buffering POST.
+# On a loaded host or a slow Pi those assertions fire as FALSE failures
+# even though the functional behavior is correct, so they are excluded
+# from the default suite and run on a quiet/dedicated lane via
+# `uv run pytest -m perf tests/e2e/`. Nothing is deleted — the tagged
+# tests still run, just on the perf lane.
+addopts = "-m 'not load and not perf and not stress'"
+markers = [
+  "e2e: end-to-end test exercising the full package stack (tests/e2e/)",
+  "load: long-running load test gated out of the default suite (tests/e2e/test_e2e_2[1234]_*); run via `pytest -m load`",
+  "stress: stress test run on the nightly CI cron only; run via `pytest -m stress` (plan § 1.1.10)",
+  "perf: performance-budget assertions (SYNTHETIC_RETURN_BUDGET_SECONDS); run on a quiet/dedicated lane via `-m perf`; excluded from the default suite because a loaded host produces false failures",
+]

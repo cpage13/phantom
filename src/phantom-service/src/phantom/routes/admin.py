@@ -1,0 +1,2137 @@
+"""Admin endpoint router (loopback, no auth — ADR-004).
+
+Plan § 2.3.19.
+-------------------------------------------
+
+The pre-Phase-1 admin surface branched on ``row.tier`` to pick the
+matching upload store + body store half (11+ tier-discriminating
+sites). Every site is collapsed to the single
+:attr:`InstanceContext.store` + :attr:`InstanceContext.body_store`
+references (the dual-store carry is gone from InstanceContext per
+F-Slice1D-B). Body-location surfacing in responses uses the new
+``body_location`` discriminator on :class:`UploadRow` —
+:class:`ChainAdminDetail` carries ``body_location: Literal['ram',
+'file']`` instead of ``tier`` + ``committed``.
+
+Operator-facing filter: ``list_uploads`` accepts an optional
+``body_location`` query parameter that the underlying store filter
+respects.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import tarfile
+from collections.abc import AsyncIterator
+from datetime import datetime
+from pathlib import Path
+from typing import Annotated, Any, Final, Literal, get_args
+from uuid import UUID
+
+from fastapi import APIRouter, Body, Depends, FastAPI, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import StreamingResponse
+
+from phantom.config.settings import AdminLookupCfg
+from phantom.instances.context import InstanceContext, instance_storage_paths
+from phantom.instances.dispatcher import InstanceDispatcher
+from phantom.models.admin import (
+    AdminStatusResponse,
+    AuthStatus,
+    BulkDeleteResponse,
+    ChainAdminDetail,
+    CountersResponse,
+    CounterValue,
+    DeleteFilter,
+    ExtractFilter,
+    GaugesResponse,
+    GaugeValue,
+    GroupMember,
+    GroupStatusResponse,
+    IdentifierLookupResponse,
+    InstanceListResponse,
+    InstanceStatusResponse,
+    InstanceSummary,
+    ListUploadsResponse,
+    QuarantineEntry,
+    QuarantineInventoryResponse,
+    QuarantineRestoreResponse,
+    RamPressureStatusResponse,
+    ResolvedDefaultsSummary,
+    SaturationStatus,
+    StateBreakdown,
+    StatsResponse,
+    TierBreakdown,
+    TokenListResponse,
+    TokenPushRequest,
+    UploadStatusSummary,
+)
+from phantom.models.chain import ChainState
+from phantom.models.errors import STATUS_FOR_CODE, ErrorCode, error_response
+from phantom.models.upload import BodyLocation, UploadRow, UploadState
+from phantom.observability.metrics import MetricsRegistry
+from phantom.routes._version import ADMIN_ROUTER_PREFIX
+from phantom.runtime.reload import RELOAD_FAILURE_ERRORS, apply_reload
+from phantom.storage.errors import ReplayBodyDiscardedError, ReplayRefusedAttemptingError
+from phantom.storage.integrity import (
+    list_quarantines,
+    load_backup_manifest,
+    quarantine,
+    restore_mode_switch_backup,
+)
+from phantom.storage.interface import StateTally
+from phantom.storage.sqlite_store import PHANTOM_LOCAL_UUID_METADATA_KEY
+from phantom.workers.saturation import AdmissionGranted, row_holds_slot
+
+logger = logging.getLogger(__name__)
+
+# The two states in which a group member is still moving. The group
+# rollup's ``all_finished`` is the structural rule "no member is in this
+# set" (NOT a terminal-set membership test: the storage and SDK terminal
+# sets differ by corrupted/auth_expired, and both count as finished for
+# the client because neither progresses without intervention).
+_STILL_MOVING_STATES: Final[frozenset[ChainState]] = frozenset({"queued", "attempting"})
+
+# Per-instance cap on rows packed into a single ``export.tar`` response.
+# A deployed instance in the field accumulates at most a few thousand
+# buffered bodies before manual intervention; this cap protects the
+# in-memory tar builder from runaway buffer growth without losing
+# real-world coverage. Operators needing more granular slices should use the
+# ``state`` / ``route`` filter to scope the export.
+_EXPORT_TAR_PER_INSTANCE_LIMIT = 10_000
+
+
+def _admin_error(
+    code: ErrorCode,
+    message: str,
+    *,
+    instance_id: str = "unrouted",
+    details: dict[str, Any] | None = None,
+) -> Response:
+    """Build a canonical :class:`ErrorEnvelope`-shaped admin response.
+
+    Admin endpoints share Phantom's standard error envelope so the SDK
+    can decode them via the same ``EXCEPTION_FOR_CODE`` machinery used
+    for ingress errors. FastAPI's default ``HTTPException`` emits
+    ``{"detail": ...}``; here we emit ``{"error": {...}}`` per plan
+    §5.6 + ADR-010.
+
+    Args:
+        code: The stable ADR-010 error code (selects the HTTP status).
+        message: Human-readable explanation for the operator.
+        instance_id: The instance the error concerns, or ``"unrouted"``.
+        details: Optional code-specific context surfaced in the envelope's
+            ``error.details`` (the ADR-017 ``details`` shape for the code).
+    """
+    envelope = error_response(
+        code,
+        message,
+        instance_id=instance_id,
+        request_id="",
+        details=details,
+    )
+    return Response(
+        content=envelope.model_dump_json(),
+        media_type="application/json",
+        status_code=STATUS_FOR_CODE[code],
+    )
+
+
+def get_dispatcher() -> InstanceDispatcher:
+    """Dependency placeholder — wired by the composition root."""
+    raise NotImplementedError("InstanceDispatcher dependency must be overridden by app factory")
+
+
+def get_version() -> str:
+    """Phantom version string — overridden by the composition root."""
+    return "0.1.0"
+
+
+def get_resolved_defaults_summary() -> ResolvedDefaultsSummary | None:
+    """Resolved-defaults summary — overridden by the composition root.
+
+    Returns ``None`` in tests or partial wirings where the summary
+    isn't built. Production always wires a concrete summary via
+    :func:`phantom.app.create_app`.
+    """
+    return None
+
+
+def get_metrics_registry() -> MetricsRegistry:
+    """Process-wide :class:`MetricsRegistry` — wired by the composition root.
+
+    Plan § 4.2.5. The composition root (``app.py.create_app``) overrides
+    this dependency with ``lambda: app.state.metrics_registry``; admin
+    observability endpoints depend on it to serialize the registry into
+    JSON. Tests that exercise the endpoints may either rely on the
+    create_app override path or pass their own override via the FastAPI
+    test client's dependency overrides.
+    """
+    raise NotImplementedError("MetricsRegistry dependency must be overridden by app factory")
+
+
+def get_data_root() -> Path:
+    """Top-level ``Settings.storage.data_dir`` — wired by app factory.
+
+    Plan § 5.2.5 / § 1.4 / § 1.5. This is the TOP-LEVEL data dir; the
+    quarantine inventory and restore routes combine it with each instance's
+    ``cfg.data_dir`` (via :func:`instance_storage_paths`) to reach the
+    per-instance ``data_root`` where artifacts actually live (Finding F-1).
+    Overridden in ``create_app`` with the resolved ``Settings.storage.data_dir``
+    value.
+    """
+    raise NotImplementedError("data_root dependency must be overridden by app factory")
+
+
+router = APIRouter(prefix=ADMIN_ROUTER_PREFIX)
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+#
+# Liveness (``GET /v1/healthz``) and readiness (``GET /v1/readyz``) moved
+# to the PUBLIC health router (:mod:`phantom.routes.health`) in R12-1:
+# this admin router now serves only the loopback-bound admin surface, so
+# the orchestrator probe paths had to move to the public listener (the
+# only surface a remote probe reaches by default). Their dependency
+# placeholder ``get_degraded_instances`` and the ``_degraded_detail``
+# helper moved with them.
+
+
+@router.get("/stats", response_model=StatsResponse)
+async def get_stats(
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+    instance: str | None = Query(None),
+) -> StatsResponse:
+    """Aggregate counters across instances (optionally scoped)."""
+    targets = _scope_instances(dispatcher, instance)
+    return await _aggregate_stats(targets)
+
+
+async def _aggregate_stats(targets: list[InstanceContext]) -> StatsResponse:
+    """Aggregate stats across the given instance list."""
+    in_flight = TierBreakdown(count=0, bytes=0)
+    by_state = StateBreakdown(
+        queued=TierBreakdown(count=0, bytes=0),
+        attempting=TierBreakdown(count=0, bytes=0),
+        auth_expired=TierBreakdown(count=0, bytes=0),
+        stored=TierBreakdown(count=0, bytes=0),
+        succeeded_recent=TierBreakdown(count=0, bytes=0),
+        failed_recent=TierBreakdown(count=0, bytes=0),
+    )
+    # Plan § 2.3.19: tier → body_location collapse.
+    # Every row carries body_location ∈ {'ram', 'file'} (the source of
+    # truth for which BodyStore holds its bytes).
+    body_location_map: dict[BodyLocation, TierBreakdown] = {
+        "ram": TierBreakdown(count=0, bytes=0),
+        "file": TierBreakdown(count=0, bytes=0),
+    }
+    auth_expired_count = 0
+    # ``stored`` is terminal, so the non-terminal loop below never sees it
+    # and ``by_state.stored`` would stay structurally zero. We add a
+    # second, read-only GROUP BY aggregate (counts_by_state) and consume
+    # ONLY its ``stored`` entry here — the non-terminal entries, in_flight,
+    # and body_location keep coming from the loop, so the loop is not
+    # redundant. The two reads (auth_expired from the loop, stored from
+    # the aggregate) are eventually-consistent by design; admin stats
+    # tolerate the small skew under concurrent writes, so they are NOT
+    # forced into one transaction.
+    stored_tally = StateTally(count=0, bytes=0)
+    for ctx in targets:
+        rows = await ctx.store.list_non_terminal()
+        for row in rows:
+            body_location_map[row.body_location] = TierBreakdown(
+                count=body_location_map[row.body_location].count + 1,
+                bytes=body_location_map[row.body_location].bytes + row.body_size_bytes,
+            )
+            field = getattr(by_state, row.state, None)
+            if isinstance(field, TierBreakdown):
+                setattr(
+                    by_state,
+                    row.state,
+                    TierBreakdown(count=field.count + 1, bytes=field.bytes + row.body_size_bytes),
+                )
+            if row.state in {"queued", "attempting", "auth_expired"}:
+                in_flight = TierBreakdown(
+                    count=in_flight.count + 1, bytes=in_flight.bytes + row.body_size_bytes
+                )
+            if row.state == "auth_expired":
+                auth_expired_count += 1
+        tallies = await ctx.store.counts_by_state()
+        stored_this = tallies.get("stored", StateTally(count=0, bytes=0))
+        stored_tally = StateTally(
+            count=stored_tally.count + stored_this.count,
+            bytes=stored_tally.bytes + stored_this.bytes,
+        )
+    by_state.stored = TierBreakdown(count=stored_tally.count, bytes=stored_tally.bytes)
+    # Parked = the operator-owned non-success backlog: ``stored`` (terminal,
+    # body recoverable) plus ``auth_expired`` (waiting for a token).
+    parked_total = stored_tally.count + auth_expired_count
+    saturated = any(ctx.saturation.saturated for ctx in targets)
+    max_in_flight = sum(ctx.saturation.max_in_flight for ctx in targets)
+    max_in_flight_bytes = sum(ctx.saturation.max_in_flight_bytes for ctx in targets)
+    return StatsResponse(
+        in_flight=in_flight,
+        by_state=by_state,
+        body_location=body_location_map,
+        saturation=SaturationStatus(
+            max_in_flight=max_in_flight,
+            max_in_flight_bytes=max_in_flight_bytes,
+            saturated=saturated,
+        ),
+        auth=AuthStatus(phantom_token_expires_at=None, auth_expired_count=auth_expired_count),
+        parked_total=parked_total,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-instance & aggregate status (ADR-007)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/status", response_model=AdminStatusResponse)
+async def get_admin_status(
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+    resolved_defaults: Annotated[
+        ResolvedDefaultsSummary | None,
+        Depends(get_resolved_defaults_summary),
+    ],
+) -> AdminStatusResponse:
+    """Aggregate admin status."""
+    summaries: list[InstanceSummary] = []
+    total_backlog = 0
+    total_disk_bytes = 0
+    for ctx in dispatcher.all_instances():
+        rows = await ctx.store.list_non_terminal()
+        summaries.append(
+            InstanceSummary(
+                id=ctx.cfg.id,
+                host_prefixes=list(ctx.cfg.host_prefixes),
+                refresh_strategy="ad_client_credentials" if ctx.minter is not None else "wait",
+                in_flight=ctx.saturation.in_flight,
+            )
+        )
+        total_backlog += len(rows)
+        # Sum body-file bytes per instance — see §6.1. Walks the tree at
+        # request time; cheap for hundreds of bodies and acceptable for v1.
+        total_disk_bytes += await ctx.file_body_store.total_bytes()
+    return AdminStatusResponse(
+        ready=True,
+        disk_usage_bytes=total_disk_bytes,
+        total_backlog=total_backlog,
+        instances=summaries,
+        ad_reachability="not_configured",
+        resolved_defaults=resolved_defaults,
+    )
+
+
+@router.get("/instances", response_model=InstanceListResponse)
+async def list_instances(
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> InstanceListResponse:
+    """List all configured instances.
+
+    Returns an ``{"instances": [...]}`` envelope (not a bare array) to
+    match the SDK ``list_instances`` model and the prevailing admin-list
+    convention shared by ``/chains`` and ``/tokens`` (R-EX4).
+    """
+    out: list[InstanceSummary] = []
+    for ctx in dispatcher.all_instances():
+        out.append(
+            InstanceSummary(
+                id=ctx.cfg.id,
+                host_prefixes=list(ctx.cfg.host_prefixes),
+                refresh_strategy="ad_client_credentials" if ctx.minter is not None else "wait",
+                in_flight=ctx.saturation.in_flight,
+            )
+        )
+    return InstanceListResponse(instances=out)
+
+
+@router.get("/instances/{instance_id}/status", response_model=InstanceStatusResponse)
+async def get_instance_status(
+    instance_id: str,
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> InstanceStatusResponse:
+    """Per-instance admin status.
+
+    Raises 421 ``instance_unknown`` when the named instance is not
+    configured (plan §5.6 error table); the app-level handler converts
+    that into a canonical ``ErrorEnvelope`` response.
+    """
+    ctx = dispatcher.by_id(instance_id)
+    if ctx is None:
+        raise UnknownInstanceError(instance_id)
+    stats = await _aggregate_stats([ctx])
+    return InstanceStatusResponse(
+        id=ctx.cfg.id,
+        ready=True,
+        in_flight=stats.in_flight,
+        by_state=stats.by_state,
+        auth=stats.auth,
+        # See §6.1 — per-instance body-file bytes via the existing store helper.
+        disk_usage_bytes=await ctx.file_body_store.total_bytes(),
+        degraded_durability=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Uploads
+# ---------------------------------------------------------------------------
+
+
+def _parse_key_value_match(raw: str) -> tuple[str, str]:
+    """Parse one ``?key_value_match=`` wire value into its ``(key, value)`` pair.
+
+    Two forms (round 2 defender fix R2-3):
+
+    * Plain form, the established wire format: split at the FIRST
+      colon, so plain keys pair with colon-bearing values unchanged
+      (``ts:12:30:00`` is key ``ts``, value ``12:30:00``).
+    * Quoted-key form, for keys the plain form cannot address: a value
+      beginning with ``"`` carries the key as a double-quoted string
+      with backslash escapes for ``"`` and ``\\``, then a colon, then
+      the value (``"tag:env":prod`` is key ``tag:env``,
+      value ``prod``). The SDK emits this form automatically when the
+      key needs it.
+
+    Key and value must both be non-empty (an empty KVS key is not an
+    addressable pair and an empty value match is meaningless; the same
+    ruling as the aligned ``KeyValueMatchFilter`` min_length=1
+    contract, R2-1).
+
+    Returns:
+        The decoded ``(key, value)`` pair.
+
+    Raises:
+        KeyValueMatchInvalidError: When ``raw`` parses under neither
+            form (the handler answers the canonical 422
+            ``key_value_match_invalid`` envelope).
+    """
+    if raw.startswith('"'):
+        key_chars: list[str] = []
+        index = 1
+        closed = False
+        while index < len(raw):
+            char = raw[index]
+            if char == "\\":
+                follower = raw[index + 1] if index + 1 < len(raw) else None
+                if follower not in ('"', "\\"):
+                    raise KeyValueMatchInvalidError(
+                        raw=raw,
+                        reason=('bad escape in the quoted key (only \\" and \\\\ are defined)'),
+                    )
+                key_chars.append(follower)
+                index += 2
+                continue
+            if char == '"':
+                closed = True
+                index += 1
+                break
+            key_chars.append(char)
+            index += 1
+        if not closed:
+            raise KeyValueMatchInvalidError(
+                raw=raw, reason="the quoted key is missing its closing quote"
+            )
+        if index >= len(raw) or raw[index] != ":":
+            raise KeyValueMatchInvalidError(
+                raw=raw, reason="expected ':' immediately after the quoted key"
+            )
+        key = "".join(key_chars)
+        value = raw[index + 1 :]
+    else:
+        if ":" not in raw:
+            raise KeyValueMatchInvalidError(
+                raw=raw, reason="the value must be 'key:value' (no colon found)"
+            )
+        key, value = raw.split(":", 1)
+    if not key:
+        raise KeyValueMatchInvalidError(raw=raw, reason="the key must be non-empty")
+    if not value:
+        raise KeyValueMatchInvalidError(raw=raw, reason="the value must be non-empty")
+    return key, value
+
+
+@router.get("/chains", response_model=ListUploadsResponse)
+async def list_uploads(
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+    state: UploadState | None = Query(None),  # noqa: B008
+    route: str | None = Query(None),
+    multifile_id: UUID | None = Query(None),  # noqa: B008
+    group_id: UUID | None = Query(None),  # noqa: B008
+    since: datetime | None = Query(None),  # noqa: B008
+    limit: int = Query(100, ge=1, le=1000),
+    cursor: str | None = Query(None),
+    instance: str | None = Query(None),
+    key_value_match: str | None = Query(
+        None,
+        description=(
+            "Match rows whose metadata key-value store carries this "
+            "pair, written 'key:value' and split at the FIRST colon "
+            "(so values may contain colons). A key that itself "
+            "contains a colon, or begins with a double quote, rides "
+            "the quoted-key form '\"<key>\":<value>' with backslash "
+            "escapes for '\"' and '\\' inside the key (the SDK "
+            "encodes this automatically). Key and value must both be "
+            "non-empty; anything unparseable refuses with the 422 "
+            "key_value_match_invalid envelope."
+        ),
+    ),
+    body_location: Literal["ram", "file"] | None = Query(None),
+) -> ListUploadsResponse:
+    """List chains with filters + cursor pagination.
+
+    Single-store pagination (plan § 2.3.19) —
+    the pre-Phase-1 dual-store fan-out is gone with the schema
+    collapse. The cursor opaquely carries the underlying store's
+    continuation token.
+
+    ``body_location`` query parameter scopes by which body store
+    currently holds the chain's bytes (``ram`` vs ``file``).
+
+    The ``key_value_match`` branch is a one-shot lookup (not paginated)
+    because the underlying store helper returns at most ``limit`` rows
+    per source with no continuation token. Its wire format is parsed by
+    :func:`_parse_key_value_match`: the established first-colon split
+    for plain keys, the quoted-key form for keys containing a colon
+    (round 2 defender fix R2-3; see the query parameter description).
+
+    The ``multifile_id`` filter returns the set ordered by
+    ``send_order`` (recorded position); it is one-shot like
+    ``key_value_match`` (a multi-file set is producer-scale small), so
+    combining it with ``cursor`` is a 422 ``multifile_cursor_conflict``
+    envelope and ``next_cursor`` is always null on its responses.
+    ``group_id`` filters by the query-grouping handle and paginates
+    like every other filter.
+
+    Raises:
+        MultifileCursorConflictError: When ``multifile_id`` is combined
+            with ``cursor`` (422 ``multifile_cursor_conflict``
+            envelope).
+        KeyValueMatchInvalidError: When ``key_value_match`` does not
+            parse (422 ``key_value_match_invalid`` envelope).
+    """
+    targets = _scope_instances(dispatcher, instance)
+    if multifile_id is not None and cursor is not None:
+        raise MultifileCursorConflictError(multifile_id=multifile_id, cursor=cursor)
+    if key_value_match is not None:
+        key, value = _parse_key_value_match(key_value_match)
+        kv_rows: list[UploadRow] = []
+        for ctx in targets:
+            kv_rows.extend(await ctx.store.list_by_key_value(key, value, limit=limit))
+        if body_location is not None:
+            kv_rows = [r for r in kv_rows if r.body_location == body_location]
+        return ListUploadsResponse(uploads=kv_rows[:limit], next_cursor=None)
+
+    # Fan out across instances; the per-store helper handles the cursor.
+    # Multi-instance pagination would need an outer cursor; today every
+    # production deployment runs a single instance per Phantom process
+    # (see CONTEXT.md "Topology and storage"), so the one-instance
+    # path is the load-bearing one — the multi-instance fan-out
+    # concatenates the per-instance pages.
+    all_rows: list[UploadRow] = []
+    next_cursor: str | None = None
+    for ctx in targets:
+        chunk, store_next = await ctx.store.list_uploads(
+            state=state,
+            route=route,
+            multifile_id=multifile_id,
+            group_id=group_id,
+            since=since,
+            limit=limit,
+            cursor=cursor,
+            instance=instance,
+        )
+        all_rows.extend(chunk)
+        # Carry the last non-None cursor (single-instance: this is the
+        # store's continuation; multi-instance: the last instance's
+        # continuation, which the client uses on the next request).
+        if store_next is not None:
+            next_cursor = store_next
+
+    if body_location is not None:
+        all_rows = [r for r in all_rows if r.body_location == body_location]
+
+    # Sort merged result for determinism across the multi-instance
+    # concatenation. Default: matches the per-store ``ORDER BY
+    # received_at ASC, chain_id ASC`` so the merge is monotone. With the
+    # multifile filter the per-store order is ``send_order ASC``; the
+    # merge must preserve it, with receipt time and chain_id as
+    # deterministic tiebreaks.
+    if multifile_id is not None:
+        all_rows.sort(key=lambda r: (r.send_order, r.received_at, r.chain_id))
+    else:
+        all_rows.sort(key=lambda r: (r.received_at, r.chain_id))
+
+    return ListUploadsResponse(
+        uploads=all_rows[:limit],
+        next_cursor=next_cursor,
+    )
+
+
+@router.get("/chains/{chain_id}", response_model=ChainAdminDetail)
+async def get_upload(
+    chain_id: UUID,
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> ChainAdminDetail:
+    """Return a :class:`ChainAdminDetail` projection of one chain.
+
+    Admin-only (loopback per ADR-004). Extends the wire-facing
+    :class:`ChainResponse` with ``body_location`` so operators and E2E
+    tests can inspect storage state without changing the SDK contract.
+
+    Round-2 extension: the persisted request envelope is surfaced via
+    :attr:`ChainAdminDetail.metadata` and :attr:`ChainAdminDetail.steps`
+    so an operator can answer "what did the producer actually send?" without
+    fetching the body. The envelope is deserialized from the row's
+    ``chain_envelope_json`` column; no schema change is required.
+    """
+    row = await _find_upload(dispatcher, chain_id)
+    if row is None:
+        raise NotFoundError(f"chain {chain_id} not found")
+    from phantom.models.chain import CapturedStep
+
+    captured = [
+        CapturedStep(step_name=step, values=dict(values.values))
+        for step, values in row.captured_values.steps.items()
+    ]
+    metadata, steps = ChainAdminDetail.project_from_envelope(row.chain_envelope_json)
+    return ChainAdminDetail(
+        chain_id=row.chain_id,
+        state=row.state,
+        received_at=row.received_at,
+        updated_at=row.updated_at,
+        next_attempt_at=row.next_attempt_at,
+        sent_at=row.sent_at,
+        group_id=row.group_id,
+        multifile_id=row.multifile_id,
+        send_order=row.send_order,
+        body_location=row.body_location,
+        last_step_completed=row.last_step_completed,
+        captured=captured,
+        attempts=row.attempts,
+        last_error=row.last_error,
+        metadata=metadata,
+        steps=steps,
+    )
+
+
+@router.get("/groups/{group_id}", response_model=GroupStatusResponse)
+async def get_group_status(
+    group_id: UUID,
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+    instance: str | None = Query(None),
+) -> GroupStatusResponse:
+    """Synthesized rollup for one query group (cycle-7 task 4.4).
+
+    Fans out over instances via the aggregate idiom (a group can
+    legitimately straddle instances; routing is per target URL prefix,
+    ADR-006) and folds the members in Python. 404 ONLY when no row
+    anywhere carries the id; because ``group_id`` is NOT NULL and
+    defaults to ``chain_id`` at admission, a chain_id queried as a
+    group id resolves to its self-evident singleton group (the accepted
+    shared-value-space wart: ``total=1`` and the lone member's chain_id
+    equals the queried id).
+
+    ``counts_by_state`` carries ALL EIGHT canonical states (zero counts
+    included) so the histogram has a deterministic shape;
+    ``all_finished`` is the structural finished rule (see
+    ``_STILL_MOVING_STATES``); ``first_received_at`` / ``last_sent_at``
+    are the min/max joins over the members. ``?instance=`` narrows the
+    rollup to one instance (404 when the group has no rows there).
+    """
+    targets = _scope_instances(dispatcher, instance)
+    member_rows: list[UploadRow] = []
+    for ctx in targets:
+        member_rows.extend(await ctx.store.list_by_group_id(group_id))
+    if not member_rows:
+        raise NotFoundError(f"group {group_id} not found")
+    # Deterministic member order across the multi-instance merge: the
+    # per-store listing order (receipt time, chain_id tiebreak).
+    member_rows.sort(key=lambda r: (r.received_at, r.chain_id))
+    counts_by_state: dict[ChainState, int] = dict.fromkeys(get_args(ChainState), 0)
+    for row in member_rows:
+        counts_by_state[row.state] += 1
+    all_finished = not any(row.state in _STILL_MOVING_STATES for row in member_rows)
+    sent_stamps = [row.sent_at for row in member_rows if row.sent_at is not None]
+    members = [
+        GroupMember(
+            chain_id=row.chain_id,
+            state=row.state,
+            received_at=row.received_at,
+            sent_at=row.sent_at,
+            attempts=row.attempts,
+            last_error=row.last_error,
+            send_order=row.send_order,
+            multifile_id=row.multifile_id,
+        )
+        for row in member_rows
+    ]
+    return GroupStatusResponse(
+        group_id=group_id,
+        total=len(members),
+        counts_by_state=counts_by_state,
+        all_finished=all_finished,
+        first_received_at=min(row.received_at for row in member_rows),
+        last_sent_at=max(sent_stamps) if sent_stamps else None,
+        members=members,
+    )
+
+
+@router.get("/uploads/by-captured-id/{captured_id}", response_model=IdentifierLookupResponse)
+async def lookup_by_captured_id(
+    captured_id: str,
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+    instance: str | None = Query(None),
+) -> IdentifierLookupResponse:
+    """Look up uploads by the upstream-assigned captured id (cycle-7 task 4.4).
+
+    The identifier lives inside ``captured_values_json``; WHERE it lives
+    is bound by per-instance deployment configuration
+    (``InstanceCfg.admin_lookup``), so the service stays
+    upstream-ignorant and the route takes no query params beyond
+    ``?instance=``. Every targeted instance must carry the binding;
+    otherwise the lookup refuses with ``lookup_not_configured`` (HTTP
+    400) rather than guessing or silently skipping an instance (a
+    found=false answer that ignored an unconfigured instance would be a
+    lie). A miss is 200 with ``found=false``: the question is a
+    membership test, not a resource fetch.
+
+    The bindings are snapshotted ONCE, before the unconfigured guard,
+    and the fan-out runs entirely off that snapshot: a config reload
+    repointing ``ctx.cfg`` mid-request cannot make the loop's per-ctx
+    re-read skip the instance holding the match (the found=false lie
+    the round 2 adversary proved, finding R2-4). The answer is the
+    truth as of guard time; the reloaded bindings serve the next
+    request.
+    """
+    targets = _scope_instances(dispatcher, instance)
+    # ONE read of each instance's cfg, before any await (R2-4): the
+    # guard and the fan-out below must see the same bindings.
+    snapshot: list[tuple[InstanceContext, AdminLookupCfg]] = []
+    unconfigured: list[str] = []
+    for ctx in targets:
+        cfg = ctx.cfg
+        if cfg.admin_lookup is None:
+            unconfigured.append(cfg.id)
+        else:
+            snapshot.append((ctx, cfg.admin_lookup))
+    if unconfigured:
+        raise LookupNotConfiguredError(instance_ids=tuple(unconfigured))
+    matches: list[UploadStatusSummary] = []
+    for ctx, lookup in snapshot:
+        rows = await ctx.store.find_by_captured_value(
+            lookup.capture_name, lookup.json_path, captured_id
+        )
+        matches.extend(_status_summary_for_row(row, lookup) for row in rows)
+    matches.sort(key=lambda m: (m.received_at, m.chain_id))
+    return IdentifierLookupResponse(
+        kind="captured_file_id",
+        value=captured_id,
+        found=bool(matches),
+        matches=matches,
+    )
+
+
+@router.get("/uploads/by-local-uuid/{local_uuid}", response_model=IdentifierLookupResponse)
+async def lookup_by_local_uuid(
+    local_uuid: UUID,
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+    instance: str | None = Query(None),
+) -> IdentifierLookupResponse:
+    """Look up uploads by their producer-minted local uuid (cycle-7 task 4.4).
+
+    First-class promotion of the generic
+    ``?key_value_match=phantom_local_uuid:<v>`` lookup: the metadata key
+    is PINNED store-side (the caller never spells a key or a JSON path)
+    and the result is the same status projection the captured-id lookup
+    returns. Needs NO per-instance configuration (the key is a fixed
+    Phantom convention). A miss is 200 with ``found=false``; matches is
+    a list because Phantom enforces no global uniqueness on the key.
+
+    The per-instance ``admin_lookup`` bindings (used only for the
+    best-effort ``captured_file_id`` surfacing field here) are
+    snapshotted once before the fan-out, the same reload-race posture
+    as the by-captured-id route (R2-4).
+    """
+    targets = _scope_instances(dispatcher, instance)
+    # One read of each instance's cfg before any await (R2-4 posture):
+    # the surfacing binding cannot change identity mid-request.
+    bindings = [(ctx, ctx.cfg.admin_lookup) for ctx in targets]
+    matches: list[UploadStatusSummary] = []
+    for ctx, lookup in bindings:
+        rows = await ctx.store.find_by_local_uuid(local_uuid)
+        matches.extend(_status_summary_for_row(row, lookup) for row in rows)
+    matches.sort(key=lambda m: (m.received_at, m.chain_id))
+    return IdentifierLookupResponse(
+        kind="local_uuid",
+        value=str(local_uuid),
+        found=bool(matches),
+        matches=matches,
+    )
+
+
+def _status_summary_for_row(
+    row: UploadRow,
+    lookup: AdminLookupCfg | None,
+) -> UploadStatusSummary:
+    """Project one upload row into the lookup status summary.
+
+    The two correlation fields are best-effort surfacing reads:
+    ``captured_file_id`` resolves through the instance's
+    ``admin_lookup`` binding when one exists (None otherwise; the row
+    may simply not have captured it yet), and ``local_uuid`` mirrors the
+    exact pinned envelope path the by-local-uuid lookup matches on.
+    """
+    return UploadStatusSummary(
+        chain_id=row.chain_id,
+        state=row.state,
+        received_at=row.received_at,
+        sent_at=row.sent_at,
+        attempts=row.attempts,
+        last_error=row.last_error,
+        instance_id=row.instance_id,
+        multifile_id=row.multifile_id,
+        send_order=row.send_order,
+        captured_file_id=(_captured_identifier_for_row(row, lookup) if lookup else None),
+        local_uuid=_local_uuid_for_row(row),
+    )
+
+
+def _captured_identifier_for_row(row: UploadRow, lookup: AdminLookupCfg) -> str | None:
+    """Read the configured captured identifier off one row's captured values.
+
+    Walks the SAME path the store's ``find_by_captured_value`` JSON1
+    extract uses (``steps.<capture_name>.values.<json_path>``) so what
+    the lookup matches and what the response surfaces can never drift.
+    Returns None when the step has not captured yet, the path does not
+    resolve, or the landing value is not a string.
+    """
+    step = row.captured_values.steps.get(lookup.capture_name)
+    if step is None:
+        return None
+    node: Any = step.values
+    for part in lookup.json_path.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node if isinstance(node, str) else None
+
+
+def _local_uuid_for_row(row: UploadRow) -> UUID | None:
+    """Read the pinned local-uuid metadata key off one row's envelope.
+
+    Mirrors the store's ``find_by_local_uuid`` JSON1 path EXACTLY
+    (``$.steps[0].body.value.metadata.keyValueStore.<pinned key>``,
+    camelCase only): the surfaced value is precisely what the
+    by-local-uuid lookup would match on, no more and no less. Returns
+    None when the envelope does not parse, the path does not resolve,
+    or the landing value is not a valid UUID string.
+    """
+    try:
+        envelope: Any = json.loads(row.chain_envelope_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    steps = envelope.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return None
+    node: Any = steps[0]
+    for key in ("body", "value", "metadata", "keyValueStore"):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    if not isinstance(node, dict):
+        return None
+    raw = node.get(PHANTOM_LOCAL_UUID_METADATA_KEY)
+    if not isinstance(raw, str):
+        return None
+    try:
+        return UUID(raw)
+    except ValueError:
+        return None
+
+
+@router.get("/chains/{chain_id}/body")
+async def get_upload_body(
+    chain_id: UUID,
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> StreamingResponse:
+    """Stream the body bytes."""
+    ctx, row = await _find_upload_with_ctx(dispatcher, chain_id)
+    if row is None or ctx is None:
+        raise NotFoundError(f"chain {chain_id} not found")
+    # Single body store reference; HybridBodyStore
+    # routes the read to the RAM or file half by RAM-presence.
+    body = await ctx.body_store.get_all(row.chain_id)
+    payload = b"".join(body.values())
+    return StreamingResponse(_chunk_bytes(payload), media_type="application/octet-stream")
+
+
+def _chunk_bytes(data: bytes) -> AsyncIterator[bytes]:
+    """Yield ``data`` once for streaming-friendly emission."""
+
+    async def gen() -> AsyncIterator[bytes]:
+        yield data
+
+    return gen()
+
+
+@router.get("/chains/{chain_id}/bundle")
+async def get_upload_bundle(
+    chain_id: UUID,
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> Response:
+    """Return metadata + body as a simple JSON envelope.
+
+    A real multipart implementation would require an SDK; the simple
+    JSON envelope is sufficient for admin tooling and the v1 milestone.
+    """
+    ctx, row = await _find_upload_with_ctx(dispatcher, chain_id)
+    if row is None or ctx is None:
+        raise NotFoundError(f"chain {chain_id} not found")
+    body = await ctx.body_store.get_all(row.chain_id)
+    bundle = {
+        "metadata": json.loads(row.model_dump_json()),
+        "body_refs": {name: data.hex() for name, data in body.items()},
+    }
+    return Response(content=json.dumps(bundle), media_type="application/json")
+
+
+@router.post("/chains/extract")
+async def extract_uploads(
+    filter_body: Annotated[ExtractFilter, Body()],
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> StreamingResponse:
+    """Stream a tar of matching bodies plus a manifest.json."""
+    targets = _scope_instances(dispatcher, filter_body.instance)
+    return StreamingResponse(
+        _build_tar_stream(targets, filter_body),
+        media_type="application/x-tar",
+    )
+
+
+@router.get("/export.tar")
+async def export_tar(
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> StreamingResponse:
+    """Stream every buffered body + manifest.json (ADR-005)."""
+    targets = list(dispatcher.all_instances())
+    return StreamingResponse(
+        _build_tar_stream(
+            targets,
+            ExtractFilter(state=None, route=None, since=None, chain_ids=None, instance=None),
+        ),
+        media_type="application/x-tar",
+    )
+
+
+async def _build_tar_stream(
+    targets: list[InstanceContext], filter_body: ExtractFilter
+) -> AsyncIterator[bytes]:
+    """Yield a single tar archive with manifest.json + every body.
+
+    Built entirely in-memory, then yielded as one chunk. Tar archives need
+    every member's size up front, so streaming-as-we-go is not free —
+    materializing first keeps the implementation simple and matches the
+    v1 export.tar / extract use case (producer-scale data, not GB+).
+
+    With an empty filter the export returns every row in the store —
+    including terminal states (``succeeded`` / ``failed`` / ``stored`` /
+    ``cancelled`` / ``corrupted``). ADR-005's producer-recovery use case is
+    "pull every buffered body the operator might want," which is exactly
+    the terminal set: a `stored` chain whose retry budget exhausted is
+    the primary thing an operator recovers via export.tar. Callers who
+    want only non-terminal rows must opt in via the ``state`` filter.
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        manifest: list[dict[str, Any]] = []
+        for ctx in targets:
+            # R8-5: every advertised ExtractFilter axis restricts the
+            # tar. ``chain_ids`` names exact rows, so it is served by
+            # point reads with the other axes applied as predicates (no
+            # pagination interplay, no per-instance-limit truncation of
+            # named rows); the listing path forwards ``since`` (received
+            # at or after, the DeleteFilter semantics) into the store.
+            chunk: list[UploadRow]
+            if filter_body.chain_ids is not None:
+                chunk = []
+                for cid in filter_body.chain_ids:
+                    row = await ctx.store.get(cid)
+                    if row is None or row.instance_id != ctx.cfg.id:
+                        continue
+                    if filter_body.state is not None and row.state != filter_body.state:
+                        continue
+                    if filter_body.route is not None and row.route_name != filter_body.route:
+                        continue
+                    if filter_body.since is not None and row.received_at < filter_body.since:
+                        continue
+                    chunk.append(row)
+            else:
+                chunk, _ = await ctx.store.list_uploads(
+                    state=filter_body.state,
+                    route=filter_body.route,
+                    since=filter_body.since,
+                    limit=_EXPORT_TAR_PER_INSTANCE_LIMIT,
+                )
+            for row in chunk:
+                manifest.append(
+                    {
+                        "chain_id": str(row.chain_id),
+                        "instance_id": row.instance_id,
+                        # Cycle-7 task 4.6: the query-grouping handle, so an
+                        # operator can correlate exported bodies back to the
+                        # group surface without a second lookup.
+                        "group_id": str(row.group_id),
+                        "state": row.state,
+                        "endpoint": row.endpoint,
+                        "received_at": row.received_at.isoformat(),
+                        # Cycle-7 task 4.6: confirmed-delivery instant; null
+                        # for never-delivered rows (the export's main
+                        # audience: stored/failed bodies awaiting recovery).
+                        "sent_at": (row.sent_at.isoformat() if row.sent_at else None),
+                        "body_size_bytes": row.body_size_bytes,
+                        "storage_encoding": row.storage_encoding,
+                    }
+                )
+                # Pack the body bytes through the mode-selected body store.
+                try:
+                    body = await ctx.body_store.get_all(row.chain_id)
+                except KeyError:
+                    continue
+                for name, data in body.items():
+                    info = tarfile.TarInfo(name=f"bodies/{row.chain_id}/{name}")
+                    info.size = len(data)
+                    tf.addfile(info, io.BytesIO(data))
+        manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
+        info = tarfile.TarInfo(name="manifest.json")
+        info.size = len(manifest_bytes)
+        tf.addfile(info, io.BytesIO(manifest_bytes))
+    yield buf.getvalue()
+
+
+@router.post("/chains/{chain_id}/replay", response_model=UploadRow)
+async def replay_upload(
+    chain_id: UUID,
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> UploadRow | Response:
+    """Reset attempts and re-queue.
+
+    M-W4-F7 audit closure: ``replay`` refuses when the row is currently
+    ``attempting`` (a sender is actively driving it). The store raises
+    :class:`ReplayRefusedAttemptingError` from its in-write-lock state
+    precheck; the app-registered
+    :func:`replay_refused_attempting_exception_handler` converts it
+    into the canonical 409 ``replay_refused_attempting`` envelope so
+    the operator can wait for the sender to finish (or cancel first).
+    Round 1 defender fix (R1-1): pre-fix this refusal escaped as
+    FastAPI's raw ``{"detail": ...}`` body, which the SDK could not
+    dispatch on.
+
+    Body-accounting refusal (cycle-7 phase 7 pre-round defender fix):
+    the store raises :class:`ReplayBodyDiscardedError` when the row's
+    ``body_discarded_at`` is stamped (the body is gone per the row's
+    own accounting, on either discard leg). The app-registered
+    :func:`replay_body_discarded_exception_handler` converts it into
+    the canonical 409 ``replay_body_discarded`` envelope; the row is
+    left exactly as it was (``sent_at`` preserved). Without the
+    refusal, the re-queued row would land in ``corrupted`` on the
+    sender's next claim, laundering an operator action into a
+    corruption signal.
+
+    Raises:
+        NotFoundError: When no instance holds the chain, including a
+            row deleted between the lookup and the store's write lock
+            (404 envelope).
+        ReplayBodyDiscardedError: When the row's body was already
+            discarded (409 ``replay_body_discarded`` envelope).
+        ReplayRefusedAttemptingError: When a sender is actively
+            driving the row (409 ``replay_refused_attempting``
+            envelope).
+    """
+    ctx, row = await _find_upload_with_ctx(dispatcher, chain_id)
+    if ctx is None or row is None:
+        raise NotFoundError(f"chain {chain_id} not found")
+    # R8-6: a replay re-queues the row into the in-flight set. A row
+    # whose slot was RELEASED (the sender's terminal transitions; the
+    # auth_expired park) must re-admit through the gate exactly as the
+    # AuthKicker does on wake; queued/stored rows still hold their slot
+    # and must not double-charge. On any store-side refusal the row
+    # never re-entered the in-flight set, so the slot is released
+    # again. Refusing the replay outright when the gate is full keeps
+    # the ledger truthful: re-queueing without a slot is the drift.
+    charged = not row_holds_slot(row.state, row.body_discarded_at)
+    if charged:
+        admission = await ctx.saturation.admit(row.body_size_bytes)
+        if not isinstance(admission, AdmissionGranted):
+            return _admin_error(
+                "saturation_cap",
+                "Replay refused: the saturation gate is at capacity and the "
+                "replayed row would re-enter the in-flight set; retry after "
+                "capacity frees.",
+                instance_id=ctx.cfg.id,
+            )
+    try:
+        outcome = await ctx.store.replay(chain_id)
+    except Exception:
+        if charged:
+            await ctx.saturation.release(row.body_size_bytes)
+        raise
+    if outcome is None:
+        # The row vanished between the lookup above and the store's
+        # in-lock precheck (a delete race); same answer as the up-front
+        # miss.
+        if charged:
+            await ctx.saturation.release(row.body_size_bytes)
+        raise NotFoundError(f"chain {chain_id} not found")
+    # R9-4: the admit decision above used the PRE-FETCHED state, which
+    # races the kicker's wake (charges + re-queues) and the sender's
+    # terminal transitions (release) in both directions. Reconcile
+    # against the store's in-transaction previous_state, the state the
+    # row was actually re-queued FROM:
+    # - charged here AND the row was already holding at the txn -> the
+    #   wake (or another actor) owns the live charge; return ours.
+    # - did not charge AND the row had been released by the txn -> the
+    #   re-queued row is live with no charge; add the missing one via
+    #   the no-caps reconciliation admit (the row is already queued, so
+    #   refusing now cannot un-queue it; the overshoot is bounded by
+    #   one row on a microsecond race).
+    # The hard-coded None for body_discarded_at is safe ONLY because
+    # replay refuses stamped rows up front (ReplayBodyDiscardedError is
+    # raised inside the store before any UPDATE), so a row that reached
+    # this reconcile can never have been holding-but-stamped; passing
+    # the route's pre-fetched stamp here would re-open the stale-read
+    # race this in-transaction outcome exists to close (C5).
+    truth_needs_charge = not row_holds_slot(outcome.previous_state, None)
+    if charged and not truth_needs_charge:
+        await ctx.saturation.release(row.body_size_bytes)
+    elif truth_needs_charge and not charged:
+        await ctx.saturation.reconcile_admit(outcome.row.body_size_bytes)
+    return outcome.row
+
+
+@router.post("/chains/{chain_id}/cancel", response_model=UploadRow)
+async def cancel_upload(
+    chain_id: UUID,
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> UploadRow:
+    """Transition the row to ``cancelled`` if non-terminal.
+
+    The cancel path OWNS the gate release for the row it cancels
+    (R8-4): the sender's M-W4-F7 no-op deliberately skips release when
+    its in-flight UPDATE finds the state changed, deferring to whoever
+    changed it. The release decision uses the store's in-transaction
+    ``previous_state`` (not the route's pre-fetch, which can race a
+    sender/kicker transition) through the one shared
+    :func:`row_holds_slot` predicate.
+    """
+    ctx, row = await _find_upload_with_ctx(dispatcher, chain_id)
+    if ctx is None or row is None:
+        raise NotFoundError(f"chain {chain_id} not found")
+    outcome = await ctx.store.cancel(chain_id)
+    if outcome.previous_state is not None and row_holds_slot(
+        outcome.previous_state, outcome.row.body_discarded_at
+    ):
+        await ctx.saturation.release(outcome.row.body_size_bytes)
+    return outcome.row
+
+
+@router.delete("/chains/{chain_id}", status_code=204)
+async def delete_upload(
+    chain_id: UUID,
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> Response:
+    """Hard delete one chain + its body.
+
+    Releases the saturation gate when the deleted row still held a slot
+    (R8-4), using the accounting captured atomically with the DELETE.
+    """
+    ctx, row = await _find_upload_with_ctx(dispatcher, chain_id)
+    if ctx is None or row is None:
+        raise NotFoundError(f"chain {chain_id} not found")
+    await ctx.body_store.delete(chain_id)
+    accounting = await ctx.store.delete(chain_id)
+    if accounting is not None and row_holds_slot(accounting.state, accounting.body_discarded_at):
+        await ctx.saturation.release(accounting.body_size_bytes)
+    return Response(status_code=204)
+
+
+@router.delete("/chains", response_model=BulkDeleteResponse)
+async def bulk_delete_uploads(
+    filter_body: Annotated[DeleteFilter, Body()],
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> BulkDeleteResponse:
+    """Bulk delete by filter.
+
+    An all-None filter is refused with the 422
+    ``bulk_delete_filter_empty`` envelope (ADR-004: an empty filter
+    would mean "delete every row").
+
+    Raises:
+        BulkDeleteFilterEmptyError: When no filter field is set (422
+            ``bulk_delete_filter_empty`` envelope).
+    """
+    fields = (
+        filter_body.state,
+        filter_body.route,
+        filter_body.since,
+        filter_body.instance,
+    )
+    if all(v is None for v in fields):
+        raise BulkDeleteFilterEmptyError()
+    deleted = 0
+    targets = _scope_instances(dispatcher, filter_body.instance)
+    for ctx in targets:
+        removed = await ctx.store.bulk_delete(
+            state=filter_body.state,
+            route=filter_body.route,
+            since=filter_body.since,
+        )
+        # C1 closure: delete the corresponding body files alongside the
+        # rows. Previously body files were leaked until the orphan
+        # janitor's next sweep; the operator's "delete these uploads"
+        # expectation includes the bodies. R8-4: rows that still held a
+        # saturation slot release it here, per the accounting captured
+        # atomically with the DELETE.
+        #
+        # R10-D1 (the R8-3 family): the row DELETE above legalized a
+        # same-chain_id re-POST at any later instant, so each late body
+        # delete re-reads the live table immediately before acting and
+        # steps aside when a new owner exists - the new row's accepted
+        # bytes must not be wiped by the OLD row's cleanup (the bytes
+        # would already be in the store: admission puts the body before
+        # the row commits). The step-aside is safe for the new owner
+        # because re-admission cleared the chain_id namespace before
+        # its put (R11-1, _persist_row_and_claim): a committed new
+        # owner holds exactly its own declared refs, so the old row's
+        # leftovers cannot poison its get_all union. (The pre-R11-1
+        # justification here - "removed with the new row's own body
+        # lifecycle" - was false when the old row declared a ref the
+        # new row omits; finding R11-1.) Old files that outlive this
+        # loop entirely (a crash between the row DELETE and this
+        # cleanup) sit in a dead namespace until a future re-POST's
+        # clear or the orphan janitor collects them. The get-then-
+        # delete sliver (a re-POST whose put has run but whose row has
+        # not yet committed when the re-read sees no owner) is the
+        # documented irreducible residual file deletion always
+        # carries - unchanged by R11-1. The release stays keyed on the
+        # OLD row's atomically captured accounting, which no
+        # re-admission can touch.
+        for entry in removed:
+            if await ctx.store.get(entry.chain_id) is None:
+                await ctx.body_store.delete(entry.chain_id)
+            if row_holds_slot(entry.state, entry.body_discarded_at):
+                await ctx.saturation.release(entry.body_size_bytes)
+        deleted += len(removed)
+    return BulkDeleteResponse(deleted=deleted)
+
+
+# ---------------------------------------------------------------------------
+# Token cache
+# ---------------------------------------------------------------------------
+
+
+@router.get("/tokens", response_model=TokenListResponse)
+async def list_tokens(
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+    endpoint: str | None = Query(None),
+) -> TokenListResponse:
+    """List token slots (NO bearer values; ADR-004)."""
+    out = []
+    for ctx in dispatcher.all_instances():
+        out.extend(await ctx.token_cache.list_slots(endpoint=endpoint))
+    return TokenListResponse(tokens=out)
+
+
+@router.put("/tokens/{endpoint}/{uid}", status_code=204)
+async def push_token_one(
+    endpoint: str,
+    uid: str,
+    body: Annotated[TokenPushRequest, Body()],
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> Response:
+    """Push a bearer for one slot."""
+    for ctx in dispatcher.all_instances():
+        await ctx.token_cache.set(endpoint, uid, body.token, source="admin_push")
+    return Response(status_code=204)
+
+
+@router.put("/tokens/{endpoint}", status_code=204)
+async def push_token_endpoint(
+    endpoint: str,
+    body: Annotated[TokenPushRequest, Body()],
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> Response:
+    """Push a bearer to every slot at an endpoint."""
+    for ctx in dispatcher.all_instances():
+        for slot in await ctx.token_cache.list_slots(endpoint=endpoint):
+            await ctx.token_cache.set(endpoint, slot.uid, body.token, source="admin_push")
+    return Response(status_code=204)
+
+
+@router.put("/tokens", status_code=204)
+async def push_token_global(
+    body: Annotated[TokenPushRequest, Body()],
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> Response:
+    """Push a bearer to every cached slot."""
+    for ctx in dispatcher.all_instances():
+        for slot in await ctx.token_cache.list_slots():
+            await ctx.token_cache.set(slot.endpoint, slot.uid, body.token, source="admin_push")
+    return Response(status_code=204)
+
+
+@router.delete("/tokens/{endpoint}/{uid}", status_code=204)
+async def delete_token_one(
+    endpoint: str,
+    uid: str,
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> Response:
+    """Invalidate one ``(endpoint, uid)`` slot: mark it ``bad``, preserve it.
+
+    Per ADR-003 a bad token is NOT deleted - it stays in the cache with
+    ``status='bad'`` so ``GET /v1/admin/tokens`` still surfaces the slot
+    and an operator can see exactly which credential needs replacement.
+    This route therefore flips the slot's status rather than hard-deleting
+    it (R-EX3); the SDK ``invalidate_token`` contract matches.
+    """
+    for ctx in dispatcher.all_instances():
+        await ctx.token_cache.mark_bad(endpoint, uid)
+    return Response(status_code=204)
+
+
+@router.delete("/tokens", status_code=204)
+async def delete_tokens_all(
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> Response:
+    """Invalidate every slot across every instance: mark ``bad``, preserve.
+
+    The bulk analogue of :func:`delete_token_one`; per ADR-003 the slots
+    persist as ``status='bad'`` rather than being deleted (R-EX3).
+    """
+    for ctx in dispatcher.all_instances():
+        await ctx.token_cache.mark_all_bad()
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Hot reload (mirrors SIGHUP)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/reload")
+async def post_reload(request: Request) -> Response:
+    """Trigger a settings reload from the configured YAML path.
+
+    Mirrors SIGHUP: re-reads the YAML at ``app.state.settings_path``,
+    builds fresh per-instance snapshots, swaps them in the
+    :class:`SettingsHolder`, restarts AD-mint loops whose config
+    changed, and pushes new saturation caps into every gate.
+
+    Returns:
+        200 ``{"reloaded_instances": [<id>, ...]}`` on success.
+        422 ``ErrorEnvelope`` (``envelope_invalid``) on YAML parse or
+        Pydantic validation failure.
+        404 ``ErrorEnvelope`` (``not_found``) when hot reload is
+        disabled because ``create_app`` was given no ``settings_path``.
+    """
+    holder = getattr(request.app.state, "settings_holder", None)
+    settings_path = getattr(request.app.state, "settings_path", None)
+    instances = getattr(request.app.state, "instances", None)
+    if holder is None or settings_path is None or instances is None:
+        raise NotFoundError("Hot reload not configured for this process")
+    try:
+        reloaded = await apply_reload(holder, settings_path, instances)
+    except RELOAD_FAILURE_ERRORS as exc:
+        # One shared failure set with the SIGHUP path (R8-2): parse and
+        # validation failures plus file-read failures (vanished file,
+        # non-UTF-8 byte) all reject-and-keep-previous, in-envelope.
+        return _admin_error("envelope_invalid", f"Settings reload failed: {exc}")
+    return Response(
+        content=json.dumps({"reloaded_instances": reloaded}),
+        media_type="application/json",
+        status_code=200,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Observability (plan § 4.2.5)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/observability/counters", response_model=CountersResponse)
+async def get_observability_counters(
+    registry: Annotated[MetricsRegistry, Depends(get_metrics_registry)],
+) -> CountersResponse:
+    """Serialize the process-wide MetricsRegistry counters.
+
+    Plan § 4.2.5. Returns one :class:`CounterValue` per registered
+    counter; ``values`` maps the empty-string bucket plus any label
+    values that have been incremented. Even unbumped counters surface
+    a zero-valued bucket for stable response shape.
+    """
+    counters: list[CounterValue] = []
+    for name, counter in registry.counters.items():
+        counters.append(
+            CounterValue(
+                name=name,
+                description=counter.description,
+                values=dict(counter.snapshot()),
+            )
+        )
+    return CountersResponse(counters=counters)
+
+
+@router.get("/observability/gauges", response_model=GaugesResponse)
+async def get_observability_gauges(
+    registry: Annotated[MetricsRegistry, Depends(get_metrics_registry)],
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> GaugesResponse:
+    """Serialize the process-wide MetricsRegistry gauges.
+
+    Plan § 4.2.5. ``body_location_distribution`` is registered by the
+    store but populated on demand here via a SQL grouping across every
+    instance's persistent store (the gauge has no producer per plan
+    § 4.2.2 to avoid invariant-coupled per-write drift).
+    """
+    gauges: list[GaugeValue] = []
+    # Compute body_location_distribution on demand from the live store.
+    body_location_counts: dict[str, float] = {"ram": 0.0, "file": 0.0}
+    for ctx in dispatcher.all_instances():
+        rows = await ctx.store.list_non_terminal()
+        for row in rows:
+            body_location_counts[row.body_location] = (
+                body_location_counts.get(row.body_location, 0.0) + 1.0
+            )
+    for name, gauge in registry.gauges.items():
+        if name == "body_location_distribution":
+            values = body_location_counts
+        else:
+            values = dict(gauge.snapshot())
+        gauges.append(
+            GaugeValue(
+                name=name,
+                description=gauge.description,
+                values=values,
+            )
+        )
+    return GaugesResponse(gauges=gauges)
+
+
+@router.get("/observability/ram_pressure", response_model=RamPressureStatusResponse)
+async def get_observability_ram_pressure(
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> RamPressureStatusResponse:
+    """Surface RAM-pressure status across all instances.
+
+    Plan § 4.2.5. Aggregates ``ram_body_store.total_bytes()`` +
+    ``persist_controller`` queue depth across every instance. Returns
+    zero for fields whose instance configuration disables them (e.g.,
+    ``persist_controller_queue_depth = 0`` in all_ram / all_disk where
+    no PersistController is wired).
+    """
+    total_bytes = 0
+    ceiling_bytes = 0
+    pending = 0
+    queue_depth = 0
+    for ctx in dispatcher.all_instances():
+        # ram_body_store may be None in some test fixtures; defensive read.
+        ram_bs = getattr(ctx, "ram_body_store", None)
+        if ram_bs is not None:
+            total_bytes += await ram_bs.total_bytes()
+        snapshot = ctx.current_settings()
+        if snapshot.body_store.ram_ceiling_bytes is not None:
+            ceiling_bytes += snapshot.body_store.ram_ceiling_bytes
+        # PersistController exposes its internal queue size; queue + in-flight.
+        if ctx.persist_controller is not None:
+            queue_depth += ctx.persist_controller._queue.qsize()
+            pending += queue_depth + len(ctx.persist_controller._in_flight)
+    return RamPressureStatusResponse(
+        ram_body_store_bytes=total_bytes,
+        ram_ceiling_bytes=ceiling_bytes,
+        pending_migrations=pending,
+        persist_controller_queue_depth=queue_depth,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Quarantine inventory + restore (plan § 5.2.5 / § 1.4 / § 1.5)
+#
+# Quarantine artifacts are FLAT siblings in each instance's per-instance
+# data_root (``<storage.data_dir>/<cfg.data_dir>/``), not the top-level data
+# dir (Finding F-1). These routes resolve the per-instance paths via the
+# dispatcher and an ``?instance=`` selector (the established admin idiom,
+# mirroring ``/stats`` and ``/observability/gauges``).
+# ---------------------------------------------------------------------------
+
+
+@router.get("/quarantine", response_model=QuarantineInventoryResponse)
+async def get_quarantine_inventory(
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+    data_root: Annotated[Path, Depends(get_data_root)],
+    instance: str | None = Query(None),
+) -> QuarantineInventoryResponse:
+    """List backups (one entry each, plus anomalies) for one or all instances.
+
+    Plan § 5.2.5 / cycle-7 seam 2. Returns ONE :class:`QuarantineEntry` per
+    BACKUP under the targeted instance data root(s), read from the backup
+    manifests (keyed by ``backup_id``), plus one flagged anomaly entry per
+    on-disk artifact no manifest claims. Retention is admin-initiated by
+    default (no auto-aging).
+
+    Scope (Finding F-1):
+
+    * ``?instance=<id>`` — scan just that instance's per-instance data_root.
+    * omitted — scan every configured instance and concatenate the results
+      (the natural "everything quarantined across the deployment" view).
+
+    Raises:
+        UnknownInstanceError: When ``?instance=`` names an unknown instance
+            (becomes a 421 ``ErrorEnvelope``).
+    """
+    targets = _scope_instances(dispatcher, instance)
+    entries: list[QuarantineEntry] = []
+    for ctx in targets:
+        paths = instance_storage_paths(data_root, ctx.cfg)
+        entries.extend(
+            QuarantineEntry(
+                backup_id=e.backup_id,
+                reason=e.reason,
+                iso_display=e.iso_display,
+                db_path=str(e.db_path) if e.db_path is not None else None,
+                body_path=str(e.body_path) if e.body_path is not None else None,
+                has_db=e.has_db,
+                has_body=e.has_body,
+                bytes=e.bytes,
+                anomaly=e.anomaly,
+            )
+            for e in list_quarantines(paths.data_root)
+        )
+    return QuarantineInventoryResponse(quarantines=entries)
+
+
+@router.post("/quarantine/restore", response_model=QuarantineRestoreResponse)
+async def restore_quarantine_backup(
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+    data_root: Annotated[Path, Depends(get_data_root)],
+    backup_id: Annotated[UUID, Query()],
+    instance: str | None = Query(None),
+) -> QuarantineRestoreResponse:
+    """Move a ``mode_switch`` backup back into the live tree (plan § 1.5).
+
+    Strategy E.1 + cycle-7 seam 2: an explicit, clobber-safe one-call admin
+    restore addressed by IDENTITY
+    (``POST /v1/admin/quarantine/restore?backup_id=...&instance=...``). The
+    backup is resolved through its MANIFEST; the route never string-matches
+    filenames, so an unmanifested artifact (an inventory anomaly) is simply
+    not addressable here (R5-P unrepresentable). Backs up any CURRENT live
+    data to a fresh ``mode_switch`` backup first, then moves the chosen
+    backup into the now-empty live tree. Both moves are marked, so a crash
+    at any point is finished forward by
+    :func:`reconcile_interrupted_backup_move` on the next boot (review M-1).
+
+    This STAGES the restore on disk; it does NOT hot-reattach the running
+    store, which keeps its old file descriptor (Finding F-3). The operator
+    must restart in a disk-backed mode (``hybrid`` / ``all_disk``) to serve
+    the restored data; the response says so (``restart_required=True``).
+
+    Scope (Finding F-1): ``?instance=`` targets whose live tree to restore
+    INTO. Required when more than one instance is configured; defaults to the
+    sole instance otherwise. A restore is a single-target destructive
+    operation, so there is no aggregate form.
+
+    Raises:
+        UnknownInstanceError: When ``?instance=`` names an unknown instance
+            (becomes a 421 ``ErrorEnvelope``).
+        NotFoundError: When ``?instance=`` is omitted with more than one
+            instance configured, or when ``backup_id`` names no restorable
+            ``mode_switch`` backup manifest in the instance (becomes a 404
+            ``ErrorEnvelope``).
+        RestoreNoOpError: When the backup's DB half (the load-bearing half:
+            it holds the upload rows that point at the body bytes) is absent
+            on disk, the route refuses UP FRONT, before displacing any live
+            data; and when the restore moves ran but the DB still did not
+            land, it fails after the fact. Both become a 409 ``restore_noop``
+            ``ErrorEnvelope`` so the operator retries rather than receiving
+            a success-shaped response that stranded the upload metadata
+            (findings H-1 / L-2 / R5-P).
+    """
+    ctx = _resolve_single_instance(dispatcher, instance)
+    paths = instance_storage_paths(data_root, ctx.cfg)
+
+    # 1. The chosen backup must exist AS A MANIFEST and be a mode_switch
+    #    backup (the only restorable kind). Anomalies have no manifest, so
+    #    they cannot reach past this point by construction.
+    manifest = load_backup_manifest(paths.data_root, backup_id)
+    if manifest is None or manifest.reason != "mode_switch":
+        raise NotFoundError(
+            f"No restorable mode_switch backup with backup_id {backup_id} "
+            f"in instance {ctx.cfg.id!r}"
+        )
+
+    # 2. Refuse up front when the DB half is not on disk (R5-P inverse leg:
+    #    a manifested backup whose DB artifact an interrupted move or an
+    #    operator removed). Refusing BEFORE step 3 means a doomed restore
+    #    never displaces the live tree at all.
+    if not manifest.db_path.exists():
+        raise RestoreNoOpError(
+            backup_id=backup_id,
+            instance_id=ctx.cfg.id,
+            interim_backup_db=None,
+            interim_backup_body=None,
+            detail=(
+                "the backup's DB artifact is absent on disk (has_db=false in "
+                "the inventory); nothing was moved"
+            ),
+        )
+
+    # 3. Back up any CURRENT live data first (clobber-safe; the interim state
+    #    is preserved and itself becomes a manifested mode_switch backup in
+    #    the inventory).
+    interim = quarantine(paths.db_path, paths.bodies_root, reason="mode_switch")
+    interim_backup_db = str(interim.db_path) if interim.has_db else None
+    interim_backup_body = str(interim.body_path) if interim.has_body else None
+
+    # 4. Move the chosen backup into the (now-empty) live tree, addressed by
+    #    its manifest's declared paths.
+    outcome = restore_mode_switch_backup(paths.db_path, paths.bodies_root, manifest)
+
+    # 5. Fail LOUD when the DB did not land (findings H-1 / L-2 / R5-P). With
+    #    the step-2 pre-check this is the residual race only (the artifact
+    #    vanished between the check and the move, or the live DB could not be
+    #    set aside): the live uploads.db was displaced to the step-3 interim
+    #    backup and never replaced, so a success-shaped restart_required
+    #    response would strand the upload metadata. The guard keys on
+    #    db_moved alone (a body-only move is NOT a restore); a legitimately
+    #    metadata-only backup still succeeds because its DB half moved.
+    if not outcome.db_moved:
+        raise RestoreNoOpError(
+            backup_id=backup_id,
+            instance_id=ctx.cfg.id,
+            interim_backup_db=interim_backup_db,
+            interim_backup_body=interim_backup_body,
+            detail="the backup's DB artifact did not land in the live tree",
+        )
+
+    logger.warning(
+        "Restored mode_switch backup backup_id=%s into instance %r (interim backup: db=%s body=%s)",
+        backup_id,
+        ctx.cfg.id,
+        interim_backup_db,
+        interim_backup_body,
+    )
+    return QuarantineRestoreResponse(
+        restored_db=str(outcome.db_path),
+        restored_body=str(outcome.body_path),
+        interim_backup_db=interim_backup_db,
+        interim_backup_body=interim_backup_body,
+        restart_required=True,
+        detail=(
+            f"Restored backup {backup_id} into instance {ctx.cfg.id}. "
+            "Restart Phantom in a disk-backed mode (hybrid or all_disk) to "
+            "serve the restored data; the running store still holds the "
+            "pre-restore database file descriptor."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+class UnknownInstanceError(Exception):
+    """Raised when ``?instance=<id>`` or a path-param names an unknown instance.
+
+    The :func:`unknown_instance_exception_handler` (registered on the
+    FastAPI app via ``app.add_exception_handler``) converts this into a
+    canonical 421 ``ErrorEnvelope`` (plan §5.6 / ADR-010), the same
+    shape the SDK's :data:`EXCEPTION_FOR_CODE` machinery expects.
+    """
+
+    def __init__(self, instance_id: str) -> None:
+        super().__init__(f"Instance {instance_id!r} not configured")
+        self.instance_id = instance_id
+
+
+async def unknown_instance_exception_handler(
+    _request: Any,  # FastAPI Request — typed as Any to keep imports light
+    exc: UnknownInstanceError,
+) -> Response:
+    """Translate :class:`UnknownInstanceError` into a 421 ``ErrorEnvelope``."""
+    return _admin_error(
+        "instance_unknown",
+        f"Instance {exc.instance_id!r} not configured",
+    )
+
+
+class NotFoundError(Exception):
+    """Raised when an admin lookup names a resource (upload, body, slot) that doesn't exist.
+
+    The :func:`not_found_exception_handler` (registered on the FastAPI
+    app via ``app.add_exception_handler``) converts this into a canonical
+    404 ``ErrorEnvelope`` with ``error.code='not_found'`` so phantom-client
+    maps the response to :class:`PhantomNotFoundError` via the
+    :data:`EXCEPTION_FOR_CODE` table. FastAPI's default 404 (``{"detail":
+    "..."}``) does not parse against the envelope schema.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+async def not_found_exception_handler(
+    _request: Any,  # FastAPI Request — typed as Any to keep imports light
+    exc: NotFoundError,
+) -> Response:
+    """Translate :class:`NotFoundError` into a 404 ``ErrorEnvelope``."""
+    return _admin_error("not_found", exc.message)
+
+
+class RestoreNoOpError(Exception):
+    """Raised when ``POST /v1/admin/quarantine/restore`` cannot land the DB half.
+
+    Two legs, one failure meaning (findings H-1 / L-2 / R5-P): the backup's
+    DB artifact is absent on disk (refused UP FRONT, before any live data is
+    displaced), or the restore moves ran and the DB still did not land. In
+    both cases the chosen ``mode_switch`` backup was NOT restored, so rather
+    than return the success-shaped :class:`QuarantineRestoreResponse`
+    (``restart_required=True``) and strand the buffered uploads behind a
+    "looks fine" reply, the route fails loud. The
+    :func:`restore_noop_exception_handler` (registered on the FastAPI app via
+    ``app.add_exception_handler``) converts this into a canonical 409
+    ``ErrorEnvelope`` (``error.code='restore_noop'``) so the SDK raises
+    :class:`phantom_client.errors.PhantomConflictError` and the operator
+    retries. The interim backup (when one was taken) is named in the
+    ``details`` so nothing is lost.
+
+    Attributes:
+        backup_id: Identity of the backup the operator asked to restore.
+        instance_id: The instance whose live tree the restore targeted.
+        interim_backup_db: Path of the DB backed up from the live tree before
+            the restore attempt, or ``None`` when there was none (including
+            the up-front refusal, which displaces nothing).
+        interim_backup_body: Path of the body tree backed up before the
+            restore attempt, or ``None`` when there was none.
+        detail: One-line cause naming which leg refused.
+    """
+
+    def __init__(
+        self,
+        *,
+        backup_id: UUID,
+        instance_id: str,
+        interim_backup_db: str | None,
+        interim_backup_body: str | None,
+        detail: str,
+    ) -> None:
+        super().__init__(
+            f"Restore of mode_switch backup {backup_id} into instance "
+            f"{instance_id!r} did not restore the backup: {detail}."
+        )
+        self.backup_id = backup_id
+        self.instance_id = instance_id
+        self.interim_backup_db = interim_backup_db
+        self.interim_backup_body = interim_backup_body
+        self.detail = detail
+
+
+async def restore_noop_exception_handler(
+    _request: Any,  # FastAPI Request, typed as Any to keep imports light
+    exc: RestoreNoOpError,
+) -> Response:
+    """Translate :class:`RestoreNoOpError` into a 409 ``restore_noop`` envelope."""
+    return _admin_error(
+        "restore_noop",
+        (
+            f"Restore of backup {exc.backup_id} into instance {exc.instance_id} "
+            f"did not restore the backup: {exc.detail}. Retry the restore "
+            "(re-check GET /v1/admin/quarantine first). Any displaced live "
+            "data was preserved as an interim mode_switch backup."
+        ),
+        instance_id=exc.instance_id,
+        details={
+            "backup_id": str(exc.backup_id),
+            "instance_id": exc.instance_id,
+            "interim_backup_db": exc.interim_backup_db,
+            "interim_backup_body": exc.interim_backup_body,
+            "cause": exc.detail,
+        },
+    )
+
+
+class LookupNotConfiguredError(Exception):
+    """Raised when the by-captured-id lookup targets an unbound instance.
+
+    ``GET /v1/admin/uploads/by-captured-id`` can only run where the
+    deployment supplied the per-instance ``admin_lookup`` binding
+    (``capture_name`` + ``json_path``); Phantom never guesses where an
+    upstream identifier lives inside the captured values. The
+    :func:`lookup_not_configured_exception_handler` (registered on the
+    FastAPI app via ``app.add_exception_handler``) converts this into
+    the canonical 400 ``ErrorEnvelope`` with
+    ``error.code='lookup_not_configured'`` (cycle-7 task 4.3).
+
+    Attributes:
+        instance_ids: Every targeted instance missing the binding.
+    """
+
+    def __init__(self, *, instance_ids: tuple[str, ...]) -> None:
+        joined = ", ".join(instance_ids)
+        super().__init__(f"admin_lookup is not configured on instance(s): {joined}")
+        self.instance_ids = instance_ids
+
+
+async def lookup_not_configured_exception_handler(
+    _request: Any,  # FastAPI Request, typed as Any to keep imports light
+    exc: LookupNotConfiguredError,
+) -> Response:
+    """Translate :class:`LookupNotConfiguredError` into a 400 envelope."""
+    joined = ", ".join(exc.instance_ids)
+    return _admin_error(
+        "lookup_not_configured",
+        (
+            f"The by-captured-id lookup is not configured on instance(s) "
+            f"{joined}: the deployment supplies the per-instance "
+            "admin_lookup binding (capture_name + json_path); Phantom "
+            "never guesses where the upstream identifier lives."
+        ),
+        instance_id=exc.instance_ids[0] if exc.instance_ids else "unrouted",
+        details={"unconfigured_instances": list(exc.instance_ids)},
+    )
+
+
+async def replay_body_discarded_exception_handler(
+    _request: Any,  # FastAPI Request, typed as Any to keep imports light
+    exc: ReplayBodyDiscardedError,
+) -> Response:
+    """Translate :class:`ReplayBodyDiscardedError` into a 409 envelope.
+
+    Cycle-7 phase 7 pre-round defender fix. The store refuses to
+    re-queue a row whose ``body_discarded_at`` is stamped (the one
+    discard owner already deleted the bytes on the sender's immediate
+    leg or the reaper's scheduled leg); without the refusal the replay
+    would land the row in ``corrupted`` on the sender's next claim. The
+    409 ``replay_body_discarded`` envelope names the chain and the
+    discard instant; the row is left exactly as it was.
+    """
+    return _admin_error(
+        "replay_body_discarded",
+        (
+            f"Replay refused for chain {exc.chain_id}: its body was "
+            f"discarded at {exc.body_discarded_at.isoformat()} per the "
+            "retention policy, so a replay would have nothing to send. "
+            "The row is unchanged (sent_at preserved). Re-submit the "
+            "upload through POST /v1/send if it must run again."
+        ),
+        instance_id=exc.instance_id,
+        details={
+            "chain_id": str(exc.chain_id),
+            "body_discarded_at": exc.body_discarded_at.isoformat(),
+        },
+    )
+
+
+async def replay_refused_attempting_exception_handler(
+    _request: Any,  # FastAPI Request, typed as Any to keep imports light
+    exc: ReplayRefusedAttemptingError,
+) -> Response:
+    """Translate :class:`ReplayRefusedAttemptingError` into a 409 envelope.
+
+    Round 1 defender fix (R1-1). The store refuses to re-queue a row a
+    sender is actively driving (state ``attempting``, the M-W4-F7 audit
+    closure); pre-fix that refusal escaped as FastAPI's raw
+    ``{"detail": "replay_refused_attempting"}`` body, which the SDK's
+    ``raise_for_error_body`` could not dispatch on. The canonical 409
+    ``replay_refused_attempting`` envelope names the chain; the row is
+    left exactly as it was.
+    """
+    return _admin_error(
+        "replay_refused_attempting",
+        (
+            f"Replay refused for chain {exc.chain_id}: a sender is "
+            "actively driving the row (state 'attempting'), and a "
+            "re-queue would clobber the in-flight attempt. The row is "
+            "unchanged. Wait for the attempt to settle (or cancel the "
+            "chain first), then retry the replay."
+        ),
+        instance_id=exc.instance_id,
+        details={"chain_id": str(exc.chain_id)},
+    )
+
+
+class MultifileCursorConflictError(Exception):
+    """Raised when ``GET /v1/admin/chains`` combines ``multifile_id`` with ``cursor``.
+
+    The multifile listing is one-shot by design (ordered by
+    ``send_order``, never paginated), so a cursor cannot apply to it.
+    The :func:`multifile_cursor_conflict_exception_handler` (registered
+    on the FastAPI app via ``app.add_exception_handler``) converts this
+    into the canonical 422 ``multifile_cursor_conflict`` envelope.
+    Pre-fix the refusal escaped as FastAPI's raw ``{"detail": ...}``
+    body via bare ``HTTPException`` (round 2 defender fix R2-2).
+
+    Attributes:
+        multifile_id: The multifile set the request filtered on.
+        cursor: The pagination token the request tried to combine.
+    """
+
+    def __init__(self, *, multifile_id: UUID, cursor: str) -> None:
+        super().__init__(f"cursor {cursor!r} cannot be combined with multifile_id {multifile_id}")
+        self.multifile_id = multifile_id
+        self.cursor = cursor
+
+
+async def multifile_cursor_conflict_exception_handler(
+    _request: Any,  # FastAPI Request, typed as Any to keep imports light
+    exc: MultifileCursorConflictError,
+) -> Response:
+    """Translate :class:`MultifileCursorConflictError` into a 422 envelope."""
+    return _admin_error(
+        "multifile_cursor_conflict",
+        (
+            "cursor cannot be combined with multifile_id: multifile "
+            "results are ordered by send_order and are not paginated "
+            "(next_cursor is always null). Drop the cursor, or paginate "
+            "without the multifile_id filter."
+        ),
+        details={
+            "multifile_id": str(exc.multifile_id),
+            "cursor": exc.cursor,
+        },
+    )
+
+
+class KeyValueMatchInvalidError(Exception):
+    """Raised when a ``?key_value_match=`` value does not parse as ``key:value``.
+
+    The :func:`key_value_match_invalid_exception_handler` (registered
+    on the FastAPI app via ``app.add_exception_handler``) converts this
+    into the canonical 422 ``key_value_match_invalid`` envelope.
+    Pre-fix the refusal escaped as FastAPI's raw ``{"detail": ...}``
+    body via bare ``HTTPException`` (round 2 defender fix R2-2).
+
+    Attributes:
+        raw: The query value exactly as supplied.
+        reason: One-line parse failure cause.
+    """
+
+    def __init__(self, *, raw: str, reason: str) -> None:
+        super().__init__(f"key_value_match {raw!r} is invalid: {reason}")
+        self.raw = raw
+        self.reason = reason
+
+
+async def key_value_match_invalid_exception_handler(
+    _request: Any,  # FastAPI Request, typed as Any to keep imports light
+    exc: KeyValueMatchInvalidError,
+) -> Response:
+    """Translate :class:`KeyValueMatchInvalidError` into a 422 envelope."""
+    return _admin_error(
+        "key_value_match_invalid",
+        (
+            f"key_value_match {exc.raw!r} is invalid: {exc.reason}. "
+            "Supply '<key>:<value>' with non-empty key and value."
+        ),
+        details={"key_value_match": exc.raw},
+    )
+
+
+class BulkDeleteFilterEmptyError(Exception):
+    """Raised when ``DELETE /v1/admin/chains`` carries an all-None filter body.
+
+    An empty filter would mean "delete every row", which the bulk
+    surface refuses by design (ADR-004). The
+    :func:`bulk_delete_filter_empty_exception_handler` (registered on
+    the FastAPI app via ``app.add_exception_handler``) converts this
+    into the canonical 422 ``bulk_delete_filter_empty`` envelope.
+    Pre-fix the refusal escaped as FastAPI's raw ``{"detail": ...}``
+    body via bare ``HTTPException`` (round 2 defender fix R2-2).
+    """
+
+    def __init__(self) -> None:
+        super().__init__("bulk delete requires a non-empty filter")
+
+
+async def bulk_delete_filter_empty_exception_handler(
+    _request: Any,  # FastAPI Request, typed as Any to keep imports light
+    _exc: BulkDeleteFilterEmptyError,
+) -> Response:
+    """Translate :class:`BulkDeleteFilterEmptyError` into a 422 envelope."""
+    return _admin_error(
+        "bulk_delete_filter_empty",
+        (
+            "Bulk delete requires a non-empty filter: set at least one "
+            "of state, route, since, or instance. An empty filter would "
+            "delete every buffered row, which this surface refuses by "
+            "design; delete individual chains via "
+            "DELETE /v1/admin/chains/{chain_id} instead."
+        ),
+    )
+
+
+async def request_validation_exception_handler(
+    _request: Any,  # FastAPI Request, typed as Any to keep imports light
+    exc: RequestValidationError,
+) -> Response:
+    """Translate FastAPI request-parameter validation into a 422 envelope.
+
+    FastAPI raises :class:`RequestValidationError` when a typed path or
+    query parameter fails coercion (a malformed UUID in
+    ``/groups/{group_id}``, a missing required ``backup_id`` on the
+    restore route). Without this handler the reply is FastAPI's raw
+    ``{"detail": [...]}`` body, the one remaining escape from the
+    ADR-017 envelope contract (round 6 defender fix R6-4; R1-1/R2-2
+    closed the bare-``HTTPException`` escapes). The ``details`` payload
+    carries FastAPI's per-parameter findings with the offending input
+    values stripped (loc/msg/type only), keeping the envelope
+    JSON-serializable for arbitrary inputs.
+    """
+    findings = [
+        {
+            "loc": list(err.get("loc", ())),
+            "msg": str(err.get("msg", "")),
+            "type": str(err.get("type", "")),
+        }
+        for err in exc.errors()
+    ]
+    return _admin_error(
+        "request_invalid",
+        "Request parameter validation failed; see details.errors.",
+        details={"errors": findings},
+    )
+
+
+def register_admin_error_handlers(app: FastAPI) -> None:
+    """Register every admin typed-error handler on ``app``.
+
+    The single source of truth for the admin error-handler wiring
+    (round 3 defender fix R3-1). The production app factory
+    (``phantom.app.create_app``), the contract admin conftest, and
+    every test fixture that mounts :data:`router` call this helper
+    instead of registering handlers piecemeal, so a handler added
+    here reaches every tier at once and the registration sites
+    cannot drift apart. Each handler's own docstring carries the
+    rationale for its envelope code and HTTP status.
+
+    Args:
+        app: The FastAPI application mounting :data:`router`.
+    """
+    app.add_exception_handler(
+        UnknownInstanceError,
+        unknown_instance_exception_handler,  # type: ignore[arg-type]
+    )
+    app.add_exception_handler(
+        NotFoundError,
+        not_found_exception_handler,  # type: ignore[arg-type]
+    )
+    app.add_exception_handler(
+        RestoreNoOpError,
+        restore_noop_exception_handler,  # type: ignore[arg-type]
+    )
+    app.add_exception_handler(
+        LookupNotConfiguredError,
+        lookup_not_configured_exception_handler,  # type: ignore[arg-type]
+    )
+    app.add_exception_handler(
+        ReplayBodyDiscardedError,
+        replay_body_discarded_exception_handler,  # type: ignore[arg-type]
+    )
+    app.add_exception_handler(
+        ReplayRefusedAttemptingError,
+        replay_refused_attempting_exception_handler,  # type: ignore[arg-type]
+    )
+    app.add_exception_handler(
+        MultifileCursorConflictError,
+        multifile_cursor_conflict_exception_handler,  # type: ignore[arg-type]
+    )
+    app.add_exception_handler(
+        KeyValueMatchInvalidError,
+        key_value_match_invalid_exception_handler,  # type: ignore[arg-type]
+    )
+    app.add_exception_handler(
+        BulkDeleteFilterEmptyError,
+        bulk_delete_filter_empty_exception_handler,  # type: ignore[arg-type]
+    )
+    app.add_exception_handler(
+        RequestValidationError,
+        request_validation_exception_handler,  # type: ignore[arg-type]
+    )
+
+
+def _scope_instances(dispatcher: InstanceDispatcher, instance: str | None) -> list[InstanceContext]:
+    """Return one instance if id is given, else every instance.
+
+    Raises:
+        UnknownInstanceError: When ``instance`` names an unconfigured
+            instance. The app-level handler converts this into a 421
+            ``ErrorEnvelope`` per plan §5.6.
+    """
+    if instance is None:
+        return list(dispatcher.all_instances())
+    ctx = dispatcher.by_id(instance)
+    if ctx is None:
+        raise UnknownInstanceError(instance)
+    return [ctx]
+
+
+def _resolve_single_instance(
+    dispatcher: InstanceDispatcher, instance: str | None
+) -> InstanceContext:
+    """Resolve a single target instance for a destructive admin operation.
+
+    Used by the quarantine restore route (plan § 1.5), which acts on exactly
+    one instance's live tree. When ``instance`` is given it must name a
+    configured instance; when omitted it defaults to the sole instance, and
+    is otherwise required (a restore must say which live tree to write into).
+
+    Args:
+        dispatcher: The instance dispatcher.
+        instance: The ``?instance=`` selector, or ``None``.
+
+    Returns:
+        The resolved :class:`InstanceContext`.
+
+    Raises:
+        UnknownInstanceError: When ``instance`` names an unconfigured
+            instance (becomes a 421 ``ErrorEnvelope``).
+        NotFoundError: When ``instance`` is omitted and more than one
+            instance is configured, so the target is ambiguous (becomes a
+            404 ``ErrorEnvelope``).
+    """
+    if instance is not None:
+        ctx = dispatcher.by_id(instance)
+        if ctx is None:
+            raise UnknownInstanceError(instance)
+        return ctx
+    instances = dispatcher.all_instances()
+    if len(instances) == 1:
+        return instances[0]
+    raise NotFoundError(
+        "More than one instance is configured; specify ?instance=<id> to "
+        "name which instance's live tree to restore into."
+    )
+
+
+async def _find_upload(dispatcher: InstanceDispatcher, chain_id: UUID) -> UploadRow | None:
+    """Look up a row by chain_id across every instance."""
+    _, row = await _find_upload_with_ctx(dispatcher, chain_id)
+    return row
+
+
+async def _find_upload_with_ctx(
+    dispatcher: InstanceDispatcher, chain_id: UUID
+) -> tuple[InstanceContext | None, UploadRow | None]:
+    """Find ``(instance, row)`` across every instance (single store each)."""
+    for ctx in dispatcher.all_instances():
+        row = await ctx.store.get(chain_id)
+        if row is not None:
+            return ctx, row
+    return None, None

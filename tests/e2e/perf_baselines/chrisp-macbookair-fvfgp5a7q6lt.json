@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "machine_key": "chrisp-macbookair-fvfgp5a7q6lt",
+  "captured_at": "2026-06-10T18:48:40.266851Z",
+  "facts": {
+    "os_name": "Darwin",
+    "os_release": "25.5.0",
+    "cpu_arch": "arm64",
+    "cpu_count": 8,
+    "total_ram_bytes": 17179869184,
+    "python_version": "3.14.0"
+  },
+  "metrics": {
+    "delivered_throughput_uploads_per_second": 26.92850712775272,
+    "admin_read_p95_seconds": 0.047909458000503946,
+    "admin_read_count": 248,
+    "uploads_total": 48
+  }
+}

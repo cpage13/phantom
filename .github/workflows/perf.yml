@@ -1,0 +1,35 @@
+name: perf
+
+# Performance-budget tier (the SYNTHETIC_RETURN_BUDGET_SECONDS assertions on
+# the buffering POST). Run MANUALLY on a quiet lane: these assertions
+# false-fail on loaded / shared runners even when behavior is correct, so
+# they are intentionally NOT part of the per-PR gate. Trigger from the
+# Actions tab → "Run workflow".
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf
+  cancel-in-progress: false
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      # `uv sync --all-packages` installs the member packages (a plain
+      # `uv sync` prunes them, since the workspace root is `package = false`);
+      # `UV_NO_SYNC=1` stops the following `uv run` from re-syncing.
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run pytest tests/e2e/ -q -m perf

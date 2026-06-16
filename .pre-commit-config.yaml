@@ -1,0 +1,124 @@
+# Phantom pre-commit config — Phase 0 (2026-05-25).
+#
+# All hooks are `repo: local` so the rule set is version-pinned to this
+# commit. No external repo references.
+#
+# Hook order matches the order in plan § 1.1.6:
+#   1. ruff-format (formatter check)
+#   2. ruff-check (linter, with --fix)
+#   3. mypy-strict (type checker)
+#   4. forbid-asyncio-create-task-outside-composition (greppable; fails on
+#      unsupervised create_task/ensure_future/loop.create_task — allowlist below)
+#   5. forbid-unparenthesized-except-tuple (greppable)
+#   6. forbid-await-in-lock (greppable, best-effort)
+#   7. forbid-naked-sleep-in-e2e (greppable)
+#   8. forbid-mixed-saturation-basis (greppable, best-effort)
+#   9. forbid-silent-keyerror-route (greppable, Phase 0 broad form)
+#  10. forbid-out-of-order-persist (greppable, Phase 0 placeholder form)
+#  11. forbid-bare-numeric-literals-in-production (greppable, informational in Phase 0)
+#
+# forbid-unsupervised-task-spawn-outside-composition (R-4, 2026-05-29):
+# fails on the UNSUPERVISED spawn primitives — asyncio.create_task(,
+# asyncio.ensure_future(, loop.create_task( / get_*_loop().create_task(
+# — outside the composition root. TaskGroup-bound spawns
+# (`tg.create_task(...)`) are deliberately NOT flagged: membership in an
+# `async with asyncio.TaskGroup()` block IS supervision (the sender's
+# nested per-instance worker pool is a legitimate structured-concurrency
+# pattern). Sanctioned unsupervised-primitive sites:
+#   - src/phantom-service/src/phantom/app.py — the SIGHUP handler's single
+#     `loop.create_task(_sighup_reload(...))` (the signal callback runs
+#     sync on the loop thread and cannot await, so it must schedule the
+#     reload as a loop task; a strong ref + done-callback prevent GC).
+#   - src/phantom-emulator/src/phantom_emulator/server.py — emulator's
+#     internal task spawn (test-only server). Permanent allowlist.
+#   - All tests/ paths (and src/<pkg>/tests/*).
+# The earlier "exactly one asyncio.create_task site" framing was vacuous
+# (production has zero `asyncio.create_task(` — it spawns via
+# `tg.create_task`/`loop.create_task`, neither of which the old literal
+# grep matched). See scripts/precommit/forbid_create_task.sh.
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format (check)
+        entry: uv run ruff format --check
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+        args: [src/, tests/]
+
+      - id: ruff-check
+        name: ruff check (--fix)
+        entry: uv run ruff check --fix --exit-non-zero-on-fix
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+        args: [src/, tests/]
+
+      - id: mypy-strict
+        name: mypy --strict (per package)
+        # Workspace-level `mypy --strict src/` collides on dual-named
+        # `tests/` and per-package source roots ("Source file found twice"
+        # per plan note 1.1.6.D). Each package runs in its own venv so its
+        # third-party stubs (httpx, fastapi, uvicorn) resolve. See plan
+        # F6 and execution_05_25.md Finding F-P0-E for the rationale.
+        entry: bash scripts/precommit/run_mypy_per_package.sh
+        language: system
+        pass_filenames: false
+
+      - id: forbid-asyncio-create-task-outside-composition
+        name: forbid unsupervised task spawn outside composition root
+        entry: bash scripts/precommit/forbid_create_task.sh
+        language: system
+        pass_filenames: false
+
+      # forbid-unparenthesized-except-tuple — REMOVED in Phase 0.
+      # ruff format normalizes the syntactically-valid Python 3 tuple
+      # form `except A, B:` (without parens) as canonical. The pre-commit
+      # hook would have permanently conflicted with `ruff format`. The
+      # form is not Python-2 syntax on Python 3.x — both `except A, B:`
+      # and `except (A, B):` are equivalent tuple-of-exception-types.
+      # See execution_05_25.md Finding F-P0-D.
+
+      - id: forbid-await-in-lock
+        name: forbid await inside async with X_lock (best-effort)
+        entry: bash scripts/precommit/forbid_await_in_lock.sh
+        language: system
+        pass_filenames: false
+
+      - id: forbid-naked-sleep-in-e2e
+        name: forbid naked asyncio.sleep in tests/e2e
+        entry: bash scripts/precommit/forbid_naked_sleep.sh
+        language: system
+        pass_filenames: false
+
+      - id: forbid-mixed-saturation-basis
+        name: forbid encoded-bytes in saturation.admit/release (best-effort)
+        entry: bash scripts/precommit/forbid_mixed_saturation_basis.sh
+        language: system
+        pass_filenames: false
+
+      - id: forbid-silent-keyerror-route
+        name: forbid silent KeyError suppression in storage routes
+        entry: bash scripts/precommit/forbid_silent_keyerror.sh
+        language: system
+        pass_filenames: false
+
+      - id: forbid-out-of-order-persist
+        # Plan § 4.2.6 — tightened from the Phase 0 placeholder
+        # forbid_out_of_order_persist.sh (deleted). Two enforced
+        # constraints: (a) only workers/persist_controller.py is
+        # allowed to call mark_persisted(); (b) inside the persist
+        # controller, file_body_store.put must precede mark_persisted
+        # in every async function (commit-last-column ordering).
+        name: forbid out-of-order persist (commit-last-column + caller restriction)
+        entry: uv run python scripts/check_persist_ordering.py
+        language: system
+        pass_filenames: false
+
+      - id: forbid-bare-numeric-literals-in-production
+        name: forbid bare numeric literals in production code (informational)
+        entry: bash scripts/precommit/forbid_bare_numeric_literals.sh
+        language: system
+        pass_filenames: false

@@ -1,0 +1,36 @@
+name: nightly-stress
+
+# Stress E2E tier — runs nightly on cron + on manual workflow_dispatch.
+# The `stress` marker tags the long-running burst tests; they are gated out
+# of the per-PR battery and run here instead.
+
+on:
+  schedule:
+    # 07:00 UTC daily.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-stress
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      # `uv sync --all-packages` installs the member packages (a plain
+      # `uv sync` prunes them, since the workspace root is `package = false`);
+      # `UV_NO_SYNC=1` stops the following `uv run` from re-syncing.
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run pytest tests/e2e/ -q -m stress

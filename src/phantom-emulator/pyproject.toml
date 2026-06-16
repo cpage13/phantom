@@ -1,0 +1,31 @@
+[project]
+name = "phantom-emulator"
+version = "0.1.0"
+description = "Emulation server for Phantom E2E testing — mock upstream file-upload API + fake-S3 + fake-AD + configurable failure modes"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "cryptography>=48.0.0",
+    "fastapi>=0.136.1",
+    "pydantic>=2",
+    "pydantic-settings>=2.14",
+    "pyjwt>=2.12.1",
+    "python-multipart>=0.0.28",
+    "pyyaml>=6.0.3",
+    "uvicorn>=0.46.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/phantom_emulator"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.23.3",
+]
+
+[project.scripts]
+phantom-emulator = "phantom_emulator.__main__:main"

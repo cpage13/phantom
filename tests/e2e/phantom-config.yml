@@ -1,0 +1,101 @@
+# phantom config used by the E2E suite (both inprocess and docker
+# modes). Resource caps that matter to specific tests are overlaid
+# per-test via _build_phantom_settings's config_overrides hook; the
+# base YAML relies on the F6 validator's probe-derived defaults for
+# everything not overridden. Tests that need deterministic caps
+# (e.g. test_e2e_11_saturation_cap) set them in their overlay.
+#
+# Authority hierarchy: ADRs > config/phantom.yaml.example > this file.
+# Where this file disagrees with a default, the comment above the
+# override explains why.
+
+server:
+  # Inprocess mode overrides bind_tcp at runtime to an ephemeral port
+  # (see helpers/stack.py). Docker mode binds this literal port. One
+  # listener serves intake + admin + health (same-machine-only).
+  bind_tcp: "0.0.0.0:8080"
+
+storage:
+  data_dir: "/var/lib/phantom"        # overridden to a tmp dir in inprocess mode
+  # Phase 1 Slice 1.A migration: `default_tier` removed (subsumed by
+  # `body_store.mode`); `persist_trigger.{after_attempts,after_seconds}`
+  # removed; `sqlite.autovacuum` removed (hardcoded NONE by code per
+  # SD-card wear constraint); `sqlite.synchronous` default flipped to
+  # NORMAL. See plan § 0.8 config-knob migration audit + Phase 6
+  # operator playbook for the full migration story.
+  body_store:
+    mode: "hybrid"                    # production default
+  shard_prefix_chars: 2
+  compression:
+    mode: "always"
+    algorithm: "zstd"
+    level: 3
+  sqlite:
+    vacuum_cron: "0 3 * * 0"
+    journal_mode: "WAL"
+    synchronous: "NORMAL"             # SD-card-wear default per T1 research
+
+retention:
+  # Tight windows so the suite doesn't accidentally exercise reaper
+  # edge cases. `succeeded_metadata_seconds: 180` matches ADR-009.
+  succeeded_metadata_seconds: 180
+  succeeded_body_seconds: 0
+  failed_metadata_seconds: 2592000
+  failed_body_seconds: 2592000
+  cancelled_metadata_seconds: 604800
+  cancelled_body_seconds: 604800
+  stored_metadata_seconds: -1
+  stored_body_seconds: 15768000
+  auth_expired_metadata_seconds: -1
+  auth_expired_body_seconds: 15768000
+  # 5s reaper interval is tight enough for E2E tests that need to
+  # observe terminal-state cleanup without slowing the suite.
+  reaper_interval_seconds: 5
+
+retry:
+  worker_count: 2
+  poll_interval_ms: 100               # tight for E2E so terminal states reach fast
+  default_strategy:
+    type: "fixed_intervals"
+    intervals_seconds: [0, 1, 2, 5, 10]   # short intervals for E2E
+
+observability:
+  log_level: "INFO"
+
+instances:
+  - id: "primary"
+    # Host-prefix list covers every hostname the emulator might
+    # surface at: `emulator` (docker-mode service name), `127.0.0.1`
+    # (inprocess-mode loopback), and `localhost` (alternative
+    # loopback alias). The dispatcher resolves on URL hostname.
+    host_prefixes:
+      - "emulator"
+      - "127.0.0.1"
+      - "localhost"
+    data_dir: "primary"
+    capture_reexecution: false        # ADR-011 default; E2E-6b overlays explicitly
+    # Cycle-7 by-captured-id lookup binding (deployment-supplied so the
+    # service stays upstream-ignorant): the create_file step captures the
+    # emulator's fileInformation object; its id field is the upstream-
+    # assigned identifier the lookup matches on.
+    admin_lookup:
+      capture_name: "create_file"
+      json_path: "file_information.id"
+    # No refresh-strategy block. phantom-the-service does not mint by
+    # default; the upstream client's inbound submit_chain populates the
+    # cache slot via the Authorization header on the ingress request, and the
+    # sender's first attempt reads that slot. Family 7 will reintroduce
+    # the typed ``ad_mint`` block for instances that need autonomous AD
+    # client-credentials minting.
+    routes:
+      # One route, both steps. The emulator's PUT endpoint does not
+      # enforce auth (only token validity), so phantom_bearer on the
+      # PUT is harmless — the bearer header is sent but the emulator
+      # ignores it. This keeps the route table simple while matching
+      # the YAML resolver's hostname-only fnmatch.
+      - name: "emulator"
+        hosts:
+          - "emulator"
+          - "127.0.0.1"
+          - "localhost"
+        auth_mode: "phantom_bearer"

@@ -1,0 +1,49 @@
+# Docker compose for E2E mode (CI + full-fidelity local testing).
+#
+# Status: STUB. The inprocess mode (helpers/stack.py::_boot_inprocess)
+# is the required path for the smoke test landed alongside this file.
+# Docker mode is left as a stub pending CI infrastructure that knows
+# how to build phantom and phantom-emulator images.
+#
+# When Docker mode lands, `_boot_docker()` in helpers/stack.py will:
+#   1. `docker compose -f tests/e2e/docker-compose.e2e.yml up -d`
+#   2. Poll `GET http://localhost:8080/v1/readyz` until 200 (readiness is a
+#      public `*z` probe on the single listener)
+#   3. Return an E2EStack pointing at the compose-exposed port
+# `tear_down()` will then run `docker compose down -v`.
+#
+# Note: Phantom serves ONE listener - intake (POST /v1/send), the admin
+# surface (/v1/admin/*), and liveness/readiness all on 8080. In production
+# the listener defaults to loopback (ADR-004 - the loopback bind is the
+# admin access control). For E2E the phantom-config.yml overlay binds
+# `0.0.0.0:8080` so the test runner can drive the service from outside the
+# container; the service logs an "admin unauthenticated" warning for that
+# non-loopback opt-in. This is a test configuration, not production posture.
+
+services:
+  emulator:
+    image: phantom-emulator:dev
+    build:
+      context: ../../
+      dockerfile: src/phantom-emulator/src/phantom_emulator/docker/Dockerfile
+    ports:
+      - "9000:8000"
+    volumes:
+      - ./emulator-config.yml:/etc/phantom-emulator/config.yml:ro
+    environment:
+      EMULATOR_SIGNING_KEY: "e2e-test-secret"
+
+  phantom:
+    image: phantom:dev
+    build:
+      context: ../../
+      dockerfile: src/phantom-deploy/Dockerfile
+    ports:
+      - "8080:8080"     # the one listener: intake + admin + health (0.0.0.0 via the E2E config overlay)
+    volumes:
+      - ./phantom-config.yml:/etc/phantom/phantom.yaml:ro
+    environment:
+      PHANTOM_AD_PRIMARY: "e2e-test-secret"
+      PHANTOM_AD_SECONDARY: "e2e-test-secret"
+    depends_on:
+      - emulator

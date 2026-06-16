@@ -1,0 +1,237 @@
+name: per-PR
+
+# Per-PR CI battery. Jobs are independent and run in parallel — no `needs:`.
+# Each job checks out, sets up Python 3.14 + uv, then runs ONE combined step:
+#
+#   uv sync --all-packages   # the workspace root is `package = false`, so a
+#                            # plain `uv sync` installs NONE of the member
+#                            # packages (and would prune them); --all-packages
+#                            # installs phantom / phantom-client / phantom-emulator
+#   export UV_NO_SYNC=1      # so the following `uv run` does not re-sync and
+#                            # prune those members
+#   <command>
+#
+# Tiers mirror the per-push battery: static (lint / format / types /
+# pre-commit / falsifiability), unit (+ emulator smoke), integration,
+# contract, e2e-core (functional), and e2e-load (the load tier). Stress runs
+# nightly (nightly_stress.yml); perf runs manually (perf.yml).
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# Cancel superseded runs when a PR is updated.
+concurrency:
+  group: per-pr-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run ruff check src/ tests/
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run ruff format --check src/ tests/
+
+  types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      # Per-package mypy invocation; a workspace-level mypy collides on the
+      # dual module names.
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          bash scripts/precommit/run_mypy_per_package.sh
+
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run pre-commit run --all-files
+
+  unit-phantom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          cd src/phantom-service && uv run pytest tests/unit/ -q
+
+  unit-phantom-client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          cd src/phantom-client && uv run pytest tests/unit/ -q
+
+  unit-phantom-emulator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          cd src/phantom-emulator && uv run pytest tests/unit/ -q
+
+  smoke-phantom-emulator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          cd src/phantom-emulator && uv run pytest tests/smoke/ -q
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run pytest tests/integration/ -q
+
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run pytest tests/contract/ -q
+
+  # E2E core — the functional e2e battery (fast feedback). Excludes the
+  # load / perf / stress tiers, which run in their own lanes / nightly.
+  e2e-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run pytest tests/e2e/ -q -m "not load and not perf and not stress"
+
+  # E2E load tier (tests/e2e/test_e2e_2[1234]_*; ~15 min via test_e2e_23).
+  # Isolated so it does not slow e2e-core; runs on every push, as before.
+  e2e-load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run pytest tests/e2e/ -q -m load
+
+  falsifiability-post-send-size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run python scripts/check_post_send_size.py
+
+  falsifiability-descriptions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run python scripts/check_descriptions.py
+
+  # Atomic-admission contract: the upload row INSERT + idempotency_index
+  # INSERT must wrap in ONE SQLite transaction. Complements the runtime test
+  # at tests/e2e/crash_recovery/test_crash_admission_atomic.py.
+  falsifiability-atomic-admission:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run python scripts/check_atomic_admission.py
