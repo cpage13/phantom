@@ -1,6 +1,6 @@
 name: per-PR
 
-# Per-PR CI battery. Jobs are independent and run in parallel — no `needs:`.
+# Per-PR CI battery. Jobs are independent and run in parallel; no `needs:`.
 # Each job checks out, sets up Python 3.14 + uv, then runs ONE combined step:
 #
 #   uv sync --all-packages   # the workspace root is `package = false`, so a
@@ -163,7 +163,7 @@ jobs:
           export UV_NO_SYNC=1
           uv run pytest tests/contract/ -q
 
-  # E2E core — the functional e2e battery (fast feedback). Excludes the
+  # E2E core: the functional e2e battery (fast feedback). Excludes the
   # load / perf / stress tiers, which run in their own lanes / nightly.
   e2e-core:
     runs-on: ubuntu-latest
@@ -224,7 +224,7 @@ jobs:
   # acceptance criterion 3). Asserts list_by_key_value keys on the
   # bound-parameter json_each form (no _metadata_kvs_json_path interpolated
   # quoted-JSON-path), so a revert toward the version-skew bug fails on
-  # EVERY runner — ADDITIONAL to, never a substitute for, the behavioral
+  # EVERY runner; ADDITIONAL to, never a substitute for, the behavioral
   # unit-phantom-old-sqlite gate (which is blind on a modern 3.50.4 runner).
   falsifiability-kv-json-each:
     runs-on: ubuntu-latest
@@ -269,23 +269,27 @@ jobs:
         with:
           python-version: "3.14"
       - uses: astral-sh/setup-uv@v3
-      # Build old SQLite 3.43.2 -> .libs/libsqlite3.so. The tarball ref
-      # 539f74919d5d8cef is SQLite release 3.43.2 (pin a known-BREAKING build).
+      # Build old SQLite 3.43.2 -> .libs/libsqlite3.so from the year-stamped
+      # autoconf release archive (3430200 = 3.43.2, a known-BREAKING build for
+      # the quoted-json-path bug). The fossil hash-tarball URL this job first
+      # pinned (src/tarball/539f74919d5d8cef) now returns 404, so the pin
+      # moved to the stable release-archive scheme. The "Assert OLD SQLite"
+      # step below still hard-fails if the loaded build is not < 3.50.
       - name: Build old libsqlite3 (3.43.2)
         run: |
           set -euo pipefail
           cd /tmp
-          wget -q https://www.sqlite.org/src/tarball/539f74919d5d8cef/SQLite-539f74919d5d8cef.tar.gz
-          tar -xzf SQLite-539f74919d5d8cef.tar.gz
-          cd SQLite-539f74919d5d8cef
+          wget -q https://www.sqlite.org/2023/sqlite-autoconf-3430200.tar.gz
+          tar -xzf sqlite-autoconf-3430200.tar.gz
+          cd sqlite-autoconf-3430200
           CPPFLAGS="-DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_JSON1" ./configure
           make -j"$(nproc)"
-          echo "OLD_SQLITE_SO=/tmp/SQLite-539f74919d5d8cef/.libs/libsqlite3.so" >> "$GITHUB_ENV"
+          echo "OLD_SQLITE_SO=/tmp/sqlite-autoconf-3430200/.libs/libsqlite3.so" >> "$GITHUB_ENV"
       # CRITICAL: the run interpreter must be setup-python's (its _sqlite3 is
       # DYNAMICALLY linked, so LD_PRELOAD takes effect). Do NOT use `uv sync`'s
-      # .venv — that venv is built on uv's standalone Python whose _sqlite3 is
+      # .venv; that venv is built on uv's standalone Python whose _sqlite3 is
       # STATIC and would IGNORE LD_PRELOAD (the precondition below would then
-      # fail loud — safe, but the gate would never actually run). Install deps
+      # fail loud; safe, but the gate would never actually run). Install deps
       # INTO the setup-python interpreter with `uv pip install --python`.
       - name: Install deps into the dynamically-linked interpreter
         run: |
@@ -296,7 +300,7 @@ jobs:
           uv pip install --python "$PYBIN" pytest pytest-asyncio \
             -e src/phantom-service -e src/phantom-client -e src/phantom-emulator
       # HARD PRECONDITION: fail LOUDLY unless the preloaded SQLite is < 3.50.
-      # This is the gate's teeth — it stops a future masking-build bump (or a
+      # This is the gate's teeth; it stops a future masking-build bump (or a
       # static-_sqlite3 interpreter that silently ignores LD_PRELOAD) from
       # degrading this job to a 3.50.4 false-green.
       - name: Assert OLD SQLite is loaded (< 3.50)
@@ -308,7 +312,7 @@ jobs:
           print(f"loaded sqlite_version = {v}")
           parts = tuple(int(x) for x in v.split("."))
           assert parts < (3, 50), (
-              f"PRECONDITION FAILED: sqlite_version {v} is >= 3.50 — the old-SQLite "
+              f"PRECONDITION FAILED: sqlite_version {v} is >= 3.50; the old-SQLite "
               f"gate degraded to a MASKING build and would false-green. LD_PRELOAD did "
               f"not take effect (statically-linked _sqlite3?). Failing loudly."
           )
@@ -317,12 +321,12 @@ jobs:
       # tests that go false-green on 3.50.4; here they actually exercise json_each.
       # ONE pytest invocation over BOTH files with a SINGLE -k OR-expression.
       # (pytest applies a single -k across the whole collection; two -k flags
-      # would mean only the LAST applies, and -k odd matches ZERO node-ids — the
+      # would mean only the LAST applies, and -k odd matches ZERO node-ids; the
       # string "odd" lives only in the admin test's BODY, never a node-id, so the
       # real test is `test_dot_and_quote_bearing_kvs_keys_are_addressable`, which
       # the `quote_bearing` term selects. Executed-and-verified: this collects 5
-      # node-ids — the four `special_character` params incl. q"uote, plus the one
-      # `quote_bearing` admin test — and exits 0 when the json_each fix is present.)
+      # node-ids (the four `special_character` params incl. q"uote, plus the one
+      # `quote_bearing` admin test) and exits 0 when the json_each fix is present.)
       - name: Run special-char KVS tests on OLD SQLite
         run: |
           set -euo pipefail

@@ -1,11 +1,11 @@
 """Internal credential-store row + the structured destination credential.
 
 This module is the credential-subsystem analogue of :mod:`phantom.models.token`
-(a FAITHFUL copy per the 2026-06-23 owner directive — copy the token
+(a FAITHFUL copy per the 2026-06-23 owner directive: copy the token
 implementation, differ only where forced). The forced differences from the
 token shapes are:
 
-* the slot is keyed by the destination **host alone** (``dest_host``) — a SigV4
+* the slot is keyed by the destination **host alone** (``dest_host``); a SigV4
   step has no caller-supplied credential id, so the token cache's ``uid`` axis
   is dropped (ADR-002 is untouched; ``uid`` stays inert under ``aws_sigv4``);
 * the value is a **structured tagged-union credential**
@@ -13,18 +13,18 @@ token shapes are:
 
 :class:`CredCacheRow` is the boundary type between the SQLite
 ``credential_store`` table and Phantom's in-memory code. It is **internal
-only** — the credential value never crosses an HTTP response boundary
+only**; the credential value never crosses an HTTP response boundary
 (ADR-004). Admin-facing serialization uses :class:`CredentialSlot` instead,
 which carries no secret material (only the credential *type* and status). The
 admin push *into* the store uses :data:`CredentialPushBody`; that secret is
 never returned in any response.
 
-Everything around the value field — the ``observed_at`` / ``source`` /
-``status`` columns, the internal-vs-admin two-model split — copies the token
+Everything around the value field (the ``observed_at`` / ``source`` /
+``status`` columns, the internal-vs-admin two-model split) copies the token
 shapes verbatim.
 
 Both SigV4 credential variants carry an explicit, REQUIRED ``service`` (a
-:class:`SigningService`) — the scope sibling of ``region``. It is the AWS
+:class:`SigningService`), the scope sibling of ``region``. It is the AWS
 service the signer signs for, declared at provision time (never defaulted /
 inferred) so an unknown or missing service fails loud at the pydantic boundary
 rather than being silently mis-signed. A :class:`StrEnum` member IS a ``str``,
@@ -41,20 +41,20 @@ from typing import Annotated, Literal, NewType, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# The semantically-typed key — the lower-cased resolved destination hostname.
+# The semantically-typed key: the lower-cased resolved destination hostname.
 # COPY of the token cache's (endpoint, uid) key axis, DIFFERING only by dropping
 # ``uid`` (a SigV4 step has no per-request credential id; host is the whole key).
 HostCredKey = NewType("HostCredKey", str)
 
-# NOTE: ``TypeAlias`` form intentional — matches phantom.models.token's enums.
-# COPY of TokenStatus (models/token.py:26) — VERBATIM.
+# NOTE: ``TypeAlias`` form intentional; matches phantom.models.token's enums.
+# COPY of TokenStatus (models/token.py:26); VERBATIM.
 CredentialStatus: TypeAlias = Literal["fresh", "bad", "unknown"]  # noqa: UP040
 """Freshness state of the cached credential (COPY of ``TokenStatus``).
 
-* ``fresh`` — most recently observed credential; presumed valid.
-* ``bad`` — last attempt with this credential returned 401/403; kept in the
+* ``fresh``: most recently observed credential; presumed valid.
+* ``bad``: last attempt with this credential returned 401/403; kept in the
   cache anyway per ADR-003 so the admin API can surface it.
-* ``unknown`` — slot exists but has not been used yet (rare).
+* ``unknown``: slot exists but has not been used yet (rare).
 """
 
 CredentialSource: TypeAlias = Literal["admin_push", "config"]  # noqa: UP040
@@ -64,10 +64,10 @@ COPY of ``TokenSource`` (models/token.py:18), DIFFERING by the writer set: no
 ``inbound_request`` (a producer does not push credentials on ``/v1/send`` for
 pure SigV4), so just:
 
-* ``admin_push`` — operator pushed via the loopback admin credential endpoint.
-* ``config`` — a deployment declared static creds in config; materialized into
+* ``admin_push``: operator pushed via the loopback admin credential endpoint.
+* ``config``: a deployment declared static creds in config; materialized into
   the host-keyed store at settings-load (resolved literal values, never
-  env-var names — those are resolved away at load time).
+  env-var names; those are resolved away at load time).
 """
 
 
@@ -120,13 +120,13 @@ def _coerce_signing_service(v: object) -> SigningService:
 
 @dataclass(frozen=True)
 class SigV4StaticCreds:
-    """RESOLVED static AWS SigV4 key-pair — literal values, never env-var names.
+    """RESOLVED static AWS SigV4 key-pair: literal values, never env-var names.
 
     Holds the credential VALUES botocore ``SigV4Auth`` needs at sign time
     (``SigV4Auth.__init__`` takes ``(credentials, service_name, region_name)``).
     STS / temporary credentials ride via ``session_token``.
 
-    ``service`` is an EXPLICIT, REQUIRED scope input — the AWS service the
+    ``service`` is an EXPLICIT, REQUIRED scope input; the AWS service the
     signer signs for (the sibling of ``region``; the signer dispatches on it to
     select the botocore signer class). It is coerced to :class:`SigningService`
     at the pydantic boundary (the push body / config arm) and re-coerced on the
@@ -148,14 +148,14 @@ class ProfileRefCred:
     """A profile / default-chain REFERENCE; the resolver delegates to botocore.
 
     ``profile=None`` marks "the default chain". Nothing copyable is held at
-    rest for this variant — botocore resolves (and auto-refreshes SSO/STS)
+    rest for this variant; botocore resolves (and auto-refreshes SSO/STS)
     credentials at sign time.
 
     ``service`` is REQUIRED here too (and is the FIRST field, because a frozen
     dataclass forbids a required field after a defaulted one and every other
     field on this variant is defaulted). It is declared even on the profile
     variant because botocore's credential chain supplies a region but NEVER a
-    service — the signer needs the service to dispatch the signer class
+    service; the signer needs the service to dispatch the signer class
     regardless of how the credentials themselves resolve.
     """
 
@@ -165,7 +165,7 @@ class ProfileRefCred:
     kind: Literal["profile_ref"] = "profile_ref"
 
 
-# The structured credential VALUE — a 2-arm tagged union discriminated by
+# The structured credential VALUE; a 2-arm tagged union discriminated by
 # ``kind`` (the FORCED difference vs the token cache's bare ``bearer`` string).
 # ``BearerCred`` is intentionally NOT a member: a bearer is the EXISTING
 # ``phantom_bearer`` token path, not a credential-store value.
@@ -174,7 +174,7 @@ DestinationCredential: TypeAlias = SigV4StaticCreds | ProfileRefCred  # noqa: UP
 
 @dataclass(frozen=True)
 class CredCacheRow:
-    """One credential slot — INTERNAL ONLY (the credential never crosses an
+    """One credential slot; INTERNAL ONLY (the credential never crosses an
     HTTP response boundary, ADR-004).
 
     COPY of :class:`phantom.models.token.TokenCacheRow`: the ``observed_at`` /
@@ -194,7 +194,7 @@ class CredCacheRow:
 
 
 class CredentialSlot(BaseModel):
-    """Admin-facing credential slot — NO secret material (ADR-004).
+    """Admin-facing credential slot; NO secret material (ADR-004).
 
     COPY of :class:`phantom.models.admin.TokenSlot`. This is the only
     credential shape any admin HTTP response may carry (if a GET-list is ever
@@ -232,16 +232,26 @@ class SigV4StaticCredBody(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    kind: Literal["sigv4_static"] = "sigv4_static"
-    access_key_id: str = Field(..., min_length=1)
+    kind: Literal["sigv4_static"] = Field(
+        "sigv4_static", description="Union discriminator; always sigv4_static on this arm."
+    )
+    access_key_id: str = Field(
+        ..., min_length=1, description="Resolved AWS access key id literal, never an env-var name."
+    )
     secret_access_key: str = Field(
         ...,
         min_length=1,
         description="Resolved secret; never returned in any response (ADR-004).",
     )
-    region: str = Field(..., min_length=1)
+    region: str = Field(
+        ...,
+        min_length=1,
+        description="AWS region the signature is scoped to; the scope sibling of service.",
+    )
     service: SigningService = Field(..., description="AWS service this credential signs for.")
-    session_token: str | None = Field(None)
+    session_token: str | None = Field(
+        None, description="STS session token for temporary credentials; None for long-lived keys."
+    )
 
     @field_validator("service", mode="before")
     @classmethod
@@ -255,9 +265,17 @@ class ProfileRefCredBody(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    kind: Literal["profile_ref"] = "profile_ref"
-    profile: str | None = Field(None)
-    region: str | None = Field(None)
+    kind: Literal["profile_ref"] = Field(
+        "profile_ref", description="Union discriminator; always profile_ref on this arm."
+    )
+    profile: str | None = Field(
+        None,
+        description="Named AWS profile resolved at sign time; None means the default chain.",
+    )
+    region: str | None = Field(
+        None,
+        description="AWS region for the resolved profile; None defers to the profile or chain.",
+    )
     service: SigningService = Field(..., description="AWS service this credential signs for.")
 
     @field_validator("service", mode="before")
@@ -273,7 +291,7 @@ CredentialPushBody = Annotated[
 """The admin credential-push wire body (a discriminated union on ``kind``).
 
 The handler (TASK 2.4) maps this 1:1 onto the internal frozen
-:data:`DestinationCredential` variant. There is no ``BearerCredBody`` — bearers
+:data:`DestinationCredential` variant. There is no ``BearerCredBody``; bearers
 are not pushed to the SigV4 store.
 """
 
@@ -284,7 +302,7 @@ def credential_body_to_internal(
     """Map the admin-push wire body 1:1 onto the internal frozen credential.
 
     The wire body carries RESOLVED LITERAL values (the admin push side does no
-    env-var-name resolution — that is the config route's job at boot, GLOBAL
+    env-var-name resolution; that is the config route's job at boot, GLOBAL
     §1.2(a) B1). This is a straight field copy from the validated
     :class:`SigV4StaticCredBody` / :class:`ProfileRefCredBody` Pydantic body to
     the matching frozen :class:`SigV4StaticCreds` / :class:`ProfileRefCred`

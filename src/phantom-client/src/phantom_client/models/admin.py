@@ -27,7 +27,7 @@ from phantom_client.models.status import (
 )
 
 # ---------------------------------------------------------------------------
-# Filter bodies — request payloads.
+# Filter bodies: request payloads.
 # ---------------------------------------------------------------------------
 
 
@@ -36,7 +36,7 @@ class ExtractFilter(BaseModel):
 
     All fields are optional; an empty filter is allowed for the extract
     endpoint (the operator may want every row in a tar archive). For
-    deletion the filter must be non-empty — see :class:`DeleteFilter`.
+    deletion the filter must be non-empty; see :class:`DeleteFilter`.
 
     Mirrors :class:`phantom.models.admin.ExtractFilter` byte-for-byte
     (the admin-models alignment contract test). ``since`` and the
@@ -59,7 +59,7 @@ class ExtractFilter(BaseModel):
 class DeleteFilter(BaseModel):
     """Body of ``DELETE /v1/admin/chains``.
 
-    At least one field MUST be non-None — guarded server-side and
+    At least one field MUST be non-None; guarded server-side and
     pre-flight-checked by :meth:`PhantomClient.bulk_delete`. Empty
     filters raise ``EmptyFilterError`` without hitting the network.
 
@@ -115,12 +115,12 @@ class SigningService(StrEnum):
 
 
 class SigV4StaticCredBody(BaseModel):
-    """Admin credential-push body — a static SigV4 key-pair (resolved literals).
+    """Admin credential-push body: a static SigV4 key-pair (resolved literals).
 
     Mirrors the server's :class:`phantom.models.credential.SigV4StaticCredBody`
     field-for-field, with one DELIBERATE difference: the client OMITS the
     server's ``@field_validator("service", mode="before")`` coercer. Under
-    ``strict=True`` that means a raw wire string is rejected — callers MUST
+    ``strict=True`` that means a raw wire string is rejected; callers MUST
     construct this body with a :class:`SigningService` MEMBER
     (``service=SigningService.S3``), which serializes to ``"s3"`` on the wire.
     The secret is never echoed in any response (ADR-004).
@@ -128,20 +128,30 @@ class SigV4StaticCredBody(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    kind: Literal["sigv4_static"] = "sigv4_static"
-    access_key_id: str = Field(..., min_length=1)
+    kind: Literal["sigv4_static"] = Field(
+        "sigv4_static", description="Union discriminator; always sigv4_static on this arm."
+    )
+    access_key_id: str = Field(
+        ..., min_length=1, description="Resolved AWS access key id literal, never an env-var name."
+    )
     secret_access_key: str = Field(
         ...,
         min_length=1,
         description="Resolved secret; never returned in any response (ADR-004).",
     )
-    region: str = Field(..., min_length=1)
+    region: str = Field(
+        ...,
+        min_length=1,
+        description="AWS region the signature is scoped to; the scope sibling of service.",
+    )
     service: SigningService = Field(..., description="AWS service this credential signs for.")
-    session_token: str | None = Field(None)
+    session_token: str | None = Field(
+        None, description="STS session token for temporary credentials; None for long-lived keys."
+    )
 
 
 class ProfileRefCredBody(BaseModel):
-    """Admin credential-push body — a profile / default-chain reference.
+    """Admin credential-push body: a profile / default-chain reference.
 
     Mirrors the server's :class:`phantom.models.credential.ProfileRefCredBody`.
     Like :class:`SigV4StaticCredBody`, the client omits the server's ``service``
@@ -150,9 +160,17 @@ class ProfileRefCredBody(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    kind: Literal["profile_ref"] = "profile_ref"
-    profile: str | None = Field(None)
-    region: str | None = Field(None)
+    kind: Literal["profile_ref"] = Field(
+        "profile_ref", description="Union discriminator; always profile_ref on this arm."
+    )
+    profile: str | None = Field(
+        None,
+        description="Named AWS profile resolved at sign time; None means the default chain.",
+    )
+    region: str | None = Field(
+        None,
+        description="AWS region for the resolved profile; None defers to the profile or chain.",
+    )
     service: SigningService = Field(..., description="AWS service this credential signs for.")
 
 
@@ -641,7 +659,7 @@ class InstanceStatusResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Plan § 4.2.5 — Observability admin response shapes (SDK mirror).
+# Plan § 4.2.5: Observability admin response shapes (SDK mirror).
 # Mirrors phantom.models.admin byte-for-byte; enforced by the admin
 # contract test.
 # ---------------------------------------------------------------------------
@@ -803,7 +821,7 @@ class QuarantineInventoryResponse(BaseModel):
 
 
 class QuarantineRestoreResponse(BaseModel):
-    """``POST /v1/admin/quarantine/restore`` response — SDK mirror."""
+    """``POST /v1/admin/quarantine/restore`` response (SDK mirror)."""
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
