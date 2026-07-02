@@ -38,11 +38,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml  # type: ignore[import-untyped]  # types-PyYAML not in workspace dev deps
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from phantom.config.defaults import compute_defaults
 from phantom.config.probe import probe_machine
+from phantom.models.credential import SigningService, _coerce_signing_service
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,66 @@ def host_is_loopback(host: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+class TlsCfg(BaseModel):
+    """``server.tls`` block — flip the single listener from HTTP to HTTPS.
+
+    When ``enabled``, the EXISTING uvicorn listener (``__main__.py:89-93``) is
+    served with TLS: ``ssl_certfile``/``ssl_keyfile`` are passed straight to
+    ``uvicorn.run`` (``uvicorn/main.py:534-536``). Self-signed is fine — Phantom
+    does NOT verify its own cert; clients use ``verify=off`` or pin it
+    (loopback/sidecar trust model). NOT a second listener; the one socket
+    simply speaks HTTPS instead of HTTP.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")  # file-wide idiom (settings.py:108)
+
+    enabled: bool = Field(
+        False,
+        description="Serve the single listener over TLS (HTTPS) instead of plaintext HTTP.",
+    )
+    cert_path: str | None = Field(
+        None,
+        description=(
+            "PEM certificate path. Operator-supplied (self-signed OK); when None and "
+            "``enabled`` is set, Phantom auto-generates one at startup (see "
+            ":func:`phantom.runtime.tls_cert.resolve_tls_paths`)."
+        ),
+    )
+    key_path: str | None = Field(
+        None,
+        description=(
+            "PEM private-key path, paired with ``cert_path``. When None and ``enabled`` "
+            "is set, Phantom auto-generates the pair at startup."
+        ),
+    )
+    key_password: str | None = Field(
+        None,
+        description=(
+            "Optional passphrase for an encrypted private key (uvicorn ssl_keyfile_password)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _reject_half_configured_paths(self) -> TlsCfg:
+        """Reject the asymmetric (XOR) cert/key state; the resolver needs both-or-neither.
+
+        Two ``enabled`` configs are valid: BOTH paths set (operator-supplied —
+        :func:`phantom.runtime.tls_cert.resolve_tls_paths` validates and uses them
+        verbatim) OR BOTH paths None (auto-gen — the resolver mints a self-signed
+        pair). Exactly ONE set is a half-configured mistake the resolver has no
+        defined branch for, so reject it here at config-load (fails in
+        ``--validate``, friendlier than a later ``resolve_tls_paths`` / uvicorn
+        ``load_cert_chain`` failure). When ``enabled`` is False the paths are
+        inert, so the guard only applies when enabled.
+        """
+        if self.enabled and (self.cert_path is None) != (self.key_path is None):
+            raise ValueError(
+                "server.tls: set BOTH cert_path and key_path (operator-supplied), "
+                "or NEITHER (auto-gen) — not exactly one"
+            )
+        return self
+
+
 class ServerCfg(BaseModel):
     """``server`` block.
 
@@ -118,6 +179,10 @@ class ServerCfg(BaseModel):
     bind_uds: str | None = Field(
         None,
         description="Optional Unix-domain-socket path (alternative to TCP).",
+    )
+    tls: TlsCfg = Field(
+        default_factory=TlsCfg,  # type: ignore[arg-type]
+        description="See :class:`TlsCfg` — flip the single listener to HTTPS (off by default).",
     )
 
 
@@ -563,6 +628,22 @@ class RetentionCfg(BaseModel):
         ge=-1,
         description="Body retention while parked in ``auth_expired`` (default 6 months).",
     )
+    expired_metadata_seconds: int = Field(
+        2_592_000,  # 30 days — mirrors failed_metadata_seconds (a terminal give-up to audit).
+        ge=-1,
+        description=(
+            "Metadata retention after a row gives up at the send-deadline "
+            "(``expired``, ADR-032). 30 days (mirrors ``failed_metadata_seconds``)."
+        ),
+    )
+    expired_body_seconds: int = Field(
+        0,
+        ge=-1,
+        description=(
+            "Body retention for ``expired`` (0: the body is already discarded at "
+            "the transition to ``expired``, so there is nothing to retain)."
+        ),
+    )
     reaper_interval_seconds: int = Field(
         60,
         ge=1,
@@ -692,9 +773,15 @@ class RouteCfg(BaseModel):
         min_length=1,
         description="fnmatch host patterns this route matches.",
     )
-    auth_mode: Literal["phantom_bearer", "none"] = Field(
+    auth_mode: Literal["phantom_bearer", "none", "aws_sigv4"] = Field(
         ...,
-        description="Whether Phantom injects an Authorization header on this route.",
+        description=(
+            "How Phantom authenticates the outbound request on this route. "
+            "``phantom_bearer`` injects a cached Authorization bearer; "
+            "``aws_sigv4`` re-signs the request with botocore SigV4 using a "
+            "host-keyed credential from the CredentialStore; ``none`` forwards "
+            "as-is."
+        ),
     )
     timeout_seconds: float | None = Field(
         None,
@@ -707,6 +794,175 @@ class RouteCfg(BaseModel):
             "through ResolvedRoute → UpstreamRequest → httpx per-call kwarg."
         ),
     )
+    send_deadline_seconds: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "Max wall-clock seconds a buffered upload to this route may keep "
+            "trying before Phantom gives up and marks it ``expired`` (terminal, "
+            "ADR-032: body released, never re-admitted). Measured from "
+            "``received_at`` (admission). None = no deadline (retry per the "
+            "strategy forever). Restart-required (routes do not hot-reload)."
+        ),
+    )
+
+
+class SigV4CredentialCfg(BaseModel):
+    """One config-declared destination credential for the ``aws_sigv4`` signer.
+
+    This is the **config acquisition route** — the boot-time analogue of the
+    runtime admin push (``PUT /v1/admin/credentials/{dest_host}``). It is the
+    ONE place env-var *names* are accepted (GLOBAL §1.2(a) B1), mirroring
+    :class:`~phantom.config.ad_mint.AdMintConfig`'s ``primary_client_secret_env``
+    / ``secondary_client_secret_env`` (which likewise hold the *name* of an env
+    var, never the secret literal). The secret access key NEVER appears in
+    config: only the NAME of the environment variable that holds it. At boot
+    (``app.py`` lifespan, ``_build_instance_context``) the named env vars are
+    resolved to their literal values and a
+    :class:`~phantom.models.credential.SigV4StaticCreds` (or
+    :class:`~phantom.models.credential.ProfileRefCred`) of RESOLVED values is
+    written into the host-keyed credential store under ``source="config"``. By
+    the time the store holds anything, the env-var names are gone (the B1
+    invariant: resolved values in the store, names only on this config route).
+
+    Two arms, discriminated by ``kind`` (mirroring the admin push body's
+    discriminated union):
+
+    * ``sigv4_static`` — a static key-pair declared by env-var name.
+      ``access_key_id_env`` and ``secret_access_key_env`` are REQUIRED;
+      ``region`` is REQUIRED; ``session_token_env`` is optional (STS).
+    * ``profile_ref`` — a botocore profile / default-chain reference. No env
+      vars and no secret are held at rest; the signer resolves credentials at
+      sign time. ``profile=None`` marks the default chain.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    dest_host: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Destination host this credential is keyed on. Normalized through "
+            "the same ``_hostname`` helper the executor uses for its "
+            "forward-time lookup, so the config key equals the lookup key by "
+            "construction."
+        ),
+    )
+    kind: Literal["sigv4_static", "profile_ref"] = Field(
+        ...,
+        description="The credential arm (NEVER carries a resolved secret).",
+    )
+    # static arm (kind == "sigv4_static"): env-var NAMES, mirroring
+    # ad_mint.primary_client_secret_env (config/ad_mint.py:28).
+    access_key_id_env: str | None = Field(
+        None,
+        min_length=1,
+        description="Name of the env var holding the access key id (static arm).",
+    )
+    secret_access_key_env: str | None = Field(
+        None,
+        min_length=1,
+        description=(
+            "Name of the env var holding the secret access key (static arm). "
+            "The secret LITERAL never appears in config (ADR-004 / B1)."
+        ),
+    )
+    session_token_env: str | None = Field(
+        None,
+        min_length=1,
+        description=(
+            "Optional name of the env var holding the STS session token "
+            "(static arm). None means a long-lived key-pair."
+        ),
+    )
+    region: str | None = Field(
+        None,
+        min_length=1,
+        description="AWS region (static arm — required there; ignored for profile_ref).",
+    )
+    # profile-ref arm (kind == "profile_ref").
+    profile: str | None = Field(
+        None,
+        min_length=1,
+        description="AWS profile name (profile_ref arm). None means the default chain.",
+    )
+    # Scope state for BOTH arms (NOT arm-specific, NOT an env-var-resolved
+    # secret): the AWS service the signer signs for, carried onto the
+    # materialized credential. Required — strict mode rejects the bare wire
+    # string without the before-validator.
+    service: SigningService = Field(
+        ..., description="AWS service this credential signs for (both arms)."
+    )
+
+    @field_validator("service", mode="before")
+    @classmethod
+    def _validate_service(cls, v: object) -> SigningService:
+        """Coerce the wire ``service`` string to :class:`SigningService` (strict mode)."""
+        return _coerce_signing_service(v)
+
+    @model_validator(mode="after")
+    def _check_arm_fields(self) -> SigV4CredentialCfg:
+        """Enforce the per-``kind`` required-field set at settings-load.
+
+        A ``sigv4_static`` arm MUST name both key env vars and a region; a
+        ``profile_ref`` arm MUST NOT carry any static field. ``service`` is
+        REQUIRED on BOTH arms and is enforced by its non-optional typed field
+        (the field validator coerces the wire string; a missing/unknown
+        ``service`` already fails at field validation, so it needs no entry in
+        the per-arm sets here). Catching the shape error here (loud Pydantic
+        ``ValidationError``) keeps the boot materializer's static-arm
+        assumptions total — by the time the loop runs, a ``sigv4_static`` entry
+        is guaranteed to carry every name it will resolve. The boot loop still
+        owns the orthogonal failure (a NAMED env var that is absent or empty at
+        runtime).
+
+        Returns:
+            ``self`` when the arm's field set is valid.
+
+        Raises:
+            ValueError: When a required field for ``kind`` is missing, or a
+                field belonging to the other arm is present.
+        """
+        if self.kind == "sigv4_static":
+            missing = [
+                name
+                for name, value in (
+                    ("access_key_id_env", self.access_key_id_env),
+                    ("secret_access_key_env", self.secret_access_key_env),
+                    ("region", self.region),
+                )
+                if value is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"sigv4_credentials entry for dest_host={self.dest_host!r} has "
+                    f"kind='sigv4_static' but is missing required field(s): "
+                    f"{', '.join(missing)}."
+                )
+            if self.profile is not None:
+                raise ValueError(
+                    f"sigv4_credentials entry for dest_host={self.dest_host!r} has "
+                    f"kind='sigv4_static' but also sets 'profile' (a profile_ref "
+                    f"field). Pick one arm."
+                )
+        else:  # kind == "profile_ref"
+            stray = [
+                name
+                for name, value in (
+                    ("access_key_id_env", self.access_key_id_env),
+                    ("secret_access_key_env", self.secret_access_key_env),
+                    ("session_token_env", self.session_token_env),
+                    ("region", self.region),
+                )
+                if value is not None
+            ]
+            if stray:
+                raise ValueError(
+                    f"sigv4_credentials entry for dest_host={self.dest_host!r} has "
+                    f"kind='profile_ref' but also sets static-arm field(s): "
+                    f"{', '.join(stray)}. Pick one arm."
+                )
+        return self
 
 
 # AdMintConfig lives in a sibling module to keep this file focused.
@@ -859,6 +1115,44 @@ class Settings(BaseSettings):
     instances: list[InstanceCfg] = Field(
         default_factory=list,
         description="Per-instance configuration; each instance owns one storage partition.",
+    )
+
+    phantom_default_target: HttpUrl | None = Field(
+        None,
+        description=(
+            "Optional single-upstream default destination for the raw-intake "
+            "catch-all route (Phase 1). When a stock S3-style request arrives "
+            "on ``PUT /{bucket}/{key}`` (no ``?phantom=`` carrier), the "
+            "raw->envelope adapter rewrites the synthesized step URL to "
+            "``{phantom_default_target}/{bucket}/{key}`` so the destination is "
+            "a REAL upstream host, never Phantom's own bind host (which would "
+            "loop). ``None`` means no default is configured: a raw request "
+            "with no ``?phantom=`` carrier is rejected 421 ``invalid_target`` "
+            "before any durable write. Restart-required (not hot-reloaded); "
+            "env-overridable as ``PHANTOM_PHANTOM_DEFAULT_TARGET``. The "
+            "explicit ``?phantom=<full-url>`` query carrier always wins over "
+            "this default (first-hit precedence)."
+        ),
+    )
+
+    sigv4_credentials: list[SigV4CredentialCfg] = Field(
+        default_factory=list,
+        description=(
+            "Config-declared destination credentials for the ``aws_sigv4`` "
+            "signer (the boot-time analogue of the runtime admin push). Each "
+            "entry names the env var holding its secret access key (never the "
+            "secret literal — GLOBAL §1.2(a) B1 / ADR-004). At boot the named "
+            "env vars are resolved to literals and materialized into EVERY "
+            "instance's host-keyed credential store under ``source='config'`` "
+            "(``app.py`` lifespan). The credentials key on the globally-"
+            "meaningful destination host, so this map is top-level rather than "
+            "per-instance. A missing named env var is a fail-fast boot error. "
+            "Each entry also declares a REQUIRED ``service`` (the AWS service "
+            "the signer signs for, e.g. ``s3``); a missing or unknown service "
+            "is a loud ``ValidationError`` at settings-load. Empty (the "
+            "default) is a no-op: a bearer-only deployment declares nothing "
+            "here. Restart-required (not hot-reloaded)."
+        ),
     )
 
     @model_validator(mode="after")

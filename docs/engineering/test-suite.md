@@ -8,7 +8,7 @@ engineering deep dives:
 - [Reliability, Error Handling, and Security](reliability-and-security.md)
 
 Unit tests check pieces in isolation. The end-to-end suite is where Phantom is
-made to prove its reliability claims against the real four-package stack: the
+made to prove its reliability claims against the real three-package stack: the
 service, the client SDK, and the emulator standing in for the upstream, all
 wired together over real sockets. Most of the tests below do not just check a
 happy path. They inject failures (upstream outages, expired tokens, killed
@@ -29,15 +29,17 @@ every change while the long and resource-heavy ones run on their own schedule.
 | `stress` | High-volume bursts. | A nightly schedule |
 
 The default local selection runs everything except the `load`, `perf`, and
-`stress` lanes. Continuous integration widens that on each change to include
-`load` and `perf`, runs `stress` nightly, and has a full-sweep lane that runs all
-of it together.
+`stress` lanes. Continuous integration runs that same default selection on each
+change, plus a separate per-change job for the `load` lane. The `perf` lane is
+manual only (`workflow_dispatch`, on a quiet runner). The `stress` lane runs
+nightly. Those three workflows are the whole CI set; there is no full-sweep
+lane.
 
-By the numbers, the suite is roughly 110 end-to-end test files (the top level
+By the numbers, the suite is 127 end-to-end test files (the top level
 plus the `crash_recovery/`, `regression/`, `stress/`, `all_ram/`,
-`ingress_abort/`, and `db_contention/` subdirs) and about 230 collected tests:
-roughly 210 in the default lane, 2 in `load`, 9 in `perf`, and 6 in `stress`,
-with one designed `xfail`. Counts drift as tests land - see
+`ingress_abort/`, and `db_contention/` subdirs) and 243 test functions:
+226 in the default lane, 2 in `load`, 9 in `perf`, and 6 in `stress`,
+with one designed `xfail` (counts as of 2026-07-01). Counts drift as tests land - see
 `tests/e2e/regression/COVERAGE.md` for the authoritative failure-mode map.
 Performance budgets throughout are named constants in the tests, not bare
 numbers, so a budget is always self-documenting.
@@ -119,8 +121,9 @@ budget it asserts.
   directly.
 - **Hostname dispatch.** With no routing header present, requests are dispatched
   to the correct instance purely by the target URL's hostname; corrupting one
-  instance's database quarantines only that instance. (Skipped automatically on
-  hosts that cannot bind the second loopback address.)
+  instance's database quarantines only that instance. The pair is never skipped:
+  when `127.0.0.2` is not bindable, fixture setup fails loudly with a message
+  naming `scripts/dev/ensure_loopback_alias.sh`.
 - **Synthetic workload burst.** A realistic mixed-size upload burst (small and
   large objects, a config blob, an HTML payload) runs with synthetic bytes; a
   drift checker keeps the synthetic shape honest over time.
@@ -143,6 +146,71 @@ budget it asserts.
 - **Concurrency under load.** Five tests confirm byte-identity under a
   fifty-way burst, during encode, under a saturation refusal, in a mid-encode
   collision, and with two senders against one upstream.
+
+### Fake-S3 routing and SigV4 re-signing
+
+This feature lets a stock S3 SDK point at Phantom over plain HTTP while Phantom
+re-signs each upload with AWS SigV4 for the real bucket.
+
+- **SigV4 re-sign keystone (the proof the feature works end-to-end).**
+  [`tests/e2e/test_e2e_sigv4_resign_round_trip.py`](../../tests/e2e/test_e2e_sigv4_resign_round_trip.py)
+  drives a stock PUT through the catch-all, Phantom re-signs it with `S3SigV4Auth`,
+  and the emulator's SigV4 sink validates it, asserting byte-identity and the
+  signed `x-amz-content-sha256`. Four legs: the happy round trip
+  (`test_sigv4_resign_round_trip_keystone`), a wrong credential parking the row in
+  `auth_expired` (`test_sigv4_wrong_credential_parks_auth_expired`), the
+  `CredentialKicker` refresh loop where a corrected credential push wakes the
+  parked row to success (`test_sigv4_refresh_loop_wrong_then_correct_credential`),
+  and a directly-corrupted signature rejected `403`
+  (`test_sigv4_corrupted_signature_direct_put_rejected_403`). A parametrized leg
+  (`test_sigv4_resign_per_verb_round_trip`) repeats the round trip for each
+  forwarded verb and asserts the stored `S3Object.method`.
+- **Forward-as-is (`auth_mode: none`).**
+  [`tests/e2e/test_e2e_raw_intake_forward_as_is.py`](../../tests/e2e/test_e2e_raw_intake_forward_as_is.py)
+  forwards a bare upload (e.g. a presigned URL; its own signature is the auth)
+  unchanged to the emulator's auth-free `/raw` sink; a parametrized leg asserts
+  the stored `RawBody.method` for each verb.
+- **Destination via the `?phantom=` carrier.**
+  [`tests/e2e/test_e2e_raw_intake_phantom_carrier.py`](../../tests/e2e/test_e2e_raw_intake_phantom_carrier.py)
+  proves the query-carrier leg of destination resolution: the carrier alone
+  names the destination with no `phantom_default_target` configured, and the
+  carrier wins when both are set (two tests, default lane).
+- **HTTPS over a real TLS listener.**
+  [`tests/e2e/test_e2e_https_listener.py`](../../tests/e2e/test_e2e_https_listener.py)
+  runs the same re-sign-and-forward path with `server.tls.enabled`, proving the
+  upload lands byte-identically over HTTPS. This is distinct from the keystone
+  (which proves re-signing over **plaintext**) and from the TLS unit test (which
+  owns cert generation, rotation, and the XOR cert/key validator); the three are
+  not interchangeable.
+- **Config-provisioned credential.**
+  [`tests/e2e/test_e2e_config_sigv4_credential.py`](../../tests/e2e/test_e2e_config_sigv4_credential.py)
+  boots with a `sigv4_credentials` config block (env-var names) and no admin push,
+  then drives a successful re-sign, closing the config-to-store boot path e2e.
+- **Emulator sinks accept all forwarded upload verbs.** The sinks now accept
+  `PUT`, `POST`, and `PATCH` (the catch-all's full forwarded set), not PUT-only.
+  [`src/phantom-emulator/tests/unit/test_s3_router.py`](../../src/phantom-emulator/tests/unit/test_s3_router.py)
+  covers the SigV4 sink's POST/PATCH legs (happy `200` + `method` recorded,
+  `403` bad signature, `400` missing `x-amz-content-sha256`, `413` over cap) plus
+  a verb-set invariant test pinning the sink's `UPLOAD_METHODS` to the catch-all's
+  source of truth;
+  [`src/phantom-emulator/tests/unit/test_raw_sink.py`](../../src/phantom-emulator/tests/unit/test_raw_sink.py)
+  covers the raw sink's POST/PATCH legs and the load-bearing router-registration
+  order.
+- **Signer unit coverage.**
+  [`src/phantom-service/tests/unit/test_sigv4_executor.py`](../../src/phantom-service/tests/unit/test_sigv4_executor.py)
+  proves the `profile_ref` signing arm (botocore session faked at the module seam,
+  zero real AWS/SSO I/O): it signs correctly, applies the three-tier region
+  fallback (`us-east-1` default; session config wins), and raises a SigV4 signing
+  error on an empty credential chain. The TLS unit test
+  ([`src/phantom-service/tests/unit/test_tls_listener.py`](../../src/phantom-service/tests/unit/test_tls_listener.py))
+  serves a real in-process HTTPS `200` (`test_single_listener_serves_https_200`)
+  with a plaintext-to-TLS-port negative control, and owns cert generation,
+  rotation-near-expiry, and the half-configured (cert-only / key-only) rejection.
+- **Client credential surface.** The `push_credential` test in
+  [`src/phantom-client/tests/unit/test_client.py`](../../src/phantom-client/tests/unit/test_client.py)
+  asserts both credential arms issue `PUT /v1/admin/credentials/{dest_host}` with
+  the serialized body, and pins the contract that the strict client model rejects a
+  raw `service` string (callers must pass a `SigningService` member).
 
 ## Aggressor tests
 
@@ -270,9 +338,10 @@ These pin specific bugs so they cannot return.
 - **Multipart atomicity.** Multi-file uploads succeed or fail as a unit, each part
   byte-identical; duplicate part names are rejected; replays do not duplicate.
 - **Transparent proxying.** The upstream receives byte-identical bodies and
-  headers, with the single documented exception that the authorization header is
-  substituted with the cached token, and Phantom's own control headers are
-  stripped.
+  headers, with the documented exception of the auth headers: substituted with
+  the cached bearer (`phantom_bearer`) or reconstructed by the SigV4 re-sign
+  (`aws_sigv4`), the body bytes unchanged either way. Phantom's own control
+  headers are stripped.
 - **Admin completeness.** Every stored chain is fully reconstructable through the
   admin API, pagination surfaces every row exactly once, and the export recovers
   every buffered body.

@@ -24,7 +24,7 @@ from pydantic import TypeAdapter, ValidationError
 
 
 def test_chain_state_values() -> None:
-    """The eight canonical chain states are present and exact."""
+    """The nine canonical chain states are present and exact."""
     assert set(get_args(ChainState)) == {
         "queued",
         "attempting",
@@ -34,6 +34,7 @@ def test_chain_state_values() -> None:
         "stored",
         "cancelled",
         "corrupted",
+        "expired",
     }
 
 

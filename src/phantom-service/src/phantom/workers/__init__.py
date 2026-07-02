@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from phantom.workers.auth_kicker import AuthKicker
 from phantom.workers.body_orphan_janitor import BodyOrphanJanitor
+from phantom.workers.credential_kicker import CredentialKicker
 from phantom.workers.disk_pressure import DiskPressureProbe
 from phantom.workers.persist_controller import PersistController
 from phantom.workers.ram_pressure import RamPressureWatcher
@@ -26,6 +27,7 @@ __all__ = [
     "AdmissionResult",
     "AuthKicker",
     "BodyOrphanJanitor",
+    "CredentialKicker",
     "DiskPressureProbe",
     "PersistController",
     "RamPressureWatcher",

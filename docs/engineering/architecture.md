@@ -26,6 +26,13 @@ unreliable part: the network, the expiring credentials, the upstream that is
 sometimes down. The forwarding guarantee is at-least-once and idempotency-keyed,
 and the local buffer survives process restarts and power loss.
 
+Besides the `POST /v1/send` chain ingress, Phantom also exposes a stock-SDK
+fake-S3 intake: a catch-all that accepts a plain `PUT`/`POST`/`PATCH` from an
+unmodified S3 SDK, synthesizes a one-step chain, and forwards it to the real
+upstream. For routes configured `auth_mode: aws_sigv4` Phantom re-signs that
+forwarded request with AWS SigV4 (its own host-keyed credential), so a stock S3
+client needs no Phantom-specific code.
+
 Three properties hold at runtime:
 
 1. **Transparent on the wire.** Whatever bytes the producer sends are the exact
@@ -86,10 +93,15 @@ A POST flows through the service in six stages.
    every state transition. There is no separate state-machine module to drift out
    of sync.
 5. **Upstream.** The upstream transport performs the real HTTP call. Auth is
-   injected from a token cache keyed by (endpoint, uid) at the moment of the
-   attempt, so a token refreshed mid-retry is the one actually used. Template
-   placeholders are substituted, and any values the chain needs to carry forward
-   are captured from the response.
+   injected at the moment of the attempt according to the route's `auth_mode`,
+   one of three arms: `phantom_bearer` injects a bearer from a token cache keyed
+   by (endpoint, uid), so a token refreshed mid-retry is the one actually used;
+   `aws_sigv4` re-signs the outbound request with AWS SigV4 from a host-keyed
+   destination credential (the S3 signer emits and signs `x-amz-content-sha256`),
+   so a retry hours later re-signs with a fresh timestamp; `none` forwards the
+   request as-is (the inbound signature, e.g. a presigned URL, is the auth).
+   Template placeholders are substituted, and any values the chain needs to carry
+   forward are captured from the response.
 6. **Completion.** A delivered chain reaches the terminal `succeeded` state and
    its body is dropped. Captured values stay queryable through the admin API for
    the configured retention window.
@@ -175,9 +187,14 @@ alias gap (R13-2) - both eliminated by the single listener.)
 
 ## Storage architecture
 
-Each instance owns exactly one persistent SQLite database in WAL mode, at a path
-under its data directory. That database holds the upload rows, the idempotency
-index, and the token cache. Body bytes live separately, in the body store.
+Each instance owns three persistent SQLite files under its data directory.
+`uploads.db` (WAL mode) holds the upload rows and the idempotency index.
+`token_cache.db` holds the persistent token cache in its own file (ADR-030); a
+`token_cache` table is also declared inside `uploads.db` by the shared schema,
+but that copy sits empty in production. `credential_store.db` holds the
+host-keyed destination credentials for the `aws_sigv4` arm. The split keeps
+token and credential writes off the hot uploads writer lock. Body bytes live
+separately, in the body store.
 
 ### SQLite configuration
 
@@ -198,11 +215,13 @@ At startup, before recovery runs, the store also issues a
 
 ### Upload rows and states
 
-Each upload is one row. Its `state` is one of `queued`, `attempting`,
-`succeeded`, `failed`, `cancelled`, `stored`, `corrupted`, or `auth_expired`.
-The terminal states are `succeeded`, `failed`, `stored`, `cancelled`, and
-`corrupted`. Note that `auth_expired` is deliberately not terminal: such a row is
-still deliverable once a working token arrives.
+Each upload is one row. Its `state` is one of nine: `queued`, `attempting`,
+`succeeded`, `failed`, `cancelled`, `stored`, `corrupted`, `auth_expired`, or
+`expired`. The six terminal states are `succeeded`, `failed`, `stored`,
+`cancelled`, `corrupted`, and `expired`. Note that `auth_expired` is
+deliberately not terminal: such a row is still deliverable once a working token
+arrives. `expired` is terminal by design: the per-route send-deadline elapsed
+and the row is never re-admitted.
 
 A `body_location` column records whether a body currently lives in RAM or on
 disk. This column is the single durability commit point, and only one component
@@ -229,13 +248,18 @@ There are three first-class modes, selected in configuration:
 ### Single-writer-per-purpose
 
 Every table-mutating purpose has exactly one owner. Admission is the only writer
-of the row-plus-claim insert. The sender is the only writer of state transitions.
-The persist controller is the only component that flips `body_location` from RAM
-to disk. The reaper is the only one that deletes rows for retention. The boot
-recovery sweep is the only caller that marks a row `corrupted`. The pressure
-watchers, the orphan janitor, and the invariant auditor write nothing to the
-upload table at all. This discipline is what makes the concurrency tractable:
-for any given change to a row, there is exactly one place to look.
+of the row-plus-claim insert. The sender owns the attempt-outcome state
+transitions; the auth kicker and the credential kicker write the `auth_expired`
+to `queued` wake and the send-deadline flip to `expired`, and admin replay and
+cancel write their own transitions. The persist controller is the only
+component that flips `body_location` from RAM to disk. The reaper is the only
+one that deletes rows for retention. The `mark_corrupted` store method has a
+single caller, the boot recovery sweep; the sender also drives rows to
+`corrupted`, on a hash mismatch or a missing body, but through its normal
+`record_attempt_result` path. The pressure watchers, the orphan janitor, and the
+invariant auditor write nothing to the upload table at all. This discipline is
+what makes the concurrency tractable: for any given change to a row, there is
+exactly one place to look.
 
 ## Database retry mechanisms
 
@@ -384,6 +408,9 @@ failure in any of them takes the process down loudly into a restart.
   RAM copy, so a crash in the middle leaves a row that recovery can still resolve.
 - **Auth kicker.** Wakes `auth_expired` rows back to `queued` when a fresh token
   lands in the cache for their (endpoint, uid) slot.
+- **Credential kicker.** The SigV4 analogue of the auth kicker: wakes
+  `auth_expired` `aws_sigv4` rows back to `queued` when an operator pushes a
+  fresh destination credential for their host.
 
 Process-wide startup guards run in the same boot path and refuse to start the
 service in an unsafe state. They are covered in

@@ -380,7 +380,7 @@ class GroupStatusResponse(BaseModel):
     total: int = Field(..., ge=0, description="Number of member uploads in the group.")
     counts_by_state: dict[ChainState, int] = Field(
         ...,
-        description="Histogram of member states across the eight canonical ChainState values.",
+        description="Histogram of member states across the nine canonical ChainState values.",
     )
     all_finished: bool = Field(
         ...,

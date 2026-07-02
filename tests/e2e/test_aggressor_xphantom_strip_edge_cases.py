@@ -458,13 +458,20 @@ async def test_aggressor_xphantom_strip_whitespace_padded_name(tmp_path: Path) -
         # surfaced.
 
         # Per `phantom.storage.interface.TERMINAL_STATES`: succeeded,
-        # failed, stored, cancelled, corrupted. `auth_expired` is NOT
-        # terminal (auth-kicker re-queues it). For this test, ANY of
-        # these terminal landings is acceptable — the bug we pin is
+        # failed, stored, cancelled, corrupted, expired. `auth_expired`
+        # is NOT terminal (auth-kicker re-queues it). For this test, ANY
+        # of these terminal landings is acceptable — the bug we pin is
         # "chain stuck retrying forever", not "chain failed gracefully".
         async def _reached_terminal() -> bool:
             row = await pc.get_upload(chain_id)
-            return row.state in {"succeeded", "failed", "stored", "cancelled", "corrupted"}
+            return row.state in {
+                "succeeded",
+                "failed",
+                "stored",
+                "cancelled",
+                "corrupted",
+                "expired",
+            }
 
         try:
             await await_until(

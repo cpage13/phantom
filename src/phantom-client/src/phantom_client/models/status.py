@@ -38,7 +38,7 @@ UploadState: TypeAlias = ChainState  # noqa: UP040 — match TypeAlias conventio
 
 
 TERMINAL_STATES: frozenset[str] = frozenset(
-    {"succeeded", "failed", "cancelled", "stored", "corrupted", "auth_expired"}
+    {"succeeded", "failed", "cancelled", "stored", "corrupted", "auth_expired", "expired"}
 )
 """SDK-facing 'no more work happens by itself' set.
 
@@ -52,6 +52,10 @@ never retries a body-verification failure), so a poll that excluded it
 could only run to its deadline; this also matches
 ``poll_group_until_finished``, whose rollup counts ``corrupted``
 members as finished.
+Includes ``expired`` (ADR-032): truly terminal — the per-route
+send-deadline elapsed, so the upload is dead, the body is released, and
+it is never retried. Distinct from ``auth_expired``'s "stalled pending
+external action": an ``expired`` row will never progress, by anyone.
 
 Callers who need to poll *through* ``auth_expired`` — for example to
 assert eventual delivery after kicking the row with a fresh token —

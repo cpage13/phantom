@@ -1,8 +1,8 @@
-# `phantom-deploy` — Phantom service container image + reference compose
+# `phantom-deploy`: Phantom service container image + reference compose
 
 **What this is.** The container build configuration and the
 reference docker-compose for `phantom-service`. **Not a Python
-package** — this directory carries no `pyproject.toml`, no
+package**: this directory carries no `pyproject.toml`, no
 `src/`, no Python code (per [ADR-020](../../docs/adr/020-container-image-as-deployment-artifact.md),
 which supersedes the phantom-service portion of ADR-016).
 
@@ -30,7 +30,7 @@ docker buildx build \
   .
 ```
 
-The build is multi-arch via `docker buildx` — see the Docker docs
+The build is multi-arch via `docker buildx`. See the Docker docs
 for the one-time `buildx create --use` setup if you have not used
 buildx before.
 
@@ -63,9 +63,11 @@ default with no override.)
 docker compose -f src/phantom-deploy/docker-compose.yml up
 ```
 
-This pulls the published image (`ghcr.io/<org>/phantom-service:latest`)
-by default. To build locally instead, uncomment the `build:` block
-in `docker-compose.yml`.
+The compose file references a GHCR image name
+(`ghcr.io/${PHANTOM_ORG}/phantom-service:${PHANTOM_TAG}`, defaulting to
+`ghcr.io/anthropic-example-org/phantom-service:latest`). If that image
+is not published in your org, uncomment the `build:` block in
+`docker-compose.yml` to build locally.
 
 ## Configuration
 
@@ -101,7 +103,7 @@ reloadable vs. restart-required knobs.
 
 ## Volumes
 
-- `/var/lib/phantom` — the persistent data directory. Holds the
+- `/var/lib/phantom`: the persistent data directory. Holds the
   SQLite DB(s), body files, optional cold-backup snapshots, and any
   flat timestamped quarantine backups. Mount a named volume or a host
   path; the container runs as the Wolfi `nonroot` user (UID/GID
@@ -126,12 +128,12 @@ bind IS the admin access control (ADR-004).
 
 ## See also
 
-- [Operator playbook](../../docs/operator-playbook.md) —
+- [Operator playbook](../../docs/operator-playbook.md):
   deployment topology, mode selection, observability + alerting,
   failure-mode diagnosis, routine operations, YAML migration.
-- [`config/phantom.yaml.example`](../../config/phantom.yaml.example)
-  — operator-facing config reference.
-- [ADR-020](../../docs/adr/020-container-image-as-deployment-artifact.md)
-  — the deployment-shape decision.
-- [ADR-016](../../docs/adr/016-phantom-container-deployment-model.md)
-  — the superseded phantom-service portion of the prior container model.
+- [`config/phantom.yaml.example`](../../config/phantom.yaml.example):
+  operator-facing config reference.
+- [ADR-020](../../docs/adr/020-container-image-as-deployment-artifact.md):
+  the deployment-shape decision.
+- [ADR-016](../../docs/adr/016-phantom-container-deployment-model.md):
+  the superseded phantom-service portion of the prior container model.

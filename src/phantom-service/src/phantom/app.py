@@ -34,19 +34,30 @@ from fastapi import FastAPI
 from pydantic import ValidationError
 
 from phantom import __version__
-from phantom.chain.executor import ChainExecutor, default_clock
+from phantom.chain.executor import ChainExecutor, _hostname, default_clock
 from phantom.compression import BodyCodec, select_codec
 from phantom.config.probe import probe_machine
-from phantom.config.settings import InstanceCfg, Settings, host_is_loopback
+from phantom.config.settings import (
+    InstanceCfg,
+    Settings,
+    SigV4CredentialCfg,
+    host_is_loopback,
+)
 from phantom.instances.context import InstanceContext, instance_storage_paths
 from phantom.instances.dispatcher import InstanceDispatcher
 from phantom.instances.settings_holder import SettingsHolder
 from phantom.instances.snapshot import InstanceSettingsSnapshot, _build_snapshot
 from phantom.models.admin import ResolvedDefaultsSummary
+from phantom.models.credential import (
+    HostCredKey,
+    ProfileRefCred,
+    SigV4StaticCreds,
+)
 from phantom.observability import configure_logging
 from phantom.observability.metrics import MetricsRegistry
 from phantom.refresh.ad_client_credentials import AdMinter
 from phantom.routes import admin as admin_routes
+from phantom.routes import catch_all as catch_all_routes
 from phantom.routes import health as health_routes
 from phantom.routes import send as send_routes
 from phantom.routing import resolve_route
@@ -80,6 +91,7 @@ from phantom.storage import (
     SqliteTokenCache,
     SqliteUploadStore,
 )
+from phantom.storage.credential_store import SqliteCredentialStore
 from phantom.storage.integrity import (
     isolate_db_file,
     quarantine,
@@ -92,6 +104,7 @@ from phantom.transport.httpx_client import HttpxUpstreamClient
 from phantom.workers.auth_kicker import AuthKicker
 from phantom.workers.body_orphan_janitor import BodyOrphanJanitor
 from phantom.workers.cold_backup import ColdBackupScheduler
+from phantom.workers.credential_kicker import CredentialKicker
 from phantom.workers.disk_pressure import DiskPressureProbe
 from phantom.workers.invariant_audit import InvariantAuditor
 from phantom.workers.persist_controller import PersistController
@@ -351,6 +364,144 @@ class _StorageSubstrateUnwritableError(RuntimeError):
         """Store ``detail`` (the degrade detail) and pass it to ``RuntimeError``."""
         super().__init__(detail)
         self.detail = detail
+
+
+class ConfigCredentialError(RuntimeError):
+    """A ``sigv4_credentials`` config entry could not be materialized at boot.
+
+    Raised by :func:`_materialize_config_credentials` when a NAMED environment
+    variable a ``sigv4_static`` entry resolves (``access_key_id_env`` /
+    ``secret_access_key_env`` / ``session_token_env``) is absent or empty. This
+    is fail-fast by design (GLOBAL §1.2(a) B1 / plan Phase 2 TASK 2.4b): a
+    config-declared credential whose backing secret env var is missing is an
+    operator misconfiguration that must be fixed, not silently skipped — a
+    silent skip would strand every ``aws_sigv4`` forward on that host with no
+    credential and no signal. Unlike :class:`_StorageSubstrateUnwritableError`
+    (a physics boundary that DEGRADES the one instance), this is a config error
+    that PROPAGATES out of :func:`_build_instance_context` and crashes boot
+    loudly, mirroring ``ad_mint``'s posture that its secret env var must exist.
+    """
+
+
+def _resolve_required_env(var_name: str, *, dest_host: str, field: str) -> str:
+    """Resolve a named env var to a non-empty literal or fail fast.
+
+    The B1 rule's boot-time resolution: a ``sigv4_credentials`` entry holds the
+    NAME of the env var, never the secret; here (and ONLY here, at boot) the
+    name becomes the literal value the store will hold.
+
+    Args:
+        var_name: The environment-variable NAME taken from the config entry.
+        dest_host: The entry's destination host (for the error message).
+        field: The config field the name came from (for the error message).
+
+    Returns:
+        The resolved non-empty environment-variable value.
+
+    Raises:
+        ConfigCredentialError: When ``var_name`` is absent from ``os.environ``
+            or resolves to an empty string.
+    """
+    value = os.environ.get(var_name)
+    if not value:
+        raise ConfigCredentialError(
+            f"sigv4_credentials entry for dest_host={dest_host!r}: the env var "
+            f"{var_name!r} named by {field!r} is "
+            f"{'unset' if value is None else 'empty'}. Set it before boot "
+            f"(the config route names the env var; the secret literal never "
+            f"lives in config)."
+        )
+    return value
+
+
+def _config_credential_to_internal(
+    cfg: SigV4CredentialCfg,
+) -> SigV4StaticCreds | ProfileRefCred:
+    """Resolve one config entry's env-var NAMES to a RESOLVED-value credential.
+
+    The config-route analogue of
+    :func:`phantom.models.credential.credential_body_to_internal` (which maps
+    the admin-push *wire* body, whose values are already resolved literals). The
+    forced difference: the config arm carries env-var NAMES, so the
+    ``sigv4_static`` arm reads ``os.environ`` here. A ``profile_ref`` arm holds
+    no secret and reads no env var (botocore resolves it at sign time). The
+    ``sigv4_static`` arm's required fields are guaranteed present by
+    :meth:`SigV4CredentialCfg._check_arm_fields`, so the ``assert`` narrows the
+    optionals for the type checker rather than guarding a real ``None``.
+
+    Args:
+        cfg: One validated :class:`SigV4CredentialCfg` entry.
+
+    Returns:
+        The internal frozen credential (resolved literals for the static arm).
+
+    Raises:
+        ConfigCredentialError: A named env var (static arm) is unset or empty.
+    """
+    if cfg.kind == "profile_ref":
+        return ProfileRefCred(service=cfg.service, profile=cfg.profile, region=cfg.region)
+
+    # sigv4_static — the validator guarantees these are set.
+    assert cfg.access_key_id_env is not None
+    assert cfg.secret_access_key_env is not None
+    assert cfg.region is not None
+    session_token: str | None = None
+    if cfg.session_token_env is not None:
+        session_token = _resolve_required_env(
+            cfg.session_token_env, dest_host=cfg.dest_host, field="session_token_env"
+        )
+    return SigV4StaticCreds(
+        access_key_id=_resolve_required_env(
+            cfg.access_key_id_env, dest_host=cfg.dest_host, field="access_key_id_env"
+        ),
+        secret_access_key=_resolve_required_env(
+            cfg.secret_access_key_env,
+            dest_host=cfg.dest_host,
+            field="secret_access_key_env",
+        ),
+        region=cfg.region,
+        service=cfg.service,
+        session_token=session_token,
+    )
+
+
+async def _materialize_config_credentials(
+    credentials: list[SigV4CredentialCfg],
+    store: SqliteCredentialStore,
+    *,
+    instance_id: str,
+) -> None:
+    """Resolve each config-declared credential and write it into ``store``.
+
+    The boot-time config acquisition route (plan Phase 2 TASK 2.4b, Steps C/D).
+    For each entry: resolve its env-var NAMES to literals (B1, at boot), build a
+    RESOLVED-value :class:`SigV4StaticCreds` / :class:`ProfileRefCred`, and
+    ``set`` it under the normalized destination-host key with
+    ``source="config"`` — the SAME host normalization (``_hostname``) and the
+    SAME store ``set`` the runtime admin push uses, so by lookup time a
+    config-declared credential is indistinguishable from an admin-pushed one. An
+    empty list is a no-op (the bearer-only default). Runs once per instance
+    build, so EVERY instance's store receives the top-level config map.
+
+    Args:
+        credentials: The ``settings.sigv4_credentials`` entries (possibly empty).
+        store: This instance's already-started credential store.
+        instance_id: The owning instance id (for the log line).
+
+    Raises:
+        ConfigCredentialError: A static entry's named env var is unset or empty
+            (fail-fast; propagates out of :func:`_build_instance_context`).
+    """
+    for cfg in credentials:
+        key = HostCredKey(_hostname(cfg.dest_host))
+        creds = _config_credential_to_internal(cfg)
+        await store.set(key, creds, source="config")
+        logger.info(
+            "Materialized config sigv4 credential for instance=%s dest_host=%s kind=%s",
+            instance_id,
+            key,
+            cfg.kind,
+        )
 
 
 async def _stop_quietly(store: _Startable, *, description: str, instance_id: str) -> None:
@@ -733,6 +884,10 @@ async def _build_instance_context(
     # the single persistent SQLite.
     sqlite_cfg = settings.storage.sqlite
     token_cache_db_path = data_root / "token_cache.db"
+    # The aws_sigv4 signer's host-keyed destination-credential store lives in
+    # its OWN database file (separate from uploads.db and token_cache.db), so
+    # credential writes stay off the hot uploads / token-cache writer locks.
+    credential_store_db_path = data_root / "credential_store.db"
 
     # § 4D.1 - boot-open guard. Both SQLite opens (the upload store and the
     # body-less token cache) run through _open_db_with_retry_then_isolate: a
@@ -758,6 +913,10 @@ async def _build_instance_context(
 
     def _open_token_cache() -> Awaitable[SqliteTokenCache]:
         fresh = SqliteTokenCache(str(token_cache_db_path), sqlite_cfg=sqlite_cfg)
+        return _started(fresh)
+
+    def _open_credential_store() -> Awaitable[SqliteCredentialStore]:
+        fresh = SqliteCredentialStore(str(credential_store_db_path), sqlite_cfg=sqlite_cfg)
         return _started(fresh)
 
     try:
@@ -802,6 +961,55 @@ async def _build_instance_context(
             f"the token cache at {token_cache_db_path} could not be opened, "
             f"isolated, or recreated: {exc!r}",
         )
+
+    # The aws_sigv4 credential store — same boot-open guard as the token cache
+    # (own DB file, isolated via isolate_db_file rather than the body-coupled
+    # quarantine). On failure, close the already-open stores before degrading so
+    # no descriptor leaks.
+    try:
+        credential_store = await _open_db_with_retry_then_isolate(
+            open_fresh=_open_credential_store,
+            isolate=lambda: isolate_db_file(credential_store_db_path),
+            db_path=credential_store_db_path,
+            data_root=data_root,
+            description="credential store",
+            instance_id=cfg.id,
+            metrics_registry=metrics_registry,
+        )
+    except _StorageSubstrateUnwritableError as exc:
+        await _stop_quietly(token_cache, description="token cache", instance_id=cfg.id)
+        await _stop_quietly(store, description="upload store", instance_id=cfg.id)
+        return _degraded(cfg.id, DegradeReason.SUBSTRATE_UNWRITABLE, exc.detail)
+    except (aiosqlite.Error, OSError, BootOpenLockError) as exc:
+        await _stop_quietly(token_cache, description="token cache", instance_id=cfg.id)
+        await _stop_quietly(store, description="upload store", instance_id=cfg.id)
+        return _degraded(
+            cfg.id,
+            DegradeReason.STORE_OPEN_FAILED,
+            f"the credential store at {credential_store_db_path} could not be "
+            f"opened, isolated, or recreated: {exc!r}",
+        )
+
+    # Config acquisition route (plan Phase 2 TASK 2.4b): with the credential
+    # store open, materialize the top-level ``sigv4_credentials`` declarations
+    # into THIS instance's store — resolve each entry's named env var(s) to
+    # literals (the B1 boot-time resolution) and ``set`` under the normalized
+    # destination host with ``source="config"``. Empty (the default) is a
+    # no-op. A missing/empty named env var raises ConfigCredentialError, which
+    # PROPAGATES (a config error the operator must fix — not a per-instance
+    # degrade), crashing boot loudly. Runs per instance, so every instance's
+    # store receives the top-level map (the admin-push fan-out analogue). On
+    # failure, close the three already-open stores before propagating so no
+    # descriptor leaks (mirrors the degrade paths' pre-return cleanup).
+    try:
+        await _materialize_config_credentials(
+            settings.sigv4_credentials, credential_store, instance_id=cfg.id
+        )
+    except ConfigCredentialError:
+        await _stop_quietly(credential_store, description="credential store", instance_id=cfg.id)
+        await _stop_quietly(token_cache, description="token cache", instance_id=cfg.id)
+        await _stop_quietly(store, description="upload store", instance_id=cfg.id)
+        raise
 
     ram_body_store = RamBodyStore()
     file_body_store = FileBodyStore(
@@ -870,6 +1078,7 @@ async def _build_instance_context(
         resolve_route=resolve_route,
         clock=default_clock,
         instance=cfg,
+        signer_creds=credential_store,
     )
 
     instance_id = cfg.id
@@ -901,6 +1110,7 @@ async def _build_instance_context(
         saturation=saturation,
         codec_factory=codec_factory,
         current_settings=current_settings_thunk,
+        signer_creds=credential_store,
     )
 
 
@@ -950,6 +1160,8 @@ async def _stop_instance(ctx: InstanceContext) -> None:
     """
     await ctx.upstream_client.stop()
     await ctx.token_cache.stop()
+    if ctx.signer_creds is not None:
+        await ctx.signer_creds.stop()
     await ctx.body_store.stop()
     await ctx.store.stop()
 
@@ -1155,6 +1367,14 @@ def create_app(settings: Settings, *, settings_path: Path | None = None) -> Fast
         # the typed degraded set. Both exist regardless of boot outcome.
         app.dependency_overrides[send_routes.get_instance_cfgs] = lambda: settings.instances
         app.dependency_overrides[send_routes.get_degraded_instances] = lambda: tuple(degraded_boot)
+        # The raw-intake catch-all's second destination carrier (Phase 1
+        # TASK 1.3). Stringified to the str the DI surface expects (or None
+        # when no default upstream is configured).
+        app.dependency_overrides[send_routes.get_phantom_default_target] = lambda: (
+            str(settings.phantom_default_target)
+            if settings.phantom_default_target is not None
+            else None
+        )
         app.dependency_overrides[health_routes.get_version] = lambda: __version__
         app.dependency_overrides[health_routes.get_dispatcher] = lambda: dispatcher
         # Seam 3 - bind the typed degraded set so /v1/readyz + /v1/healthz
@@ -1216,11 +1436,21 @@ def create_app(settings: Settings, *, settings_path: Path | None = None) -> Fast
                         metrics_registry=metrics_registry,
                     )
                     kicker = AuthKicker(instance=ctx)
+                    # COPY of the AuthKicker wiring (plan §2.3 Step B). The
+                    # CredentialKicker reads the SAME ctx (which carries
+                    # ``signer_creds``); it registers no wake-handler and its
+                    # rescan is a no-op when ``ctx.signer_creds is None`` (the
+                    # bearer-only deployment), so spawning it on every
+                    # instance's TaskGroup is uniform and inert by default.
+                    cred_kicker = CredentialKicker(instance=ctx)
                     vacuum = VacuumScheduler(
                         instance=ctx, cron_spec=settings.storage.sqlite.vacuum_cron
                     )
                     tg.create_task(sender.run(stop_event), name=f"sender-{ctx.cfg.id}")
                     tg.create_task(kicker.run(stop_event), name=f"auth-kicker-{ctx.cfg.id}")
+                    tg.create_task(
+                        cred_kicker.run(stop_event), name=f"credential-kicker-{ctx.cfg.id}"
+                    )
                     tg.create_task(vacuum.run(stop_event), name=f"vacuum-{ctx.cfg.id}")
                     # Plan § 5.2.6 — optional per-instance cold backup.
                     # Each instance has its own data_root/uploads.db, so
@@ -1372,6 +1602,14 @@ def create_app(settings: Settings, *, settings_path: Path | None = None) -> Fast
     app.include_router(send_routes.router)
     app.include_router(health_routes.router)
     app.include_router(admin_routes.router)
+    # The raw-intake catch-all ``/{phantom_path:path}`` is root-mounted, so it
+    # MUST register LAST: FastAPI matches routes in registration order,
+    # first-match-wins, and registering before the fixed ``/v1/*`` routers
+    # would shadow ``/v1/send``, ``/v1/admin/*`` and the health probes. Mounted
+    # last (after admin), the upload verbs only reach it when no fixed route
+    # matched; its complementary GET/HEAD/DELETE/OPTIONS arm preserves the
+    # service-wide 404 for unknown non-upload requests (Phase 1 TASK 1.1).
+    app.include_router(catch_all_routes.router)
     # Every admin typed error (instance_unknown 421, not_found 404,
     # restore_noop 409, lookup_not_configured 400, replay_body_discarded
     # 409, replay_refused_attempting 409, multifile_cursor_conflict 422,
@@ -1404,6 +1642,16 @@ def create_app(settings: Settings, *, settings_path: Path | None = None) -> Fast
     app.dependency_overrides.setdefault(
         send_routes.get_degraded_instances,
         lambda: tuple(degraded_boot),
+    )
+    # The raw-intake catch-all's second destination carrier (Phase 1 TASK
+    # 1.3), bound here so a non-lifespan TestClient sees the same wiring.
+    app.dependency_overrides.setdefault(
+        send_routes.get_phantom_default_target,
+        lambda: (
+            str(settings.phantom_default_target)
+            if settings.phantom_default_target is not None
+            else None
+        ),
     )
     # The /v1/healthz + /v1/readyz probes resolve their own placeholders
     # (distinct from the admin router's), bound here so a non-lifespan

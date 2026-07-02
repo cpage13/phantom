@@ -56,7 +56,7 @@ HELD_DOWN_OBSERVATION_SECONDS: float = 1.5
 # 5xx error rate for the hold-down policy. 1.0 = every request fails.
 FORCE_5XX_RATE: float = 1.0
 
-# The eight canonical ChainState values (the rollup histogram always
+# The nine canonical ChainState values (the rollup histogram always
 # carries all of them, zero counts included).
 ALL_STATES: frozenset[str] = frozenset(
     {
@@ -68,6 +68,7 @@ ALL_STATES: frozenset[str] = frozenset(
         "stored",
         "cancelled",
         "corrupted",
+        "expired",
     }
 )
 

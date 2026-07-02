@@ -34,6 +34,7 @@ from fastapi import APIRouter, Body, Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
 
+from phantom.chain.executor import _hostname
 from phantom.config.settings import AdminLookupCfg
 from phantom.instances.context import InstanceContext, instance_storage_paths
 from phantom.instances.dispatcher import InstanceDispatcher
@@ -69,6 +70,11 @@ from phantom.models.admin import (
     UploadStatusSummary,
 )
 from phantom.models.chain import ChainState
+from phantom.models.credential import (
+    CredentialPushBody,
+    HostCredKey,
+    credential_body_to_internal,
+)
 from phantom.models.errors import STATUS_FOR_CODE, ErrorCode, error_response
 from phantom.models.upload import BodyLocation, UploadRow, UploadState
 from phantom.observability.metrics import MetricsRegistry
@@ -637,7 +643,7 @@ async def get_group_status(
     shared-value-space wart: ``total=1`` and the lone member's chain_id
     equals the queried id).
 
-    ``counts_by_state`` carries ALL EIGHT canonical states (zero counts
+    ``counts_by_state`` carries ALL NINE canonical states (zero counts
     included) so the histogram has a deterministic shape;
     ``all_finished`` is the structural finished rule (see
     ``_STILL_MOVING_STATES``); ``first_received_at`` / ``last_sent_at``
@@ -1317,6 +1323,74 @@ async def delete_tokens_all(
     """
     for ctx in dispatcher.all_instances():
         await ctx.token_cache.mark_all_bad()
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Destination-credential store (SigV4)
+# ---------------------------------------------------------------------------
+
+
+@router.put("/credentials/{dest_host}", status_code=204)
+async def push_credential_one(
+    dest_host: str,
+    body: Annotated[CredentialPushBody, Body()],
+    dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+) -> Response:
+    """Provision a destination credential for ``dest_host`` (loopback, no auth).
+
+    The SigV4 analogue of :func:`push_token_one` (the admin token push), per the
+    2026-06-23 copy directive. Differs only by the route prefix
+    (``/credentials`` vs ``/tokens``), the key (the destination host alone — a
+    SigV4 step has no caller-supplied ``uid``), and the structured
+    :data:`CredentialPushBody` (vs the bare token string).
+
+    The ``{dest_host}`` segment is normalized through the SAME ``_hostname``
+    helper the executor uses for its forward-time credential lookup
+    (``chain/executor.py``), so the push key equals the lookup key
+    ``HostCredKey(_hostname(full_url))`` BY CONSTRUCTION — a host pushed as
+    ``S3.amazonaws.com`` resolves a request to ``s3.amazonaws.com`` (the
+    silent-miss class the token push left latent is closed here).
+
+    Each instance's :attr:`~phantom.instances.context.InstanceContext.signer_creds`
+    store is ``set`` under that host key. ``set`` freshens the slot
+    (``status='fresh'``) AND fires the store's wake handler, which the
+    :class:`~phantom.workers.credential_kicker.CredentialKicker` registered — so
+    an operator re-pushing fresh credentials for a host wakes every parked
+    ``auth_expired`` row on that host (the loop-closing seam, mirroring the
+    token push waking the :class:`~phantom.workers.auth_kicker.AuthKicker`).
+
+    The :data:`CredentialPushBody` now declares a REQUIRED ``service`` (the AWS
+    service the credential signs for, coerced to a
+    :class:`~phantom.models.credential.SigningService` at the strict boundary),
+    so an operator PUT whose body omits ``service`` or names an unknown service
+    is rejected ``422`` at the door (before any store write) by the body
+    validator — the same fail-loud the config route applies at boot.
+
+    A bearer-only deployment carries no credential store
+    (``signer_creds is None``); such instances are skipped (the push is a no-op
+    for them — the store is optional by construction, ADR design), never a
+    crash.
+
+    Returns ``204 No Content`` with NO body — the ``secret_access_key`` is
+    therefore never echoed (ADR-004). The admin surface exposes credential
+    STATUS only, never secret material.
+
+    Args:
+        dest_host: The destination host path segment (normalized at the door).
+        body: The discriminated credential-push wire body (resolved literals).
+        dispatcher: The instance dispatcher (the same DI seam the token push
+            uses, overridden at composition root).
+
+    Returns:
+        An empty ``204`` response.
+    """
+    key = HostCredKey(_hostname(dest_host))
+    creds = credential_body_to_internal(body)
+    for ctx in dispatcher.all_instances():
+        if ctx.signer_creds is None:
+            continue
+        await ctx.signer_creds.set(key, creds, source="admin_push")
     return Response(status_code=204)
 
 

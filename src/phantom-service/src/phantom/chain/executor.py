@@ -23,13 +23,14 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, assert_never
 from urllib.parse import urlparse
 
 import httpx
 
 from phantom.chain.jsonpath import extract, find_placeholders, substitute
 from phantom.chain.parser import envelope_from_persistence_json
+from phantom.chain.sigv4_signer import SigV4SigningError, sign_sigv4
 from phantom.config.settings import InstanceCfg
 from phantom.models.chain import (
     ChainBodyBytes,
@@ -39,9 +40,10 @@ from phantom.models.chain import (
     ChainEnvelope,
     ChainStep,
 )
+from phantom.models.credential import CredCacheRow, HostCredKey
 from phantom.models.upload import CapturedStepValues, CapturedValues, UploadRow
 from phantom.routing import ResolvedRoute
-from phantom.storage.interface import TokenCache
+from phantom.storage.interface import CredentialStore, TokenCache
 from phantom.transport.interface import UpstreamClient, UpstreamRequest
 
 logger = logging.getLogger(__name__)
@@ -140,6 +142,20 @@ class CaptureIncomplete:
     missing_captures: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SendDeadlineExpired:
+    """The per-route send-deadline elapsed (now - received_at > deadline).
+
+    Strategy-agnostic give-up backstop (ADR-032): the row has been trying past
+    its route's ``send_deadline_seconds`` ceiling, so it transitions to the
+    terminal ``expired`` state (body released, never re-admitted). Returned by
+    :meth:`ChainExecutor._check_send_deadline` for a claimed/``attempting`` row;
+    the sender routes it to the shared ``expire_row`` writer.
+    """
+
+    deadline_seconds: int
+
+
 ExecuteStepResult = (
     Succeeded
     | FailedAuth
@@ -150,6 +166,7 @@ ExecuteStepResult = (
     | CaptureExpiredRewind
     | TemplateUnresolved
     | CaptureIncomplete
+    | SendDeadlineExpired
 )
 
 
@@ -164,6 +181,7 @@ class ChainExecutor:
         resolve_route: Callable[[str, InstanceCfg], ResolvedRoute],
         clock: Callable[[], datetime],
         instance: InstanceCfg,
+        signer_creds: CredentialStore | None = None,
     ) -> None:
         """Construct the executor.
 
@@ -176,12 +194,20 @@ class ChainExecutor:
             clock: A callable returning a UTC ``datetime`` — injectable
                 for deterministic tests.
             instance: The instance whose routes apply.
+            signer_creds: OPTIONAL host-keyed destination-credential store for
+                the ``aws_sigv4`` auth mode (the SigV4 analogue of
+                ``token_cache``). ``None`` (the default) when no route uses
+                ``aws_sigv4``; an ``aws_sigv4`` route resolved while this is
+                ``None`` is treated as a missing credential — ``FailedAuth``
+                that PARKS in ``auth_expired`` (NOT terminal). Defaulting to
+                ``None`` keeps every existing construction site unchanged.
         """
         self._cache = token_cache
         self._client = upstream_client
         self._resolve_route = resolve_route
         self._clock = clock
         self._instance = instance
+        self._signer_creds = signer_creds
 
     async def execute_one_step(
         self,
@@ -229,13 +255,63 @@ class ChainExecutor:
 
         full_url = self._absolute_url(substituted_url, envelope)
 
-        # (c) Inject auth via route policy.
+        # (c) Inject auth via route policy. The dispatch is exhaustive over
+        # ResolvedRoute.auth_mode (if/elif/else + assert_never) so adding a new
+        # auth mode without an arm is a mypy error, not a silent no-auth
+        # fall-through (the prior bare ``if`` would have behaved like ``none``).
         resolved = self._resolve_route(full_url, self._instance)
+
+        # (a') Send-deadline gate (ADR-032) — the give-up backstop, independent
+        # of the retry strategy. Placed here (after ``resolved`` exists, before
+        # any signing/sending work) because the capture-TTL gate (a) at the top
+        # of this method runs BEFORE ``resolved`` is computed and the deadline is
+        # a per-route property. Checked once per attempt against the cheapest
+        # correct point that has ``resolved``.
+        deadline_check = self._check_send_deadline(row, resolved)
+        if deadline_check is not None:
+            return deadline_check
+
         if resolved.auth_mode == "phantom_bearer":
             slot = await self._cache.get(_hostname(full_url), row.uid)
             if slot is None or slot.status == "bad":
                 return FailedAuth(status=401, observed_at=self._clock())
             substituted_headers["Authorization"] = slot.bearer
+        elif resolved.auth_mode == "aws_sigv4":
+            # SigV4 signer arm (COPY of the bearer arm above): the host-keyed
+            # CredentialStore slot is the refreshable slot, the analogue of the
+            # (endpoint, uid) token slot. A missing/bad credential — including
+            # ``signer_creds is None`` (no store wired) and a ProfileRefCred
+            # whose botocore chain yields nothing — marks the slot bad (when a
+            # store exists) and returns FailedAuth, which PARKS the row in
+            # ``auth_expired`` (NOT terminal) to await a credential re-push.
+            dest_host = HostCredKey(_hostname(full_url))
+            row_cred = await self._signer_creds_for(dest_host)
+            if row_cred is None or row_cred.status == "bad":
+                await self._mark_signer_creds_bad(dest_host)
+                return FailedAuth(status=401, observed_at=self._clock())
+            try:
+                # Re-sign THIS request now (fresh X-Amz-Date) over the rehydrated
+                # body. botocore mutates ``substituted_headers`` in place; the
+                # body stays byte-identical (transparent-proxy invariant).
+                await sign_sigv4(
+                    method=step.method,
+                    url=full_url,
+                    headers=substituted_headers,
+                    body=body_bytes,
+                    credential=row_cred.credential,
+                )
+            except SigV4SigningError:
+                logger.warning(
+                    "aws_sigv4 credential resolution failed for host %s; "
+                    "marking slot bad and parking (auth_expired)",
+                    dest_host,
+                )
+                await self._mark_signer_creds_bad(dest_host)
+                return FailedAuth(status=401, observed_at=self._clock())
+        elif resolved.auth_mode == "none":
+            pass  # forward as-is — no Phantom-injected auth.
+        else:  # pragma: no cover — exhaustive over the Literal above.
+            assert_never(resolved.auth_mode)
 
         # (d) Inject idempotency header.
         if step.idempotency_header:
@@ -295,12 +371,71 @@ class ChainExecutor:
             if resolved.auth_mode == "phantom_bearer":
                 # Mark the slot bad so the sender knows what to do.
                 await self._cache.mark_bad(_hostname(full_url), row.uid)
+            elif resolved.auth_mode == "aws_sigv4":
+                # Symmetric to the bearer mark-bad: flip the host-keyed cred
+                # slot to ``bad`` so the row stays parked until a fresh
+                # credential re-push freshens it (the kicker wakes on ``fresh``).
+                await self._mark_signer_creds_bad(HostCredKey(_hostname(full_url)))
             return FailedAuth(status=response.status, observed_at=self._clock())
         if 400 <= response.status < 500:
             return Failed4xx(status=response.status, body=response.body)
         if response.status >= 500:
             return Failed5xx(status=response.status)
         return FailedNetwork(error=f"Unexpected status {response.status}")
+
+    async def _signer_creds_for(self, dest_host: HostCredKey) -> CredCacheRow | None:
+        """Return the host-keyed credential row, or ``None`` when unusable.
+
+        The SigV4 analogue of the bearer ``token_cache.get`` lookup at the inject
+        site. ``None`` covers both "no credential store wired"
+        (``signer_creds is None`` — no route needs ``aws_sigv4`` in this
+        deployment) and "no slot for this host yet"; the caller treats both
+        identically (missing credential → park).
+        """
+        if self._signer_creds is None:
+            return None
+        return await self._signer_creds.get(dest_host)
+
+    async def _mark_signer_creds_bad(self, dest_host: HostCredKey) -> None:
+        """Flip the host's credential slot to ``bad`` (no-op without a store).
+
+        ADR-003: a bad credential stays in the store so the admin API can
+        surface it; the kicker re-wakes the parked row only once a re-push
+        freshens the slot. A no-op when ``signer_creds is None`` (there is no
+        slot to mark) — the row still parks via the ``FailedAuth`` return.
+        """
+        if self._signer_creds is None:
+            return
+        await self._signer_creds.mark_bad(dest_host)
+
+    def _check_send_deadline(
+        self,
+        row: UploadRow,
+        resolved: ResolvedRoute,
+    ) -> SendDeadlineExpired | None:
+        """Return ``SendDeadlineExpired`` when the row has been trying past its deadline.
+
+        The deadline is wall-time since admission (``row.received_at``).
+        Strategy-agnostic by design (ADR-032): ``fixed_intervals`` discards
+        ``since_received`` entirely (``strategies/fixed_intervals.py``) and would
+        otherwise retry forever, so this executor-side gate is the belt to the
+        strategy's suspenders. ``None`` route deadline = no ceiling (the safe
+        default that changes no existing behaviour).
+
+        Args:
+            row: The claimed/``attempting`` row being executed.
+            resolved: The resolved route policy (carries ``send_deadline_seconds``).
+
+        Returns:
+            ``SendDeadlineExpired`` when ``now - received_at`` exceeds the route's
+            ``send_deadline_seconds``; otherwise ``None``.
+        """
+        deadline = resolved.send_deadline_seconds
+        if deadline is None:
+            return None
+        if (self._clock() - row.received_at).total_seconds() > deadline:
+            return SendDeadlineExpired(deadline_seconds=deadline)
+        return None
 
     def _check_capture_ttl(
         self,

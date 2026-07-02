@@ -14,10 +14,18 @@ from __future__ import annotations
 
 import fnmatch
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeAlias
 from urllib.parse import urlparse
 
 from phantom.config.settings import InstanceCfg
+
+# The outbound-auth mode a route declares. Named here (rather than left as a
+# bare inline Literal) so consumers that branch on it — the executor's auth
+# arm, the two kickers' auth_mode guard — compare against an
+# exhaustiveness-checkable type instead of raw strings (CONTEXT "no raw string
+# comparisons when the value set is known"). Mirrors ``RouteCfg.auth_mode``
+# (config/settings.py).
+AuthMode: TypeAlias = Literal["phantom_bearer", "none", "aws_sigv4"]  # noqa: UP040
 
 
 @dataclass(frozen=True)
@@ -26,14 +34,21 @@ class ResolvedRoute:
 
     Attributes:
         route_name: The matched ``RouteCfg.name``.
-        auth_mode: Whether Phantom injects ``Authorization`` on this route.
+        auth_mode: How Phantom authenticates the outbound request on this
+            route (``phantom_bearer`` bearer-inject, ``aws_sigv4`` re-sign, or
+            ``none``).
         timeout_seconds: Per-route HTTP timeout (None falls back to the
             upstream client's default of 30 s).
+        send_deadline_seconds: Max wall-clock seconds a buffered upload may
+            keep trying before it gives up to the terminal ``expired`` state
+            (None = no deadline). Measured from ``row.received_at``; read by
+            the executor's send-deadline gate and the kicker parked-row sweeps.
     """
 
     route_name: str
-    auth_mode: Literal["phantom_bearer", "none"]
+    auth_mode: AuthMode
     timeout_seconds: float | None = None
+    send_deadline_seconds: int | None = None
 
 
 def _hostname(url: str) -> str:
@@ -63,10 +78,11 @@ def resolve_route(url: str, instance_cfg: InstanceCfg) -> ResolvedRoute:
                     route_name=route.name,
                     auth_mode=route.auth_mode,
                     timeout_seconds=route.timeout_seconds,
+                    send_deadline_seconds=route.send_deadline_seconds,
                 )
     raise ValueError(
         f"No route matched URL {url!r} (host={host!r}) for instance {instance_cfg.id!r}"
     )
 
 
-__all__ = ["ResolvedRoute", "resolve_route"]
+__all__ = ["AuthMode", "ResolvedRoute", "resolve_route"]

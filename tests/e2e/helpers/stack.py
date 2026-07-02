@@ -33,12 +33,14 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import UUID
 
+import httpx
 import jwt
 import pytest
 import uvicorn
 import yaml  # type: ignore[import-untyped]  # types-PyYAML not in workspace dev deps
 from phantom.app import create_app as phantom_create_app
 from phantom.config.settings import Settings, load_settings
+from phantom.runtime.tls_cert import resolve_tls_paths
 from phantom_client import PhantomClient
 from phantom_emulator import AppConfig as EmulatorAppConfig
 from phantom_emulator import Server as EmulatorServer
@@ -47,7 +49,7 @@ from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.config import load_config as load_emulator_config
 from phantom_emulator.failure.injection import FailurePolicy
 from phantom_emulator.routers.control import ReceivedEntry
-from phantom_emulator.state import EmulatorState
+from phantom_emulator.state import EmulatorState, RawBody, S3Object
 
 logger = logging.getLogger(__name__)
 
@@ -442,6 +444,28 @@ class EmulatorControl:
         """Return the accepted-bodies log."""
         return self._server.received()
 
+    def s3_object(self, bucket: str, key: str) -> S3Object | None:
+        """Return the stored S3 object for ``(bucket, key)``, or ``None``.
+
+        The e2e read seam for the SigV4 sink: byte-identity assertions read
+        ``stack.emulator.s3_object(bucket, key).body`` instead of reaching
+        into :class:`EmulatorState` (which is held on
+        :class:`EmulatorServer`, not on :class:`E2EStack`). Mirrors
+        :meth:`received` over the path-style store.
+        """
+        return self._server.state.s3_objects.get((bucket, key))
+
+    def raw_body(self, path: str) -> RawBody | None:
+        """Return the stored ``RawBody`` for the forwarded ``path``, or ``None``.
+
+        The e2e read seam for the auth-free ``/raw`` sink — the forward-as-is
+        analogue of :meth:`s3_object`. A test reads
+        ``stack.emulator.raw_body(path).method`` / ``.body`` instead of reaching
+        into :class:`EmulatorState.raw_bodies` directly. The key is the full
+        forwarded path (no leading slash, as the sink keys it).
+        """
+        return self._server.state.raw_bodies.get(path)
+
     def clear_received(self) -> None:
         """Drop every accepted body record."""
         self._server.clear_received()
@@ -470,7 +494,12 @@ async def boot_stack(
             Per-test config overlay (e.g., saturation caps, retention
             windows, codec mode) for tests that need behavior diverging
             from the suite default. Use ``None`` (the default) to boot
-            from the pinned YAML unchanged.
+            from the pinned YAML unchanged. A string value of
+            ``"{EMULATOR_URL}"`` (optionally with a suffix, e.g.
+            ``"{EMULATOR_URL}/raw"``) is rewritten to the live in-process
+            emulator base URL before Phantom boots — the seam (TASK 1.3a)
+            by which an emulator-targeting route gets the ephemeral
+            emulator host:port.
         extra_emulators: Number of additional emulator instances to
             boot, each on its own ephemeral port. Used by tests that
             assert multi-instance dispatch correctness (E2E-20). Their
@@ -542,6 +571,36 @@ def _deep_merge_dict(
     return base
 
 
+def _substitute_emulator_url(node: Any, emulator_url: str) -> None:
+    """Replace the literal ``"{EMULATOR_URL}"`` token in every string leaf in place.
+
+    The token-substitution seam for emulator-targeting e2e (TASK 1.3a): a
+    per-test ``config_overrides`` value such as
+    ``phantom_default_target = "{EMULATOR_URL}"`` (or ``"{EMULATOR_URL}/raw"``)
+    is rewritten to the live, post-allocation emulator base URL after the
+    deep-merge and before the merged YAML is serialized. Plain ``str.replace``
+    so a suffix (``/raw``, ``/{bucket}/{key}``) concatenates naturally.
+    Recurses through dicts and lists; leaves non-string scalars untouched.
+
+    Args:
+        node: The merged-YAML subtree to rewrite in place (dict, list, or
+            scalar). Non-container, non-string scalars are no-ops.
+        emulator_url: The live emulator base URL the token resolves to.
+    """
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, str):
+                node[k] = v.replace("{EMULATOR_URL}", emulator_url)
+            else:
+                _substitute_emulator_url(v, emulator_url)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            if isinstance(v, str):
+                node[i] = v.replace("{EMULATOR_URL}", emulator_url)
+            else:
+                _substitute_emulator_url(v, emulator_url)
+
+
 async def _boot_inprocess(
     *,
     tmp_path: Path | None,
@@ -565,6 +624,14 @@ async def _boot_inprocess(
 
     # 1. Boot the primary emulator on an ephemeral port.
     primary_emu = await _boot_one_emulator()
+    # Its ephemeral port is already allocated, so the live base URL is
+    # known HERE — before _build_phantom_settings runs at step 2. This is
+    # the value the `{EMULATOR_URL}` substitution token (TASK 1.3a) resolves
+    # to, the seam by which an emulator-targeting route gets the ephemeral
+    # host:port that the caller's pre-boot config_overrides dict cannot see
+    # (the later `emulator_url = emulator_server.url()` is the same value —
+    # emulator_server IS primary_emu — but it is computed after the build).
+    primary_emulator_url = primary_emu.url()
 
     # 1b. Boot any extra emulators for tests that need a second
     #     upstream (E2E-20 multi-instance dispatch). The §9.3
@@ -588,6 +655,7 @@ async def _boot_inprocess(
         bind_port=phantom_port,
         data_dir=data_dir,
         config_overrides=config_overrides,
+        emulator_url=primary_emulator_url,  # the live URL for `{EMULATOR_URL}` substitution
     )
     emulator_server = primary_emu
     emulator_url = emulator_server.url()
@@ -604,6 +672,17 @@ async def _boot_inprocess(
         settings,
         settings_path=settings_path if enable_hot_reload else None,
     )
+    # TLS: when a test sets ``server.tls.enabled`` via config_overrides, the
+    # ONE listener serves HTTPS — mirroring production's ``__main__.py`` shape
+    # (``resolve_tls_paths`` -> ssl_certfile/ssl_keyfile; both ``None`` when off,
+    # so the plaintext path is byte-identical). Auto-gen mode (no cert/key paths)
+    # needs no ssl_keyfile_password. Passed as explicit (``None``-defaulted)
+    # ``uvicorn.Config`` args rather than a splat so the types check cleanly.
+    tls_enabled = settings.server.tls.enabled
+    ssl_certfile: str | None = None
+    ssl_keyfile: str | None = None
+    if tls_enabled:
+        ssl_certfile, ssl_keyfile = resolve_tls_paths(settings.server.tls, str(data_dir))
     uv_config = uvicorn.Config(
         app=phantom_app,
         host=INPROCESS_BIND_HOST,
@@ -611,16 +690,24 @@ async def _boot_inprocess(
         log_level=settings.observability.log_level.lower(),
         lifespan="on",
         access_log=False,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
     )
     phantom_uv_server = uvicorn.Server(config=uv_config)
     phantom_serve_task = asyncio.create_task(phantom_uv_server.serve())
     await _await_uvicorn_started(phantom_uv_server, phantom_serve_task, "phantom")
 
-    phantom_url = f"http://{INPROCESS_BIND_HOST}:{phantom_port}"
+    # Reach the listener over HTTPS when TLS is enabled (else plaintext, as before).
+    scheme = "https" if tls_enabled else "http"
+    phantom_url = f"{scheme}://{INPROCESS_BIND_HOST}:{phantom_port}"
 
     # 4. Open the SDK client. One PhantomClient covers both intake and admin
-    #    (they ride the same single listener).
-    phantom_client = PhantomClient(phantom_url)
+    #    (they ride the same single listener). The auto-gen TLS cert is
+    #    self-signed, so inject a real httpx transport with ``verify=False`` —
+    #    a test-harness seam only (the SDK needs no HTTPS field; ``phantom_url``
+    #    already accepts ``https://``).
+    client_transport = httpx.AsyncHTTPTransport(verify=False) if tls_enabled else None
+    phantom_client = PhantomClient(phantom_url, transport=client_transport)
     await phantom_client.__aenter__()
 
     emulator = EmulatorControl(server=emulator_server)
@@ -781,6 +868,7 @@ def _build_phantom_settings(
     bind_port: int,
     data_dir: Path,
     config_overrides: Mapping[str, Any] | None = None,
+    emulator_url: str | None = None,
 ) -> tuple[Settings, Path]:
     """Build a phantom :class:`Settings` from YAML with runtime overrides.
 
@@ -801,6 +889,12 @@ def _build_phantom_settings(
             host / port / data_dir mutations. Per-test config customization
             (saturation caps, retention windows, codec mode, etc.) lives
             here so the base YAML stays the canonical default.
+        emulator_url: The live in-process emulator base URL (host:port).
+            When provided, the literal ``"{EMULATOR_URL}"`` token in every
+            merged-YAML string leaf is rewritten to this value AFTER the
+            deep-merge and BEFORE serialization (TASK 1.3a) — the seam by
+            which an emulator-targeting route gets the ephemeral host:port.
+            ``None`` (the default) leaves the merged YAML untouched.
 
     Returns:
         ``(settings, merged_path)``. ``merged_path`` is the on-disk
@@ -816,6 +910,13 @@ def _build_phantom_settings(
     raw.setdefault("storage", {})["data_dir"] = str(data_dir)
     if config_overrides is not None:
         _deep_merge_dict(raw, config_overrides)
+    # Resolve the `{EMULATOR_URL}` token (TASK 1.3a) on the post-merge tree so
+    # an emulator-targeting overlay value (e.g. phantom_default_target =
+    # "{EMULATOR_URL}/raw") points at the live ephemeral emulator. Runs before
+    # serialization so load_settings sees the resolved URL; _pin_probe_defaults
+    # touches only numeric fields, which never carry the token.
+    if emulator_url is not None:
+        _substitute_emulator_url(raw, emulator_url)
     # Write to a tmp file so load_settings runs the full validator path.
     import tempfile
 

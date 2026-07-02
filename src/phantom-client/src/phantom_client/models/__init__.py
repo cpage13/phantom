@@ -14,6 +14,7 @@ from phantom_client.models.admin import (
     BulkDeleteResponse,
     ChainAdminDetail,
     ChainAdminStepDetail,
+    CredentialPushBody,
     DeleteFilter,
     ExtractFilter,
     GroupMember,
@@ -23,6 +24,9 @@ from phantom_client.models.admin import (
     InstanceSummary,
     KeyValueMatchFilter,
     ListUploadsResponse,
+    ProfileRefCredBody,
+    SigningService,
+    SigV4StaticCredBody,
     UploadBundle,
     UploadStatusSummary,
 )
@@ -69,6 +73,7 @@ __all__ = [
     "ChainResponse",
     "ChainState",
     "ChainStep",
+    "CredentialPushBody",
     "DeleteFilter",
     # admin.py
     "ExtractFilter",
@@ -80,9 +85,12 @@ __all__ = [
     "InstanceSummary",
     "KeyValueMatchFilter",
     "ListUploadsResponse",
+    "ProfileRefCredBody",
     "ReadyResponse",
     # envelope.py
     "ResponseHeaders",
+    "SigV4StaticCredBody",
+    "SigningService",
     "SortKey",
     # status.py
     "StatsResponse",

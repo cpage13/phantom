@@ -28,6 +28,8 @@ _RETENTION_WINDOW_FIELDS: tuple[str, ...] = (
     "stored_body_seconds",
     "auth_expired_metadata_seconds",
     "auth_expired_body_seconds",
+    "expired_metadata_seconds",
+    "expired_body_seconds",
 )
 
 # A value below the -1 sentinel: must be a loud validation error, never a

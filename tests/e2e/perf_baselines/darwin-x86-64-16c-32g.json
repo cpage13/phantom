@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "machine_key": "imacpro",
+  "machine_key": "darwin-x86-64-16c-32g",
   "captured_at": "2026-06-11T17:53:44.389021Z",
   "facts": {
     "os_name": "Darwin",

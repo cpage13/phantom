@@ -12,7 +12,7 @@ from phantom.compression.interface import BodyCodec
 from phantom.config.settings import InstanceCfg
 from phantom.instances.snapshot import InstanceSettingsSnapshot
 from phantom.refresh.ad_client_credentials import AdMinter
-from phantom.storage.interface import BodyStore, TokenCache, UploadStore
+from phantom.storage.interface import BodyStore, CredentialStore, TokenCache, UploadStore
 from phantom.strategies.interface import UploadStrategy
 from phantom.transport.interface import UpstreamClient
 
@@ -178,3 +178,14 @@ class InstanceContext:
     # propagates without restarting the worker pool. The composition
     # root binds this to ``lambda: settings_holder.snapshot_for(cfg.id)``.
     current_settings: Callable[[], InstanceSettingsSnapshot]
+    signer_creds: CredentialStore | None = None
+    """Host-keyed destination-credential store for the ``aws_sigv4`` auth mode.
+
+    The DUAL-HOLD: the composition root constructs one
+    :class:`~phantom.storage.credential_store.SqliteCredentialStore` per
+    instance, passes it to ``ChainExecutor(signer_creds=…)`` AND places the SAME
+    object here, so the admin credential-push handler can write into it under the
+    destination-host key (the model is the token PUSH path). ``None`` (the
+    default) when the deployment uses no ``aws_sigv4`` route — keeping existing
+    construction sites unchanged.
+    """

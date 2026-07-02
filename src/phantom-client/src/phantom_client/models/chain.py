@@ -45,12 +45,16 @@ ChainState: TypeAlias = Literal[  # noqa: UP040 — see note above
     "stored",
     "cancelled",
     "corrupted",
+    "expired",
 ]
 """Upload-row state as observed by SDK callers. See ADR-010 §Response.
 
 ``corrupted`` is a terminal state surfaced when body verification fails
 on send (storage hash mismatch or codec round-trip drift); the row is
-never retried.
+never retried. ``expired`` is a terminal state (ADR-032) reached when the
+per-route send-deadline elapses: the upload is dead, the body is released,
+and the row is never re-admitted — distinct from ``auth_expired``, which
+is re-queued once a fresh token arrives.
 """
 
 

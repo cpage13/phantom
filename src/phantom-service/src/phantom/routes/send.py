@@ -24,7 +24,6 @@ from phantom.chain.parser import (
     parse_multipart_request,
 )
 from phantom.config.settings import InstanceCfg
-from phantom.instances.context import InstanceContext
 from phantom.instances.dispatcher import (
     InstanceDispatcher,
     InstanceNotFoundError,
@@ -37,6 +36,7 @@ from phantom.models.upload import UploadRow
 from phantom.routes._version import SEND_ROUTER_PREFIX
 from phantom.routes.admission import (
     AdmissionInputs,
+    AdmissionOutcome,
     ChainAdmissionError,
     admit_chain,
 )
@@ -96,6 +96,20 @@ def get_degraded_instances() -> Sequence[DegradedInstance]:
     return ()
 
 
+def get_phantom_default_target() -> str | None:
+    """The configured raw-intake default upstream target, or ``None``.
+
+    Wired by the composition root to ``str(settings.phantom_default_target)``
+    (or ``None`` when unset). Consumed ONLY by the raw-intake catch-all
+    (``routes/catch_all.py``) as the second destination carrier, after the
+    explicit ``?phantom=<url>`` query parameter. Defaults to ``None`` (no
+    default configured) so a partial wiring or a test harness that does not
+    override it simply has no default target — a raw request with no
+    ``?phantom=`` carrier then rejects 421 ``invalid_target``.
+    """
+    return None
+
+
 router = APIRouter(prefix=SEND_ROUTER_PREFIX)
 
 
@@ -128,7 +142,7 @@ async def post_send(
     # names the configured target id directly, so check it BEFORE reading
     # any body bytes: a degraded target does not get to spike RAM with a
     # body it cannot store. Host-prefix-routed requests are guarded after
-    # the URL is parsed (inside _parse_and_resolve), since their target id
+    # the URL is parsed (inside resolve_and_admit), since their target id
     # is not known yet.
     if instance_header is not None:
         degraded = _degraded_guard_response(
@@ -141,37 +155,26 @@ async def post_send(
         if degraded is not None:
             return degraded
 
-    resolved = await _parse_and_resolve(
+    parsed = await _parse_and_resolve(
         request,
-        dispatcher=dispatcher,
         max_buffered_bytes=max_buffered_bytes,
-        instance_cfgs=instance_cfgs,
-        degraded_instances=degraded_instances,
-        instance_header=instance_header,
         request_id=request_id,
     )
-    if isinstance(resolved, Response):
-        return resolved
-    envelope, body_refs, instance_ctx = resolved
+    if isinstance(parsed, Response):
+        return parsed
+    envelope, body_refs = parsed
 
+    # The grouping/ordering trio is parsed here (before the shared
+    # resolve_and_admit prelude) because only the JSON/multipart ingress
+    # path carries X-Phantom-Group-Id / -Multifile-Id / -Order; the
+    # raw-intake adapter (which shares the same prelude) never sends them.
+    # A malformed value is attributed to ``"unrouted"`` — the request has
+    # not yet been admitted to any instance at this point — matching the
+    # sentinel resolve_and_admit uses for its own unroutable errors.
     try:
         group_id, multifile_id, send_order = _parse_grouping_headers(
-            request.headers, instance_id=instance_ctx.cfg.id
+            request.headers, instance_id="unrouted"
         )
-        inputs = AdmissionInputs(
-            request_id=request_id,
-            uid_header=uid_header,
-            instance_header=instance_header,
-            idempotency_header=idempotency_header,
-            envelope=envelope,
-            body_refs=body_refs,
-            authorization=request.headers.get("Authorization"),
-            content_encoding=request.headers.get("Content-Encoding"),
-            group_id=group_id,
-            multifile_id=multifile_id,
-            send_order=send_order,
-        )
-        outcome = await admit_chain(inputs, instance_ctx)
     except ChainAdmissionError as exc:
         return _error_response(
             exc.code,
@@ -181,7 +184,148 @@ async def post_send(
             details=dict(exc.details) if exc.details else None,
             headers=exc.headers,
         )
-    return _build_chain_response(outcome.row, envelope=envelope, status=outcome.status_code)
+
+    result = await resolve_and_admit(
+        request_id=request_id,
+        uid_header=uid_header,
+        instance_header=instance_header,
+        idempotency_header=idempotency_header,
+        envelope=envelope,
+        body_refs=body_refs,
+        authorization=request.headers.get("Authorization"),
+        content_encoding=request.headers.get("Content-Encoding"),
+        group_id=group_id,
+        multifile_id=multifile_id,
+        send_order=send_order,
+        dispatcher=dispatcher,
+        instance_cfgs=instance_cfgs,
+        degraded_instances=degraded_instances,
+    )
+    if isinstance(result, Response):
+        return result
+    return _build_chain_response(result.row, envelope=envelope, status=result.status_code)
+
+
+async def resolve_and_admit(
+    *,
+    request_id: str,
+    uid_header: str,
+    instance_header: str | None,
+    idempotency_header: str | None,
+    envelope: ChainEnvelope,
+    body_refs: dict[str, bytes],
+    authorization: str | None,
+    content_encoding: str | None,
+    group_id: UUID | None,
+    multifile_id: UUID | None,
+    send_order: int | None,
+    dispatcher: InstanceDispatcher,
+    instance_cfgs: Sequence[InstanceCfg],
+    degraded_instances: Sequence[DegradedInstance],
+) -> AdmissionOutcome | Response:
+    """Shared post-resolution prelude for every chain-ingress path.
+
+    Given an already-built (parsed OR synthesized) envelope plus its
+    body_refs and the pinned admission scalars, run the load-bearing tail
+    that ``POST /v1/send`` and the raw-intake catch-all share:
+
+    1. § 4D.2 host-prefix-route degraded-boot guard (fires BEFORE
+       ``admit_chain`` so no durable write is attempted against a degraded
+       instance).
+    2. Dispatcher resolution of the owning :class:`InstanceContext`
+       (``NoMatchingInstanceError`` → 421 ``invalid_target``;
+       ``InstanceNotFoundError`` → 421 ``instance_unknown``).
+    3. :class:`AdmissionInputs` construction and the call into
+       :func:`admit_chain`.
+
+    The destination host is taken from the envelope's first step
+    (``_resolve_first_step_url``); both callers must therefore have already
+    rewritten ``steps[0].url`` to a REAL upstream host (the raw-intake
+    adapter does this from its destination carriers; ``post_send`` inherits
+    it from the producer-supplied envelope). Extracting this prelude keeps
+    one source of truth for the 421 mapping and the :class:`AdmissionInputs`
+    shape so the two ingress paths cannot drift — the same precedent
+    :func:`admit_chain` set when it was lifted out of ``post_send``.
+
+    Args:
+        request_id: Per-request correlation id for error envelopes.
+        uid_header: The ``X-Phantom-Uid`` value (``""`` when absent).
+        instance_header: Optional ``X-Phantom-Instance`` explicit-routing
+            override; ``None`` selects the host-prefix routing path.
+        idempotency_header: Optional ``X-Phantom-Idempotency-Key``; ``None``
+            lets admission fall back to ``str(chain_id)``.
+        envelope: The built chain envelope (first-step URL already pointing
+            at the real destination).
+        body_refs: The body-ref payloads keyed by ref name (``{}`` when the
+            submission carried no body).
+        authorization: Optional inbound ``Authorization`` header, cached
+            against the resolved endpoint by admission.
+        content_encoding: Optional inbound ``Content-Encoding`` header.
+        group_id: Pre-parsed grouping handle, or ``None``.
+        multifile_id: Pre-parsed multi-file association id, or ``None``.
+        send_order: Pre-parsed ordering position, or ``None``.
+        dispatcher: The live instance dispatcher.
+        instance_cfgs: Configured instances (for the degraded-boot guard).
+        degraded_instances: The typed degraded set (for the guard).
+
+    Returns:
+        The :class:`AdmissionOutcome` on success, or a canonical error
+        :class:`Response` to return verbatim (degraded guard, routing
+        failure, or any :class:`ChainAdmissionError` admission refused).
+    """
+    first_step_url = _resolve_first_step_url(envelope)
+
+    degraded = _degraded_guard_response(
+        instance_cfgs=instance_cfgs,
+        degraded_instances=degraded_instances,
+        url=first_step_url,
+        instance_header=instance_header,
+        request_id=request_id,
+    )
+    if degraded is not None:
+        return degraded
+
+    try:
+        instance_ctx = dispatcher.resolve(first_step_url, instance_header)
+    except InstanceNotFoundError:
+        return _error_response(
+            "instance_unknown",
+            f"X-Phantom-Instance {instance_header!r} not configured",
+            instance_id="unrouted",
+            request_id=request_id,
+        )
+    except NoMatchingInstanceError:
+        return _error_response(
+            "invalid_target",
+            f"No instance accepts target {first_step_url!r}",
+            instance_id="unrouted",
+            request_id=request_id,
+        )
+
+    try:
+        inputs = AdmissionInputs(
+            request_id=request_id,
+            uid_header=uid_header,
+            instance_header=instance_header,
+            idempotency_header=idempotency_header,
+            envelope=envelope,
+            body_refs=body_refs,
+            authorization=authorization,
+            content_encoding=content_encoding,
+            group_id=group_id,
+            multifile_id=multifile_id,
+            send_order=send_order,
+        )
+        return await admit_chain(inputs, instance_ctx)
+    except ChainAdmissionError as exc:
+        return _error_response(
+            exc.code,
+            exc.message,
+            instance_id=exc.instance_id,
+            request_id=request_id,
+            details=dict(exc.details) if exc.details else None,
+            headers=exc.headers,
+        )
 
 
 def _parse_grouping_headers(
@@ -256,17 +400,13 @@ def _parse_grouping_headers(
 async def _parse_and_resolve(
     request: Request,
     *,
-    dispatcher: InstanceDispatcher,
     max_buffered_bytes: int,
-    instance_cfgs: Sequence[InstanceCfg],
-    degraded_instances: Sequence[DegradedInstance],
-    instance_header: str | None,
     request_id: str,
-) -> tuple[ChainEnvelope, dict[str, bytes], InstanceContext] | Response:
-    """Parse the request body and resolve the owning live instance.
+) -> tuple[ChainEnvelope, dict[str, bytes]] | Response:
+    """Precheck size and parse the request body into ``(envelope, body_refs)``.
 
-    The middle of the ingress flow, between the header reads and
-    admission:
+    The ``POST /v1/send`` body stage, between the header reads and the
+    shared :func:`resolve_and_admit` prelude:
 
     1. H2 audit closure: precheck ``Content-Length`` before reading any
        body bytes. A producer declaring an oversized payload sees a 413
@@ -276,19 +416,14 @@ async def _parse_and_resolve(
        uploads (no Content-Length) bypass this check by design and are
        caught by the streaming size cap inside :func:`_parse_body`.
     2. Body parsing (JSON or multipart) into ``(envelope, body_refs)``.
-    3. § 4D.2 host-prefix-route degraded guard. The target host lives in
-       the parsed envelope, so this is the earliest the configured
-       target id is known for host-routed requests. Fires BEFORE
-       ``admit_chain`` so no durable write is attempted against a
-       degraded instance. (When an ``X-Phantom-Instance`` header was
-       given the handler already guarded it before any body bytes were
-       read; the resolver short-circuits on the header again here
-       harmlessly.)
-    4. Dispatcher resolution to the owning :class:`InstanceContext`.
+
+    Destination resolution and the § 4D.2 host-prefix-route degraded
+    guard moved into :func:`resolve_and_admit` (the shared post-resolution
+    prelude), which both this route and the raw-intake catch-all call.
 
     Returns:
-        The parsed ``(envelope, body_refs, instance_ctx)`` triple, or
-        the canonical error :class:`Response` to return verbatim.
+        The parsed ``(envelope, body_refs)`` pair, or the canonical error
+        :class:`Response` to return verbatim.
     """
     content_length_check = _check_content_length(
         request.headers.get("Content-Length"),
@@ -298,40 +433,7 @@ async def _parse_and_resolve(
     if content_length_check is not None:
         return content_length_check
 
-    parsed = await _parse_body(request, max_buffered_bytes, request_id=request_id)
-    if isinstance(parsed, Response):
-        return parsed
-    envelope, body_refs = parsed
-
-    first_step_url = _resolve_first_step_url(envelope)
-
-    degraded = _degraded_guard_response(
-        instance_cfgs=instance_cfgs,
-        degraded_instances=degraded_instances,
-        url=first_step_url,
-        instance_header=instance_header,
-        request_id=request_id,
-    )
-    if degraded is not None:
-        return degraded
-
-    try:
-        instance_ctx = dispatcher.resolve(first_step_url, instance_header)
-    except InstanceNotFoundError:
-        return _error_response(
-            "instance_unknown",
-            f"X-Phantom-Instance {instance_header!r} not configured",
-            instance_id="unrouted",
-            request_id=request_id,
-        )
-    except NoMatchingInstanceError:
-        return _error_response(
-            "invalid_target",
-            f"No instance accepts target {first_step_url!r}",
-            instance_id="unrouted",
-            request_id=request_id,
-        )
-    return envelope, body_refs, instance_ctx
+    return await _parse_body(request, max_buffered_bytes, request_id=request_id)
 
 
 def _check_content_length(

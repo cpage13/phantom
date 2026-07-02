@@ -45,7 +45,7 @@ _KVS_KEY = "bench"
 _KVS_VALUE = "left-rail"
 # The e2e stack's fixed credential-cache axis value.
 _UID = "00000000-0000-0000-0000-000000000001"
-# The eight canonical ChainState values (the rollup histogram always
+# The nine canonical ChainState values (the rollup histogram always
 # carries all of them, zero counts included).
 _ALL_STATES: frozenset[str] = frozenset(
     {
@@ -57,6 +57,7 @@ _ALL_STATES: frozenset[str] = frozenset(
         "stored",
         "cancelled",
         "corrupted",
+        "expired",
     }
 )
 

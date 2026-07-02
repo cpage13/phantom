@@ -19,7 +19,7 @@ from pydantic import ValidationError
 
 
 def test_state_alias() -> None:
-    """UploadState shares the eight canonical ChainState literals."""
+    """UploadState shares the nine canonical ChainState literals."""
     assert set(get_args(UploadState)) == {
         "queued",
         "attempting",
@@ -29,6 +29,7 @@ def test_state_alias() -> None:
         "stored",
         "cancelled",
         "corrupted",
+        "expired",
     }
 
 

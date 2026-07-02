@@ -49,7 +49,12 @@ async def _build(
         id="primary",
         host_prefixes=["*"],
         data_dir="primary",
-        routes=[RouteCfg(name="r", hosts=["*"], auth_mode="none")],
+        # phantom_bearer: these tests exercise the bearer-wake path (a token
+        # set() re-queues a parked row). With the §2.5 auth_mode guard the
+        # AuthKicker only wakes phantom_bearer rows, so the route the parked
+        # row resolves to must be phantom_bearer for the scenario to be valid
+        # (a "none" route would never have parked via the bearer path).
+        routes=[RouteCfg(name="r", hosts=["*"], auth_mode="phantom_bearer")],
     )
     sat = saturation or SaturationGate(
         max_in_flight=100,

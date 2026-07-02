@@ -10,6 +10,12 @@ loopback default bind IS the admin access control (ADR-004): admin, like
 everything, is reachable only on the machine. An operator who wants network
 reachability sets ``bind_tcp`` explicitly (e.g. ``0.0.0.0:8080``) and gets
 the unauthenticated-exposure warning from :func:`phantom.app.create_app`.
+
+When ``server.tls.enabled`` is set, that SAME single socket is served over
+TLS (HTTPS) instead of plaintext — ``ssl_*`` kwargs are splatted into the
+existing ``uvicorn.run`` (the cert pair comes from
+:func:`phantom.runtime.tls_cert.resolve_tls_paths`); still ONE listener, not
+a second server. TLS does not change the bind, only the wire.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from typing import TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +33,20 @@ _DEFAULT_TCP_PORT: int = 8080
 # Default bind host when ``bind_tcp`` is an empty string (no host segment).
 # Loopback, matching the same-machine-only deployment default.
 _DEFAULT_TCP_HOST: str = "127.0.0.1"
+
+
+class _SslKwargs(TypedDict, total=False):
+    """The optional ``ssl_*`` keyword arguments for ``uvicorn.run``.
+
+    A ``total=False`` TypedDict (not a bare ``dict[str, str]``) so mypy matches
+    each key to ``uvicorn.run``'s correspondingly-named parameter — and so an
+    EMPTY mapping (TLS off) splats to nothing, keeping the call byte-for-byte
+    today's plaintext behavior. Populated only when ``server.tls.enabled``.
+    """
+
+    ssl_certfile: str
+    ssl_keyfile: str
+    ssl_keyfile_password: str
 
 
 def main() -> int:
@@ -86,11 +107,41 @@ def main() -> int:
     # partition ``server.bind_tcp`` into host / port. ``uvicorn.run`` owns
     # the process signals (clean SIGINT/SIGTERM drain); the lifespan installs
     # SIGHUP for hot reload (a distinct signal uvicorn does not touch).
+    #
+    # When ``server.tls.enabled``, ``ssl_kwargs`` (built below) is splatted
+    # into the SAME call so the one socket serves HTTPS; empty otherwise
+    # (byte-for-byte plaintext). NOT a second listener.
+    tls = settings.server.tls
+    ssl_kwargs: _SslKwargs = {}
+    if tls.enabled:
+        # Resolve to a usable (cert_path, key_path). For an operator-supplied
+        # pair this validates existence; when both are None it auto-generates /
+        # rotates a self-signed pair and returns the stable paths. (Import kept
+        # local, like the other `__main__` runtime imports above.)
+        from phantom.runtime.tls_cert import resolve_tls_paths
+
+        cert_path, key_path = resolve_tls_paths(tls, settings.storage.data_dir)
+        ssl_kwargs["ssl_certfile"] = cert_path
+        ssl_kwargs["ssl_keyfile"] = key_path
+        # ssl_keyfile_password applies ONLY to an OPERATOR-supplied encrypted
+        # key. The TlsCfg XOR validator guarantees both-or-neither, so
+        # `tls.cert_path is not None` IS exactly the operator-supplied case; the
+        # `is None` case is auto-gen, whose key is written UNENCRYPTED — passing
+        # a password there would make uvicorn try to decrypt an unencrypted key
+        # and fail at bind. So gate the password on operator-supplied only.
+        if tls.cert_path is not None and tls.key_password is not None:
+            ssl_kwargs["ssl_keyfile_password"] = tls.key_password
+
     if settings.server.bind_uds is not None:
-        uvicorn.run(app, uds=settings.server.bind_uds)
+        uvicorn.run(app, uds=settings.server.bind_uds, **ssl_kwargs)
     else:
         host, _, port = settings.server.bind_tcp.partition(":")
-        uvicorn.run(app, host=host or _DEFAULT_TCP_HOST, port=int(port or _DEFAULT_TCP_PORT))
+        uvicorn.run(
+            app,
+            host=host or _DEFAULT_TCP_HOST,
+            port=int(port or _DEFAULT_TCP_PORT),
+            **ssl_kwargs,
+        )
     return 0
 
 

@@ -29,6 +29,12 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from phantom.models.admin import TokenSlot
+from phantom.models.credential import (
+    CredCacheRow,
+    CredentialSource,
+    DestinationCredential,
+    HostCredKey,
+)
 from phantom.models.token import TokenCacheRow, TokenSource
 from phantom.models.upload import CapturedValues, UploadRow, UploadState
 
@@ -152,6 +158,14 @@ WakeHandler = Callable[[str, str], Awaitable[None]]
 Args: ``(endpoint, uid)`` — the slot that was just written. The ``uid``
 here is the credential-cache axis (X-Phantom-Uid value); not to be
 confused with chain_id.
+"""
+
+CredentialWakeHandler = Callable[[HostCredKey], Awaitable[None]]
+"""Callback registered with :class:`CredentialStore.register_wake_handler`.
+
+COPY of :data:`WakeHandler` with the ONE forced difference: the credential
+store keys on the destination host alone, so the handler takes a single
+``(dest_host)`` argument rather than the token cache's ``(endpoint, uid)``.
 """
 
 
@@ -483,9 +497,12 @@ class UploadStore(Protocol):
 
         M-W4-F7 audit closure: the UPDATE is guarded by
         ``state IN ('succeeded','failed','corrupted','cancelled','queued',
-        'auth_expired','stored')`` — every state EXCEPT ``attempting``.
-        A sender is actively driving an ``attempting`` row, so replay
-        must refuse rather than clobber the sender's in-flight work.
+        'auth_expired','stored')`` — every state EXCEPT ``attempting``
+        and the body-released terminal ``expired`` (ADR-032). A sender is
+        actively driving an ``attempting`` row, so replay must refuse
+        rather than clobber the sender's in-flight work; an ``expired``
+        row has no body to replay and is refused up front by the
+        body-accounting guard below, so it too stays out of the IN-set.
         Round 1 defender fix (R1-1): that refusal raises the typed
         :class:`phantom.storage.errors.ReplayRefusedAttemptingError`
         and leaves the row untouched (caller responds with the
@@ -758,11 +775,56 @@ class TokenCache(Protocol):
         ...
 
 
-TERMINAL_STATES: frozenset[Literal["succeeded", "failed", "stored", "cancelled", "corrupted"]] = (
-    frozenset({"succeeded", "failed", "stored", "cancelled", "corrupted"})
-)
+class CredentialStore(Protocol):
+    """Host-keyed destination-credential store. Disk-backed per ADR-003.
+
+    A COPY of the :class:`TokenCache` Protocol surface, keyed by the resolved
+    destination host alone (no ``uid`` axis) and holding a structured
+    :data:`~phantom.models.credential.DestinationCredential` value rather than a
+    bearer string. The credential value is read internally only (the signer
+    retrieves it at sign time); the admin surface exposes status only (ADR-004).
+    """
+
+    async def start(self) -> None:
+        """Open the underlying connection."""
+        ...
+
+    async def stop(self) -> None:
+        """Close the underlying connection."""
+        ...
+
+    async def get(self, dest_host: HostCredKey) -> CredCacheRow | None:
+        """Return the cached row for ``dest_host`` or ``None``."""
+        ...
+
+    async def set(
+        self,
+        dest_host: HostCredKey,
+        credential: DestinationCredential,
+        *,
+        source: CredentialSource,
+    ) -> CredCacheRow:
+        """Write the slot, update ``observed_at``, fire registered wake handlers."""
+        ...
+
+    async def mark_bad(self, dest_host: HostCredKey) -> None:
+        """ADR-003: bad credentials stay in the store; status flips to ``bad``."""
+        ...
+
+    def register_wake_handler(self, handler: CredentialWakeHandler) -> None:
+        """Register a callback invoked on every ``set()``."""
+        ...
+
+
+TERMINAL_STATES: frozenset[
+    Literal["succeeded", "failed", "stored", "cancelled", "corrupted", "expired"]
+] = frozenset({"succeeded", "failed", "stored", "cancelled", "corrupted", "expired"})
 """States after which a row never advances on its own — only the reaper
 or admin actions move it. ``auth_expired`` is NOT terminal (auth_kicker
 re-queues it on token refresh). ``corrupted`` is terminal — body
-verification failed at send time and no retry will resolve it.
+verification failed at send time and no retry will resolve it. ``expired``
+is terminal (ADR-032): the per-route send-deadline elapsed, the body was
+released, and the row is never re-admitted — the deliberate OPPOSITE of
+``auth_expired``, which stays out of this set so the kickers keep sweeping
+it (``list_non_terminal`` is ``WHERE state NOT IN (TERMINAL_STATES)``).
 """

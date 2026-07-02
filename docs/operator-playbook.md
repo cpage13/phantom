@@ -1,4 +1,4 @@
-# Phantom — Operator Playbook
+# Phantom: Operator Playbook
 
 > The operational reference for deploying, configuring, monitoring,
 > and recovering Phantom. Read this after `README.md` and
@@ -25,8 +25,8 @@
   the producer's process, not a multi-tenant service. Unit of
   failure = one producer.
 - **Pi-class hardware.** The smart defaults (saturation caps, RAM
-  ceiling, worker count) are calibrated for 2–8 GiB RAM + 16–256 GiB
-  SD-card storage. Rack-server deployments work but should tune
+  ceiling, worker count) are calibrated for 2 to 8 GiB RAM and 16 to
+  256 GiB SD-card storage. Rack-server deployments work but should tune
   manually.
 - **Loopback admin.** The deployment is same-machine-only: ONE listener
   serves intake + admin + health on one socket, bound to `127.0.0.1` by
@@ -44,17 +44,12 @@
 
 ### Container build + run
 
-Phantom is published to **both** GHCR and Docker Hub on every release
-tag — pull from whichever you prefer:
-
-- `ghcr.io/<org>/phantom-service:<tag>`
-- `docker.io/<org>/phantom-service:<tag>`
-
-(Per ADR-020.) Both image streams are produced from the same build by
-the release workflow and tagged identically; there is no
-"primary"/"secondary" — they are equivalent. Operators using existing
-Docker Hub credentials can pull from there directly with no GHCR
-authentication setup.
+The image name is `ghcr.io/<org>/phantom-service:<tag>` per ADR-020
+(GHCR only; Docker Hub publication stopped with ADR-020). This repo
+ships no release workflow, so produce the image yourself: build
+locally with the `buildx` command below (or the `build:` block in
+`src/phantom-deploy/docker-compose.yml`), or publish your build to
+your own org's GHCR and pull it from there.
 
 Build from source:
 
@@ -66,7 +61,7 @@ docker buildx build \
   .
 ```
 
-Run (pick whichever registry you prefer):
+Run (the locally built tag, or your own GHCR ref):
 
 ```bash
 docker run \
@@ -74,7 +69,8 @@ docker run \
   -v /etc/phantom/phantom.yaml:/etc/phantom/phantom.yaml \
   -e PHANTOM_SERVER__BIND_TCP=0.0.0.0:8080 \
   -p 127.0.0.1:8080:8080 \
-  docker.io/<org>/phantom-service:<tag>
+  phantom-service:dev \
+  -c /etc/phantom/phantom.yaml
 ```
 
 The single listener (intake + admin + health) defaults to loopback, which
@@ -85,22 +81,25 @@ loopback-only on the machine, so the unauthenticated admin surface is not
 exposed beyond the host. A bare-metal run uses the config's loopback
 default with no override.
 
-The image entrypoint is `python -m phantom -c /etc/phantom/phantom.yaml`.
-The container is config-agnostic — every per-deployment knob lives in
+The image entrypoint is `python -m phantom` with no default arguments.
+The `-c <path>` config flag is required, so supply it as the container
+command: the `-c /etc/phantom/phantom.yaml` tail of the run example
+above, or `command: ["-c", "/etc/phantom/phantom.yaml"]` in compose.
+The container is config-agnostic: every per-deployment knob lives in
 the mounted YAML or in `PHANTOM_*` env vars.
 
 ### Reference compose
 
 `src/phantom-deploy/docker-compose.yml` carries a single-machine
 reference compose for local dev. Production producer deployments use
-Balena / Kubernetes / nomad / systemd-podman — whichever fits the
+Balena / Kubernetes / nomad / systemd-podman, whichever fits the
 fleet.
 
 ---
 
 ## 2. Configuration walkthrough
 
-`config/phantom.yaml.example` is the operator reference — every
+`config/phantom.yaml.example` is the operator reference: every
 field is enumerated with inline comments. The big-picture sections:
 
 | YAML section | What it controls |
@@ -123,8 +122,8 @@ field is enumerated with inline comments. The big-picture sections:
 Retention's per-state windows are **time-based**: each terminal state has
 metadata + body windows (e.g. `failed` = 30 days, `stored`/`auth_expired`
 metadata = forever), and the reaper deletes rows once their window
-elapses. `saturation.max_in_flight` bounds only *in-flight* rows — a
-terminal row has already released its slot — so it does **not** cap the
+elapses. `saturation.max_in_flight` bounds only *in-flight* rows (a
+terminal row has already released its slot), so it does **not** cap the
 table. This means under sustained ingest that produces terminal rows
 faster than the windows reap them (a flapping upstream generating
 `failed` rows, or steady traffic into the forever-retained
@@ -138,18 +137,19 @@ This is bounded two ways:
    as a hard ceiling *after* the time-based passes. If the table exceeds
    `max_rows` it evicts **oldest-DONE-first** (by `updated_at`) until at or
    below the cap. Only fully-terminal rows
-   (`succeeded`/`failed`/`cancelled`/`stored`/`corrupted`) are evictable;
-   in-flight (`queued`/`attempting`) and still-deliverable `auth_expired`
-   rows are **never** evicted, so the backstop cannot drop an undelivered
-   upload. If the overage is all ineligible rows, the cap is left unmet
-   (durability wins over the count cap) and the shortfall is logged. Raise
+   (`succeeded`/`failed`/`cancelled`/`stored`/`corrupted`/`expired`) are
+   evictable; in-flight (`queued`/`attempting`) and still-deliverable
+   `auth_expired` rows are **never** evicted, so the backstop cannot drop
+   an undelivered upload. If the overage is all ineligible rows, the cap
+   is left unmet (durability wins over the count cap); the reaper logs
+   only the evicted count, not the shortfall. Raise
    or lower it per the SD-card size on the producer; set `-1` to opt into the
    historical unbounded (time-only) contract.
 2. **Size for the forever-retained states.** Independently of the row cap,
    estimate `peak_terminal_rows × avg_row_bytes` for `stored`/`auth_expired`
    over your retention horizon and provision the SD card accordingly.
 
-`max_rows` is a backstop, not a substitute for the time windows — set it
+`max_rows` is a backstop, not a substitute for the time windows: set it
 generously above steady-state so it only fires under pathological growth.
 It is hot-reloadable (lands on the next reaper sweep).
 
@@ -201,9 +201,95 @@ admissions after the reload), persist trigger size threshold,
 capture re-execution, retry params, the admin lookup binding, and
 body-store tuning (linger, RAM ceiling, RAM-pressure poll).
 **Restart-required:** worker count, the instance list
-(adding/removing an instance), `body_store.mode`, and every
+(adding/removing an instance), `body_store.mode`,
+`storage.max_buffered_bytes`, and every
 `ad_mint` knob including the refresh timings (the reload logs a
 WARNING when `ad_mint` changes). See ADR-013.
+
+### 2.3 Service-based signing (`aws_sigv4`) and credentials
+
+A route whose `auth_mode` is `aws_sigv4` makes Phantom **re-sign** each
+outbound request with a fresh AWS SigV4 signature for the destination
+host, using a host-keyed credential you provision. The three
+`auth_mode` arms:
+
+- `aws_sigv4`: Phantom re-signs (this section).
+- `none`: the request's own signature (for example a presigned URL) is
+  the auth.
+- `phantom_bearer`: Phantom injects a cached `Authorization`.
+
+Re-signing is what lets a producer push to S3 with a stock S3 SDK
+(boto3) pointed at Phantom; see the README "upload with a stock S3 SDK"
+quick start. The destination is resolved from `phantom_default_target`
+(or a per-request `?phantom=<url>` carrier). See ADR-033.
+
+The route declaration that turns on re-signing:
+
+```yaml
+instances:
+  - id: s3-uploads
+    host_prefixes: ["s3.amazonaws.com", "*.s3.amazonaws.com"]  # required: fnmatch, declaration order
+    data_dir: "s3-uploads"      # required: subdirectory under storage.data_dir
+    routes:
+      - name: s3
+        hosts: ["s3.amazonaws.com", "*.s3.amazonaws.com"]  # fnmatch, declaration order
+        auth_mode: aws_sigv4        # phantom_bearer | none | aws_sigv4
+        timeout_seconds: 600        # optional; big S3 PUTs
+phantom_default_target: "https://s3.amazonaws.com"   # raw-intake default destination
+```
+
+Credentials can be declared at boot in a top-level `sigv4_credentials:` block.
+This block holds **env-var NAMES only, never the secret literal**; the named
+env vars are resolved at boot and materialized into the host-keyed store. Both
+arms require `service`; a `sigv4_static` arm requires both key env vars and a
+region, a `profile_ref` arm carries no static fields:
+
+```yaml
+sigv4_credentials:
+  - dest_host: "s3.amazonaws.com"
+    kind: "sigv4_static"
+    access_key_id_env: "AWS_ACCESS_KEY_ID"
+    secret_access_key_env: "AWS_SECRET_ACCESS_KEY"   # name of the env var, never the secret
+    region: "us-east-1"
+    service: "s3"
+  - dest_host: "my-s3.example.com"
+    kind: "profile_ref"
+    profile: "prod-account"     # omit for the default chain
+    service: "s3"
+```
+
+The runtime equivalent is the admin credential push (§5, "SigV4 credential
+failures"), which carries resolved literals instead of env-var names.
+
+### 2.4 Enabling HTTPS on the listener
+
+The single listener flips from HTTP to HTTPS with `server.tls.enabled: true`
+(no second socket). Leave `cert_path`/`key_path` unset for an auto-generated
+self-signed cert, or supply your own PEM pair; set BOTH or NEITHER (exactly
+one is a boot error, the XOR rule):
+
+```yaml
+server:
+  bind_tcp: "0.0.0.0:8080"
+  tls:
+    enabled: true        # flips the ONE listener to HTTPS (no second socket)
+    # Auto-gen self-signed (localhost + 127.0.0.1, 825-day, rotated near expiry):
+    #   leave cert_path and key_path unset.
+    # Operator-supplied PEM pair (set BOTH or NEITHER):
+    # cert_path: "/etc/phantom/tls/phantom.crt"
+    # key_path:  "/etc/phantom/tls/phantom.key"
+    # key_password: null   # only for an encrypted operator key
+```
+
+Then probe it (the `-k` / `verify=False` is because the auto-gen cert is
+self-signed):
+
+```bash
+curl -k https://localhost:8080/v1/healthz
+```
+
+Auto-generated keys are unencrypted, so `key_password` is ignored for them; it
+applies only to an encrypted operator-supplied key.
 
 ---
 
@@ -216,7 +302,7 @@ deployment, not per-upload. All three are tested and supported.
 
 1. **How much RAM does the producer have?**
    - <2 GiB → consider `all_disk`.
-   - 2–8 GiB (typical Pi-class producer) → `hybrid` is the default.
+   - 2 to 8 GiB (typical Pi-class producer) → `hybrid` is the default.
    - >8 GiB and you want max throughput → `hybrid` still wins
      unless body sizes are unpredictably large.
 
@@ -231,13 +317,16 @@ deployment, not per-upload. All three are tested and supported.
 3. **How much data-loss-on-restart can you tolerate?**
    - Zero → `all_disk`. Every admission is on disk before the 202;
      restarts lose nothing.
-   - "Last few seconds" — `hybrid` (default). Successful uploads
+   - "Last few seconds" → `hybrid` (default). Successful uploads
      drop body bytes immediately; pending-retry uploads migrate to
      disk after `linger_seconds=90`; in-flight RAM bodies at
      restart are lost (and the recovery sweep quarantines the
      stale rows).
-   - "I'm running tests; data loss is fine" → `all_ram`. RAM only;
-     restart wipes everything. Use only for E2E tests.
+   - "Bodies are re-creatable; restart loss is acceptable" →
+     `all_ram`. A first-class production mode for ephemeral
+     workloads that tolerate body loss on restart. RAM only; a
+     restart wipes every undelivered body (see the caveat under
+     *The three modes* below).
 
 4. **How predictable are body sizes?**
    - Mostly small (<100 MiB) → `hybrid` with the default
@@ -281,8 +370,8 @@ storage:
   any stale `body_location='file'` rows that somehow exist).
 - No PersistController spawned.
 - Trade-off: zero disk wear; zero durability across restarts.
-  Useful for ephemeral test deployments where the producer will
-  re-submit on any failure.
+  Fits ephemeral production workloads (and test rigs) where the
+  producer re-submits on any failure.
 
 > **Destructive mode-flip guard (back-up-and-run).** `all_ram` wires a
 > RAM-only body store with no disk awareness. Switching **into** `all_ram`
@@ -300,11 +389,9 @@ storage:
 > pair), bumps the `mode_switch_backup_total` counter, logs a loud WARNING,
 > and boots fresh over the now-empty live tree. No data is lost (the bytes
 > sit in the backup, neither corrupted nor leaked) and the service stays up.
-> The backup is listed by `GET /v1/admin/quarantine` with `reason=mode_switch`
-> and moved back into the live tree by `POST /v1/admin/quarantine/restore`.
-> To return to a durable posture: set `hybrid` or `all_disk`, restart, then
-> restore (see the matrix below and § 5 *Retrievability*). If the buffered
-> uploads are disposable, simply delete the `mode_switch` backup artifacts.
+> The inventory listing and the restore workflow are under *Switching modes*
+> below. If the buffered uploads are disposable, simply delete the
+> `mode_switch` backup artifacts.
 
 #### `all_disk`
 
@@ -349,8 +436,11 @@ data up, the durable-recovery workflow is:
    backup (manifest-driven) with `reason=mode_switch`, its `backup_id`
    (the restore handle), an `iso_display` stamp (display and sort only),
    and `has_db` / `has_body` flags reporting what is on disk right now.
-   An artifact with no manifest surfaces as a flagged anomaly entry
-   (`backup_id` null); anomalies are never restorable.
+   The route takes an optional instance selector:
+   `GET /v1/admin/quarantine?instance=<id>` scopes one instance, and
+   omitting it aggregates the inventory across every configured
+   instance. An artifact with no manifest surfaces as a flagged anomaly
+   entry (`backup_id` null); anomalies are never restorable.
 2. Set `body_store.mode` back to `hybrid` or `all_disk` (a disk-backed mode
    that can actually serve restored bodies) and restart.
 3. Restore it:
@@ -373,21 +463,23 @@ switch, rerun, kill, or reload* for the full durability picture.
 
 ## 4. Observability + alerting
 
-### Structured logs
+### Logs
 
-Phantom emits JSON-line logs at the configured `observability.log_level`.
-Bearer tokens are redacted by the `bearer_redaction` filter; sensitive
-captured values (marked `sensitive=True` per ADR-009/010) are
-redacted by the `SensitiveCaptureRedactor` filter.
+Phantom emits plain-text log lines at the configured
+`observability.log_level`, formatted
+`%(asctime)s %(levelname)s %(name)s %(message)s`. Bearer tokens are
+redacted by the `BearerRedactionFilter`; sensitive captured values
+(marked `sensitive=True` per ADR-009/010) are redacted by the
+`SensitiveCaptureRedactor`.
 
-Key log events to alert on:
+Key log lines to alert on (plain text; grep the message):
 
-| Event | Severity | What it means |
+| Log line (grep for) | Severity | What it means |
 |---|---|---|
-| `db_quarantine` ERROR | ERROR | SQLite corruption detected at startup; the live DB and body tree moved to a flat backup pair in the instance data root (`uploads.corrupted.<stamp>.db` + `bodies.quarantine.<stamp>/`, named by a `backup.<backup_id>.manifest.json`). Service is serving with fresh empty state if `fail_open=true`. |
-| `invariant_violation` ERROR | ERROR | InvariantAuditor row walk found a violation. Inspect the `label` field. |
-| `body_orphan_swept` INFO | INFO (high rate = WARNING) | BodyOrphanJanitor deleted orphan file(s). Normal at low rate; high rate indicates a bug. |
-| `ram_pressure_signal` INFO | INFO (high rate = WARNING) | RamPressureWatcher signaled the PersistController. High rate means the RAM ceiling is too tight. |
+| `DB integrity check failed` / `DB quarantined` | ERROR | SQLite corruption detected at startup; the live DB and body tree moved to a flat backup pair in the instance data root (`uploads.corrupted.<stamp>.db` + `bodies.quarantine.<stamp>/`, named by a `backup.<backup_id>.manifest.json`). Service is serving with fresh empty state if `fail_open=true`. |
+| `invariant violation:` | ERROR | InvariantAuditor row walk found a violation. The message names the kind (e.g. `missing_body_file`) and the `chain_id`. |
+| `BodyOrphanJanitor sweep removed` | INFO (high rate = investigate) | BodyOrphanJanitor deleted orphan file(s). Normal at low rate; high rate indicates a bug. |
+| `RAM pressure` | WARNING (high rate = investigate) | RamPressureWatcher signaled the PersistController. High rate means the RAM ceiling is too tight. |
 | Worker crash + `TaskGroup` cancellation | ERROR | Composition root's TaskGroup is exiting the lifespan; the container should restart. |
 
 ### Counters and gauges
@@ -403,15 +495,23 @@ running on the host).
 | `record_attempt_result_no_op_total` | Sender UPDATE matched 0 rows (admin cancel/replay raced with sender). | High rate = bug. |
 | `ram_pressure_signal_total` | RAM-pressure event fired. | High rate = ceiling too tight. |
 | `db_quarantine_total` | DB-corruption quarantine fired at startup. | non-zero → operator investigates. |
-| `cold_backup_total` / `cold_backup_failed_total` | Cold-backup outcomes. | failed rate > 0. |
+
+Cold-backup outcomes have no counter; they are log-only. Grep for
+`cold backup snapshot written` (INFO) and
+`cold backup snapshot failed; continuing` (ERROR).
 
 | Gauge | Meaning | Alert if |
 |---|---|---|
 | `saturation_balance` | In-flight declared bytes. | Climbing to the cap. |
-| `attempting_row_count` | Current `attempting` rows. | Spike + sender heartbeat gone → sender died mid-flight. |
 | `body_location_distribution{value=ram\|file}` | Count by `body_location`. | `ram` count growing unbounded → linger/ceiling not migrating fast enough. |
 | `persist_controller_queue_depth` | Current enqueued migrations. | Growing unbounded = controller falling behind. |
 | `ram_body_store_bytes` | RAM-body-store bytes. | Approaching `ram_ceiling_bytes`. |
+| `ram_ceiling_bytes` | The configured RAM ceiling. | Reference value for `ram_body_store_bytes`; not alerted on alone. |
+
+There is no `attempting` gauge. Read the current `attempting` count
+from `by_state.attempting` in `GET /v1/admin/stats`. A sustained spike
+there with no delivery progress means sender workers died mid-flight;
+the recovery sweep resets `attempting` rows to `queued` on restart.
 
 ### RAM-pressure dashboard
 
@@ -421,8 +521,8 @@ running on the host).
 {
   "ram_body_store_bytes": 412057600,
   "ram_ceiling_bytes": 536870912,
-  "fraction": 0.767,
-  "over_ceiling": false
+  "pending_migrations": 3,
+  "persist_controller_queue_depth": 2
 }
 ```
 
@@ -501,7 +601,7 @@ curl -s http://127.0.0.1:8080/v1/admin/uploads/by-local-uuid/<uuid>
 destination. `db_quarantine_total` counter incremented.
 `GET /v1/admin/quarantine` returns one or more entries.
 
-**Cause.** `PRAGMA integrity_check` returned non-`ok` at startup —
+**Cause.** `PRAGMA integrity_check` returned non-`ok` at startup:
 SQLite corruption from a hard power-cut + SD-card-wear, or actual
 hardware failure.
 
@@ -523,19 +623,22 @@ hardware failure.
      producing work must be re-run).
 5. Restart the container.
 
-If `db_integrity.fail_open=false`, the container won't start until
-the operator either restores from backup or accepts the fresh
-empty state by deleting the corrupted DB.
+If `db_integrity.fail_open=false`, the gate still quarantines FIRST,
+then aborts startup. The live tree is already empty at that point, so
+the next boot starts fresh; there is no corrupted DB left in the live
+position for the operator to delete. Pin `false` when you want the
+abort as a stop-the-world signal, for example to restore a cold
+backup before service resumes.
 
 **Power loss DURING quarantine is self-healing.** Quarantine renames the
 body-store root first and the corrupt DB last. The corrupt DB is the
 re-trigger: if the producer loses power mid-quarantine, the corrupt DB is left
 in place, and the next boot's integrity gate simply re-quarantines it and
-continues — in **every** body-store mode, including `all_ram`. No manual
+continues, in **every** body-store mode, including `all_ram`. No manual
 clearing of the per-instance `bodies/` tree is needed after a mid-quarantine
-power loss. (The mode-switch backup move is likewise crash-safe via its own
-in-progress marker — see § 3 *Switching modes* — so neither a mid-quarantine
-nor a mid-mode-switch power loss leaves a wedged half-state.)
+power loss. The mode-switch backup move is likewise crash-safe via its own
+in-progress marker (see § 3 *Switching modes*), so neither a mid-quarantine
+nor a mid-mode-switch power loss leaves a wedged half-state.
 
 ### RAM pressure
 
@@ -551,19 +654,19 @@ a best-effort gauge. When the RAM total breaches the ceiling, the
 `RamPressureWatcher` migrates oldest-first RAM bodies to disk. A body
 whose row is mid-attempt is skipped only while the attempt is *fresh*
 (started within ~2× `ram_pressure_poll_seconds`); an attempt stalled
-longer — e.g. a slow or unreachable upstream holding the sender pool —
+longer (e.g. a slow or unreachable upstream holding the sender pool)
 is migrated anyway. This is the F-P8-A fix: previously a slow upstream
 that pinned every oldest RAM row in `attempting` let RAM climb past the
 ceiling unbounded (OOM risk on a small producer). Migrating a stalled body is
-safe — it is fsynced to disk before its RAM copy is dropped, and the
+safe: it is fsynced to disk before its RAM copy is dropped, and the
 sender re-reads from disk on its next attempt.
 
 **Procedure.**
 
-1. Check upstream health — if upstream is healthy, raise
+1. Check upstream health. If upstream is healthy, raise
    `body_store.ram_ceiling_bytes` (hot-reloadable).
 2. If upstream is unhealthy, the bodies are migrating to disk per
-   design — verify `body_location_distribution{value=file}` is
+   design. Verify `body_location_distribution{value=file}` is
    climbing and disk usage is acceptable. RAM stays bounded by the
    ceiling even while the upstream is stalled.
 3. If the disk is also filling up, consider raising
@@ -581,7 +684,9 @@ sender re-reads from disk on its next attempt.
 **Procedure.**
 
 - If the body is legitimate and the deployment can afford the
-  RAM/disk, raise `storage.max_buffered_bytes` (hot-reloadable).
+  RAM/disk, raise `storage.max_buffered_bytes` and restart.
+  This knob is restart-required: the intake route resolves it from
+  the boot-time settings, not the hot-reload snapshot.
 - If the body is a bug (the producer generating runaway artifacts),
   fix the producer.
 
@@ -606,12 +711,57 @@ curl 'http://127.0.0.1:8080/v1/admin/tokens?endpoint=<endpoint>'
 # lists TokenSlot entries { status: "bad" | "fresh" | "unknown", ... };
 # bearer values are never returned. There is no per-slot GET: the read
 # surface is this list. Writes: PUT /v1/admin/tokens/{endpoint}/{uid};
-# removal: DELETE /v1/admin/tokens/{endpoint}/{uid}.
+# invalidation: DELETE /v1/admin/tokens/{endpoint}/{uid} (marks the
+# slot bad and preserves it per ADR-003; not a removal).
 ```
 
 For instances with `ad_mint` configured, the minter mints fresh
 tokens automatically; the operator surface for ad-mint failures
 is the log + the `auth_expired` row count.
+
+### SigV4 credential failures
+
+**Symptom.** Rows accumulate in `auth_expired` state on an `aws_sigv4` route
+(§2.3): Phantom has no usable signing credential for the destination host, or
+the credential it has was rejected.
+
+**Cause.** An `aws_sigv4` route signs each outbound request with a host-keyed
+credential from the credential store. If none is provisioned for the
+destination host, or the stored one is marked `bad`, the sender parks the row
+in `auth_expired` and waits. When a fresh credential lands, the
+`CredentialKicker` (the SigV4 analogue of the `AuthKicker`) wakes all matching
+rows. Provision or correct the credential with the admin push (resolved
+literals; `204 No Content`, the secret is never echoed back):
+
+```bash
+# Static key-pair (resolved literals; never echoed back; 204 No Content):
+curl -X PUT 'http://127.0.0.1:8080/v1/admin/credentials/s3.amazonaws.com' \
+  -H 'Content-Type: application/json' -d '{
+    "kind": "sigv4_static",
+    "access_key_id": "AKIAIOSFODNN7EXAMPLE",
+    "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "region": "us-east-1",
+    "service": "s3",
+    "session_token": null
+  }'
+
+# Profile / default-chain reference:
+curl -X PUT 'http://127.0.0.1:8080/v1/admin/credentials/s3.amazonaws.com' \
+  -H 'Content-Type: application/json' -d '{
+    "kind": "profile_ref", "service": "s3", "profile": "prod-account", "region": null
+  }'
+```
+
+Credential-surface facts:
+
+- Unlike tokens, there is **no GET or LIST credential endpoint**;
+  credential status is the `auth_expired` row count plus the logs.
+- `service` is REQUIRED on both arms. Omitting it, or naming an
+  unknown service, is rejected `422` before any store write.
+- `{dest_host}` is normalized to the forward-time lookup key, so
+  casing is forgiving.
+- SDK equivalent:
+  `await client.push_credential(dest_host=..., credential=...)`.
 
 ### Idempotency-key conflicts (422) and chain_id reuse (409)
 
@@ -620,14 +770,14 @@ is the log + the `auth_expired` row count.
 `error.code="chain_id_in_use"`.
 
 **The idempotency contract.** An `X-Phantom-Idempotency-Key` MUST be a
-function of the request body **and the destination** — the operation a
+function of the request body **and the destination**: the operation a
 key names is "deliver THESE bytes to THIS destination". Reusing one key
 for a *different* body, OR for the same body but a *different* destination
 (the resolved per-step `(method, URL)` of the chain), is a client bug:
 the first submission is already buffered, and the second would be
 silently dropped behind a 200 replay (delivered to the original place).
 Phantom rejects both with `idempotency_key_conflict` (422) instead of
-acknowledging a submission it will never deliver as sent — the producer learns
+acknowledging a submission it will never deliver as sent; the producer learns
 immediately that its key reuse dropped data. The same key with the *same*
 body *and same destination* is a legitimate replay and still returns the
 original `ChainResponse` (HTTP 200). Note the idempotency identity covers
@@ -641,11 +791,11 @@ collide.
 re-POST of a `chain_id` already held by a live row returns
 `chain_id_in_use` (409). Client-supplied UUID4 collisions are
 astronomically unlikely, so this almost always means the producer reused an
-id — mint a fresh `chain_id` per submission. (Earlier builds let this
+id; mint a fresh `chain_id` per submission. (Earlier builds let this
 escape as a naked HTTP 500; it is now a deterministic 409 with the
 ADR-017 error envelope.)
 
-**Procedure.** Both are caller-side contract violations — fix the producer's
+**Procedure.** Both are caller-side contract violations: fix the producer's
 key/chain_id derivation. No operator action on Phantom is required.
 
 ### Retrievability after a switch, rerun, kill, or reload
@@ -667,18 +817,15 @@ while Phantom is running normally.
   picks them up again. A `queued`/`attempting` row is never dropped by the
   `max_rows` backstop (§ 2.1).
 - **A hot reload (SIGHUP / `POST /v1/admin/reload`)** swaps config
-  atomically and never drops rows; only the restart-required knobs in
-  § 2.1 *Hot reload* (worker count, the instance list,
-  `body_store.mode`, `ad_mint`) need a full restart.
+  atomically and never drops rows; only the restart-required knobs
+  listed in the § 2 *Hot reload* subsection (worker count, the
+  instance list, `body_store.mode`, `storage.max_buffered_bytes`,
+  `ad_mint`) need a full restart.
 - **A recoverable mode switch** (selecting `all_ram` on a data dir that
   still holds disk bodies from a prior disk-backed run) does not destroy
-  that data: Phantom relocates the live DB and body tree to a set-aside
-  **mode-switch backup** and boots fresh (the back-up-and-run guard,
-  § 1 / ADR-025). The backup is reachable via
-  `GET /v1/admin/quarantine` (it appears with `reason=mode_switch`) and
-  is moved back into the live tree by the one-call, restart-required
-  `POST /v1/admin/quarantine/restore`. To resume service in a durable
-  posture, set `hybrid` or `all_disk` and restart, then restore.
+  that data: the back-up-and-run guard (ADR-025) relocates the live DB
+  and body tree to a set-aside **mode-switch backup** and boots fresh.
+  The inventory and restore workflow are in § 3 *Switching modes*.
 
 **The one caveat: `all_ram` bodies across a restart.** In `all_ram`
 (see § 3) a body lives only in RAM until its row reaches a terminal
@@ -704,16 +851,19 @@ operation. To force a vacuum, restart at an idle moment.
 
 ### Cold backup
 
-Opt-in via `storage.db_integrity.backup_enabled: true`. Snapshots
-the live SQLite to `<data_dir>/backups/` on `backup_period_seconds`
-cadence (default daily), keeping the last `backup_rotate_n` (default
-3). Use for deployments where DB-corruption recovery time matters
-more than disk space.
+Opt-in via `storage.db_integrity.backup_enabled: true`. Snapshots the
+live SQLite to flat files named `uploads.backup.<iso>.db` inside
+`<data_dir>/<instance.data_dir>/backups/` (no per-timestamp
+directory) on `backup_period_seconds` cadence (default daily),
+keeping the last `backup_rotate_n` (default 3). Use for deployments
+where DB-corruption recovery time matters more than disk space.
 
-To restore from backup (with the service stopped):
+To restore from backup (with the service stopped), copy the chosen
+snapshot over the live DB:
 
 ```bash
-cp <data_dir>/backups/<timestamp>/uploads.db <data_dir>/<instance>/uploads.db
+cp <data_dir>/<instance.data_dir>/backups/uploads.backup.<iso>.db \
+   <data_dir>/<instance.data_dir>/uploads.db
 ```
 
 ### Producer deployment via Balena (or any fleet manager)
@@ -751,19 +901,18 @@ this migration table BEFORE bringing up the new service:
 
 ## 8. Trust boundaries
 
-Per WS-4 Finding 6 — the operator-facing trust model:
+Per WS-4 Finding 6, the operator-facing trust model:
 
-- **Inside the container** — Phantom trusts its own filesystem,
+- **Inside the container**: Phantom trusts its own filesystem,
   its own SQLite, its own RAM. `os.umask(0o077)` is set at
   startup so any new files/dirs are owner-only.
-- **Loopback admin** — Phantom trusts any caller that can reach
-  the loopback bind. The admin surface rides the single listener,
-  which defaults to `127.0.0.1`, so the loopback default bind IS the
-  admin access control; admin endpoints don't authenticate (ADR-004).
-  If the host is shared, restrict access via firewall rules + a reverse
-  proxy with auth (out of scope for Phantom). A non-loopback `bind_tcp`
-  is a deliberate opt-in and warns.
-- **Ingress** — Phantom does NOT authenticate inbound traffic
+- **Loopback admin**: Phantom trusts any caller that can reach
+  the loopback bind; admin endpoints don't authenticate (ADR-004).
+  If the host is shared, restrict access via firewall rules + a
+  reverse proxy with auth (out of scope for Phantom). The bind
+  rules, the loopback-as-access-control rationale, and the
+  non-loopback warning are in § 1 *Deployment topology*.
+- **Ingress**: Phantom does NOT authenticate inbound traffic
   beyond the route's `auth_mode`. The producer's network reachability
   to Phantom IS the auth boundary.
 - **Bare-metal vs containerized.** On bare metal, the operator
@@ -782,12 +931,12 @@ Per WS-4 Finding 6 — the operator-facing trust model:
 
 ## See also
 
-- [`config/phantom.yaml.example`](../config/phantom.yaml.example) —
+- [`config/phantom.yaml.example`](../config/phantom.yaml.example):
   the operator-facing config reference.
-- [`docs/architecture-intent.md`](architecture-intent.md) — runtime
+- [`docs/architecture-intent.md`](architecture-intent.md): runtime
   topology, invariants, failure modes.
-- [`CONTEXT.md`](../CONTEXT.md) — domain glossary.
-- [`docs/adr/017-error-code-matrix.md`](adr/017-error-code-matrix.md)
-  — every HTTP status + reason code Phantom emits.
-- [`docs/adr/020-container-image-as-deployment-artifact.md`](adr/020-container-image-as-deployment-artifact.md)
-  — container deployment shape.
+- [`CONTEXT.md`](../CONTEXT.md): domain glossary.
+- [`docs/adr/017-error-code-matrix.md`](adr/017-error-code-matrix.md):
+  every HTTP status + reason code Phantom emits.
+- [`docs/adr/020-container-image-as-deployment-artifact.md`](adr/020-container-image-as-deployment-artifact.md):
+  container deployment shape.

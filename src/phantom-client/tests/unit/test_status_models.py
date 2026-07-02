@@ -38,7 +38,9 @@ def test_terminal_states_set() -> None:
     service never retries, so the default poll stop-set must include it.
     """
     assert (
-        frozenset({"succeeded", "failed", "cancelled", "stored", "corrupted", "auth_expired"})
+        frozenset(
+            {"succeeded", "failed", "cancelled", "stored", "corrupted", "auth_expired", "expired"}
+        )
         == TERMINAL_STATES
     )
 

@@ -8,6 +8,8 @@ dependencies = [
     "aiofiles>=24.1.0",
     "aiosqlite>=0.22.1",
     "azure-identity>=1.25.3",
+    "botocore>=1.43,<1.44",
+    "cryptography>=48.0.0",
     "fastapi>=0.136.1",
     # Bounded by the upstream client's `from httpx._types import ProxiesTypes`
     # (removed in 0.28); we follow the upstream's `httpx ^0.23.3` pin for

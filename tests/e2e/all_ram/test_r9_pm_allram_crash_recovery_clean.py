@@ -66,7 +66,7 @@ _DRAIN_POLL_SECONDS = 0.5
 
 # States from which no further upstream delivery happens (the row is "done").
 _TERMINAL_STATES = frozenset(
-    {"succeeded", "failed", "cancelled", "stored", "corrupted", "auth_expired"}
+    {"succeeded", "failed", "cancelled", "stored", "corrupted", "expired", "auth_expired"}
 )
 
 

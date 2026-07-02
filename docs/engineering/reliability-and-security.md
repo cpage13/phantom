@@ -35,6 +35,10 @@ ones, so that each failure has a name and a single place it is raised:
   fails at startup.
 - An auth-unavailable error, raised when no configured credential can mint a
   token.
+- A SigV4 signing error, raised on the `aws_sigv4` arm when the destination
+  credential cannot be resolved or its service has no signer (an unknown service
+  raises this rather than a bare `KeyError`). It is not fatal: the sender catches
+  it and parks the row in `auth_expired` to await a corrected credential push.
 - An admission error carrying a typed error code, which is mapped to an HTTP
   status and a structured error envelope on the wire.
 
@@ -46,6 +50,8 @@ is the contract a client can rely on.
 
 | HTTP | Code | Fires when | What the client should do |
 |---|---|---|---|
+| 400 | `header_invalid` | An optional grouping or ordering header on `POST /v1/send` failed to parse (`X-Phantom-Group-Id` / `X-Phantom-Multifile-Id` must be UUIDs; `X-Phantom-Order` a non-negative integer) | Fix the header; the grouping intent was not applied |
+| 400 | `lookup_not_configured` | The by-captured-id admin lookup was asked of an instance whose configuration carries no `admin_lookup` binding | Configure the binding; nothing was looked up |
 | 401 | `auth_token_missing` | The request has no authorization and there is no cached token for the slot | Refresh credentials and resend |
 | 404 | `not_found` | An admin lookup references a chain, instance, or token that does not exist | Do not retry |
 | 413 | `body_too_large` | The content-length precheck, or a mid-stream cap, is exceeded | Split the upload or raise the configured cap |
@@ -53,7 +59,14 @@ is the contract a client can rely on.
 | 421 | `instance_unknown` | The target hostname matched no configured instance | Add the host prefix to an instance |
 | 422 | envelope and body-reference validation codes | The upload envelope or a multipart part failed validation | Fix the caller; this is a request bug |
 | 422 | `idempotency_key_conflict` | An idempotency key was reused with a different body | Use a body-derived key |
+| 422 | `multifile_cursor_conflict` | An admin listing combined `?multifile_id=` with `?cursor=`; the multifile listing is one-shot by design | Drop the cursor |
+| 422 | `key_value_match_invalid` | An admin `?key_value_match=` value did not parse as `key:value` with a non-empty key and value | Fix the parameter |
+| 422 | `bulk_delete_filter_empty` | A bulk delete carried an all-empty filter, which would mean delete every row | Name at least one filter field |
+| 422 | `request_invalid` | A typed path or query parameter failed request validation (for example a malformed UUID) | Fix the request; this is a caller bug |
 | 409 | `chain_id_in_use` | The chain ID is already in use by a live row | Mint a fresh chain ID |
+| 409 | `restore_noop` | The one-call quarantine restore moved nothing into the live tree | Check the quarantine inventory and retry |
+| 409 | `replay_body_discarded` | Admin replay named a row whose body was already discarded per the row's own accounting | Do not retry; the row is left exactly as it was |
+| 409 | `replay_refused_attempting` | Admin replay named a row a sender is actively driving (`attempting`) | Wait for the attempt to settle, or cancel first, then retry |
 | 502 | `upstream_unreachable` | The upstream could not be reached. Surfaced on admin lookups only, never on the upload path | Admin-only signal |
 | 503 | `saturation_cap` | The in-flight gate refused admission | Back off and retry per `Retry-After`. Phantom is the retry engine, so the client should not itself retry aggressively |
 | 503 | `disk_pressure` | The disk-usage ceiling was crossed (a proactive limit) | Back off; the operator frees disk |
@@ -162,25 +175,30 @@ rename, fsync the parent directory).
 
 ### The service is asked to start in a bad state
 
-Five guards run at startup and refuse to start the service rather than run
-unsafely:
+Five guards run at startup. Two genuinely refuse to start rather than run
+unsafely; the others apply a correction or set the unsafe state aside and keep
+booting, loudly:
 
 1. A umask guard sets owner-only permissions process-wide, so every file created
-   afterward is private.
+   afterward is private. It always applies; it is not a refusal gate.
 2. A retention-floor guard refuses a configuration where a body would be retained
    longer than its metadata row, which would orphan the body.
 3. An instance-isolation guard refuses duplicate instance IDs, colliding or nested
    data directories (two stores on one database file is a corruption risk), and
    duplicate routing prefixes.
-4. A body-store-mode guard refuses to start in all-ram mode over a populated disk
-   body directory, which would both condemn intact on-disk rows and leak their
-   files.
+4. A body-store-mode guard no longer refuses. Starting in all-ram mode over a
+   populated disk body directory would condemn intact on-disk rows, so the guard
+   backs the live database and body tree up to a recoverable `mode_switch` pair,
+   logs loudly, and boots fresh (ADR-025). The backup is restorable through the
+   admin quarantine API.
 5. The database integrity gate quarantines a corrupt database before the store
-   opens.
+   opens and, by default, boots with fresh empty state (fail-open). An operator
+   can pin fail-closed to abort startup instead.
 
 In addition, the store reads back its pragmas after setting them and refuses to
-start if any did not take effect. A misconfiguration crashes startup cleanly,
-before any store or worker exists, and the orchestrator surfaces it.
+start if any did not take effect. A genuine misconfiguration (guards 2 and 3)
+crashes startup cleanly, before any store or worker exists, and the orchestrator
+surfaces it.
 
 ## Security posture
 
@@ -195,8 +213,10 @@ before any store or worker exists, and the orchestrator surfaces it.
   with an empty filter. Exposing the surface to a wider network is an operator
   decision to be made with a fronting reverse proxy (a non-loopback `bind_tcp`
   opt-in warns at startup that the admin API rides this listener and is
-  unauthenticated), and is outside Phantom's scope. An optional configured admin
-  secret (and HTTPS for off-box) is recorded as future work (ADR-004).
+  unauthenticated), and is outside Phantom's scope. The single listener can be
+  flipped to HTTPS (`server.tls.enabled`), but TLS encrypts the transport - it
+  does not authenticate the admin API; loopback still does (ADR-004). An optional
+  configured admin secret remains future work (ADR-004).
   Liveness/readiness probes (`/v1/healthz`, `/v1/readyz`) ride the same single
   listener.
 - **Owner-only files.** A process-wide umask of owner-only is applied first thing
@@ -207,6 +227,13 @@ before any store or worker exists, and the orchestrator surfaces it.
   Phantom-specific wire headers identify the caller and the upstream target. The
   token cache is keyed by (endpoint, uid); Phantom does not parse or interpret the
   uid.
+- **Secret material is never returned by any admin response.** The destination
+  SigV4 credential push (`PUT /v1/admin/credentials/{dest_host}`) replies `204`
+  with no body, and there is no GET/LIST credential endpoint - the only read
+  surface is the `auth_expired` row count and the logs. The credential store keys
+  on the destination host alone (a SigV4 step has no caller uid). When credentials
+  are provisioned from config rather than pushed, the config holds environment
+  variable *names*, not the secret literals, which are resolved at boot.
 - **Secret and log redaction.** A logging filter scrubs bearer tokens from every
   log record. Values a chain marks sensitive (for example a presigned upload URL)
   are redacted before formatting, and that redaction path is gated behind debug

@@ -1213,17 +1213,37 @@ class SqliteUploadStore:
         is carried in step 1's JSON body and serialized in camelCase
         (the upstream convention - the upstream client's camelCase
         alias generator produces ``keyValueStore`` for the snake-cased
-        Python attribute ``key_value_store``). The JSON path therefore queries
-        ``$.steps[0].body.value.metadata.keyValueStore.<key>`` (built by
-        :func:`_metadata_kvs_json_path`, shared with
-        :meth:`find_by_local_uuid`).
+        Python attribute ``key_value_store``).
+
+        The dynamic, caller-supplied ``key`` is matched via a table-valued
+        ``json_each`` over the FIXED, quote-free parent path
+        ``$.steps[0].body.value.metadata.keyValueStore``, binding the key
+        and value as ordinary parameters (``je.key = ?`` and
+        ``je.value = ?``). The user key therefore NEVER enters a JSON-path
+        expression. This deliberately avoids interpolating the key into a
+        quoted JSON-path label: older SQLite (the CI/deploy version, < ~3.50)
+        cannot parse an escaped ``\\"`` inside a quoted label, so a
+        quote-bearing KVS key (e.g. ``q"uote``) would otherwise silently miss
+        the lookup (memory ``sqlite-jsonpath-quote-escape-version-skew``;
+        proven on SQLite 3.43.2 and 3.50.4). ``json_each.value`` returns the
+        JSON leaf as a SQL TEXT value for string leaves, so ``je.value = ?``
+        is the same TEXT equality the prior ``json_extract(...) = ?`` ran; a
+        missing parent path yields zero rows (a clean empty result).
+
+        :meth:`find_by_local_uuid` still uses the quoted-label
+        :func:`_metadata_kvs_json_path` form, but with a fixed, quote-free
+        pinned key, so it is unaffected by the version skew.
         """
         conn = self._read_connection()
-        json_path = _metadata_kvs_json_path(key)
-        params: list[Any] = [json_path, value]
-        sql = "SELECT * FROM uploads WHERE json_extract(chain_envelope_json, ?) = ? "
+        params: list[Any] = [key, value]
+        sql = (
+            "SELECT u.* FROM uploads u, "
+            "json_each(u.chain_envelope_json, "
+            "'$.steps[0].body.value.metadata.keyValueStore') je "
+            "WHERE je.key = ? AND je.value = ? "
+        )
         if instance is not None:
-            sql += "AND instance_id = ? "
+            sql += "AND u.instance_id = ? "
             params.append(instance)
         sql += "LIMIT ?"
         params.append(limit)
@@ -1764,8 +1784,10 @@ class SqliteUploadStore:
             )
             await conn.commit()
         # The in-lock precheck guarantees the row exists and is in one of
-        # the seven non-attempting states, all of which the UPDATE's state
-        # predicate covers, so the write cannot have missed.
+        # the seven replay-eligible states the UPDATE's IN-predicate covers
+        # (every non-attempting state EXCEPT the body-released ``expired``,
+        # ADR-032, which the body-discard precheck already refuses), so the
+        # write cannot have missed.
         row = await self.get(chain_id)
         if row is None:
             raise KeyError(f"No upload row for chain_id={chain_id}")

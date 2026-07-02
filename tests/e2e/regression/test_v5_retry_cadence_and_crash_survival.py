@@ -49,7 +49,7 @@ from tests.e2e._harness.subprocess_harness import (
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.e2e]
 
-_TERMINAL = {"stored", "failed", "cancelled", "succeeded", "corrupted", "auth_expired"}
+_TERMINAL = {"stored", "failed", "cancelled", "succeeded", "corrupted", "expired", "auth_expired"}
 
 
 async def _poll(

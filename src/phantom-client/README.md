@@ -1,26 +1,27 @@
-# `phantom-client` — generic Python SDK for Phantom
+# `phantom-client`: generic Python SDK for Phantom
 
 A thin async HTTP client over Phantom-the-service's `POST /v1/send`
 ingress, the `X-Phantom-*` response headers, the admin API surface
-(chains, tokens, status, export.tar, observability, quarantine,
-reload), and the chain-status poller.
+(chains, tokens, destination SigV4 credentials, status, export.tar,
+observability, quarantine), and the chain-status poller.
 
 **What it is.** A typed Python facade so applications can submit
 chain envelopes and observe Phantom's admin surface without
 hand-rolling httpx + ADR-010 model duplication.
 
 **Audience.** Integrators building applications on top of Phantom.
-This package has no organization-internal dependencies — runtime
-deps are exactly `httpx>=0.23.3` and `pydantic>=2`. Publishable to
-public PyPI.
+This package has no organization-internal dependencies. Runtime
+deps are exactly `httpx>=0.23.3,<0.24` and `pydantic>=2`. Publishable
+to public PyPI.
 
 ## Install
 
 ```bash
-pip install phantom-client
-# or
-uv add phantom-client
+# From the repo root:
+pip install ./src/phantom-client
 ```
+
+The package is not yet published to public PyPI.
 
 Runtime requires Python 3.12+.
 
@@ -116,7 +117,7 @@ src/phantom_client/
 │                          # poll_group_until_finished
 ├── transport.py           # single HTTP source of truth (httpx.AsyncClient)
 │                          # `_build_multipart` assigns a non-empty filename
-│                          # to every part — load-bearing for the
+│                          # to every part: load-bearing for the
 │                          # transparent-proxy invariant on bodies with
 │                          # bytes >= 0x80
 ├── headers.py             # X-Phantom-* constants + build_request_headers
@@ -126,22 +127,34 @@ src/phantom_client/
 │                          # (ChainAdminDetail / GroupStatusResponse)
 └── models/
     ├── chain.py           # ADR-010 envelope shapes (byte-identical to
-    │                      # phantom.models.chain — contract-tested)
+    │                      # phantom.models.chain; contract-tested)
     │                      # Includes ChainCapture.sensitive: bool
     ├── status.py          # UploadRow, TERMINAL_STATES (poll_until stop-set),
     │                      # SortKey, TokenSlot, StatsResponse
     ├── admin.py           # filter and response models, plus ChainAdminDetail
     │                      # (admin-only; outside the contract test)
+    │                      # Credential-push bodies: SigningService,
+    │                      # SigV4StaticCredBody, ProfileRefCredBody,
+    │                      # CredentialPushBody (mirror the server per ADR-012)
     └── envelope.py        # ResponseHeaders parser
 ```
 
 ## Public surface
 
-Everything re-exported from `phantom_client.__init__`:
-`PhantomClient`, `ClientConfig`, every ADR-010 model, every error
-class, `ChainAdminDetail`. `Transport` is internal-only.
+`phantom_client.__init__` re-exports the full public surface (79
+names): `PhantomClient`; the config types (`ClientConfig`,
+`Timeouts`, `RetryPolicy`, `SubmitOptions`); every ADR-010 model;
+the status and admin models (`TERMINAL_STATES`, `UploadRow`,
+`ChainAdminDetail`, the response models, the admin filters); every
+error class plus the `EXCEPTION_FOR_CODE` map; the credential-push
+bodies (`SigningService`, `SigV4StaticCredBody`,
+`ProfileRefCredBody`, `CredentialPushBody`); the `X-Phantom-*`
+header constants with `build_request_headers` /
+`parse_response_headers`; and the pollers (`poll_until`,
+`poll_group_until_finished`). `Transport` is internal-only.
 
-`submit_chain` is the only chain-submission method.
+`submit_chain` is the only chain-submission method;
+`push_credential` provisions a destination SigV4 credential (below).
 
 ## Behaviors worth knowing
 
@@ -153,18 +166,26 @@ class, `ChainAdminDetail`. `Transport` is internal-only.
 - **Retries are transport-class only.** The SDK retries on
   `httpx.ConnectError`, `httpx.ReadTimeout`, `httpx.WriteTimeout`,
   and `httpx.PoolTimeout` up to `RetryPolicy.max_attempts`. It
-  **never retries 4xx/5xx** — Phantom IS the retry engine. Every
+  **never retries 4xx/5xx**. Phantom IS the retry engine. Every
   attempt carries the same `X-Phantom-Idempotency-Key` (defaults
   to `str(envelope.chain_id)`) so Phantom dedupes if it actually
   received the earlier attempt.
 - **`TERMINAL_STATES`** is the default stop-set for `poll_until` and
   covers every terminal `ChainState`: `succeeded`, `failed`, `stored`,
-  `cancelled`, `corrupted` (reached on body-verification failure;
-  Phantom never retries it), and `auth_expired`.
+  `cancelled`, `expired`, `corrupted` (reached on body-verification
+  failure; Phantom never retries it), and `auth_expired`.
   To poll *through* `auth_expired`, pass
   `terminal_states=frozenset({"succeeded", "failed"})`.
 - **No bearer values in admin responses.** `TokenSlot` carries
   `endpoint`, `uid`, `last_updated`, `status` only.
+- **Destination SigV4 credentials.** `push_credential(dest_host=...,
+  credential=...)` provisions a host-keyed SigV4 credential by issuing
+  `PUT /v1/admin/credentials/{dest_host}`, the SigV4 analogue of
+  `push_token`. The secret is never returned (the server replies `204`)
+  and there is no list-credentials read (no server endpoint). Construct
+  the body (`SigV4StaticCredBody` or `ProfileRefCredBody`) with a
+  `SigningService` **member** (e.g. `service=SigningService.S3`), not a
+  raw string: the client model is strict and has no coercer.
 - **One base URL.** Intake, admin, and health all ride `phantom_url`;
   Phantom serves them on a single listener (loopback by default per
   ADR-004), so there is no separate admin URL to configure.
@@ -177,12 +198,12 @@ Imported from `phantom_client.errors`:
 - **Transport-class** (retry-eligible by the SDK):
   `PhantomTransportError` (base), `PhantomConnectError`,
   `PhantomTimeoutError`, `PhantomNetworkError`.
-- **HTTP-class** (NOT retried by the SDK — Phantom IS the retry
+- **HTTP-class** (NOT retried by the SDK; Phantom IS the retry
   engine): `PhantomHttpError` (base) and per-status subclasses
   `PhantomBadRequestError` (400), `PhantomUnauthorizedError` (401),
   `PhantomNotFoundError` (404), `PhantomConflictError` (409),
   `PhantomPayloadTooLargeError` (413), `PhantomUnprocessableError`
-  (422), `PhantomValidationError` (422 — envelope_invalid /
+  (422), `PhantomValidationError` (422: envelope_invalid /
   body_ref_*), `PhantomRateLimitedError` (429),
   `PhantomServerError` (5xx), `PhantomUnavailableError` (503).
 - **SDK-side validation errors**: `PhantomEnvelopeError`
@@ -196,7 +217,8 @@ upstream repository) for the authoritative `error.code` →
 ## Tests
 
 ```bash
-cd src/phantom-client && uv run pytest
+# From the workspace root:
+uv run pytest src/phantom-client/tests
 ```
 
 Runs in well under a second against `httpx.MockTransport`.

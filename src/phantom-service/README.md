@@ -1,13 +1,13 @@
-# `phantom` — the buffering upload-proxy service
+# `phantom`: the buffering upload-proxy service
 
 FastAPI + asyncio service. Single Python process per host. Generic
-buffering HTTP proxy with **zero upstream-specific knowledge** — owns
+buffering HTTP proxy with **zero upstream-specific knowledge**. It owns
 the wire protocol, every model, every header, every error code.
 
 **What it is.** Phantom accepts a multi-step HTTP "chain envelope"
 (`ChainEnvelope` per ADR-009/010), acks fast with HTTP 202 + a
 synthetic `ChainResponse`, persists the body locally (RAM, disk, or
-a hybrid of the two — operator chooses), and runs the actual
+a hybrid of the two; the operator chooses), and runs the actual
 upstream calls in the background with retries and token refresh.
 
 **Audience.** Operators deploying Phantom on producers and developers
@@ -16,17 +16,18 @@ working on the service itself. SDK integrators read the
 
 **Distribution.** Two artifacts:
 
-- **Container image** (the production artifact) — single Wolfi
+- **Container image** (the production artifact): single Wolfi
   multi-arch image at `src/phantom-deploy/Dockerfile`. See
   [ADR-020](../../docs/adr/020-container-image-as-deployment-artifact.md).
-- **PyPI wheel** — `phantom-service` (the import name `phantom` was
+- **PyPI wheel**: `phantom-service` (the import name `phantom` was
   already taken). Suitable for in-process embedding or local dev.
 
 ## Install / build / run
 
 ```bash
-# From the workspace root — local dev:
-uv sync
+# From the workspace root. Local dev:
+uv sync --all-packages
+cp config/phantom.yaml.example config/phantom.yaml   # first run only
 uv run python -m phantom --config config/phantom.yaml
 
 # Container build (multi-arch):
@@ -40,7 +41,7 @@ docker buildx build \
 docker run \
   -v /var/lib/phantom:/var/lib/phantom \
   -v $(pwd)/config/phantom.yaml:/etc/phantom/phantom.yaml \
-  phantom-service:dev
+  phantom-service:dev -c /etc/phantom/phantom.yaml
 ```
 
 See [`config/phantom.yaml.example`](../../config/phantom.yaml.example)
@@ -52,15 +53,21 @@ for the full operator-facing configuration reference.
 src/phantom/
 ├── __init__.py
 ├── __main__.py            # `python -m phantom --config <path>`
-├── app.py                 # FastAPI factory + composition root — its lifespan
+├── app.py                 # FastAPI factory + composition root; its lifespan
 │                          # is the SOLE site that spawns every long-lived
 │                          # coroutine, under one asyncio.TaskGroup; runs the
 │                          # boot guards (startup_checks) before workers start
 ├── runtime/
-│   └── startup_checks.py  # boot-time guards the lifespan runs (umask,
-│                          # retention-floor, instance-isolation, all_ram mode
-│                          # guard, Phase 4 integrity gate) + the one shared
-│                          # build_body_store mode table
+│   ├── lock_retry.py      # bounded retry-with-backoff for transient SQLite
+│   │                      # locks at boot (recovery writes + database open)
+│   ├── reload.py          # hot-reload engine (SIGHUP + POST /v1/admin/reload
+│   │                      # both funnel through apply_reload)
+│   ├── startup_checks.py  # boot-time guards the lifespan runs (umask,
+│   │                      # retention-floor, instance-isolation, all_ram mode
+│   │                      # guard, Phase 4 integrity gate) + the one shared
+│   │                      # build_body_store mode table
+│   └── tls_cert.py        # startup TLS cert lifecycle (operator-supplied PEM
+│                          # pair or auto-gen self-signed; resolve_tls_paths)
 ├── models/                # Pydantic v2 wire and persistence types
 │                          # (ChainEnvelope family; UploadRow with body_location
 │                          # column + body_hashes; ErrorBody / ErrorEnvelope;
@@ -70,42 +77,59 @@ src/phantom/
 │   ├── probe.py           #   MachineFacts + psutil/shutil probe
 │   ├── defaults.py        #   ResolvedDefaults from probe
 │   └── ad_mint.py         #   typed AdMintConfig
-├── storage/               # SQLite stores: uploads.db + token_cache.db (ADR-030)
+├── storage/               # SQLite stores: uploads.db + token_cache.db
+│                          # + credential_store.db (ADR-030)
+│   ├── interface.py       #   UploadStore / BodyStore / TokenCache Protocols
 │   ├── sqlite_store.py    #   SqliteUploadStore (insert_with_idempotency_claim
 │   │                      #   is the atomic admission writer per ADR-019)
+│   ├── token_cache.py     #   SqliteTokenCache (own DB file: token_cache.db)
+│   ├── credential_store.py #   host-keyed destination SigV4 credential store
+│   │                      #   (own DB file: credential_store.db)
 │   ├── ram_body_store.py  #   RamBodyStore
 │   ├── file_body_store.py #   FileBodyStore (atomic rename + fsync file + parent)
 │   ├── hybrid_body_store.py #   HybridBodyStore (Ram+File composition)
 │   ├── integrity.py       #   Phase 4 PRAGMA integrity_check + quarantine
+│   ├── timestamps.py      #   UTC Z-suffix timestamps for backup + quarantine
+│   │                      #   artifact names
 │   ├── errors.py          #   StorageCorruptionError, CodecRoundTripDriftError,
 │   │                      #   BodyMissingError
 │   └── schema.sql         #   body_location ENUM('ram','file') + body_hashes_json
 ├── compression/           # BodyCodec Protocol + zstd / gzip / passthrough
 ├── chain/                 # JSONPath wrapper, envelope parser, ChainExecutor
 │                          # (discriminated-union result types; exhaustive by mypy)
+│                          # sigv4_signer.py: the aws_sigv4 re-sign arm
+│                          # (SigningService -> botocore signer dispatch)
 ├── transport/             # UpstreamClient Protocol + httpx impl
-├── refresh/               # AdMinter — supervised by app.py's lifespan TaskGroup (Phase 2 H6)
+├── refresh/               # AdMinter, supervised by app.py's lifespan TaskGroup (Phase 2 H6)
 ├── strategies/            # UploadStrategy Protocol + two retry schedulers
 ├── routing/               # resolve_route(url, instance_cfg) function
+│                          # auth_mode is 3-valued: phantom_bearer / none / aws_sigv4
 ├── instances/             # InstanceContext / InstanceDispatcher /
 │                          # InstanceSettingsSnapshot / SettingsHolder
 ├── workers/               # All supervised by app.py's lifespan TaskGroup:
-│                          #   Sender, Reaper, AuthKicker, VacuumScheduler,
+│                          #   Sender, Reaper, AuthKicker (bearer), VacuumScheduler,
+│                          #   CredentialKicker (credential_kicker.py: wakes
+│                          #   auth_expired aws_sigv4 rows on a fresh cred push),
 │                          #   SaturationGate, PersistController (sole
 │                          #   body_location='file' writer per invariant #6),
 │                          #   RamPressureWatcher, BodyOrphanJanitor,
 │                          #   DiskPressureProbe, InvariantAuditor (Phase 3),
 │                          #   ColdBackupScheduler (Phase 4 optional),
-│                          #   run_recovery (boot-time five-step sweep)
+│                          #   run_recovery (boot sweep, two actions: reset
+│                          #   attempting to queued; quarantine missing-body rows)
 ├── observability/         # logging.py (bearer redaction; SensitiveCaptureRedactor)
-│                          # metrics.py (Phase 3 — in-process counter + gauge
+│                          # metrics.py (Phase 3: in-process counter + gauge
 │                          # registry surfaced via /v1/admin/observability/*)
 └── routes/
-    ├── send.py            # POST /v1/send (under 100 lines —
+    ├── send.py            # POST /v1/send (under 100 lines;
     │                      # check_post_send_size.py asserts)
-    ├── admission.py       # admit_chain — atomic admission via
+    ├── admission.py       # admit_chain: atomic admission via
     │                      # insert_with_idempotency_claim (ADR-019, Phase 1 H7)
     ├── admin.py           # GET/POST/PUT/DELETE /v1/admin/*
+    ├── health.py          # GET /v1/healthz (liveness) + GET /v1/readyz (readiness)
+    ├── catch_all.py       # PUT|POST|PATCH /{phantom_path:path} raw-intake /
+    │                      # fake-S3 (stock-SDK ingress; ?phantom= / default target)
+    ├── _version.py        # API_VERSION "v1": single source of the /v1 router prefixes
     └── envelope.py
 ```
 
@@ -117,7 +141,9 @@ for in-process consumers (use `phantom-client` for that).
 ### The single listener (`bind_tcp`, default `127.0.0.1:8080`)
 
 The deployment is same-machine-only, so ONE listener serves intake, admin,
-and health on one socket (loopback by default).
+and health on one socket (loopback by default). Set `server.tls.enabled:
+true` to flip that same listener to HTTPS (no second socket). It uses an
+auto-gen self-signed cert or an operator-supplied PEM pair.
 
 | Endpoint | Purpose |
 |---|---|
@@ -136,7 +162,7 @@ The bind knobs are restart-required.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /v1/admin/status` | Aggregate process status — resolved defaults, observed machine facts. |
+| `GET /v1/admin/status` | Aggregate process status: resolved defaults, observed machine facts. |
 | `GET /v1/admin/stats` | Aggregate counts (per-state row tallies). |
 | `GET /v1/admin/instances` | List configured instances + per-instance summary. |
 | `GET /v1/admin/instances/{id}/status` | Per-instance status. |
@@ -153,10 +179,10 @@ The bind knobs are restart-required.
 | `POST /v1/admin/chains/{chain_id}/cancel` | Cancel a single (non-terminal) chain → `cancelled`. |
 | `DELETE /v1/admin/chains/{chain_id}` | Hard delete one chain + its body. |
 | `DELETE /v1/admin/chains` | Bulk delete by filter (rejects empty filters; C1 closure includes body-file deletion). |
-| `GET /v1/admin/tokens` | List token slots (no bearer values returned - ADR-004). |
-| `GET /v1/admin/tokens/{endpoint}/{uid}` | Token slot status (no bearer values returned - ADR-004). |
+| `GET /v1/admin/tokens` | List token slots, optionally filtered by `?endpoint=` (no bearer values returned - ADR-004). |
 | `PUT /v1/admin/tokens*` | Push a token into the cache (per-slot, per-endpoint, or all; admin override). |
-| `DELETE /v1/admin/tokens*` | Token cache removal (per-slot, per-endpoint, or all). |
+| `DELETE /v1/admin/tokens*` | Token cache invalidation (per-slot or all): slots are marked `bad` and preserved (ADR-003), not deleted. |
+| `PUT /v1/admin/credentials/{dest_host}` | Push a destination SigV4 credential into the host-keyed store (per-host; resolved literals; `204`, secret never echoed). No GET/LIST credential endpoint exists (unlike tokens). |
 | `GET /v1/admin/observability/counters` | All counters from MetricsRegistry (Phase 3). |
 | `GET /v1/admin/observability/gauges` | All gauges. |
 | `GET /v1/admin/observability/ram_pressure` | RAM-pressure snapshot. |
@@ -186,7 +212,8 @@ exception class for each.
 ## Tests
 
 ```bash
-cd src/phantom-service && uv run pytest
+# From the workspace root:
+uv run pytest src/phantom-service/tests
 ```
 
 Per-package unit + integration tests. `mypy --strict` clean
@@ -206,7 +233,7 @@ uv run scripts/check_atomic_admission.py      # admission uses insert_with_idemp
 
 ## See also
 
-- [docs/architecture-intent.md](../../docs/architecture-intent.md) — onboarding map.
-- [docs/operator-playbook.md](../../docs/operator-playbook.md) — deployment + recovery.
-- [CONTEXT.md](../../CONTEXT.md) — domain glossary.
-- [docs/adr/](../../docs/adr/) — settled decisions.
+- [docs/architecture-intent.md](../../docs/architecture-intent.md): onboarding map.
+- [docs/operator-playbook.md](../../docs/operator-playbook.md): deployment + recovery.
+- [CONTEXT.md](../../CONTEXT.md): domain glossary.
+- [docs/adr/](../../docs/adr/): settled decisions.

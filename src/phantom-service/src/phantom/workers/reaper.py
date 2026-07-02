@@ -161,6 +161,14 @@ class Reaper:
                 cfg.corrupted_metadata_seconds,
                 cfg.corrupted_body_seconds,
             ),
+            # ADR-032: the body is already discarded at the transition to
+            # ``expired`` (expired_body_seconds defaults to 0), so this row
+            # only sweeps the retained metadata after expired_metadata_seconds.
+            (
+                "expired",
+                cfg.expired_metadata_seconds,
+                cfg.expired_body_seconds,
+            ),
         )
         for state, metadata_seconds, body_seconds in retention_table:
             # Sweep-time guard (strategy D5): every window consulted here

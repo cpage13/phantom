@@ -8,6 +8,8 @@ import logging
 from datetime import UTC, datetime
 
 from phantom.instances.context import InstanceContext
+from phantom.workers._expire import expire_row
+from phantom.workers._kicker_auth_mode import row_resolved_route
 from phantom.workers.saturation import AdmissionGranted
 
 logger = logging.getLogger(__name__)
@@ -107,6 +109,61 @@ class AuthKicker:
                 # ``replay``'s up-front refusal: leave the row parked in
                 # ``auth_expired`` until the metadata-retention pass
                 # reaps it.
+                continue
+            # auth_mode GUARD (plan §2.5): with the CredentialKicker live, both
+            # kickers walk the SAME auth_expired rows on the SAME saturation
+            # gate. Each must wake ONLY rows of its kind, or the two would
+            # double-admit one row and race the auth_expired→queued requeue.
+            # Placed AFTER the cheap state + body_discarded_at filters (a
+            # discarded/non-parked row is skipped before any resolve) and
+            # BEFORE the freshness gate. ``row_resolved_route`` resolves the
+            # PERSISTED ``row.endpoint`` through ``resolve_route`` — the only
+            # raising call in the copied loop (resolve_route raises ValueError
+            # on no-match, e.g. a route removed by hot-reload between park and
+            # wake). Wrap it per row and SKIP on raise: a single un-routable
+            # parked row must NOT abort the rescan pass (which would strand
+            # every row ordered behind it forever under the 1 s rescan). One
+            # resolve feeds BOTH the auth_mode partition and the deadline sweep.
+            try:
+                resolved = row_resolved_route(row, self._instance)
+            except ValueError:
+                logger.warning(
+                    "AuthKicker: no route matches endpoint=%s for chain_id=%s; "
+                    "skipping this row (left in auth_expired for the next rescan)",
+                    row.endpoint,
+                    row.chain_id,
+                )
+                continue
+            if resolved.auth_mode != "phantom_bearer":
+                # NOT my kind — the CredentialKicker (aws_sigv4) or no kicker
+                # ("none") owns this row.
+                continue
+            # Send-deadline SWEEP (ADR-032 — the suspenders to the executor gate's
+            # belt). A phantom_bearer row parked in auth_expired awaiting a token
+            # re-push that NEVER comes has no other backstop: this kicker either
+            # wakes it (slot fresh) or leaves it parked forever. Placed AFTER the
+            # auth_mode guard (so it only sweeps rows this kicker owns) and BEFORE
+            # the freshness gate (so an over-deadline row gives up even while its
+            # slot is still bad/absent — the whole point is it has waited too
+            # long). The shared expire_row writer flips it terminal-``expired``
+            # and discards the body; the row then drops out of the next
+            # list_non_terminal (it is now in TERMINAL_STATES), so it is never
+            # woken. ``release_saturation=False``: this parked ``auth_expired``
+            # row's slot was ALREADY released at park (``_on_auth_failure``), so
+            # the writer must NOT re-release it (a double-free that transiently
+            # under-counts in_flight and over-admits past the cap). ``continue``
+            # — do not fall through to the wake.
+            deadline = resolved.send_deadline_seconds
+            if deadline is not None and (now - row.received_at).total_seconds() > deadline:
+                await expire_row(
+                    self._instance.store,
+                    self._instance.saturation,
+                    row,
+                    expected_state="auth_expired",
+                    last_error=f"send_deadline:{deadline}s",
+                    upstream_status=None,
+                    release_saturation=False,
+                )
                 continue
             slot = await self._instance.token_cache.get(row.endpoint, row.uid)
             if slot is None or slot.status != "fresh":

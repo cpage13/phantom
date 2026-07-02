@@ -398,6 +398,9 @@ def check_retention_floor(settings: Settings) -> None:
             retention.auth_expired_metadata_seconds,
         ),
         ("corrupted", retention.corrupted_body_seconds, retention.corrupted_metadata_seconds),
+        # NB: this list is (state, body, metadata) — OPPOSITE of the reaper's
+        # (state, metadata, body). ADR-032's ``expired`` pair, in THIS order:
+        ("expired", retention.expired_body_seconds, retention.expired_metadata_seconds),
     ]
     for state, body_seconds, metadata_seconds in retention_pairs:
         # Validator guarantees every retention field is non-None

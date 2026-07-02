@@ -175,6 +175,35 @@ class UpstreamCfg(BaseModel):
     )
 
 
+class S3Cfg(BaseModel):
+    """Known SigV4 test credentials the path-style PUT/GET validates against.
+
+    The validator (:func:`phantom_emulator.routers.s3._verify_sigv4`)
+    recomputes the inbound SigV4 signature and compares. It consumes
+    ``access_key_id`` (the credential-id equality check),
+    ``secret_access_key`` (the recompute key), and ``body_max_bytes``
+    (the 413 cap). ``region`` / ``service`` document the expected
+    credential scope but are NOT consumed by the recompute — the
+    request's own credential scope drives the comparison.
+
+    Defaults are the public AWS-doc example pair so a test that signs
+    client-side with the same pair round-trips with zero overlay.
+    Env-overridable via ``PHANTOM_EMULATOR_S3__SECRET_ACCESS_KEY=…``
+    (the ``__`` nested delimiter).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    access_key_id: str = Field("AKIAIOSFODNN7EXAMPLE", description="Known test access key id.")
+    secret_access_key: str = Field(
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        description="Known test secret access key (the AWS-doc example pair).",
+    )
+    region: str = Field("us-east-1", description="Expected credential-scope region.")
+    service: str = Field("s3", description="Expected credential-scope service.")
+    body_max_bytes: int = Field(DEFAULT_BODY_MAX_BYTES, ge=1, description="Per-PUT body cap.")
+
+
 class FailureInjectionCfg(BaseModel):
     """Static failure-injection defaults loaded from YAML.
 
@@ -241,6 +270,10 @@ class AppConfig(BaseSettings):
     upstream: UpstreamCfg = Field(
         default_factory=UpstreamCfg,  # type: ignore[arg-type]
         description="Upstream-facing knobs (presigned TTL, body cap, idempotency window).",
+    )
+    s3: S3Cfg = Field(
+        default_factory=S3Cfg,  # type: ignore[arg-type]
+        description="Known SigV4 test creds + region/service for the path-style S3 sink.",
     )
     failure_injection: FailureInjectionCfg = Field(
         default_factory=FailureInjectionCfg,

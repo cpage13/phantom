@@ -279,7 +279,7 @@ def test_chain_state_members_match() -> None:
 
     The two packages may use different declaration syntax for ``ChainState``
     (``TypeAlias`` vs PEP-695 ``type X = ...``); the helper unwraps both
-    forms. What matters for the wire is that the same seven state strings
+    forms. What matters for the wire is that the same nine state strings
     appear in both.
     """
     s_members = _chain_state_members(service_chain)

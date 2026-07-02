@@ -75,6 +75,7 @@ _ALL_STATES: tuple[str, ...] = (
     "stored",
     "cancelled",
     "corrupted",
+    "expired",
 )
 
 
@@ -823,7 +824,7 @@ async def test_group_rollup_correct_at_a_few_hundred_members(
     body = client.get(f"/v1/admin/groups/{group}").json()
     assert body["total"] == _BOUND_TOTAL
     assert len(body["members"]) == _BOUND_TOTAL
-    # The histogram carries the COMPLETE eight-state vocabulary, zeros
+    # The histogram carries the COMPLETE nine-state vocabulary, zeros
     # included (the absent states are an explicit 0, never omitted).
     assert body["counts_by_state"] == {
         "queued": _BOUND_QUEUED,
@@ -834,6 +835,7 @@ async def test_group_rollup_correct_at_a_few_hundred_members(
         "cancelled": 0,
         "auth_expired": _BOUND_AUTH_EXPIRED,
         "stored": 0,
+        "expired": 0,
     }
     assert body["all_finished"] is False, "a queued tail means the group is still moving"
     expected_last_sent = max(row.sent_at for row in members if row.sent_at is not None)

@@ -1,4 +1,4 @@
-"""Regression suite — one test per Critical/High audit ID.
+"""Regression suite: one test per Critical/High audit ID.
 
 Each test under this directory is a regression for one specific
 audit closure. Adding to ``COVERAGE.md`` is mandatory whenever a

@@ -5,6 +5,13 @@ description = "Emulation server for Phantom E2E testing — mock upstream file-u
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    # Lower+upper bound: the emulator's SigV4 validator (routers/s3.py) leans on
+    # private SigV4Auth internals (canonical_request reading X-Amz-Content-SHA256,
+    # the lower-level methods reading context['timestamp'], the module-level
+    # SIGNED_HEADERS_BLACKLIST) that have shifted across botocore releases. The
+    # Phase 0 unit tier (tests/unit/test_s3_router.py) is the canary: a bump that
+    # changes that call surface goes red on the bump, not silently in production.
+    "botocore>=1.43.36,<1.44",
     "cryptography>=48.0.0",
     "fastapi>=0.136.1",
     "pydantic>=2",

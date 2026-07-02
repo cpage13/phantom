@@ -38,6 +38,7 @@ from phantom.chain.executor import (
     Failed5xx,
     FailedAuth,
     FailedNetwork,
+    SendDeadlineExpired,
     Succeeded,
     TemplateUnresolved,
 )
@@ -51,6 +52,7 @@ from phantom.storage.errors import (
     StorageCorruptionError,
 )
 from phantom.storage.interface import UploadStore
+from phantom.workers._expire import expire_row
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +250,9 @@ class Sender:
         if isinstance(result, Failed4xx):
             await self._on_terminal_failure(store, row, last_error=f"4xx_status_{result.status}")
             return
+        if isinstance(result, SendDeadlineExpired):
+            await self._on_send_deadline_expired(store, row, result)
+            return
         if isinstance(result, (Failed5xx, FailedNetwork, CaptureIncomplete)):
             # CaptureIncomplete (finding R7-5-B): a 2xx whose body was missing a
             # required downstream capture is RETRYABLE — the same step re-runs
@@ -255,6 +260,15 @@ class Sender:
             # the capture. Shares the retry/exhaust→stored path with 5xx/network.
             await self._on_retryable_failure(store, row, result)
             return
+        # Exhaustiveness tail (ADR-032): this dispatch is a fall-through
+        # ``isinstance`` chain with NO static ``assert_never`` (the executor's
+        # ``ExecuteStepResult`` union is not statically checked at THIS site —
+        # only its ``auth_mode`` dispatch is). A result member added to the union
+        # without an arm above would otherwise fall through and return ``None``
+        # silently, leaving the row wedged in ``attempting`` still holding a
+        # saturation slot (executor.py "invariant #1 bent"). Crash loudly instead
+        # so a forgotten handler is a visible failure, not a stuck row.
+        raise AssertionError(f"unhandled ExecuteStepResult: {type(result).__name__}")
 
     async def _on_succeeded(self, store: UploadStore, row: UploadRow, result: Succeeded) -> None:
         """Persist a successful-step result.
@@ -583,6 +597,29 @@ class Sender:
                 row.uid,
                 exc_info=True,
             )
+
+    async def _on_send_deadline_expired(
+        self, store: UploadStore, row: UploadRow, result: SendDeadlineExpired
+    ) -> None:
+        """Give up on a claimed row past its route's send-deadline (path A → ``expired``).
+
+        The executor's send-deadline gate (a') classified this ``attempting`` row
+        as over-deadline. Delegate to the shared ``expire_row`` writer (the single
+        ``new_state="expired"`` call site, ADR-032 / ADR-015) which flips the row
+        terminal-``expired``, discards the body, and releases the saturation slot
+        — passing the ``"attempting"`` CAS pre-state for this claimed-row path.
+        ``release_saturation=True``: the ``attempting`` row STILL HOLDS the slot it
+        was admitted with, so expiring it must release that slot (path A).
+        """
+        await expire_row(
+            store,
+            self._instance.saturation,
+            row,
+            expected_state="attempting",
+            last_error=f"send_deadline:{result.deadline_seconds}s",
+            upstream_status=None,
+            release_saturation=True,
+        )
 
     async def _on_retryable_failure(
         self,

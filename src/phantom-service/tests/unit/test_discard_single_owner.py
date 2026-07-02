@@ -441,15 +441,17 @@ async def test_retained_body_row_still_replays(
     assert replay_outcome.row.sent_at == row.sent_at, "replay never clears the delivery stamp"
 
 
-def test_one_definition_and_exactly_two_call_sites() -> None:
-    """Static gate: one owner, two configured triggers, no variants.
+def test_one_definition_and_exactly_three_call_sites() -> None:
+    """Static gate: one owner, three configured triggers, no variants.
 
     * the old ``discard_body`` name is gone from src (no shadow variant);
     * the ``body_discarded_at`` SET clause lives in exactly ONE store
       method (the single owner of the row-side effect);
     * ``discard_body_and_zero_accounting`` is called from exactly one
-      site in the sender and one in the reaper, and nowhere else in
-      production code.
+      site in the sender, one in the reaper, and one in the shared
+      ``expire_row`` writer (``_expire.py``, ADR-032 — the transition to
+      the ``expired`` terminal state discards the body), and nowhere else
+      in production code.
     """
     py_files = list(_SERVICE_SRC.rglob("*.py"))
     assert py_files, f"service source not found under {_SERVICE_SRC}"
@@ -470,4 +472,4 @@ def test_one_definition_and_exactly_two_call_sites() -> None:
     assert len(set_clause_hits) == 1, (
         f"body_discarded_at must have ONE SET-clause owner: {set_clause_hits}"
     )
-    assert call_sites == {"sender.py": 1, "reaper.py": 1}, call_sites
+    assert call_sites == {"sender.py": 1, "reaper.py": 1, "_expire.py": 1}, call_sites

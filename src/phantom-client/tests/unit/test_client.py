@@ -16,12 +16,19 @@ import pytest
 from phantom_client.client import PhantomClient
 from phantom_client.config import ClientConfig
 from phantom_client.errors import EmptyFilterError
-from phantom_client.models.admin import DeleteFilter, ExtractFilter
+from phantom_client.models.admin import (
+    DeleteFilter,
+    ExtractFilter,
+    ProfileRefCredBody,
+    SigningService,
+    SigV4StaticCredBody,
+)
 from phantom_client.models.chain import (
     ChainBodyJson,
     ChainEnvelope,
     ChainStep,
 )
+from pydantic import ValidationError
 
 
 def _make_envelope() -> ChainEnvelope:
@@ -465,6 +472,128 @@ async def test_invalidate_token() -> None:
     async with _client(handler) as client:
         await client.invalidate_token(endpoint="x", uid="u")
     assert captured["method"] == "DELETE"
+
+
+# ---------------------------------------------------------------------------
+# Destination credentials (SigV4 re-sign surface).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_push_credential_static_uses_put() -> None:
+    """push_credential PUTs the static body on the host-keyed slot."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = str(request.url)
+        captured["body"] = request.content.decode()
+        return httpx.Response(204)
+
+    async with _client(handler) as client:
+        await client.push_credential(
+            dest_host="s3.amazonaws.com",
+            credential=SigV4StaticCredBody(
+                access_key_id="AKIAEXAMPLE",
+                secret_access_key="wJalrSECRET",
+                region="us-east-1",
+                service=SigningService.S3,
+            ),
+        )
+    assert captured["method"] == "PUT"
+    assert "/v1/admin/credentials/s3.amazonaws.com" in captured["url"]
+    body = json.loads(captured["body"])
+    assert body["kind"] == "sigv4_static"
+    assert body["access_key_id"] == "AKIAEXAMPLE"
+    assert body["secret_access_key"] == "wJalrSECRET"
+    assert body["region"] == "us-east-1"
+    # The SigningService member serializes to its wire string.
+    assert body["service"] == "s3"
+
+
+@pytest.mark.asyncio
+async def test_push_credential_profile_ref_uses_put() -> None:
+    """push_credential PUTs the profile-ref body (the second discriminated arm)."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = str(request.url)
+        captured["body"] = request.content.decode()
+        return httpx.Response(204)
+
+    async with _client(handler) as client:
+        await client.push_credential(
+            dest_host="s3.amazonaws.com",
+            credential=ProfileRefCredBody(
+                profile="prod",
+                region="eu-west-1",
+                service=SigningService.S3,
+            ),
+        )
+    assert captured["method"] == "PUT"
+    assert "/v1/admin/credentials/s3.amazonaws.com" in captured["url"]
+    body = json.loads(captured["body"])
+    assert body["kind"] == "profile_ref"
+    assert body["profile"] == "prod"
+    assert body["region"] == "eu-west-1"
+    assert body["service"] == "s3"
+
+
+@pytest.mark.asyncio
+async def test_push_credential_quotes_dest_host() -> None:
+    """A dest_host with reserved characters is path-escaped (quote safe='')."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(204)
+
+    async with _client(handler) as client:
+        await client.push_credential(
+            dest_host="host:9000/weird",
+            credential=ProfileRefCredBody(service=SigningService.S3),
+        )
+    # ':' -> %3A and '/' -> %2F so the host is one path segment, not a sub-path.
+    assert "/v1/admin/credentials/host%3A9000%2Fweird" in captured["url"]
+
+
+def test_cred_body_rejects_raw_service_string() -> None:
+    """The N6 contract: the strict client model has NO coercer.
+
+    A raw ``service="s3"`` string is rejected (``is_instance_of`` under
+    ``strict=True``); callers MUST pass a :class:`SigningService` member, which
+    serializes back to the ``"s3"`` wire string. This pins the deliberate
+    omission of the server's ``@field_validator("service", mode="before")``.
+    """
+    with pytest.raises(ValidationError):
+        SigV4StaticCredBody(
+            access_key_id="AKIAEXAMPLE",
+            secret_access_key="wJalrSECRET",
+            region="us-east-1",
+            service="s3",  # type: ignore[arg-type]  # raw string is the rejected case
+        )
+
+    ok = SigV4StaticCredBody(
+        access_key_id="AKIAEXAMPLE",
+        secret_access_key="wJalrSECRET",
+        region="us-east-1",
+        service=SigningService.S3,
+    )
+    # The member round-trips to the wire string the server's body accepts
+    # (the two schemas are intentionally duplicated per ADR-012 — the
+    # client emits "s3", the server's coercer ingests it).
+    assert json.loads(ok.model_dump_json())["service"] == "s3"
+
+
+def test_cred_body_requires_service() -> None:
+    """``service`` is a required field — a body built without it fails client-side."""
+    with pytest.raises(ValidationError):
+        SigV4StaticCredBody(  # type: ignore[call-arg]  # missing required 'service'
+            access_key_id="AKIAEXAMPLE",
+            secret_access_key="wJalrSECRET",
+            region="us-east-1",
+        )
 
 
 # ---------------------------------------------------------------------------

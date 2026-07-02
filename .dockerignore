@@ -1,0 +1,22 @@
+# Build-context hygiene file.
+# Keeps buildkit from shipping gigabytes (.venv/, caches, etc.) to the daemon.
+# Images are clean regardless (both Dockerfiles COPY only their own src/<pkg>/);
+# this is purely build-context size/hygiene.
+.git/
+.venv/
+**/.venv/
+.secrets/
+.agent/
+dist/
+**/dist/
+**/__pycache__/
+*.pyc
+**/*.egg-info/
+node_modules/
+**/node_modules/
+.mypy_cache/
+**/.mypy_cache/
+.pytest_cache/
+**/.pytest_cache/
+.ruff_cache/
+**/.ruff_cache/

@@ -172,6 +172,101 @@ async def test_idempotency_index_cleanup(tmp_path: Path) -> None:
     assert deleted == 0
 
 
+# ====================================================================
+# ADR-032: the reaper evicts ``expired`` rows (Task 3.6 coverage). The
+# body is already discarded at the transition to ``expired``
+# (expired_body_seconds defaults to 0), so retention is purely the
+# metadata-eviction pass on expired_metadata_seconds.
+# ====================================================================
+
+
+@pytest.mark.asyncio
+async def test_expired_metadata_window_evicts_row(tmp_path: Path) -> None:
+    """An ``expired`` row past ``expired_metadata_seconds`` is evicted (row removed)."""
+    instance = await _build(
+        tmp_path,
+        retention=_full_retention(
+            expired_metadata_seconds=1,
+            expired_body_seconds=0,
+        ),
+    )
+    old = datetime.now(tz=UTC) - timedelta(seconds=10_000)
+    chain_id = uuid4()
+    # Mirror the post-``expire_row`` shape: body already discarded, size zeroed.
+    expired_row = _row(chain_id, state="expired", updated_at=old).model_copy(
+        update={"body_discarded_at": old, "body_size_bytes": 0}
+    )
+    await instance.store.insert(expired_row)
+
+    reaper = Reaper(instances=[instance])
+    await reaper._sweep_once()
+
+    assert await instance.store.get(chain_id) is None  # metadata evicted
+
+
+@pytest.mark.asyncio
+async def test_expired_metadata_window_retains_within_window(tmp_path: Path) -> None:
+    """An ``expired`` row still inside ``expired_metadata_seconds`` survives the sweep."""
+    instance = await _build(
+        tmp_path,
+        retention=_full_retention(
+            expired_metadata_seconds=10_000,
+            expired_body_seconds=0,
+        ),
+    )
+    recent = datetime.now(tz=UTC) - timedelta(seconds=10)
+    chain_id = uuid4()
+    expired_row = _row(chain_id, state="expired", updated_at=recent).model_copy(
+        update={"body_discarded_at": recent, "body_size_bytes": 0}
+    )
+    await instance.store.insert(expired_row)
+
+    reaper = Reaper(instances=[instance])
+    await reaper._sweep_once()
+
+    surviving = await instance.store.get(chain_id)
+    assert surviving is not None  # within window → retained
+    assert surviving.state == "expired"
+
+
+@pytest.mark.asyncio
+async def test_expired_body_pass_is_noop_already_discarded(tmp_path: Path) -> None:
+    """The expired body-discard pass is a no-op: the body was discarded at the transition.
+
+    ``expired_body_seconds=0`` makes the body pass eligible immediately, but the
+    row is already stamped (body discarded at the ``expire_row`` transition), so
+    ``discard_body_and_zero_accounting`` does NOT re-flip. Crucially the reaper
+    does NOT release saturation for ``expired`` (only ``stored`` releases in that
+    pass); the slot was already released — at the path-A transition or the
+    path-B park. With ``expired_metadata_seconds`` long, the metadata survives so
+    we can assert the row was left intact by the body pass.
+    """
+    instance = await _build(
+        tmp_path,
+        retention=_full_retention(
+            expired_metadata_seconds=10_000,
+            expired_body_seconds=0,
+        ),
+    )
+    recent = datetime.now(tz=UTC) - timedelta(seconds=10)
+    chain_id = uuid4()
+    stamp = recent
+    expired_row = _row(chain_id, state="expired", updated_at=recent).model_copy(
+        update={"body_discarded_at": stamp, "body_size_bytes": 0}
+    )
+    await instance.store.insert(expired_row)
+
+    reaper = Reaper(instances=[instance])
+    await reaper._sweep_once()
+
+    surviving = await instance.store.get(chain_id)
+    assert surviving is not None
+    assert surviving.state == "expired"
+    # The body pass did not re-stamp or alter the already-discarded row.
+    assert surviving.body_discarded_at == stamp
+    assert surviving.body_size_bytes == 0
+
+
 @pytest.mark.asyncio
 async def test_unresolved_metadata_window_raises_typed_error(tmp_path: Path) -> None:
     """D5: a None metadata window aborts the sweep with RetentionConfigError.

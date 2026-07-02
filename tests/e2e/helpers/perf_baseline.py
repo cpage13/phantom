@@ -1,10 +1,11 @@
 """Per-machine performance baselines: captured first, gated after.
 
 Cycle-7 plan 06_09 task 7.2. Wall-clock performance is machine-bound,
-so the regression reference is a JSON baseline PER MACHINE (keyed by a
-stable machine identity slug, with the machine's facts attached so the
-file is self-describing), stored under ``tests/e2e/perf_baselines/``
-and committed: this machine's file is the reference for this machine;
+so the regression reference is a JSON baseline PER MACHINE CLASS
+(keyed by a generic slug built from OS, CPU architecture, core count,
+and RAM size, never the hostname, with the machine's facts attached so
+the file is self-describing), stored under ``tests/e2e/perf_baselines/``
+and committed: this class's file is the reference for this machine;
 a machine without a file CAPTURES on its first run (no assertion) and
 gates from the second run on.
 
@@ -80,9 +81,13 @@ READ_LATENCY_QUANTILE: float = 0.95
 # single hyphens.
 _MACHINE_KEY_INVALID_RUNS: re.Pattern[str] = re.compile(r"[^a-z0-9]+")
 
-# Used when the hostname is empty/unresolvable; such a machine always
+# RAM-size divisor for the machine key's GiB component.
+BYTES_PER_GIB: Final[int] = 1024**3
+
+# Used when the probed facts produce an empty slug (exotic platform
+# builds where the probes return empty strings); such a machine always
 # captures into (and gates against) this shared key.
-FALLBACK_MACHINE_KEY: str = "unknown-host"
+FALLBACK_MACHINE_KEY: str = "unknown-machine"
 
 
 class MachineFacts(BaseModel):
@@ -156,13 +161,21 @@ class PerfBaseline(BaseModel):
 def machine_key() -> str:
     """Return this machine's stable identity slug.
 
-    The hostname (``platform.node()``) is the per-machine key: stable on
-    developer machines and self-assigned on CI runners (an unseen runner
-    simply captures its own baseline on first run, which is the safe
-    default). Slugged to lowercase alphanumerics and hyphens so it is a
-    valid filename stem everywhere.
+    The key derives from generic machine-class facts (OS name, CPU
+    architecture, core count, RAM size), NEVER from the hostname: this
+    slug becomes a committed filename, and hostnames routinely embed
+    usernames, hardware model names, and device serial numbers, none of
+    which belong in the tree. Machines of the same class share a key,
+    which is the intent: the baseline records what this class of
+    machine can do, and the ``facts`` block keeps the file
+    self-describing. An unseen machine class simply captures its own
+    baseline on first run, which is the safe default. Slugged to
+    lowercase alphanumerics and hyphens so it is a valid filename stem
+    everywhere.
     """
-    raw = platform.node().lower()
+    facts = collect_machine_facts()
+    ram_gib = round(facts.total_ram_bytes / BYTES_PER_GIB)
+    raw = f"{facts.os_name}-{facts.cpu_arch}-{facts.cpu_count}c-{ram_gib}g".lower()
     slug = _MACHINE_KEY_INVALID_RUNS.sub("-", raw).strip("-")
     return slug or FALLBACK_MACHINE_KEY
 

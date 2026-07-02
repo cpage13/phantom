@@ -37,12 +37,16 @@ ChainState: TypeAlias = Literal[  # noqa: UP040 — see note above
     "stored",
     "cancelled",
     "corrupted",
+    "expired",
 ]
-"""The eight canonical chain/upload states. Snake-case canonical for
+"""The nine canonical chain/upload states. Snake-case canonical for
 ``auth_expired``. There is no separate ``received`` state — ingress
 inserts directly into ``queued``. ``corrupted`` is terminal and reached
 only when body verification fails on send (storage hash mismatch or
-codec round-trip drift); never retried.
+codec round-trip drift); never retried. ``expired`` is terminal (ADR-032):
+the per-route send-deadline elapsed, so the upload is dead, the body is
+released, and the row is NEVER re-admitted — the OPPOSITE of
+``auth_expired`` (which is re-queueable once a fresh token arrives).
 """
 
 

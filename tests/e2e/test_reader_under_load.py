@@ -108,7 +108,7 @@ REAPER_DISABLED_INTERVAL_SECONDS: int = 3600
 STORM_SENDER_WORKERS: int = 4
 STORM_SENDER_POLL_MS: int = 50
 
-# The eight canonical states; every read's state field must be one.
+# The nine canonical states; every read's state field must be one.
 VALID_STATES: frozenset[str] = frozenset(
     {
         "queued",
@@ -119,6 +119,7 @@ VALID_STATES: frozenset[str] = frozenset(
         "stored",
         "cancelled",
         "corrupted",
+        "expired",
     }
 )
 

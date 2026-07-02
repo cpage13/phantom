@@ -7,12 +7,23 @@ literal each ``_on_*`` handler writes (after the refactor that eliminated
 intermediate variables in ``_on_succeeded``), and asserts:
 
   (a) Every ChainState value that the SENDER is responsible for
-      writing has at least one incoming edge in ``workers/sender.py``.
+      writing has at least one incoming edge in ``workers/sender.py``
+      OR the shared ``workers/_expire.py`` leaf module.
   (b) Every non-terminal state has at least one outgoing reader
       somewhere under ``workers/``.
 
+The incoming-edge scan (a) walks ``workers/sender.py`` AND
+``workers/_expire.py`` because the ``expired`` transition (ADR-032) is the
+one sender-owned state whose ``new_state="expired"`` literal lives outside
+``sender.py``: it is centralised in the shared ``expire_row`` leaf module
+that both the sender give-up path and the kicker sweeps delegate to, so the
+one-writer-per-effect discipline (ADR-015) is preserved while spanning two
+callers. ``expired`` stays OUT of ``_SENDER_EXCLUDES`` — it is genuinely
+sender-owned via the delegated writer; excluding it would hide a missing
+writer rather than locate it.
+
 States explicitly NOT written by the sender (and so excluded from
-the incoming-edge invariant for this file):
+the incoming-edge invariant for these files):
   - 'attempting' — written by ``storage.claim_due`` (memory/disk store
     transition queued→attempting); the sender's role is to advance
     from attempting, not enter it.
@@ -72,15 +83,22 @@ def _extract_new_state_writes(source: str) -> set[str]:
 
 
 def test_every_sender_owned_state_has_incoming_edge() -> None:
-    """Each ChainState the sender owns shows up as a ``new_state=`` literal."""
-    sender_path = Path(__file__).parent.parent.parent / "src" / "phantom" / "workers" / "sender.py"
-    written_states = _extract_new_state_writes(sender_path.read_text())
+    """Each ChainState the sender owns shows up as a ``new_state=`` literal.
+
+    Scans ``sender.py`` AND ``_expire.py``: the ``expired`` transition
+    (ADR-032) is sender-owned but its single ``new_state="expired"`` writer
+    lives in the shared ``expire_row`` leaf module, not in ``sender.py``.
+    """
+    workers_dir = Path(__file__).parent.parent.parent / "src" / "phantom" / "workers"
+    written_states: set[str] = set()
+    for module_name in ("sender.py", "_expire.py"):
+        written_states |= _extract_new_state_writes((workers_dir / module_name).read_text())
     expected = set(get_args(ChainState)) - _SENDER_EXCLUDES
     missing = expected - written_states
     assert not missing, (
         f"ChainState values the sender is responsible for but never writes: "
-        f"{sorted(missing)}. Either the sender is missing an _on_* handler, "
-        f"or the state belongs in _SENDER_EXCLUDES."
+        f"{sorted(missing)}. Either the sender (or the shared expire_row writer) "
+        f"is missing an _on_* handler, or the state belongs in _SENDER_EXCLUDES."
     )
 
 

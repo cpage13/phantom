@@ -112,6 +112,77 @@ class AcceptedBody:
     accepted_at: datetime
 
 
+# Type alias for the path-style S3 address: (bucket, key).
+S3ObjectKey = tuple[str, str]
+
+# Type alias for the full forwarded path (no leading slash) that keys the
+# auth-free /raw sink store. The path itself is the address — there is no
+# bucket/key split and no token (contrast UploadToken / S3ObjectKey).
+RawPath = str
+
+
+@dataclass
+class S3Object:
+    """A body stored by a SigV4-validated path-style upload.
+
+    Attributes:
+        bucket: First path segment of ``<verb> /{bucket}/{key}``.
+        key: Remaining path (the object key; may contain slashes).
+        method: The inbound HTTP verb that stored it — one of the
+            forwarded upload verbs (``PUT``/``POST``/``PATCH``). Captured
+            so the e2e can assert the verb round-trips through the catch-all
+            to the sink.
+        body: Raw bytes the validated upload stored (byte-identical).
+        content_type: The request ``Content-Type``, or ``None``.
+        all_headers: Every inbound header (lowercased keys, original
+            values), captured so round-trip / transparent-proxy
+            assertions can audit the envelope — mirrors
+            :attr:`AcceptedBody.all_headers`.
+        stored_at: Server-side acceptance timestamp.
+    """
+
+    bucket: str
+    key: str
+    method: str
+    body: bytes
+    content_type: str | None
+    all_headers: dict[str, str]
+    stored_at: datetime
+
+
+@dataclass
+class RawBody:
+    """A body stored by the auth-free, token-free /raw sink (TASK 0.5).
+
+    The forward-as-is Phase-1 analogue of :class:`AcceptedBody`: no token,
+    no auth — the full forwarded path itself is the key. Accepts any forwarded
+    upload verb (PUT/POST/PATCH), recording it in :attr:`method`.
+    ``all_headers`` is captured (lowercased keys, original values) so the e2e
+    can assert that ``X-Phantom-*`` headers were stripped and a benign upstream
+    header survived.
+
+    Attributes:
+        path: The full forwarded path (no leading slash) used as the store
+            key — slash-bearing keys captured whole by the ``:path``
+            convertor.
+        method: The inbound HTTP verb that stored it — one of the forwarded
+            upload verbs (``PUT``/``POST``/``PATCH``). Captured so the e2e
+            can assert the verb round-trips through the catch-all to the sink.
+        body: Raw bytes the unsigned, tokenless upload stored (byte-identical).
+        content_type: The request ``Content-Type``, or ``None``.
+        all_headers: Every inbound header (lowercased keys, original
+            values) — mirrors :attr:`AcceptedBody.all_headers`.
+        stored_at: Server-side acceptance timestamp.
+    """
+
+    path: str
+    method: str
+    body: bytes
+    content_type: str | None
+    all_headers: dict[str, str]
+    stored_at: datetime
+
+
 @dataclass
 class IdempotencyEntry:
     """A cached create-call response keyed by ``Idempotency-Key``.
@@ -154,6 +225,13 @@ class EmulatorState:
         file_id_to_token: Reverse lookup so ``GET /v1/files/{id}``
             can resolve a record minted on the create call.
         accepted_bodies: The received-body log keyed by upload token.
+        s3_objects: Path-style S3 sink store, keyed by ``(bucket, key)``;
+            populated by a SigV4-validated ``PUT /{bucket}/{key}``.
+        raw_bodies: Auth-free /raw sink store, keyed by the full forwarded
+            path; populated by an unsigned, tokenless ``PUT /raw/{path}``
+            (TASK 0.5). Distinct from ``accepted_bodies`` (token-keyed) and
+            ``s3_objects`` ((bucket, key)-keyed) so the capture paths never
+            collide.
         idempotency_cache: Idempotency dedup cache keyed by header.
         failure_state: Failure-injection policy + counters.
         auth_mode_overrides: Per-scope auth-mode overrides; absent
@@ -183,6 +261,8 @@ class EmulatorState:
     pending_uploads: dict[UploadToken, PendingUpload] = field(default_factory=dict)
     file_id_to_token: dict[UUID, UploadToken] = field(default_factory=dict)
     accepted_bodies: dict[UploadToken, AcceptedBody] = field(default_factory=dict)
+    s3_objects: dict[S3ObjectKey, S3Object] = field(default_factory=dict)
+    raw_bodies: dict[RawPath, RawBody] = field(default_factory=dict)
     accepted_idempotency_keys: dict[UploadToken, IdempotencyKey] = field(default_factory=dict)
     idempotency_cache: dict[IdempotencyKey, IdempotencyEntry] = field(default_factory=dict)
     auth_mode_overrides: dict[str, AuthMode] = field(default_factory=dict)

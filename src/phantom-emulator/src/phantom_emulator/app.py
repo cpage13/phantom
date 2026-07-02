@@ -24,6 +24,8 @@ from phantom_emulator.failure.injection import FailureInjectionState
 from phantom_emulator.failure.middleware import make_failure_middleware
 from phantom_emulator.routers import auth as auth_router
 from phantom_emulator.routers import control as control_router
+from phantom_emulator.routers import raw_sink as raw_sink_router
+from phantom_emulator.routers import s3 as s3_router
 from phantom_emulator.routers import upstream as upstream_router
 from phantom_emulator.state import EmulatorState
 
@@ -108,5 +110,22 @@ def create_app(cfg: AppConfig, state: EmulatorState | None = None) -> FastAPI:
     app.include_router(auth_router.router)
     app.include_router(upstream_router.router)
     app.include_router(control_router.router)
+    # The auth-free /raw/{path:path} sink is registered BEFORE the s3 catch-all
+    # and AFTER the literal routers. Both /raw/{path:path} and the s3
+    # /{bucket}/{key:path} are :path catch-alls, and a PUT /raw/foo matches
+    # BOTH; Starlette resolves by registration-order first-match, so only
+    # because raw_sink is registered first does /raw/* reach the auth-free sink
+    # (200) instead of the SigV4 validator (which 403s an unsigned PUT). See
+    # plan TASK 0.5 Step C.
+    app.include_router(raw_sink_router.router)
+    # The bare /{bucket}/{key:path} S3 catch-all is the most-greedy route, so
+    # it MUST be the FINAL include_router: Starlette matching is
+    # registration-order first-match, so every literal route above (and the
+    # literal-prefixed /raw/... router) wins and the catch-all only fires for
+    # paths no earlier router claimed. If this is registered earlier (or
+    # another router is added after it), the catch-all swallows /v1/files/abc
+    # as {bucket: "v1", key: "files/abc"} and silently breaks every literal
+    # route.
+    app.include_router(s3_router.router)
 
     return app

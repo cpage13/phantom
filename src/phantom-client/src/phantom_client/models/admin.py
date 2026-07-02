@@ -10,6 +10,7 @@ additions don't fault the SDK.
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -91,6 +92,80 @@ class KeyValueMatchFilter(BaseModel):
 
     key: str = Field(..., min_length=1, description="Metadata KVS key to match.")
     value: str = Field(..., min_length=1, description="Metadata KVS value to match.")
+
+
+# ---------------------------------------------------------------------------
+# Destination-credential push bodies (the SigV4 re-sign surface).
+# ---------------------------------------------------------------------------
+
+
+class SigningService(StrEnum):
+    """AWS service a destination credential SigV4-signs for.
+
+    Mirrors the server's :class:`phantom.models.credential.SigningService`
+    (the schema is intentionally duplicated across the process boundary per
+    ADR-012). A ``StrEnum``, so each member IS its wire value (``"s3"``) and
+    serializes for free at the pydantic boundary. Today S3 is the only
+    implemented service; the literal ``"s3"`` is defined HERE exactly once on
+    the client side, and all logic references the symbol
+    :attr:`SigningService.S3` by dot notation.
+    """
+
+    S3 = "s3"
+
+
+class SigV4StaticCredBody(BaseModel):
+    """Admin credential-push body — a static SigV4 key-pair (resolved literals).
+
+    Mirrors the server's :class:`phantom.models.credential.SigV4StaticCredBody`
+    field-for-field, with one DELIBERATE difference: the client OMITS the
+    server's ``@field_validator("service", mode="before")`` coercer. Under
+    ``strict=True`` that means a raw wire string is rejected — callers MUST
+    construct this body with a :class:`SigningService` MEMBER
+    (``service=SigningService.S3``), which serializes to ``"s3"`` on the wire.
+    The secret is never echoed in any response (ADR-004).
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    kind: Literal["sigv4_static"] = "sigv4_static"
+    access_key_id: str = Field(..., min_length=1)
+    secret_access_key: str = Field(
+        ...,
+        min_length=1,
+        description="Resolved secret; never returned in any response (ADR-004).",
+    )
+    region: str = Field(..., min_length=1)
+    service: SigningService = Field(..., description="AWS service this credential signs for.")
+    session_token: str | None = Field(None)
+
+
+class ProfileRefCredBody(BaseModel):
+    """Admin credential-push body — a profile / default-chain reference.
+
+    Mirrors the server's :class:`phantom.models.credential.ProfileRefCredBody`.
+    Like :class:`SigV4StaticCredBody`, the client omits the server's ``service``
+    coercer: construct with a :class:`SigningService` member, not a raw string.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    kind: Literal["profile_ref"] = "profile_ref"
+    profile: str | None = Field(None)
+    region: str | None = Field(None)
+    service: SigningService = Field(..., description="AWS service this credential signs for.")
+
+
+CredentialPushBody = Annotated[
+    SigV4StaticCredBody | ProfileRefCredBody, Field(discriminator="kind")
+]
+"""The admin credential-push wire body (a discriminated union on ``kind``).
+
+Mirrors the server's :data:`phantom.models.credential.CredentialPushBody`. The
+runtime value is always one of the two concrete ``BaseModel`` arms; the alias
+itself is a typing construct, so a caller passes a constructed
+:class:`SigV4StaticCredBody` / :class:`ProfileRefCredBody` instance.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +392,7 @@ class GroupStatusResponse(BaseModel):
     total: int = Field(..., ge=0, description="Number of member uploads in the group.")
     counts_by_state: dict[ChainState, int] = Field(
         ...,
-        description="Histogram of member states across the eight canonical ChainState values.",
+        description="Histogram of member states across the nine canonical ChainState values.",
     )
     all_finished: bool = Field(
         ...,
@@ -763,6 +838,7 @@ __all__ = [
     "BulkDeleteResponse",
     "CounterValue",
     "CountersResponse",
+    "CredentialPushBody",
     "DeleteFilter",
     "ExtractFilter",
     "GaugeValue",
@@ -771,9 +847,12 @@ __all__ = [
     "InstanceSummary",
     "KeyValueMatchFilter",
     "ListUploadsResponse",
+    "ProfileRefCredBody",
     "QuarantineEntry",
     "QuarantineInventoryResponse",
     "QuarantineRestoreResponse",
     "RamPressureStatusResponse",
+    "SigV4StaticCredBody",
+    "SigningService",
     "UploadBundle",
 ]

@@ -51,9 +51,11 @@ from phantom_client.models.admin import (
     InstanceStatusResponse,
     InstanceSummary,
     ListUploadsResponse,
+    ProfileRefCredBody,
     QuarantineInventoryResponse,
     QuarantineRestoreResponse,
     RamPressureStatusResponse,
+    SigV4StaticCredBody,
     UploadBundle,
 )
 from phantom_client.models.chain import ChainEnvelope, ChainResponse
@@ -101,6 +103,10 @@ _PATH_LOOKUP_BY_LOCAL_UUID = "/v1/admin/uploads/by-local-uuid/{local_uuid}"
 _PATH_TOKENS = "/v1/admin/tokens"
 _PATH_TOKEN_FOR = "/v1/admin/tokens/{endpoint}/{uid}"
 _PATH_TOKEN_ENDPOINT = "/v1/admin/tokens/{endpoint}"
+
+# Destination SigV4 credential push — host-keyed, the analogue of the
+# per-(endpoint, uid) token slot above (the executor looks it up by host).
+_PATH_CREDENTIAL_FOR = "/v1/admin/credentials/{dest_host}"
 
 _PATH_STATS = "/v1/admin/stats"
 # Liveness + readiness are the public, unprefixed probe paths (GET
@@ -643,6 +649,47 @@ class PhantomClient:
     async def invalidate_all_tokens(self) -> None:
         """Mark every slot as bad."""
         await self._transport.delete_no_body(_PATH_TOKENS)
+
+    # -----------------------------------------------------------------
+    # Destination credentials (SigV4 re-sign surface).
+    # -----------------------------------------------------------------
+
+    async def push_credential(
+        self,
+        *,
+        dest_host: str,
+        credential: SigV4StaticCredBody | ProfileRefCredBody,
+    ) -> None:
+        """Provision a destination SigV4 credential for ``dest_host`` (admin, loopback).
+
+        Mirrors the server's ``PUT /v1/admin/credentials/{dest_host}`` (the SigV4
+        analogue of :meth:`push_token`). The body is the discriminated
+        ``CredentialPushBody``; ``dest_host`` is the real upstream host the
+        credential signs for (e.g. ``"s3.amazonaws.com"``). Returns nothing
+        (server replies ``204``; the secret is never echoed). A fresh push wakes
+        any parked ``auth_expired`` rows on that host.
+
+        Args:
+            dest_host: Destination host key (normalized server-side via the same
+                ``_hostname`` rule the executor uses for lookup).
+            credential: A :class:`SigV4StaticCredBody` (static key-pair) or
+                :class:`ProfileRefCredBody` (profile / default chain). Construct it
+                with a :class:`SigningService` member (e.g. ``service=SigningService.S3``),
+                NOT a raw string — the client model is strict and has no coercer.
+
+        Example:
+            >>> await client.push_credential(
+            ...     dest_host="s3.amazonaws.com",
+            ...     credential=SigV4StaticCredBody(
+            ...         access_key_id="AKIA...", secret_access_key="wJal...",
+            ...         region="us-east-1", service=SigningService.S3,
+            ...     ),
+            ... )
+        """
+        await self._transport.put_json(
+            _PATH_CREDENTIAL_FOR.format(dest_host=quote(dest_host, safe="")),
+            body=credential,
+        )
 
     # -----------------------------------------------------------------
     # Status / health / stats.

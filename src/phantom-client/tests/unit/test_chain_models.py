@@ -35,6 +35,7 @@ def test_chain_state_values() -> None:
         "stored",
         "cancelled",
         "corrupted",
+        "expired",
     }
 
 
