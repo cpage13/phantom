@@ -19,7 +19,7 @@
 
 services:
   phantom-service:
-    image: ghcr.io/${PHANTOM_ORG:-anthropic-example-org}/phantom-service:${PHANTOM_TAG:-latest}
+    image: ghcr.io/${PHANTOM_ORG:-your-org}/phantom-service:${PHANTOM_TAG:-latest}
     # Uncomment to build locally from the repository root:
     # build:
     #   context: ../../

@@ -65,9 +65,9 @@ docker compose -f src/phantom-deploy/docker-compose.yml up
 
 The compose file references a GHCR image name
 (`ghcr.io/${PHANTOM_ORG}/phantom-service:${PHANTOM_TAG}`, defaulting to
-`ghcr.io/anthropic-example-org/phantom-service:latest`). If that image
-is not published in your org, uncomment the `build:` block in
-`docker-compose.yml` to build locally.
+`ghcr.io/your-org/phantom-service:latest`). Set `PHANTOM_ORG` to your own
+GHCR org, or if that image is not published, uncomment the `build:` block
+in `docker-compose.yml` to build locally.
 
 ## Configuration
 
