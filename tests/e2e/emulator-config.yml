@@ -41,9 +41,9 @@ auth:
 
 upstream:
   # 1-hour TTL on minted presigned URLs is plenty for the happy path
-  # and the metadata-down / S3-down retry scenarios. Tests that
-  # specifically exercise capture-TTL expiry (E2E-6a, E2E-6b) call
-  # `Server.set_presigned_ttl(1)` per-test.
+  # and the metadata-down / S3-down retry scenarios. The strict E2E-6 matrix
+  # overrides both presigned and idempotency windows so they remain live
+  # beyond the whole scenario while Phantom's observation TTL is short.
   presigned_ttl_seconds: 3600
   body_max_bytes: 2147483648
   idempotency_dedup_window_seconds: 3600
