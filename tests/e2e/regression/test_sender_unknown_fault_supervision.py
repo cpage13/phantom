@@ -115,7 +115,7 @@ async def _await_succeeded(client: PhantomClient, chain_id: UUID) -> ChainAdminD
         last = await client.get_upload(chain_id)
         if last.state == "succeeded":
             return last
-        await asyncio.sleep(_DELIVERY_POLL_SECONDS)  # pre-commit-allow: bounded status poll
+        await asyncio.sleep(_DELIVERY_POLL_SECONDS)  # pre-commit-allow: sleep; bounded status poll
     raise AssertionError(
         f"chain {chain_id} did not recover to succeeded; "
         f"last state={getattr(last, 'state', None)!r}"
@@ -139,7 +139,7 @@ async def _await_in_flight(phantom_url: str, expected: int) -> None:
         observed = await _live_in_flight(phantom_url)
         if observed == expected:
             return
-        await asyncio.sleep(_DELIVERY_POLL_SECONDS)  # pre-commit-allow: bounded status poll
+        await asyncio.sleep(_DELIVERY_POLL_SECONDS)  # pre-commit-allow: sleep; bounded status poll
     raise AssertionError(f"live in_flight stayed at {observed}; expected {expected}")
 
 
