@@ -15,6 +15,13 @@ Per worker:
    PersistController is wired, enqueue the chain for RAM→disk migration
    (plan § 2.3.11 retry-linger trigger; § 2.3.18 sender wiring).
 
+Classified transient SQLite contention is recoverable at both storage
+boundaries in the worker loop. A pre-claim lock retries the claim on a later
+poll. A post-claim lock waits one poll and lets the worker continue; the row is
+already durably ``attempting`` and remains available to startup recovery. This
+catch does not silently requeue the row. Non-transient ``OperationalError`` and
+all other unknown exceptions still escape supervision.
+
 Plan § 2.3.18 collapsed the dual-store
 round-robin to a single-store loop; body reads route through
 :attr:`InstanceContext.body_store`; the retry-linger trigger calls
@@ -138,7 +145,19 @@ class Sender:
                 await asyncio.sleep(self._poll_seconds)
                 continue
             row = claimed[0]
-            await self._drive_one(store, row)
+            try:
+                await self._drive_one(store, row)
+            except sqlite3.OperationalError as exc:
+                if not is_transient_lock_error(exc):
+                    raise
+                logger.warning(
+                    "drive_one hit transient SQLite contention in worker %d "
+                    "for chain_id=%s; row remains attempting for recovery",
+                    idx,
+                    row.chain_id,
+                )
+                await asyncio.sleep(self._poll_seconds)
+                continue
 
     async def _load_body_refs(self, row: UploadRow) -> dict[str, bytes]:
         """Load and verify body_refs for ``row``.

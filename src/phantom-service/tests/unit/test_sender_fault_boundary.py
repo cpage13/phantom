@@ -1,18 +1,20 @@
-"""Narrow sender claim-boundary exception classification tests.
+"""Narrow sender storage-boundary exception classification tests.
 
 The real-process E2Es prove unknown pre- and post-claim faults crash and
 recover. These small tests pin the one exception that deliberately remains
-recoverable at the polling boundary: classified SQLite lock contention.
+recoverable before and after claim: classified SQLite lock contention.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import Callable
 from unittest.mock import MagicMock
 
 import pytest
 from phantom.instances.context import InstanceContext
+from phantom.models.upload import UploadRow
 from phantom.storage.interface import UploadStore
 from phantom.workers.sender import Sender
 
@@ -22,7 +24,7 @@ async def test_transient_claim_lock_is_retried() -> None:
     stop_event = asyncio.Event()
     calls = 0
 
-    async def _claim_due(*_args: object, **_kwargs: object) -> list[object]:
+    async def _claim_due(*_args: object, **_kwargs: object) -> list[UploadRow]:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -48,6 +50,68 @@ async def test_non_transient_claim_operational_error_escapes() -> None:
     instance = MagicMock(spec=InstanceContext)
     instance.store = store
     sender = Sender(instance=instance, worker_count=1, poll_interval_ms=1)
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        await sender._worker_loop(0, asyncio.Event())
+
+
+async def test_transient_post_claim_lock_continues_polling(
+    make_upload_row: Callable[..., UploadRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A classified post-claim lock leaves supervision alive for another poll."""
+    stop_event = asyncio.Event()
+    row = make_upload_row(state="attempting")
+    claim_calls = 0
+    drive_calls = 0
+
+    async def _claim_due(*_args: object, **_kwargs: object) -> list[UploadRow]:
+        nonlocal claim_calls
+        claim_calls += 1
+        if claim_calls == 1:
+            return [row]
+        stop_event.set()
+        return []
+
+    async def _drive_one(_store: UploadStore, driven_row: UploadRow) -> None:
+        nonlocal drive_calls
+        drive_calls += 1
+        assert driven_row is row
+        raise sqlite3.OperationalError("database is locked")
+
+    store = MagicMock(spec=UploadStore)
+    store.claim_due.side_effect = _claim_due
+    instance = MagicMock(spec=InstanceContext)
+    instance.store = store
+    sender = Sender(instance=instance, worker_count=1, poll_interval_ms=1)
+    monkeypatch.setattr(sender, "_drive_one", _drive_one)
+
+    await sender._worker_loop(0, stop_event)
+
+    assert claim_calls == 2
+    assert drive_calls == 1
+
+
+async def test_non_transient_post_claim_operational_error_escapes(
+    make_upload_row: Callable[..., UploadRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-lock post-claim OperationalError remains fatal."""
+    row = make_upload_row(state="attempting")
+
+    async def _claim_due(*_args: object, **_kwargs: object) -> list[UploadRow]:
+        return [row]
+
+    async def _drive_one(_store: UploadStore, driven_row: UploadRow) -> None:
+        assert driven_row is row
+        raise sqlite3.OperationalError("no such table: uploads")
+
+    store = MagicMock(spec=UploadStore)
+    store.claim_due.side_effect = _claim_due
+    instance = MagicMock(spec=InstanceContext)
+    instance.store = store
+    sender = Sender(instance=instance, worker_count=1, poll_interval_ms=1)
+    monkeypatch.setattr(sender, "_drive_one", _drive_one)
 
     with pytest.raises(sqlite3.OperationalError, match="no such table"):
         await sender._worker_loop(0, asyncio.Event())

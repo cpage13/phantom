@@ -20,10 +20,13 @@ table, a type error):
   retry-with-backoff (ADR-022) and surface a genuine fault as a real
   error, rather than crashing startup over a transient lock or looping
   forever on a real one.
-- **Sender claim poll.** `claim_due` can hit the same cross-process
-  contention. The sender retries a classified transient lock on its next poll,
-  while a schema-class or unknown fault must escape TaskGroup supervision and
-  trigger the production fatal-worker path.
+- **Sender storage boundaries.** Both `claim_due` and the post-claim
+  `_drive_one` storage transitions can hit the same cross-process contention.
+  The sender waits one poll and continues after a classified transient lock.
+  A post-claim row is already durably `attempting`; the catch does not requeue
+  or promise delivery, and startup recovery can reclaim it. A schema-class or
+  unknown fault must escape TaskGroup supervision and trigger the production
+  fatal-worker path.
 
 If these three paths classified errors differently — or each rolled its own
 substring check — they could drift: one path could treat a real
@@ -37,7 +40,8 @@ Introduce a single shared classifier,
 `is_transient_lock_error(exc: BaseException) -> bool`, in
 `storage/sqlite_store.py` (re-exported from `storage/__init__.py`). It is
 the one definition of "this error is a ride-it-out lock contention, not a
-permanent fault," and admission, recovery, and sender claim polling consult it.
+permanent fault," and admission, recovery, and both sender storage boundaries
+consult it.
 
 ### Deliberately narrow
 
@@ -68,7 +72,7 @@ error without a prior `isinstance` narrowing; the classifier does the
 ## Consequences
 
 - **One classification rule, three consumers.** Admission, recovery, and
-  sender claim polling cannot disagree about whether a given error is
+  sender storage handling cannot disagree about whether a given error is
   transient.
 - **A real bug is never masked.** The narrow fragment set means a
   schema/type `OperationalError` is surfaced, not retried into a
@@ -89,8 +93,8 @@ error without a prior `isinstance` narrowing; the classifier does the
   storage_unavailable`).
 - `phantom.workers.recovery` — the recovery consumer (→ bounded
   retry-with-backoff).
-- `phantom.workers.sender` — the claim-poll consumer (→ retry only classified
-  contention; other faults escape supervision).
+- `phantom.workers.sender` — the pre-/post-claim consumer (→ wait and continue
+  only for classified contention; other faults escape supervision).
 - ADR-021 — the `busy_timeout` value the cross-process case outlasts.
 - ADR-022 — recovery's bounded retry that the classifier gates.
 - ADR-017 — the `storage_unavailable` / `internal_error` rows.

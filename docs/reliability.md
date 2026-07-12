@@ -168,6 +168,13 @@ is never masked behind an infinite retry.
 bounded retry-with-backoff (see [§1.1](#11-crash-and-power-loss-recovery-sweep)),
 independent of `busy_timeout`.
 
+**What happens in the sender.** A classified lock before claim waits one poll
+and retries. The same classified `OperationalError` after a row was claimed
+also waits one poll and lets the worker continue polling instead of killing the
+process. The row remains durably `attempting`; this handling does not silently
+requeue it or promise immediate delivery, and startup recovery can reclaim it.
+Non-transient and unknown exceptions still escape fatal supervision.
+
 **What you observe.** Under a transient external hold, the producer's POST
 gets a retryable 503 and tries again; nothing is lost and nothing
 crashes. The `busy_timeout` is **1000 ms** (lowered from 5000 ms) so a
@@ -398,7 +405,7 @@ contention tests are the highest-value durability coverage.
 |---|---|---|
 | External lock held past `busy_timeout` at admission → clean `503 storage_unavailable` | [`tests/e2e/regression/test_r9_v6_external_lock_admission_clean_503.py`](../tests/e2e/regression/test_r9_v6_external_lock_admission_clean_503.py) | A sibling holding `BEGIN IMMEDIATE` past the timeout yields a retryable 503, not a naked 5xx (ADR-021). |
 | External lock at recovery boot → bounded retry, never a wedged startup | [`tests/e2e/crash_recovery/test_r9_v6_recovery_boot_survives_external_lock.py`](../tests/e2e/crash_recovery/test_r9_v6_recovery_boot_survives_external_lock.py) | Recovery rides out a long external lock via its own retry-with-backoff and comes up healthy (ADR-022, ADR-023). |
-| External lock causes no corruption and no WAL blow-up | [`tests/e2e/db_contention/test_external_lock_no_corruption_no_wal_blowup.py`](../tests/e2e/db_contention/test_external_lock_no_corruption_no_wal_blowup.py) | Durability holds under sustained external contention; the data layer never corrupts. |
+| External lock causes no process death, corruption, or WAL blow-up | [`tests/e2e/db_contention/test_external_lock_no_corruption_no_wal_blowup.py`](../tests/e2e/db_contention/test_external_lock_no_corruption_no_wal_blowup.py) | Classified post-claim contention does not kill sender supervision; durable rows survive, integrity remains `ok`, and the WAL remains reclaimable. |
 | `busy_timeout` value and the transient-lock classifier | [`src/phantom-service/tests/unit/test_sqlite_store.py`](../src/phantom-service/tests/unit/test_sqlite_store.py), [`src/phantom-service/tests/unit/test_token_cache.py`](../src/phantom-service/tests/unit/test_token_cache.py) | The pragma is applied at the lowered value; `is_transient_lock_error` classifies lock fragments and rejects non-lock `OperationalError` (ADR-023). |
 | `all_ram` under external lock | [`tests/e2e/all_ram/test_r9_pm_allram_ram_ceiling_clean.py`](../tests/e2e/all_ram/test_r9_pm_allram_ram_ceiling_clean.py) | The lock fixes are mode-independent (shared SQLite). |
 
