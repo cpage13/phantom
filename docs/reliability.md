@@ -76,8 +76,12 @@ terminal state: never a silent loss and never a wedged service.**
 ## 1.1 Crash and power loss (recovery sweep)
 
 **Trigger.** The process dies abruptly: power loss, OOM-kill, container
-SIGKILL, or an unhandled worker exception that cascades out of the
-composition root's `asyncio.TaskGroup` and exits the process non-zero.
+SIGKILL, or an ordinary unhandled worker exception that cascades out of the
+composition root's `asyncio.TaskGroup`. For the worker case, the production
+CLI's fatal-worker bridge stops uvicorn; pinned uvicorn 0.46 drains and
+re-raises SIGTERM, producing signal termination. Uvicorn's default post-start
+lifespan handling would only log the failure. TaskGroup's direct
+`SystemExit`/`KeyboardInterrupt` special cases are outside this bridge.
 
 **What happens.** The orchestrator restarts the container. Before the
 sender pool opens, a boot-time **recovery sweep** runs:
@@ -90,6 +94,10 @@ sender pool opens, a boot-time **recovery sweep** runs:
    already in a terminal state (see below).
 3. `body_location='ram'` rows are quarantined: the RAM store is empty
    after a restart by design, so the body is genuinely gone.
+4. After those state corrections, the fresh in-memory saturation gate is
+   reconstructed from every persisted row that still holds a slot. A paused
+   upstream therefore exposes recovered backlog as live `in_flight` capacity
+   before delivery resumes; terminal release returns it to zero.
 
 **What you observe.** The service comes back up healthy. Rows that were
 durably on disk resume retrying with their last-known token. Rows whose

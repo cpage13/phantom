@@ -16,6 +16,7 @@ import logging
 import random
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -36,6 +37,45 @@ UploadToken = str
 
 # Type alias for the Idempotency-Key header value.
 IdempotencyKey = str
+
+
+class UpstreamEventKind(StrEnum):
+    """Closed kinds in the append-only two-step upstream event oracle."""
+
+    METADATA_CREATE = "metadata_create"
+    BODY_PUT = "body_put"
+
+
+@dataclass(frozen=True)
+class MetadataCreateEvent:
+    """One successful metadata-create response, including cache hits."""
+
+    occurred_at: datetime
+    kind: UpstreamEventKind
+    chain_id: UUID | None
+    idempotency_key: IdempotencyKey | None
+    file_id: UUID
+    upload_token: UploadToken
+    upload_url: str
+    cache_hit: bool
+
+
+@dataclass(frozen=True)
+class BodyPutEvent:
+    """One accepted upload PUT; unlike ``accepted_bodies``, never overwritten."""
+
+    occurred_at: datetime
+    kind: UpstreamEventKind
+    chain_id: UUID | None
+    idempotency_key: IdempotencyKey | None
+    file_id: UUID
+    upload_token: UploadToken
+    upload_url: str
+    body_hash: str
+    body_size: int
+
+
+UpstreamEvent = MetadataCreateEvent | BodyPutEvent
 
 
 @dataclass
@@ -224,7 +264,12 @@ class EmulatorState:
         pending_uploads: Pending presigned URLs keyed by upload token.
         file_id_to_token: Reverse lookup so ``GET /v1/files/{id}``
             can resolve a record minted on the create call.
-        accepted_bodies: The received-body log keyed by upload token.
+        accepted_bodies: Latest accepted body keyed by upload token. This
+            materialized view intentionally overwrites repeated PUTs.
+        upstream_events: Append-only successful metadata-create and body-PUT
+            oracle. It preserves every request occurrence for cardinality and
+            ordering assertions while the latest-value maps retain their
+            established behavior.
         s3_objects: Path-style S3 sink store, keyed by ``(bucket, key)``;
             populated by a SigV4-validated ``PUT /{bucket}/{key}``.
         raw_bodies: Auth-free /raw sink store, keyed by the full forwarded
@@ -261,6 +306,7 @@ class EmulatorState:
     pending_uploads: dict[UploadToken, PendingUpload] = field(default_factory=dict)
     file_id_to_token: dict[UUID, UploadToken] = field(default_factory=dict)
     accepted_bodies: dict[UploadToken, AcceptedBody] = field(default_factory=dict)
+    upstream_events: list[UpstreamEvent] = field(default_factory=list)
     s3_objects: dict[S3ObjectKey, S3Object] = field(default_factory=dict)
     raw_bodies: dict[RawPath, RawBody] = field(default_factory=dict)
     accepted_idempotency_keys: dict[UploadToken, IdempotencyKey] = field(default_factory=dict)

@@ -11,21 +11,18 @@ theme:
     it to ``corrupted`` with ``last_error='storage_corruption:
     body_missing_in_sender:[...]'``.
 
-(b) TaskGroup-cancellation closure (Phase 2 § 3.2.5) — every
-    long-lived coroutine is supervised by the composition-root
-    :class:`asyncio.TaskGroup`. An unhandled exception in any task
-    cancels the entire group; the lifespan re-raises so the
-    orchestrator sees a hard process exit. This regression test
-    asserts that the supervision contract holds: an exception
-    raised inside a TaskGroup-supervised coroutine cancels its
-    siblings and propagates out.
+(b) Lower-layer TaskGroup semantics pin (Phase 2 § 3.2.5) — an unhandled
+    ordinary exception cancels siblings and propagates as an exception group.
+    This local stdlib demonstration does NOT prove the production CLI exits;
+    `test_sender_unknown_fault_supervision.py` is the authoritative real-
+    process composition-root, uvicorn bridge, and recovery proof.
 
 Test (a) drives the silent-route closure by directly invoking
 ``_load_body_refs`` on a row whose body files are absent; asserts
 :class:`BodyMissingError` is raised (the pre-H8 behavior was
 returning an empty dict).
 
-Test (b) constructs a minimal asyncio.TaskGroup with two
+Test (b) constructs only a minimal asyncio.TaskGroup with two
 coroutines; one raises; asserts the sibling is cancelled AND the
 group exit-handler re-raises an ExceptionGroup containing the
 original exception.
@@ -119,15 +116,12 @@ async def test_h10a_missing_body_raises_body_missing_error(tmp_path: Path) -> No
 
 
 async def test_h10b_taskgroup_cancels_siblings_on_exception() -> None:
-    """H10(b) TaskGroup-cancellation: one worker's exception cancels the rest.
+    """H10(b) lower-layer TaskGroup semantics: one exception cancels siblings.
 
-    The composition root supervises every long-lived coroutine via a
-    single :class:`asyncio.TaskGroup`. An unhandled exception in any
-    member coroutine cancels the entire group and the group exits
-    with an :class:`ExceptionGroup`. This regression test asserts
-    the contract: spawn two coroutines under a TaskGroup, raise
-    inside one, observe the sibling cancelled AND the
-    ExceptionGroup propagates.
+    This test asserts only the stdlib primitive: spawn two coroutines under a
+    TaskGroup, raise inside one, observe sibling cancellation and exception-
+    group propagation. The real CLI/process contract lives in
+    ``test_sender_unknown_fault_supervision.py``.
     """
     sibling_cancelled = asyncio.Event()
 

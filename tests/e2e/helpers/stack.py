@@ -49,7 +49,7 @@ from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.config import load_config as load_emulator_config
 from phantom_emulator.failure.injection import FailurePolicy
 from phantom_emulator.routers.control import ReceivedEntry
-from phantom_emulator.state import EmulatorState, RawBody, S3Object
+from phantom_emulator.state import EmulatorState, RawBody, S3Object, UpstreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -441,8 +441,12 @@ class EmulatorControl:
         self._server.set_seed(seed)
 
     def received(self) -> list[ReceivedEntry]:
-        """Return the accepted-bodies log."""
+        """Return the token-keyed latest accepted-body view."""
         return self._server.received()
+
+    def upstream_events(self) -> list[UpstreamEvent]:
+        """Return the append-only metadata-create/body-PUT event log."""
+        return self._server.upstream_events()
 
     def s3_object(self, bucket: str, key: str) -> S3Object | None:
         """Return the stored S3 object for ``(bucket, key)``, or ``None``.
@@ -467,7 +471,7 @@ class EmulatorControl:
         return self._server.state.raw_bodies.get(path)
 
     def clear_received(self) -> None:
-        """Drop every accepted body record."""
+        """Drop latest accepted bodies and append-only upstream events."""
         self._server.clear_received()
 
     async def drain(self) -> None:

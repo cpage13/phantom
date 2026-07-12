@@ -110,7 +110,7 @@ from phantom.workers.invariant_audit import InvariantAuditor
 from phantom.workers.persist_controller import PersistController
 from phantom.workers.ram_pressure import RamPressureWatcher
 from phantom.workers.reaper import Reaper
-from phantom.workers.recovery import run_recovery
+from phantom.workers.recovery import reconcile_saturation, run_recovery
 from phantom.workers.saturation import SaturationGate
 from phantom.workers.sender import Sender
 from phantom.workers.vacuum import VacuumScheduler
@@ -1202,7 +1202,12 @@ def _warn_if_bound_non_loopback(settings: Settings) -> None:
     )
 
 
-def create_app(settings: Settings, *, settings_path: Path | None = None) -> FastAPI:
+def create_app(
+    settings: Settings,
+    *,
+    settings_path: Path | None = None,
+    worker_failure_callback: Callable[[], None] | None = None,
+) -> FastAPI:
     """Build the single ASGI application for the given :class:`Settings`.
 
     The deployment is same-machine-only (Phantom runs on the SAME box as
@@ -1230,6 +1235,12 @@ def create_app(settings: Settings, *, settings_path: Path | None = None) -> Fast
             ``None`` (e.g., tests that synthesize a Settings instance),
             hot reload is disabled (the SIGHUP handler is not installed
             and the admin endpoint returns 422).
+        worker_failure_callback: Production-server hook invoked when a
+            supervised long-lived worker raises an ordinary exception. The
+            CLI uses it to stop uvicorn, whose lifespan protocol logs
+            post-start failures but does not otherwise terminate its serving
+            loop. TaskGroup's direct ``SystemExit``/``KeyboardInterrupt``
+            special cases are outside this callback contract.
 
     Returns:
         The configured :class:`FastAPI` application.
@@ -1340,6 +1351,7 @@ def create_app(settings: Settings, *, settings_path: Path | None = None) -> Fast
                     # Recovery operates on the single persistent store + the
                     # mode-selected body store (plan § 2.3.15).
                     await run_recovery(outcome.store, outcome.body_store)
+                    await reconcile_saturation(outcome.store, outcome.saturation)
                 case DegradedInstance():
                     degraded_boot.append(outcome)
                 case _:
@@ -1401,8 +1413,9 @@ def create_app(settings: Settings, *, settings_path: Path | None = None) -> Fast
 
         # Spawn workers per instance under one TaskGroup. An unhandled
         # worker exception cancels every sibling and bubbles out as an
-        # ExceptionGroup — uvicorn exits, the orchestrator restarts. No
-        # silent worker death.
+        # ExceptionGroup. The production CLI callback below the group then
+        # requests uvicorn shutdown; pinned uvicorn drains and then re-raises
+        # SIGTERM so the orchestrator restarts. No silent worker death.
         assert settings.retry.worker_count is not None
         stop_event = asyncio.Event()
 
@@ -1559,6 +1572,14 @@ def create_app(settings: Settings, *, settings_path: Path | None = None) -> Fast
                     yield
                 finally:
                     stop_event.set()
+        except BaseExceptionGroup:
+            # TaskGroup wraps ordinary child exceptions in a group. Python
+            # deliberately re-raises child SystemExit/KeyboardInterrupt
+            # directly; do not broaden this to BaseException because normal
+            # ASGI lifespan cancellation must not masquerade as a worker crash.
+            if worker_failure_callback is not None:
+                worker_failure_callback()
+            raise
         finally:
             if sighup_installed:
                 with suppress_signal_handler_errors():

@@ -298,10 +298,21 @@ see ADR-024.) Two structural rules follow:
    legitimate structured-concurrency pattern, since that group is
    itself a child of the lifespan group.
 2. **Visible crash.** An unhandled worker exception cascades out of
-   the TaskGroup and crashes the process with a non-zero exit. The
-   container orchestrator restarts; persisted rows survive; in-flight
-   RAM bodies are lost (and the recovery sweep quarantines stale
+   the TaskGroup. The production CLI's ordinary-worker-failure callback
+   requests uvicorn shutdown; pinned uvicorn 0.46 drains and then re-raises
+   SIGTERM, terminating `python -m phantom` non-zero (uvicorn otherwise only
+   logs a post-start lifespan failure and keeps serving). TaskGroup's direct
+   `SystemExit`/`KeyboardInterrupt` special cases are outside this bridge.
+   The container orchestrator restarts; persisted rows survive; in-flight RAM
+   bodies are lost (and the recovery sweep quarantines stale
    `body_location='ram'` rows by design).
+
+On the next boot, recovery resets `attempting → queued`, completes its body
+integrity quarantine pass, and reconstructs the fresh in-memory
+`SaturationGate` from every persisted row for which the shared
+`row_holds_slot(state, body_discarded_at)` predicate is true. This happens
+before workers or ingress open, so recovered backlog cannot bypass the live
+row/byte caps.
 
 Before spawning workers the lifespan runs the boot-time guards from
 `runtime/startup_checks.py`: process-wide `apply_umask`,
@@ -411,7 +422,8 @@ unchanged: code continues to read `import phantom` /
   the SIGHUP handler (when a `settings_path` is configured),
   constructs the `SettingsHolder`, builds per-instance snapshots, and
   spawns workers via `asyncio.TaskGroup`. Unhandled worker exceptions
-  cascade out of the `TaskGroup` and crash the process visibly.
+  cascade out of the `TaskGroup`; the production CLI callback stops uvicorn,
+  whose pinned signal path drains and terminates by SIGTERM.
 
 **Public surface.** The HTTP surface is the public surface - all on the one
 listener (loopback by default): `POST /v1/send` (ingress), `GET /v1/healthz`
@@ -597,8 +609,10 @@ bugs.
     construction). The `forbid-asyncio-create-task-outside-composition`
     pre-commit grep enforces exactly this predicate (a planted
     `loop.create_task` outside the lifespan fails the hook). An unhandled
-    worker exception crashes the process; the container orchestrator
-    restarts; persisted rows survive (in-flight RAM bodies do not, and
+    ordinary worker exception invokes the production CLI's fatal-worker
+    bridge, which stops uvicorn and terminates through pinned uvicorn's
+    SIGTERM path; the container orchestrator restarts;
+    persisted rows survive (in-flight RAM bodies do not, and
     the recovery sweep quarantines stale `body_location='ram'` rows by
     design). See § 3.6 and ADR-024.
 16. **The saturation ledger balances.** Exactly one gate charge per
@@ -611,7 +625,8 @@ bugs.
     delete / bulk delete, the reaper's three removal legs) releases on
     accounting captured atomically with the removal; every re-queue of
     a released row (replay, the AuthKicker wake) re-admits through the
-    gate. The gate idles at zero. (R8-4 / R8-6.)
+    gate. Boot recovery reconstructs those same charges from persisted rows
+    before workers start. The gate idles at zero. (R8-4 / R8-6.)
 17. **Irreversible cross-worker effects confirm-then-act on live
     state.** A worker acting on another owner's rows re-reads the live
     truth at the decision instant instead of trusting a snapshot: the
@@ -885,7 +900,7 @@ punch-list failure modes.
 | Content-Length over `max_buffered_bytes` (Phase 2 H2) | Pre-stream Content-Length check OR mid-stream byte counter. | 413 `body_too_large` with detail keys `{ "declared": ..., "limit": ..., "reason": ... }`. | `tests/e2e/test_e2e_10_parser_error.py`, `src/phantom-service/tests/unit/test_send_route.py`. |
 | Malformed envelope | Parser raises `ParserError(code, details)` synchronously. | 422 `ErrorEnvelope`; SDK raises `PhantomValidationError`. | Contract tests. |
 | Idempotency replay | Admission detects the idempotency key matches an existing row. | 200 with the prior `ChainResponse` body (NOT 202); no re-admission. Phase 1 H7 closure. | `tests/e2e/test_multipart_idempotent_replay.py`. |
-| Worker crashes with unhandled exception | Composition-root `asyncio.TaskGroup` cancels every sibling and re-raises out of the lifespan. | Process exits non-zero. Container orchestrator restarts. Persisted rows survive; in-flight RAM bodies lost. See § 3.6. | `tests/e2e/regression/test_h10_silent_route_and_supervision.py`. |
+| Worker crashes with an ordinary unhandled exception | Composition-root `asyncio.TaskGroup` cancels every sibling and re-raises out of the lifespan; the CLI fatal-worker bridge stops uvicorn. (`SystemExit`/`KeyboardInterrupt` are outside this bridge.) | Pinned uvicorn 0.46 drains and terminates by SIGTERM. Container orchestrator restarts. Persisted rows survive; recovery resets a post-claim `attempting` row and saturation reconciles `1 → 0`. See § 3.6. | `tests/e2e/regression/test_sender_unknown_fault_supervision.py` (real pre-claim/post-claim subprocess faults and unpatched restart); lower-layer body-missing and TaskGroup semantics remain in `test_h10_silent_route_and_supervision.py`. |
 
 ---
 

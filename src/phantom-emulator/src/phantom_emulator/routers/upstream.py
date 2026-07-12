@@ -27,6 +27,7 @@ See plan §4.11.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -40,8 +41,11 @@ from phantom_emulator.auth.modes import AuthModePolicy, authenticate
 from phantom_emulator.routers._deps import get_state
 from phantom_emulator.state import (
     AcceptedBody,
+    BodyPutEvent,
     EmulatorState,
     IdempotencyEntry,
+    MetadataCreateEvent,
+    UpstreamEventKind,
 )
 from phantom_emulator.upload.correlation import echo_metadata_kvs, extract_metadata_kvs
 from phantom_emulator.upload.presigned import PresignedTokenStore
@@ -101,8 +105,8 @@ def _maybe_cached_response(
     state: EmulatorState,
     idem_key: str | None,
     now: datetime,
-) -> tuple[dict[str, Any], str] | None:
-    """Return cached (response_json, upload_token) if the key is fresh."""
+) -> IdempotencyEntry | None:
+    """Return the fresh cached entry for ``idem_key``, if one exists."""
     if idem_key is None:
         return None
     entry = state.idempotency_cache.get(idem_key)
@@ -111,7 +115,34 @@ def _maybe_cached_response(
     if entry.expires_at <= now:
         del state.idempotency_cache[idem_key]
         return None
-    return entry.response_json, entry.upload_token
+    return entry
+
+
+def _chain_id(metadata_kvs: dict[str, str]) -> UUID | None:
+    """Return a validated local UUID correlation, never arbitrary metadata."""
+    value = metadata_kvs.get("phantom_local_uuid")
+    if value is None:
+        return None
+    try:
+        return UUID(value)
+    except ValueError:
+        return None
+
+
+def _upload_url(response_json: dict[str, Any]) -> str:
+    """Read the synthetic emulator upload URL from a create response."""
+    value = response_json.get("uploadUrl")
+    if not isinstance(value, str):
+        raise RuntimeError("emulator create response is missing uploadUrl")
+    return value
+
+
+def _idempotency_key_for_token(state: EmulatorState, token: str) -> str | None:
+    """Resolve the currently cached idempotency key for ``token``."""
+    for entry in state.idempotency_cache.values():
+        if entry.upload_token == token:
+            return entry.key
+    return None
 
 
 @router.post("/v1/files/create")
@@ -150,9 +181,22 @@ async def create_file(
 
     cached = _maybe_cached_response(state, idem_key, now)
     if cached is not None:
-        cached_json, cached_token = cached
-        logger.info("idempotency hit key=%s token=%s", idem_key, cached_token[:8])
-        return JSONResponse(cached_json)
+        pending = state.pending_uploads.get(cached.upload_token)
+        metadata_kvs = pending.metadata_kvs if pending is not None else {}
+        state.upstream_events.append(
+            MetadataCreateEvent(
+                occurred_at=now,
+                kind=UpstreamEventKind.METADATA_CREATE,
+                chain_id=_chain_id(metadata_kvs),
+                idempotency_key=idem_key,
+                file_id=cached.file_id,
+                upload_token=cached.upload_token,
+                upload_url=_upload_url(cached.response_json),
+                cache_hit=True,
+            )
+        )
+        logger.info("idempotency hit key=%s token=%s", idem_key, cached.upload_token[:8])
+        return JSONResponse(cached.response_json)
 
     kvs = extract_metadata_kvs(body_json)
     file_id = uuid4()
@@ -194,6 +238,19 @@ async def create_file(
             file_id=file_id,
             expires_at=now + timedelta(seconds=ttl),
         )
+
+    state.upstream_events.append(
+        MetadataCreateEvent(
+            occurred_at=now,
+            kind=UpstreamEventKind.METADATA_CREATE,
+            chain_id=_chain_id(kvs),
+            idempotency_key=idem_key,
+            file_id=file_id,
+            upload_token=upload_token,
+            upload_url=upload_url,
+            cache_hit=False,
+        )
+    )
 
     logger.info(
         "create_file file_id=%s upload_token=%s kvs_count=%d",
@@ -253,12 +310,29 @@ async def put_upload(
         accepted_at=now,
     )
 
-    # Record the matching idempotency key on the accepted body for
-    # /control/received introspection.
-    for entry in state.idempotency_cache.values():
-        if entry.upload_token == token:
-            state.accepted_idempotency_keys[token] = entry.key
-            break
+    # Record the matching idempotency key on the latest-value view and the
+    # append-only event oracle. Emulator-generated upload URLs/tokens are
+    # synthetic test values; no inbound Authorization or arbitrary metadata
+    # is copied into the event log.
+    idempotency_key = _idempotency_key_for_token(state, token)
+    if idempotency_key is not None:
+        state.accepted_idempotency_keys[token] = idempotency_key
+    upload_url_value = pending.file_information.get("contentUrl")
+    if not isinstance(upload_url_value, str):
+        raise RuntimeError("pending emulator upload is missing contentUrl")
+    state.upstream_events.append(
+        BodyPutEvent(
+            occurred_at=now,
+            kind=UpstreamEventKind.BODY_PUT,
+            chain_id=_chain_id(pending.metadata_kvs),
+            idempotency_key=idempotency_key,
+            file_id=pending.file_id,
+            upload_token=token,
+            upload_url=upload_url_value,
+            body_hash=hashlib.sha256(body).hexdigest(),
+            body_size=len(body),
+        )
+    )
 
     logger.info("put_upload token=%s body=%d bytes", token[:8], len(body))
     return Response(status_code=200)

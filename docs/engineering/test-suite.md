@@ -16,6 +16,12 @@ processes, corrupted files, held database locks, mid-upload disconnects) and
 assert that Phantom behaves correctly anyway. That is the point of the suite: to
 show the durability is real, not asserted.
 
+For the two-step emulator protocol, exact cardinality comes from its typed,
+append-only upstream event oracle: every successful metadata-create response
+(including a cached idempotency hit) and every accepted body PUT is a distinct
+event. The older token-keyed accepted-body map remains useful as a latest-value
+view but is not an exact-once oracle because a repeated PUT overwrites its key.
+
 ## How the suite is tiered
 
 Tests carry markers that sort them into lanes, so the fast majority can run on
@@ -71,6 +77,14 @@ budget it asserts.
 - **Shutdown and restart.** A row is in `attempting` at shutdown; on restart,
   recovery resets it to `queued` and the next attempt completes. Database: the
   RAM-to-disk persist is verified and the body survives the restart.
+- **Unknown sender fault and restart.** A test-owned child launcher stops the
+  real sender immediately before claim and immediately after durable claim,
+  then raises an unknown exception. The production process must exit non-zero;
+  the stopped database must show `queued` or `attempting` respectively; an
+  unpatched restart must reconstruct saturation at one while upstream is
+  paused, then deliver exactly one metadata-create/PUT sequence and reconcile
+  saturation to zero. Under pinned uvicorn 0.46, the fatal bridge's supported
+  status is signal termination by SIGTERM after a graceful drain.
 - **Parser errors.** A malformed or oversized envelope produces a structured
   error envelope on the wire, which the client surfaces as a typed validation
   error carrying the error code and details.

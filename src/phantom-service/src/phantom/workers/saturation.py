@@ -80,9 +80,9 @@ keeps the cases exhaustive.
 class SaturationGate:
     """Tracks in-flight count and bytes; admits or rejects new uploads.
 
-    The gate is consulted synchronously by the ingress handler. State
-    is in-process only — it does not survive restart, which is fine
-    because the recovery sweep doesn't reuse in-flight counts.
+    The gate is consulted synchronously by the ingress handler. Its counters
+    are in-process only; boot recovery reconstructs them from persisted rows
+    before workers start.
 
     Disk-pressure accounting is updated by an external probe via
     :meth:`set_disk_usage_bytes`; the probe runs out of band so the gate's
@@ -287,13 +287,10 @@ class SaturationGate:
     async def reconcile_admit(self, actual_bytes: int) -> None:
         """Charge the ledger for a row that is ALREADY live, bypassing caps.
 
-        R9-4 reconciliation ONLY: the replay route's pre-fetched admit
-        decision can race the sender's terminal release, leaving a
-        re-queued row live with no charge. The row cannot be un-queued
-        at that point, so the missing charge is added unconditionally
-        to keep invariant #16's one-charge-per-live-row truth; the
-        overshoot past a full gate is bounded by one row per such
-        microsecond race. Every ordinary admission MUST go through
+        Used only when the row already exists and therefore cannot be refused:
+        boot reconstruction charges every persisted slot-holding row, and the
+        R9-4 replay race repairs a re-queued row whose pre-fetched decision
+        lost to sender release. Every ordinary admission MUST go through
         :meth:`admit`.
         """
         async with self._lock:

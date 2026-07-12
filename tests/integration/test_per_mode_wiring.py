@@ -53,6 +53,7 @@ pytestmark = pytest.mark.asyncio
 _INSTANCE_ID = "primary"
 _INSTANCE_DATA_DIR = "primary"
 _LIFESPAN_TIMEOUT_SECONDS = 30.0
+_NOT_DUE_FOR_SECONDS = 3600
 
 
 def _instance() -> InstanceCfg:
@@ -95,7 +96,7 @@ def _instance_ctx(app: FastAPI) -> Any:
 
 def _row(*, body_location: str) -> UploadRow:
     """Build a minimal :class:`UploadRow` for admission-replacement insertion."""
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
     from uuid import uuid4
 
     now = datetime.now(tz=UTC)
@@ -111,6 +112,10 @@ def _row(*, body_location: str) -> UploadRow:
             "body_location": body_location,
             "received_at": now,
             "updated_at": now,
+            # These tests inspect body-store wiring, not delivery. Keep the
+            # synthetic row outside the live sender's claim horizon so an
+            # intentionally minimal envelope cannot become a worker fault.
+            "next_attempt_at": now + timedelta(seconds=_NOT_DUE_FOR_SECONDS),
             "endpoint": "upstream.example.com",
             "uid": "user-1",
             "chain_envelope_json": "{}",

@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import signal
 import sys
 from typing import TypedDict
 
@@ -98,9 +100,26 @@ def main() -> int:
 
     from phantom.app import create_app
 
+    # Uvicorn's lifespan implementation logs a post-start application
+    # lifespan failure but does not stop its serving loop. Bridge the
+    # composition-root TaskGroup to the production server explicitly: the
+    # callback requests uvicorn's normal signal-driven shutdown. Pinned
+    # uvicorn 0.46 restores its signal handlers after the graceful drain and
+    # re-raises SIGTERM, so the measured process status is ``-SIGTERM``; this
+    # callback does not return control to the final success return below.
+
+    def _stop_after_worker_failure() -> None:
+        """Request production-server shutdown for a supervised worker fault."""
+        logger.critical("supervised worker failed; stopping Phantom process")
+        os.kill(os.getpid(), signal.SIGTERM)
+
     # Pass the YAML path so the lifespan can install SIGHUP and the
     # ``POST /v1/admin/reload`` endpoint has a file to re-read.
-    app = create_app(settings, settings_path=_Path(args.config))
+    app = create_app(
+        settings,
+        settings_path=_Path(args.config),
+        worker_failure_callback=_stop_after_worker_failure,
+    )
     # One uvicorn server bound to the single listener. UDS takes precedence
     # over TCP (the documented connections-table posture): when
     # ``server.bind_uds`` is set, bind the Unix-domain socket; otherwise

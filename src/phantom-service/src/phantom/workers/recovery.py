@@ -2,7 +2,7 @@
 
 The single persistent ``uploads`` table replaces
 the dual-store layout, and the ``committed`` column is gone (replaced
-by ``body_location``). The sweep does two things only:
+by ``body_location``). Startup recovery does three things:
 
 1. Reset every ``attempting`` row to ``queued`` (invariant #7).
    Sender pools were mid-attempt at process exit; their writes never
@@ -14,6 +14,8 @@ by ``body_location``). The sweep does two things only:
    atomic-unit commitment (strategy §1 / plan § 0.4 glossary): a
    single missing file in the body list means the chain cannot be
    sent intact, so no retry will fix it.
+3. After the sweep, reconstruct the fresh process's saturation ledger from
+   every persisted row for which ``row_holds_slot`` is true.
 
 Body-location discriminates the integrity check's expectations:
 
@@ -63,6 +65,7 @@ from phantom.runtime.lock_retry import (
     retry_on_transient_lock,
 )
 from phantom.storage.interface import TERMINAL_STATES
+from phantom.workers.saturation import SaturationGate, row_holds_slot
 
 if TYPE_CHECKING:
     from phantom.storage.interface import BodyStore, UploadStore
@@ -263,4 +266,27 @@ async def run_recovery(
         )
 
 
-__all__ = ["RecoveryLockError", "run_recovery"]
+async def reconcile_saturation(store: UploadStore, saturation: SaturationGate) -> None:
+    """Reconstruct the in-memory saturation ledger from recovered rows.
+
+    Recovery has already reset ``attempting`` and quarantined missing bodies
+    before this function runs. Collect charge sizes while the read cursor is
+    open, then mutate only the in-memory gate after the cursor drains. The
+    shared :func:`row_holds_slot` predicate keeps boot reconstruction aligned
+    with sender, reaper, replay, and removal release ownership.
+
+    Args:
+        store: Recovered persistent upload store.
+        saturation: Fresh per-process gate to reconstruct.
+    """
+    charge_sizes: list[int] = []
+    async for row in store.iter_rows():
+        if row_holds_slot(row.state, row.body_discarded_at):
+            charge_sizes.append(row.body_size_bytes)
+    for body_size_bytes in charge_sizes:
+        await saturation.reconcile_admit(body_size_bytes)
+    if charge_sizes:
+        logger.info("Recovery reconstructed %d saturation charges", len(charge_sizes))
+
+
+__all__ = ["RecoveryLockError", "reconcile_saturation", "run_recovery"]

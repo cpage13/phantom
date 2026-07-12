@@ -55,6 +55,7 @@ from uuid import UUID
 import httpx
 import jwt
 import yaml
+from phantom_emulator.state import UpstreamEvent
 
 logger = logging.getLogger("e2e.subprocess_harness")
 
@@ -225,11 +226,15 @@ class EmulatorHandle:
     url: str
 
     def received(self) -> list[Any]:
-        """Return the emulator's accepted-bodies log."""
+        """Return the emulator's token-keyed latest accepted-body view."""
         return self.server.received()
 
+    def upstream_events(self) -> list[UpstreamEvent]:
+        """Return the append-only metadata-create/body-PUT event log."""
+        return self.server.upstream_events()
+
     def clear_received(self) -> None:
-        """Drop every accepted body record."""
+        """Drop latest accepted bodies and append-only upstream events."""
         self.server.clear_received()
 
     def inject_failure(self, policy: Any) -> None:
@@ -382,11 +387,20 @@ class PhantomSubprocess:
     # URL). Kept as an alias so tests reaching admin endpoints can read
     # ``proc.admin_url`` without caring about the collapse.
     admin_url: str = ""
+    argv: tuple[str, ...] | None = None
+    env_overrides: dict[str, str] = field(default_factory=dict)
     _proc: subprocess.Popen[bytes] | None = field(default=None)
     _log_path: Path | None = field(default=None)
 
     @classmethod
-    def make(cls, config_path: Path, bind_port: int) -> PhantomSubprocess:
+    def make(
+        cls,
+        config_path: Path,
+        bind_port: int,
+        *,
+        argv: tuple[str, ...] | None = None,
+        env_overrides: dict[str, str] | None = None,
+    ) -> PhantomSubprocess:
         """Construct (not yet started) against a config + port.
 
         The single listener serves intake + admin + health on ``bind_port``,
@@ -395,6 +409,10 @@ class PhantomSubprocess:
         Args:
             config_path: The written YAML config.
             bind_port: The listener port (intake + admin + health).
+            argv: Optional complete child argv. The default is the production
+                ``python -m phantom`` entry point.
+            env_overrides: Optional child-only environment additions or
+                replacements. The parent process is never mutated.
 
         Returns:
             An unstarted :class:`PhantomSubprocess`.
@@ -405,6 +423,8 @@ class PhantomSubprocess:
             bind_port=bind_port,
             url=url,
             admin_url=url,
+            argv=argv,
+            env_overrides={} if env_overrides is None else dict(env_overrides),
         )
 
     async def start(self) -> None:
@@ -413,6 +433,7 @@ class PhantomSubprocess:
         self._log_path = log_path
         env = dict(os.environ)
         env.setdefault(_SIGNING_KEY_ENV, SIGNING_SECRET)
+        env.update(self.env_overrides)
         # Spawn the venv interpreter DIRECTLY (sys.executable is the venv's
         # python inside the test session; phantom is installed editable).
         # The previous `uv run python -m phantom` indirection left a resident
@@ -424,7 +445,9 @@ class PhantomSubprocess:
         # terminate() needs no forwarding, and the registry tracks the truth.
         with open(log_path, "wb") as logf:
             self._proc = subprocess.Popen(
-                [sys.executable, "-m", "phantom", "-c", str(self.config_path)],
+                self.argv
+                if self.argv is not None
+                else (sys.executable, "-m", "phantom", "-c", str(self.config_path)),
                 cwd=str(_REPO_ROOT),
                 stdout=logf,
                 stderr=subprocess.STDOUT,
@@ -462,6 +485,47 @@ class PhantomSubprocess:
     def pid(self) -> int | None:
         """The OS pid, or ``None`` if not started."""
         return self._proc.pid if self._proc is not None else None
+
+    @property
+    def returncode(self) -> int | None:
+        """The child exit status, or ``None`` while it is still running."""
+        return self._proc.poll() if self._proc is not None else None
+
+    async def wait_for_expected_exit(self, *, timeout_seconds: float = 30.0) -> int:
+        """Wait for the child to exit and require a non-zero status.
+
+        Args:
+            timeout_seconds: Maximum wait for TaskGroup failure to stop the
+                process.
+
+        Returns:
+            The observed non-zero process exit status.
+
+        Raises:
+            AssertionError: If no process is running, it times out, or exits
+                successfully instead of surfacing the expected fault.
+        """
+        if self._proc is None:
+            raise AssertionError("phantom subprocess was not started")
+        try:
+            returncode = await asyncio.to_thread(self._proc.wait, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise AssertionError(
+                f"phantom subprocess stayed alive for {timeout_seconds}s after expected fault; "
+                f"log tail:\n{self._read_log_tail()}"
+            ) from exc
+        if returncode == 0:
+            raise AssertionError(
+                "phantom subprocess exited successfully after an expected unknown fault; "
+                f"log tail:\n{self._read_log_tail()}"
+            )
+        return returncode
+
+    def read_full_log(self) -> str:
+        """Return the complete child log, or a sentinel when unavailable."""
+        if self._log_path is None or not self._log_path.exists():
+            return "<no log>"
+        return self._log_path.read_text(errors="replace")
 
     def sigkill(self) -> None:
         """Deliver a genuine ``SIGKILL`` — no lifespan teardown, WAL mid-write.

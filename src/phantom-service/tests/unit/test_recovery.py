@@ -17,7 +17,8 @@ import pytest
 from phantom.models.upload import BodyHash, BodyHashes, StorageHash, UploadRow
 from phantom.storage import FileBodyStore, RamBodyStore, SqliteUploadStore
 from phantom.storage.hybrid_body_store import HybridBodyStore
-from phantom.workers.recovery import run_recovery
+from phantom.workers.recovery import reconcile_saturation, run_recovery
+from phantom.workers.saturation import SaturationGate
 
 from .conftest import track_started
 
@@ -99,6 +100,28 @@ async def test_attempting_reset_to_queued(tmp_path: Path) -> None:
     fresh = await store.get(chain_id)
     assert fresh is not None
     assert fresh.state == "queued"
+
+
+@pytest.mark.asyncio
+async def test_boot_reconstructs_only_slot_holding_saturation_rows(tmp_path: Path) -> None:
+    """Queued/stored persisted rows charge a fresh gate; released states do not."""
+    store = await _build_store(tmp_path)
+    queued_id = uuid4()
+    stored_id = uuid4()
+    await store.insert(_row(queued_id, state="queued", body_hashes=_hashes_for(b"q")))
+    await store.insert(_row(stored_id, state="stored", body_hashes=_hashes_for(b"s")))
+    await store.insert(_row(uuid4(), state="auth_expired", body_hashes=_hashes_for(b"a")))
+    await store.insert(_row(uuid4(), state="succeeded", body_hashes=_hashes_for(b"d")))
+    saturation = SaturationGate(
+        max_in_flight=10,
+        max_in_flight_bytes=10_000,
+        max_disk_bytes=0,
+    )
+
+    await reconcile_saturation(store, saturation)
+
+    assert saturation.in_flight == 2
+    assert saturation.in_flight_bytes == 128
 
 
 @pytest.mark.asyncio

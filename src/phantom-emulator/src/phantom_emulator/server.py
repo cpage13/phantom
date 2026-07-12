@@ -22,7 +22,7 @@ from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.config import AppConfig
 from phantom_emulator.failure.injection import FailurePolicy
 from phantom_emulator.routers.control import ReceivedEntry
-from phantom_emulator.state import EmulatorState, IssuedToken
+from phantom_emulator.state import EmulatorState, IssuedToken, UpstreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +179,7 @@ class Server:
         self.state.failure_state.set_seed(seed)
 
     def received(self) -> list[ReceivedEntry]:
-        """Return the accepted-bodies log.
+        """Return the token-keyed latest accepted-body view.
 
         Mirrors ``GET /control/received``.
         """
@@ -209,13 +209,18 @@ class Server:
             )
         return entries
 
+    def upstream_events(self) -> list[UpstreamEvent]:
+        """Return a snapshot of the append-only two-step upstream event log."""
+        return list(self.state.upstream_events)
+
     def clear_received(self) -> None:
-        """Drop every accepted body record.
+        """Drop latest accepted bodies and append-only upstream events.
 
         Mirrors ``POST /control/clear-received``.
         """
         self.state.accepted_bodies.clear()
         self.state.accepted_idempotency_keys.clear()
+        self.state.upstream_events.clear()
 
     async def drain(self, *, timeout_seconds: float = DEFAULT_DRAIN_TIMEOUT_SECONDS) -> None:
         """Wait briefly for in-flight requests to settle.

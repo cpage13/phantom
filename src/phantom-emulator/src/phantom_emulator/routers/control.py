@@ -390,8 +390,9 @@ async def set_seed(
 async def clear_received(
     state: StateDep,
 ) -> Response:
-    """Drop every accepted body record."""
+    """Drop latest accepted bodies and append-only upstream events."""
     state.accepted_bodies.clear()
     state.accepted_idempotency_keys.clear()
+    state.upstream_events.clear()
     logger.info("clear_received")
     return Response(status_code=204)

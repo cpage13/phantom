@@ -10,6 +10,7 @@ import pytest
 from phantom_emulator.app import create_app
 from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.config import AppConfig, AuthCfg
+from phantom_emulator.state import BodyPutEvent, MetadataCreateEvent
 
 
 async def _mint_token(client: httpx.AsyncClient) -> str:
@@ -102,6 +103,36 @@ async def test_create_idempotency_dedup(client: httpx.AsyncClient) -> None:
     assert r1.json() == r2.json()
 
 
+async def test_idempotency_cache_hit_is_a_distinct_create_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cached replay preserves response identity but appends another create event."""
+    monkeypatch.setenv("EMULATOR_SIGNING_KEY", "x" * 32)
+    app = create_app(AppConfig(auth=AuthCfg(default_mode=AuthMode.NONE)))
+    state = app.state.emulator_state
+    transport = httpx.ASGITransport(app=app)
+    local_uuid = uuid4()
+    payload = {
+        "domain": "D",
+        "fileName": "f",
+        "metadata": {"keyValueStore": {"phantom_local_uuid": str(local_uuid)}},
+    }
+    headers = {"Idempotency-Key": "cached-event-key"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://emulator") as client:
+        first = await client.post("/v1/files/create", json=payload, headers=headers)
+        second = await client.post("/v1/files/create", json=payload, headers=headers)
+
+    assert first.json() == second.json()
+    events = [event for event in state.upstream_events if isinstance(event, MetadataCreateEvent)]
+    assert len(events) == 2
+    assert [event.cache_hit for event in events] == [False, True]
+    assert events[0].chain_id == events[1].chain_id == local_uuid
+    assert events[0].idempotency_key == events[1].idempotency_key == "cached-event-key"
+    assert events[0].file_id == events[1].file_id
+    assert events[0].upload_token == events[1].upload_token
+    assert events[0].upload_url == events[1].upload_url
+
+
 async def test_create_different_idempotency_keys_distinct(
     client: httpx.AsyncClient,
 ) -> None:
@@ -146,6 +177,47 @@ async def test_put_accepts_body_records_metadata(client: httpx.AsyncClient) -> N
         },
     )
     assert r.status_code == 200
+
+
+async def test_repeated_puts_are_append_only_events_despite_latest_value_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two PUTs to one token remain two events while the latest map has one key."""
+    monkeypatch.setenv("EMULATOR_SIGNING_KEY", "x" * 32)
+    app = create_app(AppConfig(auth=AuthCfg(default_mode=AuthMode.NONE)))
+    state = app.state.emulator_state
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://emulator") as client:
+        create_response = await client.post(
+            "/v1/files/create",
+            json={
+                "domain": "D",
+                "fileName": "f",
+                "metadata": {"keyValueStore": {"phantom_local_uuid": str(uuid4())}},
+            },
+            headers={"Idempotency-Key": "append-only-key"},
+        )
+        relative_url = create_response.json()["uploadUrl"].replace("http://emulator", "")
+        first = await client.put(relative_url, content=b"first")
+        second = await client.put(relative_url, content=b"second")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(state.accepted_bodies) == 1
+    create_events = [
+        event for event in state.upstream_events if isinstance(event, MetadataCreateEvent)
+    ]
+    put_events = [event for event in state.upstream_events if isinstance(event, BodyPutEvent)]
+    assert len(create_events) == 1
+    assert len(put_events) == 2
+    assert put_events[0].upload_token == put_events[1].upload_token
+    assert put_events[0].body_hash != put_events[1].body_hash
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://emulator") as client:
+        cleared = await client.post("/control/clear-received")
+    assert cleared.status_code == 204
+    assert state.accepted_bodies == {}
+    assert state.upstream_events == []
 
 
 async def test_put_expired_token_403(client: httpx.AsyncClient) -> None:

@@ -28,6 +28,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import sqlite3
 from datetime import UTC, datetime
 
 from phantom.chain.executor import (
@@ -52,6 +53,7 @@ from phantom.storage.errors import (
     StorageCorruptionError,
 )
 from phantom.storage.interface import UploadStore
+from phantom.storage.sqlite_store import is_transient_lock_error
 from phantom.workers._expire import expire_row
 
 logger = logging.getLogger(__name__)
@@ -123,18 +125,20 @@ class Sender:
             now = datetime.now(tz=UTC)
             try:
                 claimed = await store.claim_due(now, limit=CLAIM_BATCH_SIZE)
-            except Exception:
-                logger.exception("claim_due failed in worker %d", idx)
+            except sqlite3.OperationalError as exc:
+                if not is_transient_lock_error(exc):
+                    raise
+                logger.warning(
+                    "claim_due hit transient SQLite contention in worker %d; retrying",
+                    idx,
+                )
                 await asyncio.sleep(self._poll_seconds)
                 continue
             if not claimed:
                 await asyncio.sleep(self._poll_seconds)
                 continue
             row = claimed[0]
-            try:
-                await self._drive_one(store, row)
-            except Exception:
-                logger.exception("Worker %d failed to drive row %s", idx, row.chain_id)
+            await self._drive_one(store, row)
 
     async def _load_body_refs(self, row: UploadRow) -> dict[str, bytes]:
         """Load and verify body_refs for ``row``.
