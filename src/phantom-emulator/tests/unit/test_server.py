@@ -58,8 +58,13 @@ async def test_inject_failure_via_typed_surface() -> None:
                 json={},
             )
         assert r.status_code == 503
+        assert server.error_rate_5xx_count(FailureScope.UPSTREAM_FILES_CREATE) == 1
+        events = server.error_rate_5xx_events(FailureScope.UPSTREAM_FILES_CREATE)
+        assert len(events) == 1
+        assert events[0].scope is FailureScope.UPSTREAM_FILES_CREATE
 
         server.clear_failures()
+        assert server.error_rate_5xx_count(FailureScope.UPSTREAM_FILES_CREATE) == 0
     finally:
         await server.stop()
 

@@ -14,8 +14,12 @@ def test_set_clear() -> None:
     pol = FailurePolicy(scope=FailureScope.UPSTREAM_FILES_CREATE, error_rate_5xx=0.5)
     state.set_policy(pol)
     assert state.resolve(FailureScope.UPSTREAM_FILES_CREATE) is pol
+    event = state.record_error_rate_5xx(FailureScope.UPSTREAM_FILES_CREATE)
+    assert event.scope is FailureScope.UPSTREAM_FILES_CREATE
+    assert state.error_rate_5xx_count(FailureScope.UPSTREAM_FILES_CREATE) == 1
     state.clear_all()
     assert state.resolve(FailureScope.UPSTREAM_FILES_CREATE) is None
+    assert state.error_rate_5xx_count(FailureScope.UPSTREAM_FILES_CREATE) == 0
 
 
 def test_most_specific_wins() -> None:
@@ -41,6 +45,19 @@ def test_call_count_increments() -> None:
     assert state.record_call(FailureScope.UPSTREAM_FILES_CREATE) == 1
     assert state.record_call(FailureScope.UPSTREAM_FILES_CREATE) == 2
     assert state.record_call(FailureScope.UPSTREAM_FILES_UPLOAD) == 1
+
+
+def test_error_rate_5xx_observations_are_typed_per_scope_and_separate() -> None:
+    """5xx observations neither alias scopes nor mutate auth call counts."""
+    state = FailureInjectionState(seed=0)
+    first = state.record_error_rate_5xx(FailureScope.UPSTREAM_FILES_CREATE)
+    second = state.record_error_rate_5xx(FailureScope.UPSTREAM_FILES_CREATE)
+    upload = state.record_error_rate_5xx(FailureScope.UPSTREAM_FILES_UPLOAD)
+
+    assert state.error_rate_5xx_for_scope(FailureScope.UPSTREAM_FILES_CREATE) == (first, second)
+    assert state.error_rate_5xx_for_scope(FailureScope.UPSTREAM_FILES_UPLOAD) == (upload,)
+    assert state.error_rate_5xx_count(FailureScope.UPSTREAM_FILES_CREATE) == 2
+    assert state.call_counts == {}
 
 
 def test_seeded_rng_deterministic() -> None:

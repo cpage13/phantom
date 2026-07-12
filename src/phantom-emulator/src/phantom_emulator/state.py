@@ -267,9 +267,12 @@ class EmulatorState:
         accepted_bodies: Latest accepted body keyed by upload token. This
             materialized view intentionally overwrites repeated PUTs.
         upstream_events: Append-only successful metadata-create and body-PUT
-            oracle. It preserves every request occurrence for cardinality and
-            ordering assertions while the latest-value maps retain their
-            established behavior.
+            oracle. It preserves every successful metadata response and accepted
+            body side effect for exact successful-event cardinality and ordering
+            assertions while the latest-value maps retain their established
+            behavior. The ``error_rate_5xx`` branch's rejected attempts are
+            observed separately by ``failure_state``; other 503 mechanisms are
+            intentionally outside that narrow ledger.
         s3_objects: Path-style S3 sink store, keyed by ``(bucket, key)``;
             populated by a SigV4-validated ``PUT /{bucket}/{key}``.
         raw_bodies: Auth-free /raw sink store, keyed by the full forwarded

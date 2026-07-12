@@ -41,11 +41,11 @@ manual only (`workflow_dispatch`, on a quiet runner). The `stress` lane runs
 nightly. Those three workflows are the whole CI set; there is no full-sweep
 lane.
 
-By the numbers, the suite is 127 end-to-end test files (the top level
+By the numbers, the suite is 128 end-to-end test files (the top level
 plus the `crash_recovery/`, `regression/`, `stress/`, `all_ram/`,
-`ingress_abort/`, and `db_contention/` subdirs) and 243 test functions:
-226 in the default lane, 2 in `load`, 9 in `perf`, and 6 in `stress`,
-with one designed `xfail` (counts as of 2026-07-01). Counts drift as tests land - see
+`ingress_abort/`, and `db_contention/` subdirs) and 248 test functions:
+231 in the default lane, 2 in `load`, 9 in `perf`, and 6 in `stress`,
+with no designed `xfail` (counts as of 2026-07-12). Counts drift as tests land - see
 `tests/e2e/regression/COVERAGE.md` for the authoritative failure-mode map.
 Performance budgets throughout are named constants in the tests, not bare
 numbers, so a budget is always self-documenting.
@@ -70,10 +70,23 @@ budget it asserts.
 - **Auth refresh.** A 401 parks the row in `auth_expired`. An external token push
   lands a fresh bearer, and the auth kicker wakes the row to `succeeded`.
   Database: `auth_expired` then `succeeded`.
-- **Capture expiry.** With re-execution off (the default), an expired capture
-  window moves the chain to `stored` with its body still recoverable. With
-  re-execution on, Phantom re-runs the first step under an idempotency key and the
-  upstream returns the same object identity, reaching `succeeded`.
+- **Capture expiry.** A strict three-case matrix drives the same two-step chain
+  through a short Phantom capture-observation TTL while the emulator's actual
+  capability and idempotency windows remain longer than the whole scenario.
+  At least one PUT is proven rejected by the scoped 5xx policy before rewind.
+  With re-execution off
+  (the default), the chain performs one metadata create, accepts no PUT, and
+  moves to `stored` with its body still recoverable. With re-execution on and a
+  declared idempotency header, two metadata requests resolve to the same logical
+  identity, token, and cached URL before one PUT succeeds. Without a declared
+  idempotency header, the two metadata requests create distinct identities and
+  URLs, and the single successful PUT consumes the second result. The emulator's
+  append-only successful-event oracle proves exact successful metadata-response
+  and accepted-PUT cardinality and identity; the separate `error_rate_5xx`
+  oracle proves attempts rejected by that branch. It does not count
+  `unavailable_until` or global-pause 503s. None of these cases is conditional or
+  expected to fail. Reexecution renews Phantom's observation timestamp; a
+  cached upstream response does not by itself renew the capability it contains.
 - **Shutdown and restart.** A row is in `attempting` at shutdown; on restart,
   recovery resets it to `queued` and the next attempt completes. Database: the
   RAM-to-disk persist is verified and the body survives the restart.

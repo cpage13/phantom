@@ -73,7 +73,7 @@ instances:
       - "127.0.0.1"
       - "localhost"
     data_dir: "primary"
-    capture_reexecution: false        # ADR-011 default; E2E-6b overlays explicitly
+    capture_reexecution: false        # ADR-011 base; strict E2E-6 matrix replaces/omits it per leg
     # Cycle-7 by-captured-id lookup binding (deployment-supplied so the
     # service stays upstream-ignorant): the create_file step captures the
     # emulator's fileInformation object; its id field is the upstream-

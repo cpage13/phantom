@@ -73,6 +73,7 @@ async def test_503_when_unavailable(
     r = await client.post("/v1/files/create")
     assert r.status_code == 503
     assert r.headers.get("Retry-After") == "5"
+    assert state.failure_state.error_rate_5xx_count(FailureScope.UPSTREAM_FILES_CREATE) == 0
 
 
 async def test_401_after_n_calls(
@@ -160,6 +161,8 @@ async def test_5xx_with_full_probability(
     )
     r = await client.post("/v1/files/create")
     assert r.status_code == 503
+    assert state.failure_state.error_rate_5xx_count(FailureScope.UPSTREAM_FILES_CREATE) == 1
+    assert state.failure_state.call_counts == {}
 
 
 async def test_global_pause_short_circuits(

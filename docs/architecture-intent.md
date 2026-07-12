@@ -882,8 +882,8 @@ punch-list failure modes.
 | Failure | Trigger / detection | Recovery / response | Regression test |
 |---|---|---|---|
 | Upstream metadata POST returns 5xx | Sender classifies as `Failed5xx`. | State `attempting → queued` with `next_attempt_at` per the retry strategy. | `tests/e2e/regression/test_v5_retry_cadence_and_crash_survival.py`. |
-| S3 PUT returns 5xx (or network error) | Same as above on step 2. | Same. The captured presigned URL is still on the row; retry only re-runs step 2 unless the URL expired. | Same. |
-| Presigned URL expires (capture TTL elapsed) | Executor's capture-TTL gate. | Per `row.capture_reexecution_active`: `False` → `stored`; `True` → executor rewinds to the producing step and re-executes with the chain's `idempotency_key`. See ADR-011. | `tests/e2e/test_e2e_06_capture_expiry.py`. |
+| S3 PUT returns 5xx (or network error) | Same as above on step 2. | Same. The captured presigned URL remains on the row; retry re-runs step 2 while Phantom's observation TTL remains live. Actual upstream capability expiry is a separate clock that Phantom cannot infer from the local TTL gate. | Same. |
+| Referenced capture's Phantom observation TTL elapses | Executor's capture-TTL gate; this does not prove that the upstream capability itself expired. | Per `row.capture_reexecution_active`: `False` → `stored`; `True` → executor rewinds to the producing step and renews Phantom's observation timestamp. A declared per-step idempotency header lets an honoring upstream preserve identity, but an exact cached response cannot revive an actually expired URL. Enabling this requires both verified identity/idempotency behavior and compatible upstream capability renewal or lifetime. Without an idempotency header, re-execution can create a distinct upstream object. See ADR-011. | `tests/e2e/test_e2e_06_capture_expiry.py` strictly proves keyed, unkeyed, and default-disabled behavior, at least one upload PUT rejected by the configured `error_rate_5xx` branch before rewind, and exact successful create-response/accepted-PUT events. |
 | Upstream returns 401 (token stale) | Sender classifies as `FailedAuth`. | `token_cache.mark_bad(endpoint, uid)`; row → `auth_expired`. `AdMinter` mints fresh when configured; `AuthKicker` wakes matching rows when a fresh token lands. | `tests/e2e/test_e2e_04_auth_kicker.py`, `tests/e2e/test_e2e_36_token_expiry_recovery.py`. |
 | `aws_sigv4` credential missing or rejected | The executor's `aws_sigv4` arm raises `SigV4SigningError` (no credential for the host, or its service has no signer). | Sender marks the slot bad; row → `auth_expired` (NOT terminal). On a fresh credential push for that `dest_host`, the `CredentialKicker` wakes the parked rows (the SigV4 analogue of the 401 cycle). Body bytes are never altered. | `tests/e2e/test_e2e_sigv4_resign_round_trip.py` (`test_sigv4_wrong_credential_parks_auth_expired`, `test_sigv4_refresh_loop_wrong_then_correct_credential`). |
 | Producer restart | Process loss. | RAM bodies lost; `body_location='file'` rows survive. Admission's atomic transaction (Phase 1 H7) ensures every committed row has an idempotency claim. RAM rows are quarantined by the recovery sweep. | `tests/e2e/crash_recovery/test_crash_recovery_idempotent.py`. |
@@ -909,11 +909,14 @@ punch-list failure modes.
 Items the code still has to resolve at implementation time. None
 block starting work.
 
-1. **Upstream `Idempotency-Key` semantics are unverified.**
+1. **Upstream idempotency and capability semantics are unverified.**
    ADR-011 defaults `capture_reexecution: false` for an upstream
    instance pending real verification that the upstream dedups
-   `POST /v2/files` on `Idempotency-Key`. The YAML flip from `false`
-   to `true` is an operator action gated on the verification result.
+   `POST /v2/files` on `Idempotency-Key` and that replay either renews the
+   returned capability or returns a capability whose real lifetime safely
+   exceeds Phantom's observation/retry window. The YAML flip from `false`
+   to `true` is an operator action gated on both verification results; exact
+   cached response replay alone cannot revive an expired URL.
 2. **Per-step body-size limit on upstream responses.** The default
    "read it all" is acceptable for small upstream response shapes (<8 KiB)
    but adding a soft cap is a future-proofing nicety.
@@ -947,13 +950,12 @@ Four layers, each with a different role:
   by the admin-model alignment test
   (`test_admin_models_alignment.py`); only the chain byte-equality
   test excludes it (see § 5 invariant #7).
-- **Workspace-root E2E suite** (`tests/e2e/`). pytest. 127 test
+- **Workspace-root E2E suite** (`tests/e2e/`). pytest. 128 test
   files across the top level plus the `crash_recovery/`, `regression/`,
   `stress/`, `all_ram/`, `ingress_abort/`, and `db_contention/`
-  subdirs - 243 test functions, of which 226 run in the default
+  subdirs - 248 test functions, of which 231 run in the default
   lane (the `load` / `perf` / `stress` markers gate out the rest) and
-  one is a designed `xfail` (the ADR-011 capture-TTL re-execution
-  case). Counts are as of 2026-07-01 and drift as tests land. Boots
+  none is a designed `xfail`. Counts are as of 2026-07-12 and drift as tests land. Boots
   real Phantom + real emulator, drives through the
   test-owned driver, asserts on three surfaces (producer-side return,
   Phantom admin, emulator's received log). Includes transparent-proxy tests, concurrency tests,

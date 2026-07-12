@@ -47,7 +47,11 @@ from phantom_emulator import Server as EmulatorServer
 from phantom_emulator.app import create_app as emulator_create_app
 from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.config import load_config as load_emulator_config
-from phantom_emulator.failure.injection import FailurePolicy
+from phantom_emulator.failure.injection import (
+    ErrorRate5xxEvent,
+    FailurePolicy,
+    FailureScope,
+)
 from phantom_emulator.routers.control import ReceivedEntry
 from phantom_emulator.state import EmulatorState, RawBody, S3Object, UpstreamEvent
 
@@ -408,6 +412,14 @@ class EmulatorControl:
         """Drop every installed failure policy."""
         self._server.clear_failures()
 
+    def error_rate_5xx_count(self, scope: FailureScope) -> int:
+        """Return the error-rate-generated 503 count for one request scope."""
+        return self._server.error_rate_5xx_count(scope)
+
+    def error_rate_5xx_events(self, scope: FailureScope) -> tuple[ErrorRate5xxEvent, ...]:
+        """Return immutable error-rate-generated 503 events for one scope."""
+        return self._server.error_rate_5xx_events(scope)
+
     def pause(self) -> None:
         """Refuse upstream requests with 503 until :meth:`resume`."""
         self._server.pause()
@@ -435,6 +447,10 @@ class EmulatorControl:
     def set_presigned_ttl(self, seconds: int) -> None:
         """Set the default presigned URL lifetime."""
         self._server.set_presigned_ttl(seconds)
+
+    def set_idempotency_dedup_window(self, seconds: int) -> None:
+        """Set the create-response idempotency cache lifetime."""
+        self._server.set_idempotency_dedup_window(seconds)
 
     def set_seed(self, seed: int) -> None:
         """Reseed the failure-injection RNG."""

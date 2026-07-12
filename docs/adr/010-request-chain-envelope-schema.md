@@ -2,6 +2,16 @@
 
 ADR-009 specified the request-chain *mechanism* (multi-step buffered uploads with JSONPath capture and `{{step.var}}` substitution) but left the exact wire-protocol shape — JSON keys, body tagging, multipart conventions, method names — unspecified. The four 2026-05-12 strategy agents each invented a different shape under that gap. This ADR pins the schema so phantom, phantom-client, and phantom-emulator can build against one source of truth. Models are Pydantic v2 with `Field` descriptions on every attribute, matching the project's coding standards. Capture-expiry re-execution behavior (when a captured value's `ttl_seconds` is reached before later steps complete) is gated on upstream idempotency support and is the subject of ADR-011.
 
+## Amendment — 2026-07-12: optional header, two-part enablement gate
+
+The final sentence above records the original idempotency-only assumption and
+is superseded by ADR-011's current authority. The runtime does not gate rewind
+on `idempotency_header`: if capture reexecution is enabled, an expired Phantom
+observation rewinds whether the producing step declares the header or not.
+Omission can create a duplicate upstream identity. A declared header is
+required for identity-safe reexecution and is still insufficient by itself;
+operators must also verify compatible upstream capability renewal or lifetime.
+
 ## Envelope (top-level)
 
 ```python
@@ -67,7 +77,7 @@ class ChainStep(BaseModel):
     )
     idempotency_header: str | None = Field(
         None,
-        description="If set, Phantom sends this header name with the envelope's idempotency_key value on every attempt of this step. Required for ADR-011's re-execution behavior. Typical value: 'Idempotency-Key'.",
+        description="Optional header name. If set, Phantom sends it with the envelope's idempotency_key on every attempt of this step. Capture reexecution still occurs when omitted and may create a duplicate; declaring an upstream-honored header is required for identity-safe reexecution but does not itself renew a returned capability. See ADR-011. Typical value: 'Idempotency-Key'.",
     )
 ```
 

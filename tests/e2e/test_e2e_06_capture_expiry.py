@@ -1,34 +1,18 @@
-"""E2E-6 — Capture-TTL expiry handling per ADR-011.
+"""Strict ADR-011 capture-expiry reexecution matrix.
 
-Two sub-cases:
-
-- ``test_capture_expiry_default_false_transitions_to_stored`` —
-  ``capture_reexecution: false`` (the suite's default). When the
-  captured ``upload_url`` expires before step 2 can use it, the
-  chain transitions to ``stored`` and the body stays recoverable
-  via the bulk export.
-- ``test_capture_expiry_operator_true_reexecutes_step_1`` —
-  ``capture_reexecution: true``. Phantom re-runs step 1 with the
-  chain's idempotency key; the emulator's idempotency cache returns
-  the same ``file_information.id`` and a fresh ``upload_url``; the
-  retried step 2 succeeds.
-
-Both sub-cases construct their chain envelopes inline (rather than
-via the driver) because the driver hard-codes
-``ttl_seconds=7 days`` on the ``upload_url`` capture.
-The tests need a 1-2 second TTL to make capture expiry observable
-within the suite's runtime budget, so they craft a custom envelope
-through :meth:`PhantomClient.submit_chain` directly.
-
-The chain-envelope shape mirrors what the driver would build:
-step 1 POSTs to ``/v2/files`` with ``Idempotency-Key`` set; step 2
-PUTs to ``{{create_file.upload_url}}``. Only the capture TTL
-differs.
+The three scenarios share one two-step chain and differ only in whether the
+metadata step declares ``Idempotency-Key`` and whether the instance enables
+capture reexecution. The emulator's append-only successful-event oracle is the
+authority for exact successful-response/accepted-side-effect cardinality and
+capability identity; a separate ``error_rate_5xx`` oracle proves PUTs rejected
+by that configured branch.
 """
 
 from __future__ import annotations
 
-from uuid import uuid4
+import hashlib
+from datetime import timedelta
+from uuid import UUID, uuid4
 
 import pytest
 from phantom_client import (
@@ -37,96 +21,100 @@ from phantom_client import (
     ChainCapture,
     ChainEnvelope,
     ChainStep,
-    PhantomClient,
 )
+from phantom_client.models.admin import ChainAdminDetail
 from phantom_emulator.failure.injection import FailurePolicy, FailureScope
+from phantom_emulator.state import BodyPutEvent, MetadataCreateEvent, UpstreamEvent
 
-from .helpers.assertions import assert_chain_reaches_state, assert_emulator_received
-from .helpers.stack import DEFAULT_FAKE_SUB, E2EStack, EmulatorControl, boot_stack
+from .helpers.assertions import assert_chain_reaches_state
+from .helpers.stack import DEFAULT_FAKE_SUB, E2EStack, boot_stack
 from .helpers.timing import await_until
 
-# Shared payload and envelope shape constants ------------------------------
+pytestmark = [pytest.mark.asyncio, pytest.mark.e2e]
 
-# Body payload bytes — small enough to fit in any tier, large enough
-# that the emulator's body_size assertion has meaning.
-TEST_BODY: bytes = b"phantom-e2e-capture-expiry-body-bytes-00000000"
+TEST_BODY = b"phantom-e2e-capture-expiry-body-bytes"
+CAPTURE_TTL_SECONDS = 2
+CAPABILITY_TTL_SECONDS = 60
+WAIT_BUDGET_SECONDS = 20.0
+SERIAL_WAIT_COUNT = 2
+CAPABILITY_LIFETIME_MARGIN_SECONDS = 10.0
+WHOLE_SCENARIO_WORST_CASE_SECONDS = WAIT_BUDGET_SECONDS * SERIAL_WAIT_COUNT
+EVENT_POLL_SECONDS = 0.05
+FORCE_5XX_RATE = 1.0
+EXPECTED_BODY_HASH = hashlib.sha256(TEST_BODY).hexdigest()
 
-# JSON body for step 1 — matches the shape the CreateFileRequest
-# serializes to in camelCase. The fields here are the minimum the
-# emulator's ``create_file`` handler needs to mint a valid response;
-# extra fields are passed through to ``metadata.keyValueStore``.
-TEST_FILE_NAME: str = "e2e_capture_expiry_test"
-TEST_DOMAIN: str = "generic"
-TEST_LANE_BASE: str = "metadata_table"
-TEST_UPLOADER_ID: str = "12345"
-TEST_LABEL: str = "alpha"
-
-# Capture TTL. 2 seconds is short enough that one retry interval
-# (``intervals_seconds: [0, 1, 2, ...]``) lands past expiry, but
-# long enough that the first attempt of step 2 isn't already too
-# late before phantom even hits send().
-CAPTURE_TTL_SECONDS: int = 2
-
-# The failure-injection rate used to keep step 2 in the retry loop
-# long enough for the capture to expire. Every PUT in the failure
-# window returns 503.
-FORCE_5XX_RATE: float = 1.0
-
-# Budget for the chain to reach ``stored`` (sub-case 6a). The
-# retry interval list is [0, 1, 2, ...]; the capture-TTL is 2s; so
-# expiry triggers on the third attempt (at intervals_offset=3s),
-# which is comfortably under 10s.
-STORED_BUDGET_SECONDS: float = 10.0
-
-# Budget for the chain to reach ``succeeded`` after the failure is
-# lifted in sub-case 6b. The re-execution path issues a fresh step 1
-# (which the emulator's idempotency cache returns from the dedup
-# entry), a fresh step 2 against the fresh upload_url, and a
-# success. 15-second budget.
-SUCCEEDED_BUDGET_SECONDS: float = 15.0
+_FILE_NAME = "capture-expiry-matrix"
+_DOMAIN = "generic"
+_LANE_BASE = "metadata_table"
+_UPLOADER_ID = "12345"
+_LABEL = "capture-matrix"
 
 
-pytestmark = pytest.mark.e2e
-
-
-def _build_capture_expiry_envelope(
-    *,
-    chain_id: object,
-    emulator_url: str,
-) -> ChainEnvelope:
-    """Build a two-step upload envelope with a short capture TTL.
-
-    The envelope is structurally identical to what
-    :func:`tests.e2e._driver.build_in_memory_upload_envelope`
-    produces, except the ``upload_url`` capture's ``ttl_seconds`` is
-    :data:`CAPTURE_TTL_SECONDS` (short) instead of the production
-    7-day value. The ``Idempotency-Key`` header is declared on step
-    1 so ADR-011 re-execution behavior can engage when enabled.
-    """
-    body_value: dict[str, object] = {
-        "fileName": TEST_FILE_NAME,
-        "domain": TEST_DOMAIN,
-        "laneBaseName": TEST_LANE_BASE,
-        "metadata": {
-            "keyValueStore": {
-                "uploader_id": TEST_UPLOADER_ID,
-                "label": TEST_LABEL,
-                "phantom_local_uuid": str(chain_id),
+def _config(*, capture_reexecution: bool | None) -> dict[str, object]:
+    """Return a deterministic one-worker overlay for one matrix case."""
+    instance: dict[str, object] = {
+        "id": "primary",
+        "host_prefixes": ["emulator", "127.0.0.1", "localhost"],
+        "data_dir": "primary",
+        "routes": [
+            {
+                "name": "emulator",
+                "hosts": ["emulator", "127.0.0.1", "localhost"],
+                "auth_mode": "phantom_bearer",
+            }
+        ],
+    }
+    if capture_reexecution is not None:
+        instance["capture_reexecution"] = capture_reexecution
+    return {
+        "instances": [instance],
+        "retry": {
+            "worker_count": 1,
+            "poll_interval_ms": 50,
+            "default_strategy": {
+                "type": "fixed_intervals",
+                "intervals_seconds": [0, 1, 2, 5, 10],
             },
         },
+        "retention": {"reaper_interval_seconds": 3600},
     }
-    step_create = ChainStep(
+
+
+def _build_envelope(
+    *,
+    chain_id: UUID,
+    emulator_url: str,
+    keyed: bool,
+) -> ChainEnvelope:
+    """Build the two-step chain with a deliberately short Phantom capture TTL."""
+    create_step = ChainStep(
         name="create_file",
         method="POST",
-        url=emulator_url.rstrip("/") + "/v2/files",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        body=ChainBodyJson(kind="json", value=body_value),
+        url=f"{emulator_url.rstrip('/')}/v2/files",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        body=ChainBodyJson(
+            kind="json",
+            value={
+                "fileName": _FILE_NAME,
+                "domain": _DOMAIN,
+                "laneBaseName": _LANE_BASE,
+                "metadata": {
+                    "keyValueStore": {
+                        "uploader_id": _UPLOADER_ID,
+                        "label": _LABEL,
+                        "phantom_local_uuid": str(chain_id),
+                    }
+                },
+            },
+        ),
         capture=[
             ChainCapture.model_validate(
-                {"name": "upload_url", "from": "$.uploadUrl", "ttl_seconds": CAPTURE_TTL_SECONDS}
+                {
+                    "name": "upload_url",
+                    "from": "$.uploadUrl",
+                    "ttl_seconds": CAPTURE_TTL_SECONDS,
+                    "sensitive": True,
+                }
             ),
             ChainCapture.model_validate(
                 {
@@ -136,15 +124,15 @@ def _build_capture_expiry_envelope(
                 }
             ),
         ],
-        idempotency_header="Idempotency-Key",
+        idempotency_header="Idempotency-Key" if keyed else None,
     )
-    step_put = ChainStep(
+    put_step = ChainStep(
         name="put_s3",
         method="PUT",
         url="{{create_file.upload_url}}",
         headers={
-            "x-amz-meta-uploader-id": TEST_UPLOADER_ID,
-            "x-amz-meta-label": TEST_LABEL,
+            "x-amz-meta-uploader-id": _UPLOADER_ID,
+            "x-amz-meta-label": _LABEL,
             "x-amz-meta-phantom-local-uuid": str(chain_id),
         },
         body=ChainBodyRef(kind="body_ref", name="body", content_type="application/octet-stream"),
@@ -152,208 +140,199 @@ def _build_capture_expiry_envelope(
         idempotency_header=None,
     )
     return ChainEnvelope(
-        chain_id=chain_id,  # type: ignore[arg-type]
+        chain_id=chain_id,
         idempotency_key=str(chain_id),
-        steps=[step_create, step_put],
+        steps=[create_step, put_step],
         default_target=None,
     )
 
 
-async def test_capture_expiry_default_false_transitions_to_stored(
-    stack: E2EStack,
-    phantom_client: PhantomClient,
-    emulator: EmulatorControl,
-) -> None:
-    """Capture TTL expires; default config sends chain to ``stored`` (sub-case 6a).
+def _events(stack: E2EStack, chain_id: UUID) -> list[UpstreamEvent]:
+    """Return successful upstream events for the matrix chain only."""
+    return [event for event in stack.emulator.upstream_events() if event.chain_id == chain_id]
 
-    Step 1 succeeds (captures upload_url with TTL=2s). Step 2 is
-    blocked by a 100% 5xx policy on the PUT path; the retry loop
-    walks the intervals [0, 1, 2, ...]; on the third retry the
-    capture has expired (now > captured_at + 2s) and Phantom
-    transitions the row to ``stored`` per ADR-011 with
-    ``capture_reexecution: false`` (the suite default).
-    """
-    emulator.clear_received()
-    emulator.clear_failures()
-    emulator.inject_failure(
-        FailurePolicy(  # type: ignore[call-arg]  # FailurePolicy fields have defaults; mypy lacks pydantic plugin
+
+def _create_events(stack: E2EStack, chain_id: UUID) -> list[MetadataCreateEvent]:
+    """Return successful metadata-create events for ``chain_id``."""
+    return [event for event in _events(stack, chain_id) if isinstance(event, MetadataCreateEvent)]
+
+
+async def _boot_case(*, capture_reexecution: bool | None) -> E2EStack:
+    """Boot with upstream lifetimes beyond the whole two-wait scenario."""
+    assert CAPABILITY_TTL_SECONDS >= (
+        WHOLE_SCENARIO_WORST_CASE_SECONDS + CAPABILITY_LIFETIME_MARGIN_SECONDS
+    )
+    stack = await boot_stack(config_overrides=_config(capture_reexecution=capture_reexecution))
+    stack.emulator.clear_received()
+    stack.emulator.clear_failures()
+    stack.emulator.set_presigned_ttl(CAPABILITY_TTL_SECONDS)
+    stack.emulator.set_idempotency_dedup_window(CAPABILITY_TTL_SECONDS)
+    stack.emulator.inject_failure(
+        FailurePolicy(  # type: ignore[call-arg]  # pydantic defaults; plugin unavailable
             scope=FailureScope.UPSTREAM_FILES_UPLOAD,
             error_rate_5xx=FORCE_5XX_RATE,
         )
     )
+    return stack
 
-    chain_id = uuid4()
-    envelope = _build_capture_expiry_envelope(
-        chain_id=chain_id,
-        emulator_url=stack.emulator_url,
-    )
-    bearer = stack.fake_security_token()
 
-    await phantom_client.submit_chain(
+async def _submit(stack: E2EStack, envelope: ChainEnvelope) -> None:
+    """Submit one matrix chain through the public SDK."""
+    await stack.phantom_client.submit_chain(
         envelope,
         body_refs={"body": TEST_BODY},
         uid=DEFAULT_FAKE_SUB,
-        auth_token=f"Bearer {bearer}",
-    )
-
-    # Wait for the chain to reach the ``stored`` terminal state.
-    # ``assert_chain_reaches_state`` returns :class:`ChainAdminDetail`
-    # post-Wave-3b (the admin endpoint returns the extended detail
-    # shape; the wire-facing :class:`ChainResponse` is unchanged).
-    chain_response = await assert_chain_reaches_state(
-        phantom_client,
-        chain_id,
-        state="stored",
-        timeout_seconds=STORED_BUDGET_SECONDS,
-    )
-    assert chain_response.state == "stored"
-    assert chain_response.last_step_completed == "create_file", (
-        f"expected last_step_completed='create_file' (step 2 never ran to "
-        f"terminal-success); got {chain_response.last_step_completed!r}"
-    )
-
-    # The captured upload_url is preserved on the row even though
-    # the chain transitioned to ``stored``. Admin can query the
-    # captured values for diagnostics.
-    captured_by_name = {cs.step_name: cs.values for cs in chain_response.captured}
-    assert "create_file" in captured_by_name
-    assert "upload_url" in captured_by_name["create_file"]
-
-    # The emulator received the create POST (step 1 succeeded) but
-    # NOT the PUT body — step 2 was 503'd repeatedly and never
-    # accepted a body. Body retention defaults preserve the body on
-    # ``stored`` per ``stored_body_seconds: 15768000`` (6 months) so
-    # operator recovery via ``GET /v1/admin/export.tar`` is meaningful.
-    matched_entries = [
-        entry
-        for entry in emulator.received()
-        if entry.metadata_kvs.get("phantom_local_uuid") == str(chain_id)
-    ]
-    assert not matched_entries, (
-        f"expected zero emulator-received entries (the PUT never landed); "
-        f"got {len(matched_entries)}"
+        auth_token=f"Bearer {stack.fake_security_token()}",
     )
 
 
-async def test_capture_expiry_operator_true_reexecutes_step_1(
-    emulator: EmulatorControl,
+async def _release_after_rejected_put_and_second_create(
+    stack: E2EStack,
+    chain_id: UUID,
 ) -> None:
-    """Capture TTL expires; ``capture_reexecution: true`` re-runs step 1 (sub-case 6b).
+    """Clear the PUT fault after one rejection and create number two are observed."""
 
-    Boots a per-test stack with the ``primary`` instance's
-    ``capture_reexecution`` flag flipped to ``true``. Step 1
-    succeeds the first time; step 2 fails until the capture expires;
-    Phantom re-executes step 1 using the chain's ``idempotency_key``
-    on the ``Idempotency-Key`` header. The emulator's idempotency
-    cache returns the previously-cached response (same
-    ``file_information.id``, fresh ``upload_url``), Phantom updates
-    its capture, step 2 runs against the fresh URL, the chain
-    succeeds.
+    async def _failure_then_second_create_observed() -> bool:
+        rejected_puts = stack.emulator.error_rate_5xx_count(FailureScope.UPSTREAM_FILES_UPLOAD)
+        return rejected_puts >= 1 and len(_create_events(stack, chain_id)) >= 2
 
-    The clear-failures step lets the re-executed step 2 actually
-    succeed; otherwise the chain would keep rewinding indefinitely.
-    """
-    # We intentionally do not depend on the session ``stack`` fixture
-    # for this sub-case — we need a per-test instance with
-    # ``capture_reexecution: true`` and the rest of the YAML
-    # unchanged. ``boot_stack(config_overrides=...)`` is the helper's
-    # supported path for that.
-    del emulator  # the per-test stack carries its own emulator handle
+    await await_until(
+        _failure_then_second_create_observed,
+        timeout_seconds=WAIT_BUDGET_SECONDS,
+        poll_interval_seconds=EVENT_POLL_SECONDS,
+        message="oracles never observed a rejected PUT followed by the second metadata create",
+    )
+    second_create = _create_events(stack, chain_id)[1]
+    rejected_events = stack.emulator.error_rate_5xx_events(FailureScope.UPSTREAM_FILES_UPLOAD)
+    assert stack.emulator.error_rate_5xx_count(FailureScope.UPSTREAM_FILES_UPLOAD) >= 1
+    assert rejected_events
+    assert rejected_events[0].occurred_at <= second_create.occurred_at
+    stack.emulator.clear_failures()
 
-    overrides: dict[str, object] = {
-        "instances": [
-            {
-                "id": "primary",
-                "host_prefixes": ["emulator", "127.0.0.1", "localhost"],
-                "data_dir": "primary",
-                "capture_reexecution": True,
-                "routes": [
-                    {
-                        "name": "emulator",
-                        "hosts": ["emulator", "127.0.0.1", "localhost"],
-                        "auth_mode": "phantom_bearer",
-                    }
-                ],
-            }
-        ]
-    }
-    stack = await boot_stack(config_overrides=overrides)
+
+def _captured_create(detail: ChainAdminDetail) -> dict[str, object]:
+    """Return the final create-step captured values from admin detail."""
+    by_step = {entry.step_name: entry.values for entry in detail.captured}
+    value = by_step["create_file"]
+    assert isinstance(value, dict)
+    return value
+
+
+async def test_capture_expiry_keyed_reexecutes_with_cached_identity() -> None:
+    """Enabled + keyed: two creates share identity/URL, then one PUT succeeds."""
+    stack = await _boot_case(capture_reexecution=True)
+    chain_id = uuid4()
     try:
-        local_emulator = stack.emulator
-        local_phantom_client = stack.phantom_client
-        local_emulator.clear_received()
-        local_emulator.clear_failures()
-        local_emulator.inject_failure(
-            FailurePolicy(  # type: ignore[call-arg]  # FailurePolicy fields have defaults; mypy lacks pydantic plugin
-                scope=FailureScope.UPSTREAM_FILES_UPLOAD,
-                error_rate_5xx=FORCE_5XX_RATE,
-            )
+        await _submit(
+            stack,
+            _build_envelope(chain_id=chain_id, emulator_url=stack.emulator_url, keyed=True),
         )
-
-        chain_id = uuid4()
-        envelope = _build_capture_expiry_envelope(
-            chain_id=chain_id,
-            emulator_url=stack.emulator_url,
-        )
-        bearer = stack.fake_security_token()
-
-        await local_phantom_client.submit_chain(
-            envelope,
-            body_refs={"body": TEST_BODY},
-            uid=DEFAULT_FAKE_SUB,
-            auth_token=f"Bearer {bearer}",
-        )
-
-        # Give the chain a moment to hit capture expiry and rewind
-        # (the row should transition through ``queued`` and back to
-        # step 1). Then clear failures so the re-executed step 2 can
-        # actually succeed.
-        async def _last_completed_back_to_create() -> bool:
-            snapshot = await local_phantom_client.get_upload(chain_id)
-            # On rewind, ``last_step_completed`` resets — the executor
-            # sets it back to None and re-issues step 1. We treat any
-            # transient non-terminal state as proof the rewind path
-            # engaged; the final assertion checks chain succeeded.
-            return snapshot.state in {"queued", "attempting", "succeeded"}
-
-        await await_until(
-            _last_completed_back_to_create,
-            timeout_seconds=STORED_BUDGET_SECONDS,
-            message="chain did not engage rewind path",
-        )
-
-        local_emulator.clear_failures()
-
-        chain_response = await assert_chain_reaches_state(
-            local_phantom_client,
+        await _release_after_rejected_put_and_second_create(stack, chain_id)
+        detail = await assert_chain_reaches_state(
+            stack.phantom_client,
             chain_id,
             state="succeeded",
-            timeout_seconds=SUCCEEDED_BUDGET_SECONDS,
+            timeout_seconds=WAIT_BUDGET_SECONDS,
         )
-        assert chain_response.state == "succeeded"
 
-        # The emulator's received log should show the body landed
-        # exactly once — even though step 1 was re-executed (and the
-        # idempotency dedup returned the cached create response),
-        # step 2 only ever ran to terminal-success once.
-        received_entry = await assert_emulator_received(
-            local_emulator,
-            phantom_local_uuid=str(chain_id),
-            body_size=len(TEST_BODY),
-        )
-        assert received_entry.body_size == len(TEST_BODY)
-
-        # Crucial ADR-011 assertion: only one unique
-        # ``fileInformation.id`` value was captured across the
-        # chain's lifetime. The idempotency cache served the same
-        # ``file_information`` on the re-execution rather than
-        # creating a new ``pending_upload``.
-        captured_by_name = {cs.step_name: cs.values for cs in chain_response.captured}
-        file_info = captured_by_name["create_file"]["file_information"]
-        assert isinstance(file_info, dict)
-        # Only assertable in the final captured-values map; the
-        # idempotency cache's behaviour means the second execution's
-        # ``fileInformation.id`` matches the first's.
-        assert "id" in file_info, f"file_information missing 'id': {file_info}"
+        events = _events(stack, chain_id)
+        assert len(events) == 3
+        first, second, put = events
+        assert isinstance(first, MetadataCreateEvent)
+        assert isinstance(second, MetadataCreateEvent)
+        assert isinstance(put, BodyPutEvent)
+        assert [first.cache_hit, second.cache_hit] == [False, True]
+        assert first.idempotency_key == second.idempotency_key == str(chain_id)
+        assert first.file_id == second.file_id == put.file_id
+        assert first.upload_token == second.upload_token == put.upload_token
+        assert first.upload_url == second.upload_url == put.upload_url
+        assert second.occurred_at - first.occurred_at >= timedelta(seconds=CAPTURE_TTL_SECONDS)
+        assert second.occurred_at <= put.occurred_at
+        assert put.occurred_at < second.occurred_at + timedelta(seconds=CAPTURE_TTL_SECONDS)
+        assert put.body_size == len(TEST_BODY)
+        assert put.body_hash == EXPECTED_BODY_HASH
+        captured = _captured_create(detail)
+        assert captured["upload_url"] == second.upload_url
+        file_information = captured["file_information"]
+        assert isinstance(file_information, dict)
+        assert file_information["id"] == str(second.file_id)
     finally:
+        stack.emulator.clear_failures()
+        await stack.tear_down()
+
+
+async def test_capture_expiry_unkeyed_reexecutes_with_distinct_identity() -> None:
+    """Enabled + unkeyed: two distinct creates, then one PUT uses the second."""
+    stack = await _boot_case(capture_reexecution=True)
+    chain_id = uuid4()
+    try:
+        await _submit(
+            stack,
+            _build_envelope(chain_id=chain_id, emulator_url=stack.emulator_url, keyed=False),
+        )
+        await _release_after_rejected_put_and_second_create(stack, chain_id)
+        detail = await assert_chain_reaches_state(
+            stack.phantom_client,
+            chain_id,
+            state="succeeded",
+            timeout_seconds=WAIT_BUDGET_SECONDS,
+        )
+
+        events = _events(stack, chain_id)
+        assert len(events) == 3
+        first, second, put = events
+        assert isinstance(first, MetadataCreateEvent)
+        assert isinstance(second, MetadataCreateEvent)
+        assert isinstance(put, BodyPutEvent)
+        assert first.idempotency_key is None and second.idempotency_key is None
+        assert [first.cache_hit, second.cache_hit] == [False, False]
+        assert first.file_id != second.file_id
+        assert first.upload_token != second.upload_token
+        assert first.upload_url != second.upload_url
+        assert put.file_id == second.file_id
+        assert put.upload_token == second.upload_token
+        assert put.upload_url == second.upload_url
+        assert second.occurred_at - first.occurred_at >= timedelta(seconds=CAPTURE_TTL_SECONDS)
+        assert second.occurred_at <= put.occurred_at
+        assert put.occurred_at < second.occurred_at + timedelta(seconds=CAPTURE_TTL_SECONDS)
+        assert put.body_size == len(TEST_BODY)
+        assert put.body_hash == EXPECTED_BODY_HASH
+        captured = _captured_create(detail)
+        assert captured["upload_url"] == second.upload_url
+        file_information = captured["file_information"]
+        assert isinstance(file_information, dict)
+        assert file_information["id"] == str(second.file_id)
+    finally:
+        stack.emulator.clear_failures()
+        await stack.tear_down()
+
+
+async def test_capture_expiry_disabled_stores_without_reexecution() -> None:
+    """Default-disabled control: one create, zero accepted PUTs, stored."""
+    stack = await _boot_case(capture_reexecution=None)
+    chain_id = uuid4()
+    try:
+        await _submit(
+            stack,
+            _build_envelope(chain_id=chain_id, emulator_url=stack.emulator_url, keyed=True),
+        )
+        detail = await assert_chain_reaches_state(
+            stack.phantom_client,
+            chain_id,
+            state="stored",
+            timeout_seconds=WAIT_BUDGET_SECONDS,
+        )
+
+        events = _events(stack, chain_id)
+        assert len(events) == 1
+        create = events[0]
+        assert isinstance(create, MetadataCreateEvent)
+        assert create.cache_hit is False
+        assert create.idempotency_key == str(chain_id)
+        assert detail.last_step_completed == "create_file"
+        assert detail.updated_at >= create.occurred_at + timedelta(seconds=CAPTURE_TTL_SECONDS)
+        captured = _captured_create(detail)
+        assert captured["upload_url"] == create.upload_url
+    finally:
+        stack.emulator.clear_failures()
         await stack.tear_down()

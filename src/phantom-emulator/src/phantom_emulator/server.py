@@ -20,7 +20,11 @@ import uvicorn
 
 from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.config import AppConfig
-from phantom_emulator.failure.injection import FailurePolicy
+from phantom_emulator.failure.injection import (
+    ErrorRate5xxEvent,
+    FailurePolicy,
+    FailureScope,
+)
 from phantom_emulator.routers.control import ReceivedEntry
 from phantom_emulator.state import EmulatorState, IssuedToken, UpstreamEvent
 
@@ -100,6 +104,16 @@ class Server:
         assert self.state.failure_state is not None
         self.state.failure_state.clear_all()
 
+    def error_rate_5xx_count(self, scope: FailureScope) -> int:
+        """Return the error-rate-generated 503 count for one request scope."""
+        assert self.state.failure_state is not None
+        return self.state.failure_state.error_rate_5xx_count(scope)
+
+    def error_rate_5xx_events(self, scope: FailureScope) -> tuple[ErrorRate5xxEvent, ...]:
+        """Return immutable error-rate-generated 503 events for one scope."""
+        assert self.state.failure_state is not None
+        return self.state.failure_state.error_rate_5xx_for_scope(scope)
+
     def pause(self) -> None:
         """Refuse upstream requests until :meth:`resume`.
 
@@ -169,6 +183,10 @@ class Server:
         Mirrors ``POST /control/presigned-ttl``.
         """
         self.state.cfg.upstream.presigned_ttl_seconds = seconds
+
+    def set_idempotency_dedup_window(self, seconds: int) -> None:
+        """Set the create-response idempotency cache lifetime for new entries."""
+        self.state.cfg.upstream.idempotency_dedup_window_seconds = seconds
 
     def set_seed(self, seed: int) -> None:
         """Reseed the failure-injection RNG.

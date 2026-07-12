@@ -134,6 +134,7 @@ async def _maybe_inject_failure(
             )
 
     if policy.error_rate_5xx > 0 and fs is not None and fs.rng.random() < policy.error_rate_5xx:
+        fs.record_error_rate_5xx(scope)
         logger.info("failure_inject: 5xx coin flip at %s", request.url.path)
         return JSONResponse(
             {"error": "service_unavailable"},
