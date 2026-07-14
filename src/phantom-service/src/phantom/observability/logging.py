@@ -10,16 +10,38 @@ Configures stdlib logging with two filters:
   upstream's presigned-PUT URL). Components that log captured-value dicts emit
   records with structured ``extra`` fields; this filter mutates the
   record in-place before the formatter sees it.
+
+String-level filters cannot reach values that dependencies interpolate
+through non-string args at format time, so :func:`configure_logging` also
+caps the known secret-bearing dependency loggers (``_DEPENDENCY_LOG_CAPS``).
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from typing import Final
 
 _BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._\-]+")
 _REDACTED = "Bearer <redacted>"
 _SENSITIVE_REDACTED = "<redacted>"
+
+# Dependency loggers whose records interpolate secret-bearing values by
+# design and therefore bypass string-level redaction. aiosqlite's DEBUG
+# statement log formats the bound-parameter tuple through a non-string
+# functools.partial arg (bearer tokens on the token-cache INSERT, credential
+# JSON on the store write), so BearerRedactionFilter never sees the token as
+# a string. httpx's INFO request line and httpcore's DEBUG wire chatter
+# carry full request URLs, and a presigned upload URL is a sensitive
+# capture. Capping these loggers is the leak boundary for dependency-
+# authored records; Phantom's own records stay at the operator-configured
+# level and pass through the redaction filters. The production no-leak
+# guard (tests/e2e/test_production_log_no_leak.py) enforces this boundary.
+_DEPENDENCY_LOG_CAPS: Final[dict[str, int]] = {
+    "aiosqlite": logging.INFO,
+    "httpx": logging.WARNING,
+    "httpcore": logging.WARNING,
+}
 
 
 class BearerRedactionFilter(logging.Filter):
@@ -109,3 +131,8 @@ def configure_logging(level: str) -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level)
+    # Bound the dependency loggers that embed secrets or sensitive URLs in
+    # their own records (see _DEPENDENCY_LOG_CAPS). Applied after the root
+    # level so an operator DEBUG never re-opens the dependency leak surface.
+    for name, cap in _DEPENDENCY_LOG_CAPS.items():
+        logging.getLogger(name).setLevel(cap)
