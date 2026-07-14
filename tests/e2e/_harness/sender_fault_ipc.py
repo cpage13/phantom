@@ -92,8 +92,6 @@ def run_child_handshake(
             peer.settimeout(_remaining(deadline))
             peer.sendall(b"RELEASED\n")
     except (OSError, TimeoutError) as exc:
-        if isinstance(exc, SenderFaultIpcError):
-            raise
         raise SenderFaultIpcError("sender fault IPC child handshake failed") from exc
 
 

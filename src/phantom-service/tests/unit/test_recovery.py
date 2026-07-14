@@ -104,7 +104,12 @@ async def test_attempting_reset_to_queued(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_boot_reconstructs_only_slot_holding_saturation_rows(tmp_path: Path) -> None:
-    """Queued/stored persisted rows charge a fresh gate; released states do not."""
+    """Queued/stored persisted rows charge a fresh gate; released states do not.
+
+    Includes the ``stored`` + ``body_discarded_at`` carve-out: a stored row
+    whose body was already discarded released its slot at body-discard time,
+    so boot reconstruction must not re-charge it (``row_holds_slot``).
+    """
     store = await _build_store(tmp_path)
     queued_id = uuid4()
     stored_id = uuid4()
@@ -112,6 +117,14 @@ async def test_boot_reconstructs_only_slot_holding_saturation_rows(tmp_path: Pat
     await store.insert(_row(stored_id, state="stored", body_hashes=_hashes_for(b"s")))
     await store.insert(_row(uuid4(), state="auth_expired", body_hashes=_hashes_for(b"a")))
     await store.insert(_row(uuid4(), state="succeeded", body_hashes=_hashes_for(b"d")))
+    await store.insert(
+        _row(
+            uuid4(),
+            state="stored",
+            body_hashes=_hashes_for(b"x"),
+            body_discarded_at=datetime.now(tz=UTC),
+        )
+    )
     saturation = SaturationGate(
         max_in_flight=10,
         max_in_flight_bytes=10_000,

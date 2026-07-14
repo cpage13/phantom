@@ -120,8 +120,7 @@ async def test_e2e_32_one_refresh_wakes_n(
     bearer parks in ``auth_expired`` on the same
     ``(endpoint, uid)`` slot — exactly one cache slot, not N. The
     post-push recovery (a single cache-write waking all N rows) is
-    documented but xfailed pending the recovery-path investigation
-    flagged in E2E-31.
+    proven by ``test_e2e_32_single_refresh_wakes_all_parked`` below.
     """
     # Setup — fresh emulator state.
     emulator.clear_received()

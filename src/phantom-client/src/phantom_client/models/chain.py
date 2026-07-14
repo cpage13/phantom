@@ -180,10 +180,12 @@ class ChainCapture(BaseModel):
         None,
         ge=1,
         description=(
-            "Optional capture-value lifetime in seconds. If set and a later step "
-            "uses this value after the TTL has elapsed, capture-expiry "
-            "re-execution behavior (ADR-011) applies. If None, the capture is "
-            "treated as non-expiring."
+            "Optional capture-observation TTL in seconds: how long Phantom's "
+            "local observation of this captured value stays fresh. This is "
+            "Phantom's own clock, distinct from any upstream capability "
+            "lifetime. If set and a later step uses the value after the TTL "
+            "has elapsed, capture-expiry re-execution behavior (ADR-011) "
+            "applies. None means non-expiring."
         ),
     )
     sensitive: bool = Field(
@@ -247,9 +249,12 @@ class ChainStep(BaseModel):
     idempotency_header: str | None = Field(
         None,
         description=(
-            "If set, Phantom sends this header name with the envelope's "
-            "idempotency_key value on every attempt of this step. Required for "
-            "ADR-011's re-execution behavior. Typical value: 'Idempotency-Key'."
+            "Optional header name. If set, Phantom sends it with the envelope's "
+            "idempotency_key on every attempt of this step. Capture reexecution "
+            "still occurs when omitted and may create a duplicate; declaring an "
+            "upstream-honored header is required for identity-safe reexecution "
+            "but does not itself renew a returned capability. See ADR-011. "
+            "Typical value: 'Idempotency-Key'."
         ),
     )
 

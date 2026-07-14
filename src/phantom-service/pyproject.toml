@@ -22,7 +22,10 @@ dependencies = [
     "python-multipart>=0.0.20",
     "pyyaml>=6",
     "structlog>=25.5.0",
-    "uvicorn>=0.46.0",
+    # 0.46-series pin: the CLI's fatal-worker bridge relies on this series'
+    # documented drain-then-re-raise SIGTERM behavior; the supervision E2E
+    # asserts the exact -SIGTERM status. Bump deliberately, with that lane.
+    "uvicorn>=0.46.0,<0.47",
     "zstandard>=0.25.0",
 ]   # add with `uv add` from this directory
 

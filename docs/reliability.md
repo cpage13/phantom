@@ -83,6 +83,14 @@ re-raises SIGTERM, producing signal termination. Uvicorn's default post-start
 lifespan handling would only log the failure. TaskGroup's direct
 `SystemExit`/`KeyboardInterrupt` special cases are outside this bridge.
 
+A deliberate consequence: a row that deterministically raises an unknown
+fault crash-loops the service, because each restart's recovery requeues the
+row and a worker reclaims it. There is no poison-row quarantine, and
+`attempts` does not increment on a crashed attempt, so no counter demotes
+such a row. The design prefers a loud restart loop over a silently degraded
+process; breaking the loop means fixing the fault or removing the row (admin
+cancel/replay can take a row out of circulation).
+
 **What happens.** The orchestrator restarts the container. Before the
 sender pool opens, a boot-time **recovery sweep** runs:
 
@@ -173,6 +181,9 @@ and retries. The same classified `OperationalError` after a row was claimed
 also waits one poll and lets the worker continue polling instead of killing the
 process. The row remains durably `attempting`; this handling does not silently
 requeue it or promise immediate delivery, and startup recovery can reclaim it.
+The parked row keeps the saturation slot it was admitted with: no in-process
+path requeues it, so that slot stays held until a restart (boot reconstruction
+re-charges it, delivery then releases it) or an operator admin cancel/replay.
 Non-transient and unknown exceptions still escape fatal supervision.
 
 **What you observe.** Under a transient external hold, the producer's POST
