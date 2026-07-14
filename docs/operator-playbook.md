@@ -263,6 +263,20 @@ failures"), which carries resolved literals instead of env-var names.
 
 ### 2.4 Enabling HTTPS on the listener
 
+**Should you enable it?** TLS is off by default, and that is the right default
+for the primary deployment. Phantom is a same-machine sidecar reached over
+loopback (`bind_tcp: 127.0.0.1:8080`, the default). Loopback traffic never
+crosses a network, so plaintext there is fine and needs no certificate. Enable
+TLS when you expose Phantom on a real network, for example a non-loopback
+`bind_tcp` such as `0.0.0.0:8080`. In that case supply your own certificate from
+a trusted certificate authority, or front Phantom with a TLS-terminating reverse
+proxy. The auto-generated self-signed certificate below is a localhost
+smoke-test convenience only; it forces clients to disable certificate
+verification, which is not appropriate for network traffic. TLS also does not
+authenticate the admin API (ADR-004): it encrypts the wire, it does not check
+who is calling, so a network-exposed admin surface still needs an authenticating
+proxy in front of it. See [ADR-034](adr/034-tls-opt-in-loopback-default.md).
+
 The single listener flips from HTTP to HTTPS with `server.tls.enabled: true`
 (no second socket). Leave `cert_path`/`key_path` unset for an auto-generated
 self-signed cert, or supply your own PEM pair; set BOTH or NEITHER (exactly
@@ -281,8 +295,10 @@ server:
     # key_password: null   # only for an encrypted operator key
 ```
 
-Then probe it (the `-k` / `verify=False` is because the auto-gen cert is
-self-signed):
+Then probe it. The `-k` / `verify=False` here is only because the auto-gen cert
+is self-signed; it is a localhost check, not a pattern for real clients. With an
+operator-supplied certificate from a trusted CA, clients verify normally and
+`-k` is not needed:
 
 ```bash
 curl -k https://localhost:8080/v1/healthz

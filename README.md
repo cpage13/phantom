@@ -35,7 +35,7 @@ docker run --rm \
 curl http://localhost:8080/v1/healthz
 ```
 
-That is the whole deploy. Everything (ingress, admin, health) rides the one port. To serve HTTPS, set `server.tls.enabled: true`; Phantom auto-generates a self-signed cert, or you supply your own PEM pair. Deployment, tuning, and monitoring live in the [operator playbook](docs/operator-playbook.md); a compose file lives at [src/phantom-deploy/docker-compose.yml](src/phantom-deploy/docker-compose.yml).
+That is the whole deploy. Everything (ingress, admin, health) rides the one port. Ingress is plain HTTP by default, which is the right posture for the same-host loopback deployment. To serve HTTPS (enable it when exposing Phantom on a network), set `server.tls.enabled: true`; Phantom auto-generates a self-signed cert, or you supply your own PEM pair. Deployment, tuning, and monitoring live in the [operator playbook](docs/operator-playbook.md); a compose file lives at [src/phantom-deploy/docker-compose.yml](src/phantom-deploy/docker-compose.yml).
 
 ## Use it in three moves
 
