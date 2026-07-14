@@ -6,6 +6,12 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "aiofiles>=24.1.0",
+    # azure-identity's async ClientSecretCredential (the AD-mint path in
+    # refresh/ad_client_credentials.py) builds its pipeline on azure-core's
+    # AioHttpTransport, which hard-requires aiohttp; azure-identity declares it
+    # only optionally, so without this line an ad_mint instance crashes its
+    # minter at credential construction with ImportError. Proven by the T3 E2E.
+    "aiohttp>=3.10",
     "aiosqlite>=0.22.1",
     "azure-identity>=1.25.3",
     "botocore>=1.43,<1.44",
