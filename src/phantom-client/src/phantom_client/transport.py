@@ -463,7 +463,11 @@ class Transport:
                 return response
             except httpx.ConnectError as exc:
                 last_error = PhantomConnectError(f"connect refused: {exc}")
-            except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as exc:
+            except httpx.TimeoutException as exc:
+                # Covers ConnectTimeout too: a dropped SYN (the most common
+                # "Phantom unreachable" shape on a real producer network) is
+                # a timeout condition for callers, not a generic network
+                # fault, so it must surface as PhantomTimeoutError.
                 last_error = PhantomTimeoutError(f"timeout: {exc}")
             except httpx.HTTPError as exc:
                 # Catch-all for other network-class failures.

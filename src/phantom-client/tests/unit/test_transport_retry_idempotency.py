@@ -14,14 +14,12 @@ it mutated the body, the same key would 409. The existing retry pins
 type; NONE of them asserts the key's stability across attempts. This
 module pins it on both encoding paths.
 
-Also pinned: ``httpx.ConnectTimeout`` is retried. The retry clause
-enumerates ``ConnectError`` and the read/write/pool timeouts
-explicitly; ``ConnectTimeout`` rides the ``httpx.HTTPError`` catch-all
-today, which is behavior-equivalent (retried, surfaced as a transport
-error after exhaustion) - but it is the single most common
-"Phantom unreachable" shape on a real producer network (dropped SYN), so
-its retry behavior must not regress if the exception clauses are ever
-reshuffled.
+Also pinned: ``httpx.ConnectTimeout`` is retried and, once exhausted,
+surfaces as ``PhantomTimeoutError`` (the retry clause catches
+``httpx.TimeoutException``, which covers connect/read/write/pool). A
+dropped SYN is the single most common "Phantom unreachable" shape on a
+real producer network, so both its retry behavior and its typed mapping
+must not regress if the exception clauses are ever reshuffled.
 
 These are PASSING attacks: the transport already behaves; the pins make
 the surface regression-proof (loop convention: a passing attack on an
@@ -37,7 +35,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from phantom_client.config import ClientConfig, RetryPolicy
-from phantom_client.errors import PhantomTransportError
+from phantom_client.errors import PhantomTimeoutError, PhantomTransportError
 from phantom_client.models.chain import (
     ChainBodyJson,
     ChainBodyRef,
@@ -207,12 +205,13 @@ async def test_connect_timeout_is_retried_like_every_transport_failure() -> None
 
 @pytest.mark.asyncio
 async def test_connect_timeout_exhaustion_surfaces_a_transport_error() -> None:
-    """Exhausted ``ConnectTimeout`` retries surface as a transport-class error.
+    """Exhausted ``ConnectTimeout`` retries surface as ``PhantomTimeoutError``.
 
     A downstream adapter's non-4xx fallback predicate is "any non-4xx
     falls back to the direct path", keyed on the ``PhantomTransportError``
-    hierarchy, so the exhausted error must stay inside it regardless of
-    which except clause classifies the timeout.
+    hierarchy, so the exhausted error must stay inside it; and since a
+    dropped SYN is a timeout condition, it must carry the timeout type,
+    not the generic network catch-all.
     """
     envelope = _make_envelope(with_body_ref=False)
 
@@ -222,7 +221,7 @@ async def test_connect_timeout_exhaustion_surfaces_a_transport_error() -> None:
     transport = _transport_for(handler)
     await transport.start()
     try:
-        with pytest.raises(PhantomTransportError):
+        with pytest.raises(PhantomTimeoutError) as excinfo:
             await transport.submit_chain(
                 envelope,
                 body_refs=None,
@@ -230,5 +229,6 @@ async def test_connect_timeout_exhaustion_surfaces_a_transport_error() -> None:
                 auth_token=None,
                 options=None,
             )
+        assert isinstance(excinfo.value, PhantomTransportError)
     finally:
         await transport.aclose()
