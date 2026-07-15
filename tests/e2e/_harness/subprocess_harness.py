@@ -389,6 +389,11 @@ class PhantomSubprocess:
     admin_url: str = ""
     argv: tuple[str, ...] | None = None
     env_overrides: dict[str, str] = field(default_factory=dict)
+    # CA-bundle path for a TLS-enabled child. None (the default) keeps the
+    # plaintext-HTTP behavior byte-for-byte; set, the harness reaches the
+    # child over https and the health poll VERIFIES against this bundle
+    # (never ``verify=False`` — the T5 operator-TLS posture).
+    tls_verify: str | None = None
     _proc: subprocess.Popen[bytes] | None = field(default=None)
     _log_path: Path | None = field(default=None)
 
@@ -400,6 +405,7 @@ class PhantomSubprocess:
         *,
         argv: tuple[str, ...] | None = None,
         env_overrides: dict[str, str] | None = None,
+        tls_verify: str | None = None,
     ) -> PhantomSubprocess:
         """Construct (not yet started) against a config + port.
 
@@ -413,11 +419,17 @@ class PhantomSubprocess:
                 ``python -m phantom`` entry point.
             env_overrides: Optional child-only environment additions or
                 replacements. The parent process is never mutated.
+            tls_verify: Optional CA-bundle path for a child whose config sets
+                ``server.tls.enabled``. When set, ``url`` (and ``admin_url``)
+                become ``https://`` and the health poll verifies the listener
+                against exactly this bundle. Default ``None``: plaintext HTTP,
+                byte-for-byte the prior behavior.
 
         Returns:
             An unstarted :class:`PhantomSubprocess`.
         """
-        url = f"http://{HOST}:{bind_port}"
+        scheme = "https" if tls_verify is not None else "http"
+        url = f"{scheme}://{HOST}:{bind_port}"
         return cls(
             config_path=config_path,
             bind_port=bind_port,
@@ -425,6 +437,7 @@ class PhantomSubprocess:
             admin_url=url,
             argv=argv,
             env_overrides={} if env_overrides is None else dict(env_overrides),
+            tls_verify=tls_verify,
         )
 
     async def start(self) -> None:
@@ -461,7 +474,10 @@ class PhantomSubprocess:
     async def _await_health(self) -> None:
         """Poll the admin health endpoint until it answers or the budget expires."""
         deadline = time.monotonic() + HEALTH_TIMEOUT_SECONDS
-        async with httpx.AsyncClient(timeout=2.0) as client:
+        # verify is inert for the default plaintext http URL; for a TLS child
+        # it pins trust to the caller-supplied bundle (never verify=False).
+        verify: str | bool = self.tls_verify if self.tls_verify is not None else True
+        async with httpx.AsyncClient(timeout=2.0, verify=verify) as client:
             while time.monotonic() < deadline:
                 if self._proc is not None and self._proc.poll() is not None:
                     tail = self._read_log_tail()
