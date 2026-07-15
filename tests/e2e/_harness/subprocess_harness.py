@@ -440,8 +440,20 @@ class PhantomSubprocess:
             tls_verify=tls_verify,
         )
 
-    async def start(self) -> None:
-        """Popen the service and wait for ``/v1/healthz`` to answer 200."""
+    def spawn(self, *, label: str | None = None) -> None:
+        """Popen the service child WITHOUT waiting for health.
+
+        The launch half of :meth:`start`, exposed for the lanes that must not
+        health-poll: an expected-early-exit child (wrong TLS key password), a
+        child that may legitimately block boot past the health budget (held
+        external lock), or a non-TCP listener the poll cannot reach (UDS).
+        Callers own their readiness (or exit) observation, typically via
+        :meth:`wait_for_expected_exit` or a lane-specific probe.
+
+        Args:
+            label: Optional provenance label for the daemon registry (leak
+                attribution). Defaults to the config path.
+        """
         log_path = self.config_path.parent / f"phantom-{int(time.time() * 1000)}.log"
         self._log_path = log_path
         env = dict(os.environ)
@@ -466,9 +478,16 @@ class PhantomSubprocess:
                 stderr=subprocess.STDOUT,
                 env=env,
             )
-        # Register BEFORE the health wait: a daemon that hangs mid-boot when
-        # its test dies is exactly the leak the session reaper exists for.
-        DAEMON_REGISTRY.register(self._proc, label=f"config={self.config_path}")
+        # Register at spawn time, before any wait: a daemon that hangs
+        # mid-boot when its test dies is exactly the leak the session reaper
+        # exists for.
+        DAEMON_REGISTRY.register(
+            self._proc, label=label if label is not None else f"config={self.config_path}"
+        )
+
+    async def start(self) -> None:
+        """Popen the service and wait for ``/v1/healthz`` to answer 200."""
+        self.spawn()
         await self._await_health()
 
     async def _await_health(self) -> None:

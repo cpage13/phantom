@@ -35,7 +35,6 @@ import ipaddress
 import os
 import socket
 import ssl
-import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -158,40 +157,6 @@ def _served_certificate_der(host: str, port: int, ca_path: Path) -> bytes:
     return der
 
 
-def _launch_no_health_wait(p: PhantomSubprocess) -> None:
-    """Popen the Phantom child WITHOUT the health wait (expected-early-exit lane).
-
-    Replicates the launch half of ``PhantomSubprocess.start()`` minus the
-    health poll, following the precedent in
-    ``crash_recovery/test_r9_v6_recovery_boot_survives_external_lock.py``:
-    the wrong-password child must die BEFORE health, so the standard start()
-    would misreport the expected exit as a boot failure.
-    """
-    import subprocess
-    import sys
-
-    from tests.e2e._harness.subprocess_harness import (
-        _REPO_ROOT,
-        _SIGNING_KEY_ENV,
-        DAEMON_REGISTRY,
-        SIGNING_SECRET,
-    )
-
-    log_path = p.config_path.parent / f"phantom-{int(time.time() * 1000)}.log"
-    p._log_path = log_path
-    env = dict(os.environ)
-    env.setdefault(_SIGNING_KEY_ENV, SIGNING_SECRET)
-    with open(log_path, "wb") as logf:
-        p._proc = subprocess.Popen(
-            [sys.executable, "-m", "phantom", "-c", str(p.config_path)],
-            cwd=str(_REPO_ROOT),
-            stdout=logf,
-            stderr=subprocess.STDOUT,
-            env=env,
-        )
-    DAEMON_REGISTRY.register(p._proc, label=f"t5-no-health-wait config={p.config_path}")
-
-
 async def test_operator_encrypted_key_serves_verified_https_and_delivers(
     tmp_path: Path,
 ) -> None:
@@ -307,7 +272,9 @@ async def test_wrong_key_password_exits_before_health_with_no_leak(
     )
     proc = PhantomSubprocess.make(config_path, port, tls_verify=str(cert_path))
     try:
-        _launch_no_health_wait(proc)
+        # spawn() (not start()): the wrong-password child must die BEFORE
+        # health, so the health poll would misreport the expected exit.
+        proc.spawn(label=f"t5-no-health-wait config={proc.config_path}")
         returncode = await proc.wait_for_expected_exit(timeout_seconds=_EXIT_BUDGET_SECONDS)
         assert returncode != 0
 

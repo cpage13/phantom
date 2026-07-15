@@ -154,47 +154,6 @@ class _ExternalLock:
         self._thread.join(timeout=10.0)
 
 
-def _launch_no_health_wait(p: PhantomSubprocess) -> None:
-    """Popen the Phantom subprocess WITHOUT waiting for /v1/healthz.
-
-    Replicates the launch half of ``PhantomSubprocess.start()`` but skips the
-    health poll, so the caller controls when/whether to consider the boot
-    healthy. Needed because the held lock can legitimately block startup
-    recovery past the harness's 30 s health budget — that is correct blocking
-    (the fix riding out the lock), not a failure, and must not raise here.
-    """
-    import os
-    import subprocess
-    import sys
-
-    from tests.e2e._harness.subprocess_harness import (
-        _SIGNING_KEY_ENV,
-        DAEMON_REGISTRY,
-        SIGNING_SECRET,
-    )
-
-    log_path = p.config_path.parent / f"phantom-{int(time.time() * 1000)}.log"
-    p._log_path = log_path  # type: ignore[attr-defined]
-    env = dict(os.environ)
-    env.setdefault(_SIGNING_KEY_ENV, SIGNING_SECRET)
-    # Direct venv-interpreter spawn, mirroring PhantomSubprocess.start():
-    # the Popen pid must BE the daemon (no resident wrapper), or kills and
-    # the session reaper only ever reach the wrapper.
-    with open(log_path, "wb") as logf:
-        p._proc = subprocess.Popen(  # type: ignore[attr-defined]
-            [sys.executable, "-m", "phantom", "-c", str(p.config_path)],
-            cwd=str(_REPO_ROOT),
-            stdout=logf,
-            stderr=subprocess.STDOUT,
-            env=env,
-        )
-    # Same session-end leak protection as PhantomSubprocess.start().
-    DAEMON_REGISTRY.register(
-        p._proc,  # type: ignore[attr-defined]
-        label=f"no-health-wait config={p.config_path}",
-    )
-
-
 async def _await_health_or_death(p: PhantomSubprocess, *, budget_seconds: float) -> bool:
     """Poll health until 200 (True) or the proc dies / budget expires (False)."""
     import httpx
@@ -303,8 +262,12 @@ async def test_recovery_boot_survives_external_lock_past_busy_timeout(tmp_path: 
         cfg2 = write_phantom_config(
             data_dir=data_dir, bind_port=port2, config_overrides=_overrides()
         )
+        # spawn() (not start()): the held lock can legitimately block startup
+        # recovery past the harness's 30 s health budget. That is correct
+        # blocking (the fix riding out the lock), not a failure, so the
+        # health observation is owned below by _await_health_or_death.
         p2 = PhantomSubprocess.make(cfg2, port2)
-        _launch_no_health_wait(p2)
+        p2.spawn(label=f"no-health-wait config={p2.config_path}")
 
         # Hold the full window so recovery's first write contends for well over
         # busy_timeout (the hold outlasts cold-start).
