@@ -22,6 +22,11 @@ Key behaviors:
   raised as a typed :class:`~phantom_client.errors.PhantomHttpError`
   subclass.
 - ``Authorization`` is never logged — the logging filter redacts it.
+- A ``unix:`` ``phantom_url`` (the documented UDS form of the service
+  connections table) is routed through a real
+  ``httpx.AsyncHTTPTransport(uds=...)`` automatically; a missing socket
+  therefore surfaces as :class:`~phantom_client.errors.PhantomConnectError`
+  like any refused TCP connect, never as an unsupported-protocol error.
 """
 
 from __future__ import annotations
@@ -53,6 +58,32 @@ _PATH_SEND = "/v1/send"
 
 # Backoff jitter range; ±50% per RetryPolicy.backoff_jitter docstring.
 _JITTER_HALF_RANGE = 0.5
+
+# The documented Unix-domain-socket form of ``phantom_url``: ``unix:`` + the
+# socket path (the service connections-table contract, mirroring
+# ``server.bind_uds`` on the service side). Never handed to httpx as a URL —
+# bare ``unix:`` is not a fetchable httpx scheme.
+_UDS_URL_SCHEME = "unix:"
+# Synthetic authority for request construction over UDS. httpx still needs an
+# http base URL to build the request line and Host header; the UDS transport
+# owns the actual connection routing, so this host token is never resolved.
+_UDS_SYNTHETIC_BASE_URL = "http://phantom"
+
+
+def _uds_socket_path(phantom_url: str) -> str | None:
+    """Return the socket path when ``phantom_url`` is the ``unix:`` UDS form.
+
+    ``unix:/abs/path.sock`` is the documented spelling;
+    ``unix:///abs/path.sock`` (an empty URL authority) is tolerated as an
+    alias. Any other URL returns ``None`` and is treated as the TCP form.
+    """
+    if not phantom_url.startswith(_UDS_URL_SCHEME):
+        return None
+    path = phantom_url[len(_UDS_URL_SCHEME) :]
+    if path.startswith("//"):
+        # unix:///abs/path — strip the empty authority marker.
+        path = path[2:]
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -152,13 +183,25 @@ class Transport:
         self._client: httpx.AsyncClient | None = None
 
     async def start(self) -> None:
-        """Open the underlying httpx client. Idempotent."""
+        """Open the underlying httpx client. Idempotent.
+
+        A ``unix:`` ``phantom_url`` selects a real UDS transport and the
+        synthetic http base URL (httpx cannot fetch a bare ``unix:`` URL); an
+        injected test transport always wins over the automatic selection.
+        """
         if self._client is not None:
             return
+        transport = self._injected_transport
+        base_url = self._config.phantom_url
+        uds_path = _uds_socket_path(base_url)
+        if uds_path is not None:
+            if transport is None:
+                transport = httpx.AsyncHTTPTransport(uds=uds_path)
+            base_url = _UDS_SYNTHETIC_BASE_URL
         self._client = httpx.AsyncClient(
-            transport=self._injected_transport,
+            transport=transport,
             timeout=self._timeout,
-            base_url=self._config.phantom_url,
+            base_url=base_url,
             headers=self._config.default_headers,
         )
         _LOG.debug("transport started: phantom_url=%s", self._config.phantom_url)

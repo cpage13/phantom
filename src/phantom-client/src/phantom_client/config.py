@@ -146,7 +146,12 @@ class ClientConfig(BaseModel):
 
     phantom_url: str = Field(
         "http://127.0.0.1:8080",
-        description="Phantom base URL (no path). Intake, admin, and health all ride this one URL.",
+        description=(
+            "Phantom base URL (no path). Intake, admin, and health all ride this one "
+            "URL. TCP form ``http(s)://host:port``, or the Unix-domain-socket form "
+            "``unix:/abs/path.sock`` (the service's ``server.bind_uds``), which the "
+            "SDK routes through a UDS transport automatically."
+        ),
     )
     default_uid: str | None = Field(
         None,

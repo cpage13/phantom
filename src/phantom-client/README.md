@@ -189,6 +189,10 @@ header constants with `build_request_headers` /
 - **One base URL.** Intake, admin, and health all ride `phantom_url`;
   Phantom serves them on a single listener (loopback by default per
   ADR-004), so there is no separate admin URL to configure.
+- **Unix-domain sockets.** When Phantom binds `server.bind_uds`, pass the
+  UDS form directly: `PhantomClient("unix:/var/run/phantom.sock")`. The
+  SDK routes it through a UDS transport automatically; a missing socket
+  raises `PhantomConnectError` exactly like a refused TCP connect.
 - **Async-first.** No sync facade; wrap with `asyncio.run`.
 
 ## Error model

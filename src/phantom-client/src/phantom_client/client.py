@@ -174,7 +174,10 @@ class PhantomClient:
             config_or_base_url: Either a complete :class:`ClientConfig`
                 or a base URL string. When a string, a default
                 :class:`ClientConfig` is synthesized with
-                ``phantom_url=<string>``.
+                ``phantom_url=<string>``. Accepts the TCP form
+                (``http://host:port``) or the Unix-domain-socket form
+                (``unix:/abs/path.sock``); the UDS form is routed through
+                a UDS transport automatically.
             timeout: When ``config_or_base_url`` is a string, overrides
                 the default read timeout. Ignored when a
                 :class:`ClientConfig` is passed (use

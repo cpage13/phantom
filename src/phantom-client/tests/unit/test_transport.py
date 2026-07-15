@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -30,7 +31,8 @@ from phantom_client.models.chain import (
     ChainEnvelope,
     ChainStep,
 )
-from phantom_client.transport import Transport, _compute_backoff
+from phantom_client.models.status import HealthResponse
+from phantom_client.transport import Transport, _compute_backoff, _uds_socket_path
 
 
 def _make_envelope(*, with_body_ref: bool = False) -> ChainEnvelope:
@@ -644,3 +646,43 @@ async def test_submit_chain_emits_grouping_headers(
         "x-phantom-order",
         "x-phantom-idempotency-key",
     }
+
+
+# ---------------------------------------------------------------------------
+# UDS phantom_url form (the documented unix: contract).
+# ---------------------------------------------------------------------------
+
+
+def test_uds_socket_path_accepts_documented_forms_and_rejects_tcp() -> None:
+    """Objective: pin the unix: URL parse.
+
+    Expected: the documented ``unix:/abs/path`` form and the tolerated
+    ``unix:///abs/path`` alias both yield the socket path; TCP URLs yield
+    ``None`` (unchanged TCP routing).
+    """
+    assert _uds_socket_path("unix:/var/run/phantom.sock") == "/var/run/phantom.sock"
+    assert _uds_socket_path("unix:///var/run/phantom.sock") == "/var/run/phantom.sock"
+    assert _uds_socket_path("http://127.0.0.1:8080") is None
+    assert _uds_socket_path("https://phantom.example:8443") is None
+
+
+async def test_uds_missing_socket_maps_to_connect_error(tmp_path: Path) -> None:
+    """Objective: a unix: URL with an absent socket is a typed CONNECT failure.
+
+    Expected: ``PhantomConnectError`` — the bare-string form routes through a
+    real UDS transport, so a missing socket fails at connect exactly like a
+    refused TCP port. Before the unix: routing existed the same call fell
+    through to httpx as an unsupported URL scheme and surfaced as the generic
+    ``PhantomNetworkError``, which is the defect this pins against.
+    """
+    config = ClientConfig(
+        phantom_url=f"unix:{tmp_path / 'absent-phantom.sock'}",
+        retry_policy=RetryPolicy(enabled=False),
+    )
+    transport = Transport(config)
+    await transport.start()
+    try:
+        with pytest.raises(PhantomConnectError):
+            await transport.get_json("/v1/healthz", model=HealthResponse)
+    finally:
+        await transport.aclose()
