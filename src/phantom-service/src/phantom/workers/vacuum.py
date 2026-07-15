@@ -68,19 +68,30 @@ class VacuumScheduler:
     async def run(self, stop_event: asyncio.Event) -> None:
         """Tick every ~30s; fire VACUUM when the cron matches and saturation=0."""
         while not stop_event.is_set():
-            now = self._clock()
-            slot = (now.year, now.month, now.day, now.hour, now.minute)
-            if (
-                slot != self._last_run_minute
-                and _matches_cron(self._cron, now)
-                and self._instance.saturation.in_flight == 0
-            ):
-                self._last_run_minute = slot
-                await self._vacuum()
+            await self._tick(self._clock())
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=30)
             except TimeoutError:
                 continue
+
+    async def _tick(self, now: datetime) -> None:
+        """One scheduling decision at ``now``; fires at most one VACUUM.
+
+        The complete gate in one place: a minute-slot not already fired
+        (same-minute dedup), a cron match, and ``saturation.in_flight == 0``
+        (the flash-wear invariant: never VACUUM under load). :meth:`run` is
+        loop coordination around this method and nothing else, so a test can
+        drive real ticks at injected times without copying any decision
+        logic.
+        """
+        slot = (now.year, now.month, now.day, now.hour, now.minute)
+        if (
+            slot != self._last_run_minute
+            and _matches_cron(self._cron, now)
+            and self._instance.saturation.in_flight == 0
+        ):
+            self._last_run_minute = slot
+            await self._vacuum()
 
     async def _vacuum(self) -> None:
         """Run VACUUM on the persistent store via the Protocol method."""
