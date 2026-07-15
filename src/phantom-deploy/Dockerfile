@@ -1,6 +1,9 @@
-# syntax=docker/dockerfile:1.7
-#
 # phantom-service container image — Wolfi multi-arch (linux/amd64 + linux/arm64).
+#
+# Deliberately NO `# syntax=docker/dockerfile:X` pin: the directive makes
+# every build fetch the frontend image from docker.io (an availability and
+# credential dependency that has broken builds), and this file uses only
+# core features the engine's built-in frontend has carried for years.
 #
 # This is THE Dockerfile for phantom-service. ADR-020 (Phase 6)
 # supersedes the prior three Dockerfiles under src/phantom-service/docker/ —
