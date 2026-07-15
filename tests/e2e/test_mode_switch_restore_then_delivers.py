@@ -143,10 +143,21 @@ async def _await_buffered(data_dir: Path, *, minimum: int = 1) -> None:
 
 
 async def _await_body_on_disk(bodies_root: Path) -> None:
-    """Poll until at least one body file lands under ``bodies_root``."""
+    """Poll until at least one COMPLETED body file lands under ``bodies_root``.
+
+    Excludes the ``.tmp/`` staging directory (FileBodyStore's atomic-rename
+    staging): a staged entry is not a persisted body and can vanish between
+    scan and use, so counting it satisfies the precondition prematurely.
+    Same fix as the back-up-and-run module's helper.
+    """
     deadline = time.monotonic() + _PRECONDITION_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        if any(p.is_file() for p in bodies_root.rglob("*")):
+        completed = (
+            p
+            for p in bodies_root.rglob("*")
+            if p.is_file() and ".tmp" not in p.relative_to(bodies_root).parts
+        )
+        if any(completed):
             return
         await asyncio.sleep(_PRECONDITION_POLL_SECONDS)  # pre-commit-allow: sleep
     raise AssertionError(f"no body file landed under {bodies_root} within the precondition window")

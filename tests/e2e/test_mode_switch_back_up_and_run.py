@@ -407,10 +407,21 @@ async def test_crash_mid_backup_is_reconciled_on_next_boot(
 
 
 async def _await_body_on_disk(bodies_root: Path) -> Path:
-    """Poll until at least one body file lands under ``bodies_root``; return it."""
+    """Poll until at least one COMPLETED body file lands under ``bodies_root``.
+
+    Excludes the ``.tmp/`` staging directory: FileBodyStore stages writes
+    there and atomically renames them into the shard tree, so a staging entry
+    can vanish between this scan and the caller's read. CI first lost that
+    race on the Linux runners (FileNotFoundError on a ``.tmp`` path); a
+    staged file is not a persisted body.
+    """
     deadline = time.monotonic() + _PRECONDITION_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        files = [p for p in bodies_root.rglob("*") if p.is_file()]
+        files = [
+            p
+            for p in bodies_root.rglob("*")
+            if p.is_file() and ".tmp" not in p.relative_to(bodies_root).parts
+        ]
         if files:
             return files[0]
         await asyncio.sleep(_PRECONDITION_POLL_SECONDS)  # pre-commit-allow: sleep
