@@ -258,11 +258,18 @@ class EmulatorHandle:
         await self.server.stop()
 
 
-async def boot_emulator() -> EmulatorHandle:
+async def boot_emulator(*, tls: tuple[str, str] | None = None) -> EmulatorHandle:
     """Boot one phantom-emulator in-process on a loopback port.
 
     Mirrors ``tests/e2e/helpers/stack._boot_one_emulator`` but standalone so
     the reproducers do not depend on the pytest conftest.
+
+    Args:
+        tls: Optional ``(cert_path, key_path)`` PEM pair. When set, the
+            in-process uvicorn serves HTTPS and the handle's ``url`` (and the
+            emulator's JWT issuer) become ``https://`` — the T3 trusted-HTTPS
+            authority lane (azure-identity refuses plaintext authorities).
+            Default ``None``: plaintext HTTP, byte-for-byte prior behavior.
     """
     os.environ.setdefault(_SIGNING_KEY_ENV, SIGNING_SECRET)
     import uvicorn
@@ -273,14 +280,24 @@ async def boot_emulator() -> EmulatorHandle:
     emu_port = allocate_port()
     cfg_path = _REPO_ROOT / "tests" / "e2e" / "emulator-config.yml"
     emu_cfg = load_emulator_config(cfg_path)
+    scheme = "https" if tls is not None else "http"
     emu_cfg.server.host = HOST
     emu_cfg.server.port = emu_port
-    emu_cfg.auth.issuer = f"http://{HOST}:{emu_port}"
+    emu_cfg.auth.issuer = f"{scheme}://{HOST}:{emu_port}"
 
     app = emulator_create_app(emu_cfg)
     state = app.state.emulator_state
+    ssl_kwargs: dict[str, str] = (
+        {} if tls is None else {"ssl_certfile": tls[0], "ssl_keyfile": tls[1]}
+    )
     uv_config = uvicorn.Config(
-        app=app, host=HOST, port=emu_port, log_level="warning", lifespan="on", access_log=False
+        app=app,
+        host=HOST,
+        port=emu_port,
+        log_level="warning",
+        lifespan="on",
+        access_log=False,
+        **ssl_kwargs,  # type: ignore[arg-type]
     )
     uv_server = uvicorn.Server(config=uv_config)
     serve_task = asyncio.create_task(uv_server.serve())
@@ -295,6 +312,8 @@ async def boot_emulator() -> EmulatorHandle:
         config=emu_cfg, state=state, uv_server=uv_server, serve_task=serve_task, port=emu_port
     )
     url = server.url()
+    if tls is not None:
+        url = url.replace("http://", "https://", 1)
     logger.info("emulator up at %s", url)
     return EmulatorHandle(server=server, url=url)
 

@@ -61,6 +61,11 @@ def _scope_for_path(path: str) -> FailureScope:
         return FailureScope.UPSTREAM_FILES_GET
     if path.startswith("/oauth/token") or path.startswith("/.well-known/"):
         return FailureScope.AUTH_TOKEN
+    # The AAD tenant token alias (POST /{tenant}/oauth2/v2.0/token) — the
+    # direct path azure-identity requests. Suffix-matched because the first
+    # segment is the caller's tenant id, not a fixed prefix.
+    if path.endswith("/oauth2/v2.0/token"):
+        return FailureScope.AUTH_TOKEN
     return FailureScope.GLOBAL
 
 
@@ -264,6 +269,14 @@ def make_failure_middleware(
     ) -> Response:
         path = request.url.path
         scope = _scope_for_path(path)
+
+        # T3 test-only gate: when installed, the first AUTH_TOKEN arrival is
+        # signalled and HELD here — before policy evaluation and dispatch —
+        # so the test controls exactly when minting proceeds.
+        gate = state.auth_token_gate
+        if scope is FailureScope.AUTH_TOKEN and gate is not None:
+            gate.reached.set()
+            await gate.release.wait()
 
         if state.global_paused and _is_upstream_path(path):
             logger.debug("global_paused: short-circuit %s", path)

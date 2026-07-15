@@ -12,6 +12,7 @@ the FastAPI ``Depends`` mechanism.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 from dataclasses import dataclass, field
@@ -245,6 +246,45 @@ class IdempotencyEntry:
     expires_at: datetime
 
 
+@dataclass(frozen=True)
+class MintAttempt:
+    """One ordered token-endpoint attempt (the T3 lifecycle ledger).
+
+    Deliberately carries NO secret material: ``slot`` is the safe tag the
+    endpoint resolved from :attr:`EmulatorState.mint_slot_secrets` via
+    ``hmac.compare_digest`` ("primary" / "secondary" / "unknown").
+
+    Attributes:
+        seq: 1-based order of the attempt.
+        slot: Safe slot tag of the presented secret.
+        status: The HTTP status the endpoint answered (200 mint / 401 reject).
+        at: Attempt timestamp (UTC).
+    """
+
+    seq: int
+    slot: str
+    status: int
+    at: datetime
+
+
+@dataclass
+class AuthTokenGate:
+    """Test-only gate on the AUTH_TOKEN middleware path (T3 lifecycle).
+
+    Installed CLOSED before the Phantom child boots: the middleware sets
+    ``reached`` when the first token request arrives and then holds on
+    ``release`` before policy evaluation / router dispatch, so the eager
+    minter cannot win the race against the test's park-first phase.
+
+    Attributes:
+        release: The test opens this to let token requests proceed.
+        reached: Set by the middleware when a token request first arrives.
+    """
+
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+    reached: asyncio.Event = field(default_factory=asyncio.Event)
+
+
 @dataclass
 class EmulatorState:
     """In-process container for every mutable emulator observable.
@@ -324,6 +364,18 @@ class EmulatorState:
     # This is the T4 STS oracle: it proves the token MATTERED, rather than
     # accepting whatever token happened to be signed.
     expected_session_token: str | None = None
+    # T3 lifecycle test surface (all inert unless a test arms them):
+    # ``mint_slot_secrets`` maps a SAFE slot tag ("primary"/"secondary") to
+    # the synthetic secret the test injected; the token endpoint compares the
+    # presented secret via hmac.compare_digest and records ONLY the tag.
+    # ``mint_attempts`` is the ordered attempt ledger (seq/slot/status/at —
+    # never a secret, token, header, or form body). ``auth_token_gate``, when
+    # installed (closed) BEFORE the child boots, makes the AUTH_TOKEN
+    # middleware path signal ``reached`` and hold before policy evaluation /
+    # dispatch, so a test fully controls when the first mint proceeds.
+    mint_slot_secrets: dict[str, str] = field(default_factory=dict)
+    mint_attempts: list[MintAttempt] = field(default_factory=list)
+    auth_token_gate: AuthTokenGate | None = None
     plain_bearer_allowlist: set[str] = field(default_factory=set)
     api_key_secret: str | None = None
     static_jwt: str | None = None

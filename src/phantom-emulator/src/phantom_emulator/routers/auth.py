@@ -9,7 +9,9 @@ See plan §4.10.
 
 from __future__ import annotations
 
+import hmac
 import logging
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
@@ -18,7 +20,7 @@ from fastapi.responses import JSONResponse
 from phantom_emulator.auth.jwks import build_jwks
 from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.routers._deps import get_state
-from phantom_emulator.state import EmulatorState, IssuedToken
+from phantom_emulator.state import EmulatorState, IssuedToken, MintAttempt
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,31 @@ router = APIRouter()
 
 # Reusable typed dependency. FastAPI inspects the Annotated metadata.
 StateDep = Annotated[EmulatorState, Depends(get_state)]
+
+
+def _record_mint_attempt(state: EmulatorState, client_secret: str, status: int) -> None:
+    """Append one ordered, secret-free entry to the T3 mint-attempt ledger.
+
+    Inert unless a test armed :attr:`EmulatorState.mint_slot_secrets`. The
+    presented secret is resolved to its SAFE slot tag via
+    ``hmac.compare_digest`` and immediately discarded; the ledger never
+    carries a secret, token, header, or form body.
+    """
+    if not state.mint_slot_secrets:
+        return
+    slot = "unknown"
+    for tag, secret in state.mint_slot_secrets.items():
+        if hmac.compare_digest(client_secret, secret):
+            slot = tag
+            break
+    state.mint_attempts.append(
+        MintAttempt(
+            seq=len(state.mint_attempts) + 1,
+            slot=slot,
+            status=status,
+            at=datetime.now(UTC),
+        )
+    )
 
 
 @router.post("/oauth/token")
@@ -89,6 +116,7 @@ async def token_endpoint(
     ]
     if not matching:
         logger.info("oauth/token rejected: unknown client_id %s", client_id)
+        _record_mint_attempt(state, client_secret, 401)
         return JSONResponse(
             {"error": "invalid_client"},
             status_code=401,
@@ -107,12 +135,47 @@ async def token_endpoint(
     )
 
     expires_in = state.cfg.auth.default_expires_in_seconds
+    _record_mint_attempt(state, client_secret, 200)
     return JSONResponse(
         {
             "access_token": token,
             "token_type": "Bearer",
             "expires_in": expires_in,
         }
+    )
+
+
+@router.post("/{tenant_id}/oauth2/v2.0/token")
+async def tenant_token_alias(
+    tenant_id: str,
+    grant_type: Annotated[str, Form()],
+    client_id: Annotated[str, Form()],
+    client_secret: Annotated[str, Form()],
+    state: StateDep,
+    scope: Annotated[str | None, Form()] = None,
+) -> JSONResponse:
+    """The AAD tenant token path — azure-identity's direct POST target.
+
+    ``azure-identity`` (locked 1.25.3) POSTs ``/{tenant}/oauth2/v2.0/token``
+    on the configured authority with NO discovery round-trip, so the generic
+    ``/oauth/token`` alias alone cannot serve an autonomous-mint scenario.
+    Same grant, same validation, same mint, same T3 attempt ledger: this
+    delegates to :func:`token_endpoint` verbatim. The tenant segment is
+    accepted and ignored (the emulator is single-tenant by configuration).
+
+    Registration note: this parameterized route lives on the auth router,
+    which registers BEFORE the S3 catch-all (``/{bucket}/{key:path}``), so
+    first-match keeps it out of the sink; an S3 key literally shaped
+    ``oauth2/v2.0/token`` under a POST would shadow into this route, which no
+    scenario does.
+    """
+    del tenant_id
+    return await token_endpoint(
+        grant_type=grant_type,
+        client_id=client_id,
+        client_secret=client_secret,
+        state=state,
+        scope=scope,
     )
 
 
