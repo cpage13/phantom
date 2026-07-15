@@ -164,7 +164,8 @@ jobs:
           uv run pytest tests/contract/ -q
 
   # E2E core: the functional e2e battery (fast feedback). Excludes the
-  # load / perf / stress tiers, which run in their own lanes / nightly.
+  # load / perf / stress tiers (own lanes / nightly) and the docker tier
+  # (its own e2e-docker job below).
   e2e-core:
     runs-on: ubuntu-latest
     steps:
@@ -176,7 +177,24 @@ jobs:
       - run: |
           uv sync --all-packages
           export UV_NO_SYNC=1
-          uv run pytest tests/e2e/ -q -m "not load and not perf and not stress"
+          uv run pytest tests/e2e/ -q -m "not load and not perf and not stress and not docker"
+
+  # E2E docker tier (audit T7): builds both images from the repo
+  # Dockerfiles and drives the compose named-volume replacement matrix.
+  # Separate from e2e-core so image builds never slow the core battery.
+  e2e-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run pytest tests/e2e/ -q -m docker
 
   # E2E load tier (tests/e2e/test_e2e_2[1234]_*; ~15 min via test_e2e_23).
   # Isolated so it does not slow e2e-core; runs on every push, as before.

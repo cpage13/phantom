@@ -1,0 +1,61 @@
+# T7 / G4 compose topology (tests/e2e/test_docker_volume_replacement.py).
+#
+# Test-owned: every run-varying value rides the environment the test
+# provides (project name, image tags, config paths, the explicit external
+# data volume). Ports publish 0 on 127.0.0.1 so Docker assigns loopback
+# ephemeral host ports; the test discovers them AFTER startup via
+# `docker compose port <svc> <port>` and never reserves host sockets.
+#
+# The phantom data volume is deliberately `external: true` with an
+# env-selected name: the test pre-creates run-unique evidence/control
+# volumes and swaps PHANTOM_DATA_VOLUME between container replacements to
+# prove the named volume IS the durability boundary.
+#
+# Healthcheck timings here override the images' conservative defaults so
+# `compose up --wait` converges in seconds on a test runner.
+
+services:
+  emulator:
+    image: ${EMULATOR_IMAGE}
+    command: ["-c", "/etc/phantom-emulator/config.yml"]
+    environment:
+      EMULATOR_SIGNING_KEY: ${EMULATOR_SIGNING_KEY}
+    volumes:
+      - ${EMULATOR_CONFIG_FILE}:/etc/phantom-emulator/config.yml:ro
+    ports:
+      - target: 8000
+        host_ip: 127.0.0.1
+        published: 0
+        protocol: tcp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/.well-known/openid-configuration', timeout=3).status == 200 else 1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+      start_period: 2s
+
+  phantom:
+    image: ${PHANTOM_IMAGE}
+    command: ["-c", "/etc/phantom/phantom.yaml"]
+    volumes:
+      - phantom-data:/var/lib/phantom
+      - ${PHANTOM_CONFIG_FILE}:/etc/phantom/phantom.yaml:ro
+    ports:
+      - target: 8080
+        host_ip: 127.0.0.1
+        published: 0
+        protocol: tcp
+    depends_on:
+      emulator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/v1/healthz', timeout=3).status == 200 else 1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+      start_period: 2s
+
+volumes:
+  phantom-data:
+    name: ${PHANTOM_DATA_VOLUME}
+    external: true

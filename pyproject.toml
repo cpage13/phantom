@@ -124,4 +124,5 @@ markers = [
   "load: long-running load test gated out of the default suite (tests/e2e/test_e2e_2[1234]_*); run via `pytest -m load`",
   "stress: stress test run on the nightly CI cron only; run via `pytest -m stress` (plan § 1.1.10)",
   "perf: performance-budget assertions (SYNTHETIC_RETURN_BUDGET_SECONDS); run on a quiet/dedicated lane via `-m perf`; excluded from the default suite because a loaded host produces false failures",
+  "docker: compose-topology E2E requiring a Docker daemon (tests/e2e/test_docker_volume_replacement.py); runs in the dedicated e2e-docker CI job, excluded from e2e-core",
 ]
