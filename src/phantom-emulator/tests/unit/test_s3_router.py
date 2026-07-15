@@ -58,6 +58,7 @@ def _sign(
     body: bytes,
     *,
     secret: str = _SECRET_ACCESS_KEY,
+    token: str | None = None,
     extra_headers: dict[str, str] | None = None,
     signer: type[SigV4Auth] = S3SigV4Auth,
 ) -> dict[str, str]:
@@ -79,6 +80,8 @@ def _sign(
         body: Request body (``b""`` for a GET).
         secret: Signing secret. Default is the matching known secret; a
             wrong value produces a signature the server rejects.
+        token: Optional STS session token. When set, botocore adds and
+            SIGNS ``X-Amz-Security-Token`` (the T4 oracle's subject).
         extra_headers: Additional headers present BEFORE signing (so they
             are included in ``SignedHeaders``).
         signer: The botocore signer class to sign with. Default ``S3SigV4Auth``
@@ -93,7 +96,7 @@ def _sign(
     if extra_headers:
         headers.update(extra_headers)
     aws_req = AWSRequest(method=method, url=f"{_BASE_URL}{path}", data=body, headers=headers)
-    creds = Credentials(_ACCESS_KEY_ID, secret)
+    creds = Credentials(_ACCESS_KEY_ID, secret, token)
     signer(creds, _SERVICE, _REGION).add_auth(aws_req)
     return dict(aws_req.headers.items())
 
@@ -488,3 +491,81 @@ def test_upload_methods_match_catch_all_forwarded_set() -> None:
     assert set(UPLOAD_METHODS) == forwarded
     # And the value the sinks register is exactly the documented upload set.
     assert set(UPLOAD_METHODS) == {"PUT", "POST", "PATCH"}
+
+
+# ---------------------------------------------------------------------------
+# Expected-session-token oracle (audit T4 STS arm).
+# ---------------------------------------------------------------------------
+
+_SESSION_TOKEN = "t4-sts-session-token-e2e-3f8a1c"
+
+
+async def test_expected_token_matching_signed_token_stores(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """Objective: expectation armed + matching signed token -> 200 + stored.
+
+    Expected: botocore signs X-Amz-Security-Token into the request; the
+    oracle's compare passes and the ordinary recompute then validates.
+    """
+    client, state = client_and_state
+    state.expected_session_token = _SESSION_TOKEN
+    body = b"sts-ok"
+    headers = _sign("PUT", "/mybucket/sts/ok.bin", body, token=_SESSION_TOKEN)
+    response = await client.put("/mybucket/sts/ok.bin", content=body, headers=headers)
+    assert response.status_code == 200
+    assert state.s3_objects[("mybucket", "sts/ok.bin")].body == body
+
+
+async def test_expected_token_missing_token_rejected(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """Objective: expectation armed + NO token on the request -> 403, no store.
+
+    Expected: the oracle rejects before any signature recompute; the same
+    SignatureDoesNotMatch vocabulary as a bad signature.
+    """
+    client, state = client_and_state
+    state.expected_session_token = _SESSION_TOKEN
+    body = b"sts-missing"
+    headers = _sign("PUT", "/mybucket/sts/missing.bin", body)
+    response = await client.put("/mybucket/sts/missing.bin", content=body, headers=headers)
+    assert response.status_code == 403
+    assert response.json()["detail"] == "SignatureDoesNotMatch"
+    assert ("mybucket", "sts/missing.bin") not in state.s3_objects
+
+
+async def test_expected_token_mismatched_token_rejected(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """Objective: expectation armed + a DIFFERENT signed token -> 403, no store.
+
+    Expected: equality is against the exact expected value; a validly signed
+    request carrying some other token is rejected, proving the token value
+    itself mattered.
+    """
+    client, state = client_and_state
+    state.expected_session_token = _SESSION_TOKEN
+    body = b"sts-wrong"
+    headers = _sign("PUT", "/mybucket/sts/wrong.bin", body, token="t4-some-other-token")
+    response = await client.put("/mybucket/sts/wrong.bin", content=body, headers=headers)
+    assert response.status_code == 403
+    assert ("mybucket", "sts/wrong.bin") not in state.s3_objects
+
+
+async def test_no_expectation_token_signed_request_still_validates(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """Objective: oracle disarmed (None) + token-signed request -> 200.
+
+    Expected: the oracle is opt-in; a token-bearing request validates through
+    the ordinary recompute (the signed token header participates in the
+    canonical request), so pre-oracle behavior is unchanged.
+    """
+    client, state = client_and_state
+    assert state.expected_session_token is None
+    body = b"sts-disarmed"
+    headers = _sign("PUT", "/mybucket/sts/disarmed.bin", body, token=_SESSION_TOKEN)
+    response = await client.put("/mybucket/sts/disarmed.bin", content=body, headers=headers)
+    assert response.status_code == 200
+    assert state.s3_objects[("mybucket", "sts/disarmed.bin")].body == body

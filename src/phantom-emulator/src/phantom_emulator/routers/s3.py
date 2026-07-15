@@ -113,7 +113,13 @@ def _guard_reserved_bucket(bucket: str) -> None:
         raise HTTPException(status_code=404, detail="NoSuchBucket")
 
 
-def _verify_sigv4(request: Request, body: bytes, s3cfg: S3Cfg) -> None:
+def _verify_sigv4(
+    request: Request,
+    body: bytes,
+    s3cfg: S3Cfg,
+    *,
+    expected_session_token: str | None = None,
+) -> None:
     """Recompute the SigV4 signature over EXACTLY the inbound request and compare.
 
     Recompute-from-declared-``SignedHeaders``: the AWSRequest carries only
@@ -131,14 +137,24 @@ def _verify_sigv4(request: Request, body: bytes, s3cfg: S3Cfg) -> None:
             hashes the right bytes when a client omits
             ``x-amz-content-sha256`` from the signed set.
         s3cfg: The known test credentials to validate against.
+        expected_session_token: When not ``None``, the request MUST carry an
+            ``X-Amz-Security-Token`` header equal to this value (checked
+            BEFORE the recompute, ``hmac.compare_digest``). The T4 STS
+            oracle: proves the session token mattered rather than accepting
+            whatever token happened to be signed.
 
     Raises:
         HTTPException: ``403 SignatureDoesNotMatch`` on any failure
             (missing/garbled ``Authorization``, wrong credential id,
+            a missing/unequal expected session token,
             credential-scope date mismatch, a declared header absent from
             the request, declared-headers divergence, or a signature
             mismatch). Returns ``None`` on a faithful recompute match.
     """
+    if expected_session_token is not None:
+        presented = request.headers.get("x-amz-security-token")
+        if presented is None or not hmac.compare_digest(presented, expected_session_token):
+            raise _SIG_MISMATCH
     m = _AUTH_RE.match(request.headers.get("authorization", ""))
     if m is None:
         raise _SIG_MISMATCH
@@ -218,7 +234,7 @@ async def put_object(bucket: str, key: str, request: Request, state: StateDep) -
     body = await request.body()
     if len(body) > state.cfg.s3.body_max_bytes:
         raise HTTPException(status_code=413, detail="body exceeds upstream cap")
-    _verify_sigv4(request, body, state.cfg.s3)
+    _verify_sigv4(request, body, state.cfg.s3, expected_session_token=state.expected_session_token)
     all_headers = {k.lower(): v for k, v in request.headers.items()}
     state.s3_objects[(bucket, key)] = S3Object(
         bucket=bucket,
@@ -244,7 +260,7 @@ async def get_object(bucket: str, key: str, request: Request, state: StateDep) -
     bucket.
     """
     _guard_reserved_bucket(bucket)
-    _verify_sigv4(request, b"", state.cfg.s3)
+    _verify_sigv4(request, b"", state.cfg.s3, expected_session_token=state.expected_session_token)
     obj = state.s3_objects.get((bucket, key))
     if obj is None:
         raise HTTPException(status_code=404, detail="NoSuchKey")

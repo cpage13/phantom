@@ -316,6 +316,14 @@ class EmulatorState:
     idempotency_cache: dict[IdempotencyKey, IdempotencyEntry] = field(default_factory=dict)
     auth_mode_overrides: dict[str, AuthMode] = field(default_factory=dict)
     global_paused: bool = False
+    # When set, the S3 sink requires every SigV4-validated request to carry
+    # an ``X-Amz-Security-Token`` header equal to this value (compared with
+    # hmac.compare_digest) BEFORE the signature recompute; missing or unequal
+    # tokens get the same 403 SignatureDoesNotMatch as a bad signature. None
+    # (the default) leaves session-token handling to the recompute alone.
+    # This is the T4 STS oracle: it proves the token MATTERED, rather than
+    # accepting whatever token happened to be signed.
+    expected_session_token: str | None = None
     plain_bearer_allowlist: set[str] = field(default_factory=set)
     api_key_secret: str | None = None
     static_jwt: str | None = None
