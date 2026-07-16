@@ -954,7 +954,7 @@ Four layers, each with a different role:
   files across the top level plus the `crash_recovery/`, `regression/`,
   `stress/`, `all_ram/`, `ingress_abort/`, and `db_contention/`
   subdirs - 248 test functions, of which 231 run in the default
-  lane (the `load` / `perf` / `stress` markers gate out the rest) and
+  lane (the `load` / `perf` / `stress` / `docker` markers gate out the rest) and
   none is a designed `xfail`. Counts are as of 2026-07-12 and drift as tests land. Boots
   real Phantom + real emulator, drives through the
   test-owned driver, asserts on three surfaces (producer-side return,
@@ -1002,7 +1002,7 @@ Three workflows under `.github/workflows/`:
 
 | File | Trigger | Jobs |
 |---|---|---|
-| `per_pr.yml` | every PR + push to main | (1) `ruff check` + `ruff format --check`; (2) per-package `mypy --strict` via `scripts/precommit/run_mypy_per_package.sh`; (3) per-package unit tests (+ emulator smoke); (4) workspace integration + contract tests; (5) the e2e-core job, excluding the `load`, `perf`, and `stress` markers; (6) a separate e2e-load job running `-m load`; (7) the falsifiability scripts above. |
+| `per_pr.yml` | every PR + push to main | (1) `ruff check` + `ruff format --check`; (2) per-package `mypy --strict` via `scripts/precommit/run_mypy_per_package.sh`; (3) per-package unit tests (+ emulator smoke); (4) workspace integration + contract tests; (5) the e2e-core job, excluding the `load`, `perf`, `stress`, and `docker` markers; (6) a separate e2e-load job running `-m load`; (7) the e2e-docker job (`-m docker`): builds both images from the repo Dockerfiles and drives the compose named-volume replacement matrix (`tests/e2e/docker/compose.yml`); (8) the falsifiability scripts above. |
 | `nightly_stress.yml` | nightly cron + manual dispatch | `pytest tests/e2e/ -m stress`: the high-volume burst tier. |
 | `perf.yml` | manual only (`workflow_dispatch`) | `pytest tests/e2e/ -m perf`: latency/throughput budgets on a quiet runner (they false-fail on loaded shared runners). |
 

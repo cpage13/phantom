@@ -7,15 +7,12 @@ URLs and a typed :class:`EmulatorControl` that mirrors the emulator's
 ``/control/*`` surface one-to-one, so tests can drive failure
 injection without crafting HTTP control calls.
 
-Two modes are supported, selected via the ``E2E_MODE`` env var:
-
-- ``inprocess`` (default): boots phantom and phantom-emulator as
-  in-process :class:`uvicorn.Server` instances on ephemeral ports.
-  Fast local iteration (< 60 s suite target).
-- ``docker``: brings up the workspace's ``docker-compose.e2e.yml`` and
-  tears it down on suite exit. Inprocess is the required path; docker
-  mode is a stub that raises a clear error until CI infrastructure
-  lands.
+The stack boots phantom and phantom-emulator as in-process
+:class:`uvicorn.Server` instances on ephemeral ports (fast local
+iteration, < 60 s suite target). The container topology has its own
+dedicated lane and is NOT a stack mode:
+``tests/e2e/test_docker_volume_replacement.py`` builds both images and
+drives the compose file at ``tests/e2e/docker/compose.yml``.
 """
 
 from __future__ import annotations
@@ -29,7 +26,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -56,13 +53,6 @@ from phantom_emulator.routers.control import ReceivedEntry
 from phantom_emulator.state import EmulatorState, RawBody, S3Object, UpstreamEvent
 
 logger = logging.getLogger(__name__)
-
-# E2E_MODE env var: selects the boot mode. inprocess is the default
-# because it requires no Docker daemon and is faster than container
-# startup.
-ENV_MODE: str = "E2E_MODE"
-MODE_INPROCESS: Literal["inprocess"] = "inprocess"
-MODE_DOCKER: Literal["docker"] = "docker"
 
 # HS256 secret env var shared between the driver's `get_security_token`
 # fake and the emulator's JWT minter. Both sides read the same value
@@ -193,7 +183,6 @@ class E2EStack:
     use the ``stack`` pytest fixture in ``conftest.py``.
 
     Attributes:
-        mode: Which boot mode was used (`inprocess` or `docker`).
         phantom_url: HTTP base URL for Phantom's ingress endpoint.
         phantom_admin_url: HTTP base URL for Phantom's admin endpoint -
             the SAME URL as ``phantom_url`` (admin rides the one listener;
@@ -218,7 +207,6 @@ class E2EStack:
             ``None`` when hot reload is disabled (the default).
     """
 
-    mode: Literal["inprocess", "docker"]
     phantom_url: str
     phantom_admin_url: str
     emulator_url: str
@@ -252,7 +240,7 @@ class E2EStack:
             KeyError: When no instance with ``instance_id`` is wired.
         """
         if self._phantom_uv_server is None:
-            raise RuntimeError("get_instance() requires inprocess mode")
+            raise RuntimeError("get_instance() requires a live in-process stack")
         # The uvicorn config's `app` field is typed as a broad union
         # (callable / asgi / str) so mypy can't see `.state`. We know
         # we passed a FastAPI app in `_boot_inprocess`, so an explicit
@@ -548,14 +536,7 @@ async def boot_stack(
 
     Raises:
         StackBootError: When boot fails before both servers are ready.
-        NotImplementedError: When docker mode is selected but the
-            compose stack isn't available locally.
     """
-    mode = os.environ.get(ENV_MODE, MODE_INPROCESS)
-    if mode == MODE_DOCKER:
-        return await _boot_docker()
-    if mode != MODE_INPROCESS:
-        raise StackBootError(f"unknown E2E_MODE={mode!r}; expected 'inprocess' or 'docker'")
     if extra_emulator_hosts is not None and len(extra_emulator_hosts) != extra_emulators:
         raise StackBootError(
             f"extra_emulator_hosts has {len(extra_emulator_hosts)} entries but "
@@ -743,7 +724,6 @@ async def _boot_inprocess(
     )
 
     return E2EStack(
-        mode=MODE_INPROCESS,
         phantom_url=phantom_url,
         phantom_admin_url=phantom_url,
         emulator_url=emulator_url,
@@ -815,25 +795,6 @@ async def _boot_one_emulator(*, bind_host: str = INPROCESS_BIND_HOST) -> Emulato
         uv_server=emu_uv_server,
         serve_task=emu_serve_task,
         port=emu_port,
-    )
-
-
-async def _boot_docker() -> E2EStack:
-    """Boot the stack via ``docker compose up -d``.
-
-    Docker mode is stubbed for this agent — the inprocess path is the
-    required deliverable and Docker mode is nice-to-have once CI
-    runners have the compose file and image builds wired. The
-    ``docker-compose.e2e.yml`` next to this file is the contract for a
-    future implementer.
-
-    Raises:
-        NotImplementedError: Always — Docker mode is a stub.
-    """
-    raise NotImplementedError(
-        "E2E_MODE=docker is not yet implemented; use E2E_MODE=inprocess. "
-        "See tests/e2e/docker-compose.e2e.yml for the intended shape "
-        "and plan §4 (Run discipline) for the contract."
     )
 
 

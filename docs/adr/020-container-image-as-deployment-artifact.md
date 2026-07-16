@@ -55,11 +55,12 @@ Deleted:
 
 Preserved:
 
-- `src/phantom-emulator/src/phantom_emulator/docker/Dockerfile` —
-  the emulator is a separate package with its own deployment
-  lifecycle (publishable to public PyPI for any team needing the
-  two-step-upload-shape emulator). The emulator container is
-  unchanged.
+- The emulator Dockerfile (2026-07-15 amendment: now at
+  `src/phantom-emulator/Dockerfile`, the package root; the nested
+  in-package copy this ADR originally preserved was stale and was
+  removed when the docker-marked e2e lane landed). The emulator is a
+  separate package with its own lifecycle; its image is e2e/CI
+  infrastructure, built locally and never published.
 
 ### Registry
 

@@ -1,5 +1,6 @@
-# phantom config used by the E2E suite (both inprocess and docker
-# modes). Resource caps that matter to specific tests are overlaid
+# phantom config used by the E2E suite (the in-process stack, the
+# subprocess harness, and the container lane, which all derive from
+# it). Resource caps that matter to specific tests are overlaid
 # per-test via _build_phantom_settings's config_overrides hook; the
 # base YAML relies on the F6 validator's probe-derived defaults for
 # everything not overridden. Tests that need deterministic caps

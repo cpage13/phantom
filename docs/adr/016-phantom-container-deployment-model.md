@@ -9,14 +9,14 @@ Tag scheme:
 
 The build is multi-arch from a single `docker buildx build --platform linux/arm64,linux/amd64 --push` invocation. One manifest list per tag points at the two arch-specific images. Consumers pull the appropriate arch transparently — `docker pull <docker-org>/phantom-service:0.1.0` on an arm64 host pulls the arm64 image; on an amd64 host pulls the amd64 image.
 
-The base-image choice (Chainguard Wolfi) is **not** captured here — it is local to the Dockerfile (`src/phantom-service/docker/Dockerfile` and `src/phantom-emulator/src/phantom_emulator/docker/Dockerfile`) and the phantom README. Base-image substitutions are an implementation choice, not an architectural commitment.
+The base-image choice (Chainguard Wolfi) is **not** captured here — it is local to the Dockerfiles and the phantom README. Base-image substitutions are an implementation choice, not an architectural commitment.
 
-The Dockerfiles live per-package:
+The Dockerfiles live per-package (paths corrected 2026-07-15; ADR-020 consolidated the service image and the emulator image moved to its package root when the nested copy was retired):
 
-- `src/phantom-service/docker/Dockerfile` — phantom-service.
-- `src/phantom-emulator/src/phantom_emulator/docker/Dockerfile` — phantom-emulator.
+- `src/phantom-deploy/Dockerfile` — phantom-service (see ADR-020).
+- `src/phantom-emulator/Dockerfile` — phantom-emulator (e2e/CI infrastructure; never published).
 
-Earlier Debian-slim placeholders at the repo root (`docker/Dockerfile`, `docker/docker-compose.yml`) are removed in this cycle (Phase 3 of `strategy_05_18.md`). The per-package homes match the workspace structure — each image's Dockerfile sits with the package it builds — and align with `tests/e2e/docker-compose.e2e.yml`'s existing `--file` references.
+Earlier Debian-slim placeholders at the repo root (`docker/Dockerfile`, `docker/docker-compose.yml`) are removed in this cycle (Phase 3 of `strategy_05_18.md`). The stub-era `tests/e2e/docker-compose.e2e.yml` was retired 2026-07-15 in favor of the live docker-marked lane (`tests/e2e/docker/compose.yml` + `test_docker_volume_replacement.py`).
 
 Status: Accepted
 Date: 2026-05-20

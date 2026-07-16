@@ -1,14 +1,14 @@
-# phantom-emulator config used by the E2E suite (both inprocess and
-# docker modes). Pins every knob that varies between runs so the
-# suite is deterministic.
+# phantom-emulator config used by the E2E suite (the in-process stack
+# and the container lane, which mounts it verbatim). Pins every knob
+# that varies between runs so the suite is deterministic.
 #
 # Authority hierarchy: ADRs > config/phantom.yaml.example > this file.
 # Where this file disagrees with a default, the comment above the
 # override explains why.
 
 server:
-  # Inprocess mode overrides `port: 0` at runtime (see helpers/stack.py)
-  # for ephemeral-port allocation. Docker mode honors this value.
+  # The in-process stack overrides the port at runtime (helpers/stack.py)
+  # for ephemeral-port allocation. The container lane honors this value.
   host: "0.0.0.0"
   port: 8000
 
@@ -21,8 +21,9 @@ auth:
   signing:
     # HS256 because the shared secret round-trips through env vars
     # without any RSA-keypair plumbing. The matching env var
-    # (`EMULATOR_SIGNING_KEY`) is set in conftest.py for inprocess
-    # mode and in docker-compose.e2e.yml for docker mode.
+    # (`EMULATOR_SIGNING_KEY`) is set in conftest.py for the in-process
+    # stack and passed via the compose environment in
+    # tests/e2e/docker/compose.yml for the container lane.
     mode: "HS256"
     hs256_secret_env: "EMULATOR_SIGNING_KEY"
   # The issuer is rewritten to the live URL at runtime when the

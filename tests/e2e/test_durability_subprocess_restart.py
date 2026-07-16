@@ -1,10 +1,11 @@
 """Deployment durability: real-process boot + container-replacement survival (§ 5.D).
 
-Plan § 5.2 Part 5.D, the deployment-durability bundle. The Docker E2E mode is a stub
-(``_boot_docker`` raises ``NotImplementedError``), so per F-11 a literal
-container-replacement-on-a-named-volume test is approximated by the subprocess harness's
-fresh-process-on-the-same-``data_dir`` restart - which is exactly the durability contract:
-the bytes live on the volume, not in the process.
+Plan § 5.2 Part 5.D, the deployment-durability bundle. The literal
+container-replacement-on-a-named-volume proof now lives in the docker-marked lane
+(``test_docker_volume_replacement.py``); this module keeps the subprocess-level
+approximation as the fast default-lane durability proof: a fresh process on the same
+``data_dir`` - which is exactly the durability contract: the bytes live on the volume,
+not in the process.
 
 * :func:`test_subprocess_boots_with_regenerated_config_and_answers_ready_and_health`
   - the deployment shape: ``python -m phantom -c <config>`` boots from a written config

@@ -64,18 +64,19 @@ src/phantom_emulator/
 ├── upload/
 │   ├── presigned.py       # synthetic presigned-style URL mint
 │   └── correlation.py     # metadata.keyValueStore extract / echo
-├── routers/
-│   ├── auth.py            # /oauth/token + /.well-known/*
-│   ├── upstream.py        # /v1/files/create, /v1/files/upload/{token}
-│   │                      # captures Content-Encoding on AcceptedBody
-│   ├── control.py         # /control/* surface
-│   │                      # ReceivedEntry shape: body_hash, content_encoding
-│   ├── s3.py              # path-style fake-S3 sink (validates SigV4)
-│   └── raw_sink.py        # auth-free /raw/{path} sink (forward-as-is)
-└── docker/
-    ├── Dockerfile
-    └── compose.example.yml
+└── routers/
+    ├── auth.py            # /oauth/token + tenant alias + /.well-known/*
+    ├── upstream.py        # /v1/files/create, /v1/files/upload/{token}
+    │                      # captures Content-Encoding on AcceptedBody
+    ├── control.py         # /control/* surface
+    │                      # ReceivedEntry shape: body_hash, content_encoding
+    ├── s3.py              # path-style fake-S3 sink (validates SigV4)
+    └── raw_sink.py        # auth-free /raw/{path} sink (forward-as-is)
 ```
+
+The container image is built from `src/phantom-emulator/Dockerfile` (the
+package root, next to `pyproject.toml`); it is e2e/CI infrastructure,
+built locally by the docker-marked lane and never published.
 
 ## Two-step-upload endpoints
 
