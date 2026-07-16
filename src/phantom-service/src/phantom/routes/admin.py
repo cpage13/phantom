@@ -20,6 +20,7 @@ respects.
 
 from __future__ import annotations
 
+import importlib.metadata
 import io
 import json
 import logging
@@ -298,6 +299,26 @@ async def _aggregate_stats(targets: list[InstanceContext]) -> StatsResponse:
 # ---------------------------------------------------------------------------
 
 
+# The identifier this implementation reports in GET /v1/admin/status.
+# A ported implementation (e.g. phantom-go) reports its own value, so an
+# operator can always tell which binary answered.
+_IMPLEMENTATION_ID: str = "phantom-python"
+# The installed distribution whose version the status route reports.
+_SERVICE_DISTRIBUTION: str = "phantom-service"
+
+
+def _service_version() -> str:
+    """Resolve the installed phantom-service distribution version.
+
+    Falls back to ``"unknown"`` when the distribution metadata is absent
+    (an unpackaged source checkout), rather than failing the status route.
+    """
+    try:
+        return importlib.metadata.version(_SERVICE_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
 @router.get("/status", response_model=AdminStatusResponse)
 async def get_admin_status(
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
@@ -331,6 +352,8 @@ async def get_admin_status(
         instances=summaries,
         ad_reachability="not_configured",
         resolved_defaults=resolved_defaults,
+        implementation=_IMPLEMENTATION_ID,
+        service_version=_service_version(),
     )
 
 

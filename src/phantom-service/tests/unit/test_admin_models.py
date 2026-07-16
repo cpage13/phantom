@@ -192,3 +192,32 @@ def test_key_value_match_filter() -> None:
         KeyValueMatchFilter(key="", value="abc")
     with pytest.raises(ValidationError):
         KeyValueMatchFilter(key="phantom_local_uuid", value="")
+
+
+def test_admin_status_reports_implementation_identity() -> None:
+    """Objective: the dual-implementation identity fields exist with safe defaults.
+
+    Expected: a bare construction carries the Python reference identity and
+    the "unknown" version sentinel; the live route overrides the version with
+    the installed distribution (pinned separately below).
+    """
+    status = AdminStatusResponse(
+        ready=True,
+        disk_usage_bytes=0,
+        total_backlog=0,
+        instances=[],
+    )
+    assert status.implementation == "phantom-python"
+    assert status.service_version == "unknown"
+
+
+def test_service_version_resolves_installed_distribution() -> None:
+    """Objective: the status route's version helper resolves the real dist.
+
+    Expected: in the workspace (editable install), the phantom-service
+    distribution metadata exists, so the helper never reports the
+    "unknown" fallback here.
+    """
+    from phantom.routes.admin import _service_version
+
+    assert _service_version() != "unknown"

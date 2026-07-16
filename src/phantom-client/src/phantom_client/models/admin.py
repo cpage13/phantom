@@ -619,6 +619,17 @@ class AdminStatusResponse(BaseModel):
             "'not_configured' when no instance runs ad_client_credentials."
         ),
     )
+    implementation: str = Field(
+        "phantom-python",
+        description=(
+            "Which service implementation answered (phantom-python for the "
+            "reference implementation; a port reports its own identifier)."
+        ),
+    )
+    service_version: str = Field(
+        "unknown",
+        description="Version of the answering service implementation.",
+    )
 
 
 class InstanceStatusResponse(BaseModel):

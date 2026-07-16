@@ -810,6 +810,22 @@ class AdminStatusResponse(BaseModel):
             "can construct AdminStatusResponse without wiring a probe."
         ),
     )
+    implementation: str = Field(
+        "phantom-python",
+        description=(
+            "Which service implementation answered. The Python reference "
+            "implementation reports phantom-python; a ported implementation "
+            "reports its own identifier (e.g. phantom-go), so operators can "
+            "always tell which binary served the request."
+        ),
+    )
+    service_version: str = Field(
+        "unknown",
+        description=(
+            "Version of the answering implementation (the phantom-service "
+            "distribution version for the Python reference implementation)."
+        ),
+    )
 
 
 class ListUploadsResponse(BaseModel):
