@@ -36,7 +36,7 @@ from tests.e2e._harness.subprocess_harness import (
 )
 from tests.e2e.helpers.assertions import assert_chain_reaches_state
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.e2e]
+pytestmark = [pytest.mark.conformance, pytest.mark.asyncio, pytest.mark.e2e]
 
 # The AWS documentation example pair the emulator's SigV4 sink validates against.
 _ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"

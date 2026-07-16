@@ -50,7 +50,7 @@ from tests.e2e._harness.subprocess_harness import (
 
 from .helpers.stack import E2EStack, boot_stack
 
-pytestmark = pytest.mark.e2e
+pytestmark = [pytest.mark.conformance, pytest.mark.e2e]
 
 _SEED_BODY: bytes = b"phantom-5D-retention-seed-body"
 _DIGEST: str = hashlib.sha256(_SEED_BODY).hexdigest()

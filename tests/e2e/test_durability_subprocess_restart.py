@@ -53,7 +53,7 @@ from tests.e2e._harness.subprocess_harness import (
     write_phantom_config,
 )
 
-pytestmark = pytest.mark.e2e
+pytestmark = [pytest.mark.conformance, pytest.mark.e2e]
 
 _BODY_BYTES = 2 * 1024
 _PRECONDITION_TIMEOUT_SECONDS = 60.0

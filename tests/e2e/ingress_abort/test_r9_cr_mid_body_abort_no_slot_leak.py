@@ -47,7 +47,7 @@ from tests.e2e._harness.subprocess_harness import (
     write_phantom_config,
 )
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.e2e]
+pytestmark = [pytest.mark.conformance, pytest.mark.asyncio, pytest.mark.e2e]
 
 # Declared Content-Length: well under the 2 GiB max_buffered_bytes cap, so the
 # H2 precheck passes and the request enters the body-read path.

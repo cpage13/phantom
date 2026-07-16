@@ -61,7 +61,7 @@ from tests.e2e._harness.subprocess_harness import (
 )
 from tests.e2e.helpers.mode_switch import restart_phantom_on_data_dir
 
-pytestmark = [pytest.mark.asyncio]
+pytestmark = [pytest.mark.conformance, pytest.mark.asyncio]
 
 # A 1:1 5xx rate keeps an admitted body buffered (undelivered) across the switch
 # + restore; clearing the policy lets the next retry complete it.

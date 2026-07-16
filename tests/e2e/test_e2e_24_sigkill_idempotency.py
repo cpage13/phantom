@@ -97,7 +97,7 @@ DRAIN_POLL_SECONDS: float = 0.5
 REAPER_DEFERRAL_SECONDS: int = 3600
 
 
-pytestmark = [pytest.mark.e2e, pytest.mark.load]
+pytestmark = [pytest.mark.conformance, pytest.mark.e2e, pytest.mark.load]
 
 
 def _overrides() -> dict[str, Any]:

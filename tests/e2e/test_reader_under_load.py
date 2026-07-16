@@ -55,7 +55,7 @@ from .helpers.timing import await_until
 
 logger = logging.getLogger(__name__)
 
-pytestmark = pytest.mark.e2e
+pytestmark = [pytest.mark.conformance, pytest.mark.e2e]
 
 # Concurrent submitter coroutines; with the uploads-per-writer quota
 # below this keeps a sustained multi-lane ingest going while delivery

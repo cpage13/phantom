@@ -57,7 +57,7 @@ from tests.e2e._harness.subprocess_harness import (
     write_phantom_config as _write_phantom_config,
 )
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.e2e]
+pytestmark = [pytest.mark.conformance, pytest.mark.asyncio, pytest.mark.e2e]
 
 _BODY_BYTES = 4 * 1024
 _SUBMIT_CONCURRENCY = 16

@@ -47,7 +47,7 @@ from tests.e2e._harness.subprocess_harness import (
     write_phantom_config,
 )
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.e2e]
+pytestmark = [pytest.mark.conformance, pytest.mark.asyncio, pytest.mark.e2e]
 
 _TERMINAL = {"stored", "failed", "cancelled", "succeeded", "corrupted", "expired", "auth_expired"}
 

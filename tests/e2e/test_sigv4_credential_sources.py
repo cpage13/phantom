@@ -60,7 +60,7 @@ from tests.e2e.test_sigv4_credential_persistence_restart import (
     _sigv4_config_overrides,
 )
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.e2e]
+pytestmark = [pytest.mark.conformance, pytest.mark.asyncio, pytest.mark.e2e]
 
 # The AWS documentation example pair the emulator's SigV4 sink validates against.
 _ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"

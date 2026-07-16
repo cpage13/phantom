@@ -59,7 +59,7 @@ from tests.e2e._harness.subprocess_harness import (
     write_phantom_config,
 )
 
-pytestmark = [pytest.mark.asyncio]
+pytestmark = [pytest.mark.conformance, pytest.mark.asyncio]
 
 _BODY = b"phantom-schema-gate-chaos-body"
 

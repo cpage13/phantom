@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -89,6 +90,19 @@ HOST: str = "127.0.0.1"
 
 # Default fake sub claim (v1 sub UUID shape).
 DEFAULT_SUB: str = "00000000-0000-0000-0000-000000000001"
+
+# The conformance seam: when set, this command prefix launches the service
+# under test instead of the Python reference implementation (for example
+# E2E_SERVICE_CMD="/path/to/phantom-go"). Deliberately NOT PHANTOM_-prefixed:
+# the child inherits the parent env and pydantic-settings parses any
+# PHANTOM_* variable as a Settings field (extra=forbid aborts the boot).
+# The harness appends
+# `-c <config>`; a per-test explicit argv= still wins over the seam. The
+# in-process stack (helpers/stack.py) is Python-bound by construction and
+# does not consult this seam; conformance-marked modules all run through
+# THIS harness, so pointing the seam at a ported binary and running
+# `pytest -m conformance` is the cross-implementation gate.
+ENV_SERVICE_CMD: str = "E2E_SERVICE_CMD"
 
 # Health-poll budget for the subprocess boot.
 HEALTH_TIMEOUT_SECONDS: float = 30.0
@@ -201,6 +215,23 @@ class PhantomDaemonRegistry:
 # fixtures, and one pytest session is one process, so module scope IS session
 # scope here. The conftest session finalizer is the sole reaper.
 DAEMON_REGISTRY: PhantomDaemonRegistry = PhantomDaemonRegistry()
+
+
+def service_argv(config_path: Path) -> tuple[str, ...]:
+    """Resolve the child argv: the conformance seam or the Python reference.
+
+    Args:
+        config_path: The written YAML config the child boots with.
+
+    Returns:
+        The complete child argv. With :data:`ENV_SERVICE_CMD` set, its
+        shlex-split value is the command prefix; otherwise the venv's
+        ``python -m phantom``.
+    """
+    override = os.environ.get(ENV_SERVICE_CMD)
+    if override:
+        return (*shlex.split(override), "-c", str(config_path))
+    return (sys.executable, "-m", "phantom", "-c", str(config_path))
 
 
 def allocate_port() -> int:
@@ -489,9 +520,7 @@ class PhantomSubprocess:
         # terminate() needs no forwarding, and the registry tracks the truth.
         with open(log_path, "wb") as logf:
             self._proc = subprocess.Popen(
-                self.argv
-                if self.argv is not None
-                else (sys.executable, "-m", "phantom", "-c", str(self.config_path)),
+                self.argv if self.argv is not None else service_argv(self.config_path),
                 cwd=str(_REPO_ROOT),
                 stdout=logf,
                 stderr=subprocess.STDOUT,

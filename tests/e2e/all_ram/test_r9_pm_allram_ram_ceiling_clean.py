@@ -47,7 +47,7 @@ from tests.e2e._harness.subprocess_harness import (
     write_phantom_config,
 )
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.e2e]
+pytestmark = [pytest.mark.conformance, pytest.mark.asyncio, pytest.mark.e2e]
 
 _BODY_BYTES = 64 * 1024
 # The operative RAM ceiling in all_ram == the saturation bytes cap (~3 bodies).

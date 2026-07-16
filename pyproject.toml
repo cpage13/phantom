@@ -125,4 +125,5 @@ markers = [
   "stress: stress test run on the nightly CI cron only; run via `pytest -m stress` (plan § 1.1.10)",
   "perf: performance-budget assertions (SYNTHETIC_RETURN_BUDGET_SECONDS); run on a quiet/dedicated lane via `-m perf`; excluded from the default suite because a loaded host produces false failures",
   "docker: compose-topology E2E requiring a Docker daemon (tests/e2e/test_docker_volume_replacement.py); runs in the dedicated e2e-docker CI job, excluded from e2e-core",
+  "conformance: implementation-blind black-box e2e (every assertion observable over config + HTTP/UDS + filesystem artifacts + the emulator; no Python-internal log-format or dependency-behavior pins). The gate a ported service binary must pass via the E2E_SERVICE_CMD harness seam: `E2E_SERVICE_CMD=<binary> pytest -m conformance`",
 ]

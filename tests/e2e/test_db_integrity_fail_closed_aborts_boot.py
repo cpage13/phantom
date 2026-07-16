@@ -54,7 +54,7 @@ from tests.e2e._harness.subprocess_harness import (
 
 logger = logging.getLogger(__name__)
 
-pytestmark = [pytest.mark.asyncio]
+pytestmark = [pytest.mark.conformance, pytest.mark.asyncio]
 
 # A few buffered uploads so the pre-corruption DB carries real rows; 5xx
 # keeps them un-delivered and durably on disk.

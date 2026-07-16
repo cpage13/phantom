@@ -103,6 +103,7 @@ def _docker_env(binary: str) -> dict[str, str]:
 _DOCKER = _docker_binary()
 
 pytestmark = [
+    pytest.mark.conformance,
     pytest.mark.asyncio,
     pytest.mark.e2e,
     pytest.mark.docker,

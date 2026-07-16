@@ -73,7 +73,7 @@ from tests.e2e._harness.subprocess_harness import (
 # no-health-wait boot helper spawns below.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.e2e]
+pytestmark = [pytest.mark.conformance, pytest.mark.asyncio, pytest.mark.e2e]
 
 _SEED_BURST = 24
 _BODY_BYTES = 2 * 1024
