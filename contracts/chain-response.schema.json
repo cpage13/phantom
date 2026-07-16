@@ -1,0 +1,80 @@
+{
+  "$defs": {
+    "CapturedStep": {
+      "additionalProperties": false,
+      "description": "Captured values from one step, surfaced in ChainResponse on terminal-success.",
+      "properties": {
+        "step_name": {
+          "description": "The producing step's name.",
+          "title": "Step Name",
+          "type": "string"
+        },
+        "values": {
+          "additionalProperties": true,
+          "description": "Captured values keyed by capture name; matches the step's declared captures.",
+          "title": "Values",
+          "type": "object"
+        }
+      },
+      "required": [
+        "step_name",
+        "values"
+      ],
+      "title": "CapturedStep",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Phantom's reply to submit_chain and the shape of GET /v1/admin/chains/{chain_id}.",
+  "properties": {
+    "captured": {
+      "description": "Per-step captured values. Populated as steps complete; persists per the row's succeeded_metadata_seconds retention window.",
+      "items": {
+        "$ref": "#/$defs/CapturedStep"
+      },
+      "title": "Captured",
+      "type": "array"
+    },
+    "chain_id": {
+      "description": "The chain's id (= envelope.chain_id).",
+      "format": "uuid",
+      "title": "Chain Id",
+      "type": "string"
+    },
+    "last_step_completed": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Name of the most recently terminal-success step in this chain; None if none.",
+      "title": "Last Step Completed"
+    },
+    "state": {
+      "description": "Current upload-row state.",
+      "enum": [
+        "queued",
+        "attempting",
+        "succeeded",
+        "failed",
+        "auth_expired",
+        "stored",
+        "cancelled",
+        "corrupted",
+        "expired"
+      ],
+      "title": "State",
+      "type": "string"
+    }
+  },
+  "required": [
+    "chain_id",
+    "state"
+  ],
+  "title": "ChainResponse",
+  "type": "object"
+}

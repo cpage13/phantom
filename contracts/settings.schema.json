@@ -1,0 +1,1090 @@
+{
+  "$defs": {
+    "AdMintConfig": {
+      "additionalProperties": false,
+      "description": "Typed AD-mint configuration.",
+      "properties": {
+        "ad_outage_retry_seconds": {
+          "description": "Backoff schedule for AD outage retries. List is iterated; last value repeats. Empty list means fail-fast on the first outage.",
+          "items": {
+            "type": "integer"
+          },
+          "title": "Ad Outage Retry Seconds",
+          "type": "array"
+        },
+        "authority_url": {
+          "default": "https://login.microsoftonline.com",
+          "description": "OAuth2 authority URL (override only for sovereign clouds).",
+          "title": "Authority Url",
+          "type": "string"
+        },
+        "client_id": {
+          "description": "Phantom's app-registration client ID.",
+          "title": "Client Id",
+          "type": "string"
+        },
+        "endpoint": {
+          "description": "Hostname of the upstream the minted token authenticates to. Primary axis of the (endpoint, uid) cache key.",
+          "title": "Endpoint",
+          "type": "string"
+        },
+        "primary_client_secret_env": {
+          "description": "Name of the environment variable holding the primary client secret.",
+          "title": "Primary Client Secret Env",
+          "type": "string"
+        },
+        "refresh_jitter_seconds": {
+          "default": 0.5,
+          "description": "Random jitter added to refresh scheduling to spread load.",
+          "minimum": 0.0,
+          "title": "Refresh Jitter Seconds",
+          "type": "number"
+        },
+        "refresh_seconds_before_expiry": {
+          "default": 12,
+          "description": "Seconds before token expiry to mint a replacement.",
+          "minimum": 1,
+          "title": "Refresh Seconds Before Expiry",
+          "type": "integer"
+        },
+        "scope": {
+          "description": "OAuth2 scope to request (e.g., 'api://upstream.example.com/.default').",
+          "title": "Scope",
+          "type": "string"
+        },
+        "secondary_client_secret_env": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the environment variable holding the secondary (rotation) client secret. The minter tries primary first, secondary on failure. None disables rotation.",
+          "title": "Secondary Client Secret Env"
+        },
+        "tenant_id": {
+          "description": "Azure AD tenant ID for the mint request.",
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "uid": {
+          "description": "The credential-identifier value Phantom uses for cache lookup. Caller-supplied opaque string; the secondary axis of the (endpoint, uid) cache key.",
+          "title": "Uid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "client_id",
+        "primary_client_secret_env",
+        "scope",
+        "endpoint",
+        "uid"
+      ],
+      "title": "AdMintConfig",
+      "type": "object"
+    },
+    "AdminLookupCfg": {
+      "additionalProperties": false,
+      "description": "Per-instance binding for the by-captured-id admin lookup (cycle-7 task 4.3).\n\n``GET /v1/admin/uploads/by-captured-id/{captured_id}`` takes NO query\nparameters: where the upstream-assigned identifier lives inside a\nrow's captured values is upstream-specific, and Phantom stays\nupstream-ignorant, so the binding is DEPLOYMENT-SUPPLIED through this\nblock. An instance without the block answers that endpoint with a\n``lookup_not_configured`` error envelope (HTTP 400); it never guesses\na path.",
+      "properties": {
+        "capture_name": {
+          "description": "The capturing step's key under the row's captured-values 'steps' map (the step name the deployment's envelope uses for the capture that contains the upstream identifier).",
+          "minLength": 1,
+          "title": "Capture Name",
+          "type": "string"
+        },
+        "json_path": {
+          "description": "Dotted path under that step's 'values' map down to the upstream identifier field (capture name first, then keys inside the captured object).",
+          "minLength": 1,
+          "title": "Json Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "capture_name",
+        "json_path"
+      ],
+      "title": "AdminLookupCfg",
+      "type": "object"
+    },
+    "BodyStoreCfg": {
+      "additionalProperties": false,
+      "description": "BodyStore deployment-mode configuration (Phase 1).\n\nEncapsulates the three production deployment modes (`hybrid`,\n`all_ram`, `all_disk`) plus the RAM-tier ceiling + persist-controller\ncadence knobs. See plan \u00a7 0.4 glossary for the per-mode semantics.",
+      "properties": {
+        "body_orphan_sweep_seconds": {
+          "default": 3600,
+          "description": "Body-orphan janitor sweep cadence (seconds).",
+          "minimum": 1,
+          "title": "Body Orphan Sweep Seconds",
+          "type": "integer"
+        },
+        "invariant_audit_period_seconds": {
+          "default": 300,
+          "description": "InvariantAuditor sweep cadence (seconds). Plan \u00a7 4.2.3 \u2014 walks live rows and counters invariant violations against the seven \u00a70.5 invariants. Low frequency by design; CI uses the resulting counter to fail the next build on any non-zero label.",
+          "minimum": 1,
+          "title": "Invariant Audit Period Seconds",
+          "type": "integer"
+        },
+        "linger_seconds": {
+          "default": 90,
+          "description": "Persist controller retry-linger threshold (strategy \u00a72). A body in RAM with no upstream success past this threshold migrates to disk.",
+          "minimum": 0,
+          "title": "Linger Seconds",
+          "type": "integer"
+        },
+        "mode": {
+          "default": "hybrid",
+          "description": "BodyStore deployment mode. All three are first-class production modes (per strategy \u00a73). hybrid: RAM-first writes + persist controller migrates on linger or RAM-pressure (production default). all_ram: RAM-only; rows + bodies are lost on restart by design (recovery quarantines). all_disk: every admission writes directly to disk; no PersistController spawned. See plan \u00a7 2.3.10 per-mode wiring and Phase 6 operator playbook for mode-selection guidance.",
+          "enum": [
+            "hybrid",
+            "all_ram",
+            "all_disk"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "ram_ceiling_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "RamBodyStore size ceiling in bytes. None means probe-fill at startup \u2014 the ``_resolve_defaults`` model validator sets this to a hardware-aware fraction of available RAM (preserving the pre-rename ``in_memory_max_bytes`` probe-fill semantic). Explicit int overrides (e.g., 536_870_912 / 512 MiB). Ignored in all_disk mode (no RAM to bound).",
+          "title": "Ram Ceiling Bytes"
+        },
+        "ram_pressure_poll_seconds": {
+          "default": 1.0,
+          "description": "Cadence at which the ram_pressure watcher polls RamBodyStore.total_bytes().",
+          "exclusiveMinimum": 0.0,
+          "title": "Ram Pressure Poll Seconds",
+          "type": "number"
+        }
+      },
+      "title": "BodyStoreCfg",
+      "type": "object"
+    },
+    "CompressionCfg": {
+      "additionalProperties": false,
+      "description": "Body-compression knobs (req \u00a75d).\n\nPhantom always encodes per the configured ``algorithm``; there is\nno size-based short-circuit and no inbound ``Content-Encoding``\npass-through. The deployment selects one codec per Phantom process\nvia ``algorithm``; the wire-token ``\"original\"`` requests the\n:class:`PassthroughCodec` (identity codec) explicitly. The\ntransparent-proxy invariant is enforced by the sender's decode\npath plus body_hash verification, not by storage-side\npass-through.",
+      "properties": {
+        "algorithm": {
+          "default": "zstd",
+          "description": "Storage codec algorithm. ``original`` selects the :class:`PassthroughCodec` (identity).",
+          "enum": [
+            "original",
+            "zstd",
+            "gzip"
+          ],
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "level": {
+          "default": 3,
+          "description": "Codec compression level (zstd 1..22 / gzip 1..9).",
+          "minimum": 1,
+          "title": "Level",
+          "type": "integer"
+        },
+        "mode": {
+          "const": "always",
+          "default": "always",
+          "description": "Encoding policy. Only ``always`` is supported \u2014 Phantom always applies the configured codec.",
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "title": "CompressionCfg",
+      "type": "object"
+    },
+    "DbIntegrityCfg": {
+      "additionalProperties": false,
+      "description": "Phase 4 DB-corruption resilience knobs (plan \u00a7 5.2.5).\n\nTwo surfaces:\n\n* **Cold-backup (plan \u00a7 5.2.6)**. Off by default; opt-in for\n  belt-and-suspenders deployments. When enabled, the\n  :class:`phantom.workers.cold_backup.ColdBackupScheduler` is spawned\n  under the composition root's TaskGroup and snapshots the live DB\n  to ``<data_dir>/backups/`` on a configurable cadence.\n* **Fail-open vs fail-closed**. Strategy \u00a73 commits to\n  ``fail_open=True`` (\"service comes up serving empty state after\n  quarantine\"). Operators willing to abort startup on detected\n  corruption can pin ``fail_open=False`` \u2014 the composition root then\n  logs ERROR and raises after quarantining (the artifacts still get\n  preserved for retrieval).",
+      "properties": {
+        "backup_enabled": {
+          "default": false,
+          "description": "Enable periodic SQLite online-backup snapshots. Off by default \u2014 opt-in for belt-and-suspenders deployments.",
+          "title": "Backup Enabled",
+          "type": "boolean"
+        },
+        "backup_period_seconds": {
+          "default": 86400,
+          "description": "Cadence at which a backup snapshot is taken when backup_enabled is True. Default 86400 (daily).",
+          "minimum": 1,
+          "title": "Backup Period Seconds",
+          "type": "integer"
+        },
+        "backup_rotate_n": {
+          "default": 3,
+          "description": "Number of backup snapshots to keep before rotation. Default 3.",
+          "minimum": 1,
+          "title": "Backup Rotate N",
+          "type": "integer"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Default True per strategy \u00a73 \u2014 the service starts with a fresh empty SQLite after quarantine. Pin False to abort startup on detected corruption (the quarantine still fires; the process exits after).",
+          "title": "Fail Open",
+          "type": "boolean"
+        }
+      },
+      "title": "DbIntegrityCfg",
+      "type": "object"
+    },
+    "InstanceCfg": {
+      "additionalProperties": false,
+      "description": "One configured instance (ADR-006).",
+      "properties": {
+        "ad_mint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdMintConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Per-instance autonomous AD client-credentials mint configuration. When set, Phantom mints AD tokens proactively via its own app registration and writes them to the (endpoint, uid) token cache. When None (default), Phantom waits for the client to push tokens via the Authorization header on ingress. See ADR-001."
+        },
+        "admin_lookup": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdminLookupCfg"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional binding for the by-captured-id admin lookup. When None (default), GET /v1/admin/uploads/by-captured-id on this instance returns a lookup_not_configured error envelope (HTTP 400). Deployment-supplied so the service stays upstream-ignorant."
+        },
+        "capture_reexecution": {
+          "default": false,
+          "description": "ADR-011 knob \u2014 re-execute on capture-TTL expiry.",
+          "title": "Capture Reexecution",
+          "type": "boolean"
+        },
+        "data_dir": {
+          "description": "Subdirectory under storage.data_dir for this instance.",
+          "minLength": 1,
+          "title": "Data Dir",
+          "type": "string"
+        },
+        "host_prefixes": {
+          "description": "fnmatch host patterns this instance owns. First-match in declaration order.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Host Prefixes",
+          "type": "array"
+        },
+        "id": {
+          "description": "Stable instance id.",
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "routes": {
+          "description": "Per-instance routes \u2014 declaration order is precedence. Catch-all routes go last.",
+          "items": {
+            "$ref": "#/$defs/RouteCfg"
+          },
+          "title": "Routes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "host_prefixes",
+        "data_dir"
+      ],
+      "title": "InstanceCfg",
+      "type": "object"
+    },
+    "ObservabilityCfg": {
+      "additionalProperties": false,
+      "description": "``observability`` block.",
+      "properties": {
+        "log_level": {
+          "default": "INFO",
+          "description": "Root logger level.",
+          "enum": [
+            "DEBUG",
+            "INFO",
+            "WARNING",
+            "ERROR"
+          ],
+          "title": "Log Level",
+          "type": "string"
+        },
+        "log_to_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional path of a secondary log-file sink. None disables file output.",
+          "title": "Log To File"
+        },
+        "log_to_stdout": {
+          "default": true,
+          "description": "Stream log records to stdout (default true).",
+          "title": "Log To Stdout",
+          "type": "boolean"
+        }
+      },
+      "title": "ObservabilityCfg",
+      "type": "object"
+    },
+    "PersistTriggerCfg": {
+      "additionalProperties": false,
+      "description": "Operator-facing size-based persist threshold (narrow scope post-Phase-1).\n\nPhase 1 narrowed this class from its pre-refactor shape (which carried\n``after_attempts`` + ``after_seconds`` knobs) to a single field. The\npersist controller now owns retry-linger detection (time-based) and\nthe body store's mode owns deployment-wide RAM/disk policy; the only\nsurviving operator knob is the size-aware bypass, which forces\nadmission to enqueue against the persist controller (hybrid mode only)\nfor bodies above the threshold.",
+      "properties": {
+        "body_size_threshold_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "In hybrid mode, admission enqueues against the persist controller immediately (skipping linger) for bodies whose stored size (post-codec) is at or above this threshold. Ignored in all_ram + all_disk modes (no RAM-to-disk migration in either). None means use the host-probe-derived default; explicit int overrides; pin to 0 to disable size-aware persistence entirely.",
+          "title": "Body Size Threshold Bytes"
+        }
+      },
+      "title": "PersistTriggerCfg",
+      "type": "object"
+    },
+    "RetentionCfg": {
+      "additionalProperties": false,
+      "description": "Per-terminal-state retention windows (req \u00a75b post-ADR-009).\n\nAll seconds; ``-1`` means \"never expire automatically\" and is the\nONLY sentinel: every window field is validated ``ge=-1`` (C11,\nround-10 hardening), so an operator typo like ``-5`` is a loud\nvalidation error instead of silently meaning \"forever\" (the\nreaper's ``>= 0`` sweep guard treats any negative as never-expire,\nwhich fails safe but hides the typo).\n\nEvery per-state body / metadata window defaults to a hard-coded\nsensible value \u2014 these knobs are tunable but the probe doesn't\ninfluence them.",
+      "properties": {
+        "auth_expired_body_seconds": {
+          "default": 15552000,
+          "description": "Body retention while parked in ``auth_expired`` (default 6 months).",
+          "minimum": -1,
+          "title": "Auth Expired Body Seconds",
+          "type": "integer"
+        },
+        "auth_expired_metadata_seconds": {
+          "default": -1,
+          "description": "Forever (holding state).",
+          "minimum": -1,
+          "title": "Auth Expired Metadata Seconds",
+          "type": "integer"
+        },
+        "cancelled_body_seconds": {
+          "default": 604800,
+          "description": "Body retention after admin cancellation (default 7 days).",
+          "minimum": -1,
+          "title": "Cancelled Body Seconds",
+          "type": "integer"
+        },
+        "cancelled_metadata_seconds": {
+          "default": 604800,
+          "description": "7 days.",
+          "minimum": -1,
+          "title": "Cancelled Metadata Seconds",
+          "type": "integer"
+        },
+        "corrupted_body_seconds": {
+          "default": 2592000,
+          "description": "Body retention for ``corrupted`` rows. Default 30 days; operators may want to inspect the bad bytes before sweep.",
+          "minimum": -1,
+          "title": "Corrupted Body Seconds",
+          "type": "integer"
+        },
+        "corrupted_metadata_seconds": {
+          "default": 2592000,
+          "description": "Retention for ``corrupted`` rows (body-verification failure). Default 30 days, matching ``failed``.",
+          "minimum": -1,
+          "title": "Corrupted Metadata Seconds",
+          "type": "integer"
+        },
+        "expired_body_seconds": {
+          "default": 0,
+          "description": "Body retention for ``expired`` (0: the body is already discarded at the transition to ``expired``, so there is nothing to retain).",
+          "minimum": -1,
+          "title": "Expired Body Seconds",
+          "type": "integer"
+        },
+        "expired_metadata_seconds": {
+          "default": 2592000,
+          "description": "Metadata retention after a row gives up at the send-deadline (``expired``, ADR-032). 30 days (mirrors ``failed_metadata_seconds``).",
+          "minimum": -1,
+          "title": "Expired Metadata Seconds",
+          "type": "integer"
+        },
+        "failed_body_seconds": {
+          "default": 2592000,
+          "description": "Body retention after terminal upstream failure (default 30 days).",
+          "minimum": -1,
+          "title": "Failed Body Seconds",
+          "type": "integer"
+        },
+        "failed_metadata_seconds": {
+          "default": 2592000,
+          "description": "30 days.",
+          "minimum": -1,
+          "title": "Failed Metadata Seconds",
+          "type": "integer"
+        },
+        "max_rows": {
+          "default": 100000,
+          "description": "Optional row-count backstop on the ``uploads`` table (V3). The per-state windows above are purely TIME-based; ``max_in_flight`` bounds only in-flight rows, so under sustained ingest terminal rows can grow the table without bound between reaps (notably the forever-retained ``stored``/``auth_expired`` metadata). When ``max_rows >= 0`` the reaper enforces it as a hard cap AFTER its time-based passes: if the table exceeds ``max_rows`` it evicts oldest-DONE-first (by ``updated_at``) until at or below the cap. Only fully-terminal rows (succeeded/failed/cancelled/stored/corrupted) are eligible \u2014 in-flight (queued/attempting) and still-deliverable ``auth_expired`` rows are NEVER evicted, so the backstop cannot drop an undelivered upload (invariant #1 holds). Default ``100_000``: a safe row backstop sized for the smallest target producer, so an instance that never sets a value still cannot grow the table without bound. Set ``-1`` to opt into unbounded (time-only retention); tune the cap per the SD-card size on the producer.",
+          "minimum": -1,
+          "title": "Max Rows",
+          "type": "integer"
+        },
+        "reaper_interval_seconds": {
+          "default": 60,
+          "description": "Reaper sweep cadence (seconds). Default 60.",
+          "minimum": 1,
+          "title": "Reaper Interval Seconds",
+          "type": "integer"
+        },
+        "stored_body_seconds": {
+          "default": 15552000,
+          "description": "Body retention for the ``stored`` terminal state (default 6 months).",
+          "minimum": -1,
+          "title": "Stored Body Seconds",
+          "type": "integer"
+        },
+        "stored_metadata_seconds": {
+          "default": -1,
+          "description": "Forever.",
+          "minimum": -1,
+          "title": "Stored Metadata Seconds",
+          "type": "integer"
+        },
+        "succeeded_body_seconds": {
+          "default": 0,
+          "description": "Body released immediately on success.",
+          "minimum": -1,
+          "title": "Succeeded Body Seconds",
+          "type": "integer"
+        },
+        "succeeded_metadata_seconds": {
+          "default": 180,
+          "description": "Captured values queryable post-delivery (ADR-009). Default 180 s (3 minutes) so a captured upstream file id stays queryable just long enough for a caller routine to correlate.",
+          "minimum": -1,
+          "title": "Succeeded Metadata Seconds",
+          "type": "integer"
+        }
+      },
+      "title": "RetentionCfg",
+      "type": "object"
+    },
+    "RetryCfg": {
+      "additionalProperties": false,
+      "description": "``retry`` block \u2014 worker pool size and the default strategy.",
+      "properties": {
+        "default_strategy": {
+          "$ref": "#/$defs/RetryStrategyCfg",
+          "description": "The default retry-strategy block applied per upload row."
+        },
+        "poll_interval_ms": {
+          "default": 250,
+          "description": "Sender-worker poll cadence (milliseconds). Default 250.",
+          "minimum": 10,
+          "title": "Poll Interval Ms",
+          "type": "integer"
+        },
+        "worker_count": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Number of sender worker coroutines. Filled from the host probe (min(8, max(2, cpu_count))) when left unset (None).",
+          "title": "Worker Count"
+        }
+      },
+      "title": "RetryCfg",
+      "type": "object"
+    },
+    "RetryStrategyCfg": {
+      "additionalProperties": false,
+      "description": "Configuration for the default retry strategy.",
+      "properties": {
+        "base_seconds": {
+          "default": 5.0,
+          "description": "Exponential-backoff base.",
+          "minimum": 0.0,
+          "title": "Base Seconds",
+          "type": "number"
+        },
+        "cap_seconds": {
+          "default": 1800.0,
+          "description": "Exponential-backoff cap.",
+          "minimum": 0.0,
+          "title": "Cap Seconds",
+          "type": "number"
+        },
+        "factor": {
+          "default": 4.0,
+          "description": "Exponential-backoff factor.",
+          "exclusiveMinimum": 0.0,
+          "title": "Factor",
+          "type": "number"
+        },
+        "intervals_seconds": {
+          "description": "Fixed-intervals schedule (when ``type == 'fixed_intervals'``).",
+          "items": {
+            "type": "integer"
+          },
+          "title": "Intervals Seconds",
+          "type": "array"
+        },
+        "jitter": {
+          "default": 0.2,
+          "description": "Uniform jitter fraction (e.g. 0.2 \u2192 \u00b120%). Applied by BOTH ``exponential_backoff`` AND ``fixed_intervals`` (V5-C) so a backlog that fails in the same poll round de-correlates on retry instead of firing in lockstep (thundering herd) on upstream recovery. ``0.0`` preserves an exact fixed-interval schedule.",
+          "minimum": 0.0,
+          "title": "Jitter",
+          "type": "number"
+        },
+        "max_attempts": {
+          "default": -1,
+          "description": "-1 = unbounded.",
+          "title": "Max Attempts",
+          "type": "integer"
+        },
+        "max_duration_seconds": {
+          "default": 86400,
+          "description": "Hard ceiling on retry-attempt span before the row transitions to ``stored``. Default 86 400 s (24 hours).",
+          "minimum": 0,
+          "title": "Max Duration Seconds",
+          "type": "integer"
+        },
+        "type": {
+          "default": "exponential_backoff",
+          "description": "Retry-strategy plugin name.",
+          "enum": [
+            "exponential_backoff",
+            "fixed_intervals"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "RetryStrategyCfg",
+      "type": "object"
+    },
+    "RouteCfg": {
+      "additionalProperties": false,
+      "description": "One route policy within an instance.",
+      "properties": {
+        "auth_mode": {
+          "description": "How Phantom authenticates the outbound request on this route. ``phantom_bearer`` injects a cached Authorization bearer; ``aws_sigv4`` re-signs the request with botocore SigV4 using a host-keyed credential from the CredentialStore; ``none`` forwards as-is.",
+          "enum": [
+            "phantom_bearer",
+            "none",
+            "aws_sigv4"
+          ],
+          "title": "Auth Mode",
+          "type": "string"
+        },
+        "hosts": {
+          "description": "fnmatch host patterns this route matches.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Hosts",
+          "type": "array"
+        },
+        "name": {
+          "description": "Route name (logical handle).",
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "send_deadline_seconds": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Max wall-clock seconds a buffered upload to this route may keep trying before Phantom gives up and marks it ``expired`` (terminal, ADR-032: body released, never re-admitted). Measured from ``received_at`` (admission). None = no deadline (retry per the strategy forever). Restart-required (routes do not hot-reload).",
+          "title": "Send Deadline Seconds"
+        },
+        "timeout_seconds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional per-route HTTP request timeout in seconds. None means use the global default (HttpxUpstreamClient.timeout_seconds, 30 s). Useful when S3 PUTs need a much longer ceiling (e.g. 600 for 10 min on big tars) than fast metadata POSTs. Plumbs through ResolvedRoute \u2192 UpstreamRequest \u2192 httpx per-call kwarg.",
+          "title": "Timeout Seconds"
+        }
+      },
+      "required": [
+        "name",
+        "hosts",
+        "auth_mode"
+      ],
+      "title": "RouteCfg",
+      "type": "object"
+    },
+    "SaturationCfg": {
+      "additionalProperties": false,
+      "description": "Saturation caps applied at ingress.\n\nEvery numeric cap defaults to ``None`` so the model validator can\nfill it from the host probe (see :func:`Settings._resolve_defaults`).\nOperators pin individual caps in YAML to override the default; the\noverride is read literally.",
+      "properties": {
+        "large_body_threshold_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bodies at or above this size count against the separate ``max_large_in_flight`` cap as well as the regular bytes/count caps. Lets operators bound how many big bodies are concurrent without throttling small-body ingress that shares the same instance. Set to 0 to disable the large-body class entirely. Filled from the host probe when left unset (None).",
+          "title": "Large Body Threshold Bytes"
+        },
+        "max_disk_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Hard ceiling on persisted-tier disk usage. Filled from the host probe (80% of free disk at probe time) when left unset (None).",
+          "title": "Max Disk Bytes"
+        },
+        "max_in_flight": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Row-count cap across all in-flight uploads. Filled from the host probe when left unset (None). A value of 0 refuses every admission (no in-flight rows permitted).",
+          "title": "Max In Flight"
+        },
+        "max_in_flight_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Byte cap across all in-flight uploads. Filled from the host probe when left unset (None). A value of 0 refuses every admission \u2014 including 0-byte bodies \u2014 matching the zero-semantics of max_in_flight (0 == refuse-all). It is NOT an 'unlimited' sentinel; leave the field unset (None) to take the probe-derived default.",
+          "title": "Max In Flight Bytes"
+        },
+        "max_large_in_flight": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Max concurrent in-flight bodies of size >= ``large_body_threshold_bytes``. Set to 0 to refuse all large bodies (effectively an off-switch for the class). Filled from the host probe when left unset (None).",
+          "title": "Max Large In Flight"
+        }
+      },
+      "title": "SaturationCfg",
+      "type": "object"
+    },
+    "ServerCfg": {
+      "additionalProperties": false,
+      "description": "``server`` block.\n\nThe deployment is same-machine-only: Phantom runs on the SAME box as\nits producer and is reached over loopback, so ONE listener serves intake +\nadmin + health on one socket. ``bind_tcp`` (default ``127.0.0.1:8080`` -\nloopback) or ``bind_uds`` configures it. The loopback default bind IS\nthe admin access control (ADR-004); an operator who wants network\nreachability sets ``bind_tcp`` explicitly (e.g. ``0.0.0.0:8080``) and\ngets the unauthenticated-exposure warning at startup.",
+      "properties": {
+        "bind_tcp": {
+          "default": "127.0.0.1:8080",
+          "description": "TCP listen address as ``host:port`` (loopback by default; the admin API rides this listener, so a non-loopback host exposes the unauthenticated admin API - ADR-004).",
+          "title": "Bind Tcp",
+          "type": "string"
+        },
+        "bind_uds": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional Unix-domain-socket path (alternative to TCP).",
+          "title": "Bind Uds"
+        },
+        "tls": {
+          "$ref": "#/$defs/TlsCfg",
+          "description": "See :class:`TlsCfg` \u2014 flip the single listener to HTTPS (off by default)."
+        }
+      },
+      "title": "ServerCfg",
+      "type": "object"
+    },
+    "SigV4CredentialCfg": {
+      "additionalProperties": false,
+      "description": "One config-declared destination credential for the ``aws_sigv4`` signer.\n\nThis is the **config acquisition route** \u2014 the boot-time analogue of the\nruntime admin push (``PUT /v1/admin/credentials/{dest_host}``). It is the\nONE place env-var *names* are accepted (GLOBAL \u00a71.2(a) B1), mirroring\n:class:`~phantom.config.ad_mint.AdMintConfig`'s ``primary_client_secret_env``\n/ ``secondary_client_secret_env`` (which likewise hold the *name* of an env\nvar, never the secret literal). The secret access key NEVER appears in\nconfig: only the NAME of the environment variable that holds it. At boot\n(``app.py`` lifespan, ``_build_instance_context``) the named env vars are\nresolved to their literal values and a\n:class:`~phantom.models.credential.SigV4StaticCreds` (or\n:class:`~phantom.models.credential.ProfileRefCred`) of RESOLVED values is\nwritten into the host-keyed credential store under ``source=\"config\"``. By\nthe time the store holds anything, the env-var names are gone (the B1\ninvariant: resolved values in the store, names only on this config route).\n\nTwo arms, discriminated by ``kind`` (mirroring the admin push body's\ndiscriminated union):\n\n* ``sigv4_static`` \u2014 a static key-pair declared by env-var name.\n  ``access_key_id_env`` and ``secret_access_key_env`` are REQUIRED;\n  ``region`` is REQUIRED; ``session_token_env`` is optional (STS).\n* ``profile_ref`` \u2014 a botocore profile / default-chain reference. No env\n  vars and no secret are held at rest; the signer resolves credentials at\n  sign time. ``profile=None`` marks the default chain.",
+      "properties": {
+        "access_key_id_env": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the env var holding the access key id (static arm).",
+          "title": "Access Key Id Env"
+        },
+        "dest_host": {
+          "description": "Destination host this credential is keyed on. Normalized through the same ``_hostname`` helper the executor uses for its forward-time lookup, so the config key equals the lookup key by construction.",
+          "minLength": 1,
+          "title": "Dest Host",
+          "type": "string"
+        },
+        "kind": {
+          "description": "The credential arm (NEVER carries a resolved secret).",
+          "enum": [
+            "sigv4_static",
+            "profile_ref"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "profile": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "AWS profile name (profile_ref arm). None means the default chain.",
+          "title": "Profile"
+        },
+        "region": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "AWS region (static arm \u2014 required there; ignored for profile_ref).",
+          "title": "Region"
+        },
+        "secret_access_key_env": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the env var holding the secret access key (static arm). The secret LITERAL never appears in config (ADR-004 / B1).",
+          "title": "Secret Access Key Env"
+        },
+        "service": {
+          "$ref": "#/$defs/SigningService",
+          "description": "AWS service this credential signs for (both arms)."
+        },
+        "session_token_env": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional name of the env var holding the STS session token (static arm). None means a long-lived key-pair.",
+          "title": "Session Token Env"
+        }
+      },
+      "required": [
+        "dest_host",
+        "kind",
+        "service"
+      ],
+      "title": "SigV4CredentialCfg",
+      "type": "object"
+    },
+    "SigningService": {
+      "description": "Closed set of AWS services Phantom can SigV4-sign for.\n\nA ``StrEnum``, so each member IS a ``str``: it serializes to its wire value\n(``\"s3\"``) for free at the pydantic boundary and at the SQLite write\n(``asdict`` + ``json.dumps``). Today the only implemented service is S3;\nadding another is a new member + a ``_SERVICE_SIGNERS`` entry (in\n``chain.sigv4_signer``), not a redesign.\n\nThe literal ``\"s3\"`` is defined HERE exactly once (the single source of the\nwire string); all logic references the symbol :attr:`SigningService.S3` by\ndot notation.",
+      "enum": [
+        "s3"
+      ],
+      "title": "SigningService",
+      "type": "string"
+    },
+    "SqliteCfg": {
+      "additionalProperties": false,
+      "description": "SQLite-specific knobs.\n\nPhase 1: dropped the configurable ``autovacuum`` knob \u2014 ``auto_vacuum``\nis hardcoded to NONE in code per the SD-card-wear hard rule\n(plan \u00a7 0.3). The previously free-form ``synchronous`` and\n``journal_mode`` fields are narrowed to ``Literal`` types so an\noperator typo or unsupported mode is a Pydantic error at startup\nrather than a silent misconfig at runtime.",
+      "properties": {
+        "busy_timeout_ms": {
+          "default": 1000,
+          "description": "SQLite ``busy_timeout`` in milliseconds \u2014 how long SQLite busy-WAITS in its connection worker thread for a contended write lock before raising SQLITE_BUSY (finding R9-V6-1). Phantom serializes EVERY writer through one ``asyncio`` lock on a single connection, so internal write-vs-write contention is impossible by construction; this timeout ONLY governs EXTERNAL cross-process contention (a stray ``sqlite3`` admin session, a backup tool, a mis-shared data_dir). Under such a hold a LARGE value is harmful: each contended writer monopolizes the single writer slot for the full window, so an admission burst queues serially behind multiple busy-waits and the producer's HTTP read times out before admission can return its clean ``503 storage_unavailable``. The 1000 ms default rides out sub-second external blips while failing FAST under a sustained external hold so the contended write returns a clean retryable signal quickly. Boot-time recovery rides out longer locks via its own bounded retry-with-backoff, independent of this value.",
+          "minimum": 0,
+          "title": "Busy Timeout Ms",
+          "type": "integer"
+        },
+        "journal_mode": {
+          "const": "WAL",
+          "default": "WAL",
+          "description": "SQLite journal mode. Hardcoded to WAL \u2014 load-bearing for the strategy pragma set (plan \u00a7 2.3.5) and the recovery sweep's assumptions.",
+          "title": "Journal Mode",
+          "type": "string"
+        },
+        "journal_size_limit_bytes": {
+          "default": 16777216,
+          "description": "WAL journal size limit in bytes (T2 research recommendation). Default 16 MiB.",
+          "minimum": 0,
+          "title": "Journal Size Limit Bytes",
+          "type": "integer"
+        },
+        "synchronous": {
+          "default": "NORMAL",
+          "description": "SQLite synchronous level. Default changed from FULL to NORMAL (per T1 research): corruption-safe under WAL on consumer flash; loses at most the last few seconds of commits on hard power-cut. Rack-server deployments with battery-backed write cache may pin FULL. Operator playbook (Phase 6 \u00a7 7.2.10) documents the trade-off.",
+          "enum": [
+            "NORMAL",
+            "FULL",
+            "EXTRA"
+          ],
+          "title": "Synchronous",
+          "type": "string"
+        },
+        "vacuum_cron": {
+          "default": "0 3 * * 0",
+          "description": "Cron string for the VACUUM scheduler (Sunday 03:00 default).",
+          "title": "Vacuum Cron",
+          "type": "string"
+        }
+      },
+      "title": "SqliteCfg",
+      "type": "object"
+    },
+    "StorageCfg": {
+      "additionalProperties": false,
+      "description": "``storage`` block.\n\nPhase 1: removed ``default_tier`` (subsumed by ``body_store.mode``)\nand ``in_memory_max_bytes`` (renamed to ``body_store.ram_ceiling_bytes``,\nsame semantic). The new ``body_store`` nested model owns the\ndeployment-mode + RAM-tier ceiling + persist-controller cadence\nknobs.\n\nPhase 4: added ``db_integrity`` carrying the corruption-resilience\nsettings (fail-open default + cold-backup knobs).",
+      "properties": {
+        "body_store": {
+          "$ref": "#/$defs/BodyStoreCfg",
+          "description": "See :class:`BodyStoreCfg`."
+        },
+        "compression": {
+          "$ref": "#/$defs/CompressionCfg",
+          "description": "See :class:`CompressionCfg`."
+        },
+        "data_dir": {
+          "default": "/var/lib/phantom",
+          "description": "Root of the persisted-tier filesystem layout.",
+          "title": "Data Dir",
+          "type": "string"
+        },
+        "db_integrity": {
+          "$ref": "#/$defs/DbIntegrityCfg",
+          "description": "See :class:`DbIntegrityCfg` \u2014 Phase 4 corruption-resilience knobs."
+        },
+        "max_buffered_bytes": {
+          "default": 2147483648,
+          "description": "Per-upload stream-pass-through threshold (req \u00a75).",
+          "minimum": 0,
+          "title": "Max Buffered Bytes",
+          "type": "integer"
+        },
+        "persist_trigger": {
+          "$ref": "#/$defs/PersistTriggerCfg",
+          "description": "See :class:`PersistTriggerCfg`."
+        },
+        "shard_prefix_chars": {
+          "default": 2,
+          "description": "Number of leading chain_id hex chars used as a directory shard.",
+          "minimum": 0,
+          "title": "Shard Prefix Chars",
+          "type": "integer"
+        },
+        "sqlite": {
+          "$ref": "#/$defs/SqliteCfg",
+          "description": "See :class:`SqliteCfg`."
+        }
+      },
+      "title": "StorageCfg",
+      "type": "object"
+    },
+    "TlsCfg": {
+      "additionalProperties": false,
+      "description": "``server.tls`` block \u2014 flip the single listener from HTTP to HTTPS.\n\nWhen ``enabled``, the EXISTING uvicorn listener (``__main__.py:89-93``) is\nserved with TLS: ``ssl_certfile``/``ssl_keyfile`` are passed straight to\n``uvicorn.run`` (``uvicorn/main.py:534-536``). Self-signed is fine \u2014 Phantom\ndoes NOT verify its own cert; clients use ``verify=off`` or pin it\n(loopback/sidecar trust model). NOT a second listener; the one socket\nsimply speaks HTTPS instead of HTTP.",
+      "properties": {
+        "cert_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "PEM certificate path. Operator-supplied (self-signed OK); when None and ``enabled`` is set, Phantom auto-generates one at startup (see :func:`phantom.runtime.tls_cert.resolve_tls_paths`).",
+          "title": "Cert Path"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Serve the single listener over TLS (HTTPS) instead of plaintext HTTP.",
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "key_password": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional passphrase for an encrypted private key (uvicorn ssl_keyfile_password).",
+          "title": "Key Password"
+        },
+        "key_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "PEM private-key path, paired with ``cert_path``. When None and ``enabled`` is set, Phantom auto-generates the pair at startup.",
+          "title": "Key Path"
+        }
+      },
+      "title": "TlsCfg",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Top-level Phantom settings.\n\nSource precedence (lowest first):\n\n* YAML file passed to :func:`load_settings`.\n* Environment variables ``PHANTOM_<UPPER>__<UPPER>...``.\n* Explicit kwargs.\n\nAfter the model validator runs every probe-fillable knob is\nguaranteed non-``None``. Callers that touch the saturation /\nstorage / worker-pool knobs without going through\n:func:`load_settings` (e.g., raw ``Settings()`` construction in\ntests) get the same guarantee because the validator runs as part\nof construction.",
+  "properties": {
+    "instances": {
+      "description": "Per-instance configuration; each instance owns one storage partition.",
+      "items": {
+        "$ref": "#/$defs/InstanceCfg"
+      },
+      "title": "Instances",
+      "type": "array"
+    },
+    "observability": {
+      "$ref": "#/$defs/ObservabilityCfg",
+      "description": "Logging configuration (no metrics surface beyond structured logs)."
+    },
+    "phantom_default_target": {
+      "anyOf": [
+        {
+          "format": "uri",
+          "maxLength": 2083,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional single-upstream default destination for the raw-intake catch-all route (Phase 1). When a stock S3-style request arrives on ``PUT /{bucket}/{key}`` (no ``?phantom=`` carrier), the raw->envelope adapter rewrites the synthesized step URL to ``{phantom_default_target}/{bucket}/{key}`` so the destination is a REAL upstream host, never Phantom's own bind host (which would loop). ``None`` means no default is configured: a raw request with no ``?phantom=`` carrier is rejected 421 ``invalid_target`` before any durable write. Restart-required (not hot-reloaded); env-overridable as ``PHANTOM_PHANTOM_DEFAULT_TARGET``. The explicit ``?phantom=<full-url>`` query carrier always wins over this default (first-hit precedence).",
+      "title": "Phantom Default Target"
+    },
+    "retention": {
+      "$ref": "#/$defs/RetentionCfg",
+      "description": "Per-terminal-state retention windows (reaped by workers/reaper.py)."
+    },
+    "retry": {
+      "$ref": "#/$defs/RetryCfg",
+      "description": "Sender worker pool size, poll cadence, and the default retry strategy."
+    },
+    "saturation": {
+      "$ref": "#/$defs/SaturationCfg",
+      "description": "In-flight caps applied at ingress (workers/saturation.py)."
+    },
+    "server": {
+      "$ref": "#/$defs/ServerCfg",
+      "description": "HTTP server bind, ingress, and admin configuration."
+    },
+    "sigv4_credentials": {
+      "description": "Config-declared destination credentials for the ``aws_sigv4`` signer (the boot-time analogue of the runtime admin push). Each entry names the env var holding its secret access key (never the secret literal \u2014 GLOBAL \u00a71.2(a) B1 / ADR-004). At boot the named env vars are resolved to literals and materialized into EVERY instance's host-keyed credential store under ``source='config'`` (``app.py`` lifespan). The credentials key on the globally-meaningful destination host, so this map is top-level rather than per-instance. A missing named env var is a fail-fast boot error. Each entry also declares a REQUIRED ``service`` (the AWS service the signer signs for, e.g. ``s3``); a missing or unknown service is a loud ``ValidationError`` at settings-load. Empty (the default) is a no-op: a bearer-only deployment declares nothing here. Restart-required (not hot-reloaded).",
+      "items": {
+        "$ref": "#/$defs/SigV4CredentialCfg"
+      },
+      "title": "Sigv4 Credentials",
+      "type": "array"
+    },
+    "storage": {
+      "$ref": "#/$defs/StorageCfg",
+      "description": "Two-tier storage (RAM + disk), data directory, codec selection."
+    }
+  },
+  "title": "Settings",
+  "type": "object"
+}

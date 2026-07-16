@@ -1,0 +1,44 @@
+{
+  "chain_id": "00000000-0000-0000-0000-000000000001",
+  "default_target": null,
+  "idempotency_key": "example-idempotency-key-0001",
+  "steps": [
+    {
+      "body": {
+        "kind": "json",
+        "value": {
+          "content_type": "text/plain",
+          "filename": "example.txt"
+        }
+      },
+      "capture": [
+        {
+          "from": "$.upload_url",
+          "name": "upload_url",
+          "sensitive": true,
+          "ttl_seconds": 300
+        }
+      ],
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "idempotency_header": "Idempotency-Key",
+      "method": "POST",
+      "name": "create_file",
+      "url": "https://files.example.com/v1/files"
+    },
+    {
+      "body": {
+        "content_type": "text/plain",
+        "kind": "body_ref",
+        "name": "file_bytes"
+      },
+      "capture": [],
+      "headers": {},
+      "idempotency_header": null,
+      "method": "PUT",
+      "name": "upload_body",
+      "url": "{{create_file.upload_url}}"
+    }
+  ]
+}

@@ -1,0 +1,307 @@
+{
+  "$defs": {
+    "ChainBodyBytes": {
+      "additionalProperties": false,
+      "description": "Inline base64-encoded body. Use only for small payloads (< 64 KiB).",
+      "properties": {
+        "content_type": {
+          "default": "application/octet-stream",
+          "description": "Content-Type header value.",
+          "title": "Content Type",
+          "type": "string"
+        },
+        "kind": {
+          "const": "bytes",
+          "default": "bytes",
+          "description": "Discriminator tag.",
+          "title": "Kind",
+          "type": "string"
+        },
+        "value_b64": {
+          "description": "Base64-encoded body bytes.",
+          "title": "Value B64",
+          "type": "string"
+        }
+      },
+      "required": [
+        "value_b64"
+      ],
+      "title": "ChainBodyBytes",
+      "type": "object"
+    },
+    "ChainBodyJson": {
+      "additionalProperties": false,
+      "description": "JSON request body for one chain step.",
+      "properties": {
+        "kind": {
+          "const": "json",
+          "default": "json",
+          "description": "Discriminator tag.",
+          "title": "Kind",
+          "type": "string"
+        },
+        "value": {
+          "additionalProperties": true,
+          "description": "JSON object serialized as the request body. String values may contain {{step_name.capture_name}} placeholders, resolved server-side just before each step executes.",
+          "title": "Value",
+          "type": "object"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "title": "ChainBodyJson",
+      "type": "object"
+    },
+    "ChainBodyRef": {
+      "additionalProperties": false,
+      "description": "Reference to a binary blob carried as a multipart part alongside the envelope.",
+      "properties": {
+        "content_type": {
+          "default": "application/octet-stream",
+          "description": "Content-Type header value.",
+          "title": "Content Type",
+          "type": "string"
+        },
+        "kind": {
+          "const": "body_ref",
+          "default": "body_ref",
+          "description": "Discriminator tag.",
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "description": "Reference name. The actual bytes ride as the multipart part body_refs[<name>]; matching is by name.",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "ChainBodyRef",
+      "type": "object"
+    },
+    "ChainBodyText": {
+      "additionalProperties": false,
+      "description": "Plain-text request body for one chain step.",
+      "properties": {
+        "content_type": {
+          "default": "text/plain",
+          "description": "Content-Type header value sent to upstream.",
+          "title": "Content Type",
+          "type": "string"
+        },
+        "kind": {
+          "const": "text",
+          "default": "text",
+          "description": "Discriminator tag.",
+          "title": "Kind",
+          "type": "string"
+        },
+        "value": {
+          "description": "Text body; may contain {{step.var}} placeholders.",
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "title": "ChainBodyText",
+      "type": "object"
+    },
+    "ChainCapture": {
+      "additionalProperties": false,
+      "description": "A named extraction from a step's response body.",
+      "properties": {
+        "from": {
+          "description": "JSONPath expression evaluated against this step's response body. First match wins.",
+          "title": "From",
+          "type": "string"
+        },
+        "name": {
+          "description": "Capture name; referenceable as {{step_name.name}} in later steps.",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "sensitive": {
+          "default": false,
+          "description": "When True, log output redacts the captured value as <redacted>. Admin responses (loopback only) still surface the raw value. Use for captures that carry temporary credentials such as presigned PUT URLs.",
+          "title": "Sensitive",
+          "type": "boolean"
+        },
+        "ttl_seconds": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional capture-observation TTL in seconds: how long Phantom's local observation of this captured value stays fresh. This is Phantom's own clock, distinct from any upstream capability lifetime. If set and a later step uses the value after the TTL has elapsed, capture-expiry re-execution behavior (ADR-011) applies. None means non-expiring.",
+          "title": "Ttl Seconds"
+        }
+      },
+      "required": [
+        "name",
+        "from"
+      ],
+      "title": "ChainCapture",
+      "type": "object"
+    },
+    "ChainStep": {
+      "additionalProperties": false,
+      "description": "One HTTP request in the chain.",
+      "properties": {
+        "body": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "body_ref": "#/$defs/ChainBodyRef",
+                  "bytes": "#/$defs/ChainBodyBytes",
+                  "json": "#/$defs/ChainBodyJson",
+                  "text": "#/$defs/ChainBodyText"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/ChainBodyJson"
+                },
+                {
+                  "$ref": "#/$defs/ChainBodyText"
+                },
+                {
+                  "$ref": "#/$defs/ChainBodyBytes"
+                },
+                {
+                  "$ref": "#/$defs/ChainBodyRef"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Request body. Omit for body-less methods (GET, DELETE).",
+          "title": "Body"
+        },
+        "capture": {
+          "description": "Fields to extract from this step's response. Captured values become available to later steps and are persisted on the upload row.",
+          "items": {
+            "$ref": "#/$defs/ChainCapture"
+          },
+          "title": "Capture",
+          "type": "array"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Outbound headers. Values may contain {{step.var}} placeholders.",
+          "title": "Headers",
+          "type": "object"
+        },
+        "idempotency_header": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional header name. If set, Phantom sends it with the envelope's idempotency_key on every attempt of this step. Capture reexecution still occurs when omitted and may create a duplicate; declaring an upstream-honored header is required for identity-safe reexecution but does not itself renew a returned capability. See ADR-011. Typical value: 'Idempotency-Key'.",
+          "title": "Idempotency Header"
+        },
+        "method": {
+          "description": "HTTP method.",
+          "enum": [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE"
+          ],
+          "title": "Method",
+          "type": "string"
+        },
+        "name": {
+          "description": "Step name; referenced from later steps via {{name.capture_name}}.",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "url": {
+          "description": "Target URL or path; may contain {{step_name.capture_name}} placeholders resolved at execution time.",
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "method",
+        "url"
+      ],
+      "title": "ChainStep",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A multi-step buffered upload, submitted as a unit to Phantom.",
+  "properties": {
+    "chain_id": {
+      "description": "Caller-supplied chain identifier; also the Phantom upload row id and the synthetic upload-handle id returned by the upstream adapter.",
+      "format": "uuid",
+      "title": "Chain Id",
+      "type": "string"
+    },
+    "default_target": {
+      "anyOf": [
+        {
+          "format": "uri",
+          "maxLength": 2083,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional default target URL applied to steps that don't specify one. If a step's `url` is a path it's appended to this; if it's a full URL, this is ignored.",
+      "title": "Default Target"
+    },
+    "idempotency_key": {
+      "description": "Per-chain idempotency value sent to upstreams that support it. Stable across Phantom retries of any step. May be omitted (or left blank) by the caller: when absent or whitespace-only it auto-defaults to str(chain_id); a non-blank caller value wins.",
+      "minLength": 1,
+      "title": "Idempotency Key",
+      "type": "string"
+    },
+    "steps": {
+      "description": "Ordered list of HTTP steps. Step N may reference captured values from any step M where M < N via {{step_name.capture_name}}.",
+      "items": {
+        "$ref": "#/$defs/ChainStep"
+      },
+      "minItems": 1,
+      "title": "Steps",
+      "type": "array"
+    }
+  },
+  "required": [
+    "chain_id",
+    "idempotency_key",
+    "steps"
+  ],
+  "title": "ChainEnvelope",
+  "type": "object"
+}

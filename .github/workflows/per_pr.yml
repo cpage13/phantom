@@ -273,6 +273,25 @@ jobs:
           export UV_NO_SYNC=1
           uv run python scripts/check_atomic_admission.py
 
+  # Contract-drift gate: contracts/ is generated FROM the Python wire/admin/
+  # config models by scripts/export_contracts.py (the Go implementation's
+  # language-neutral source of truth). --check regenerates into a temp dir
+  # and byte-compares against the committed contracts/ tree, so a model
+  # change without a matching regeneration fails here instead of silently
+  # drifting.
+  contracts-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run python scripts/export_contracts.py --check
+
   # Old-SQLite gate (the json_each prerequisite, §1.4a / TASK 0.1). The per-PR
   # unit lane runs uv-managed CPython 3.14 => SQLite 3.50.4, which MASKS the
   # quote-bearing-key bug. This job builds an OLD libsqlite3 (3.43.2) from

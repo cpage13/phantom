@@ -1,0 +1,13 @@
+{
+  "X_PHANTOM_ATTEMPTS": "X-Phantom-Attempts",
+  "X_PHANTOM_GROUP_ID": "X-Phantom-Group-Id",
+  "X_PHANTOM_IDEMPOTENCY_KEY": "X-Phantom-Idempotency-Key",
+  "X_PHANTOM_INSTANCE": "X-Phantom-Instance",
+  "X_PHANTOM_MULTIFILE_ID": "X-Phantom-Multifile-Id",
+  "X_PHANTOM_NEXT_ATTEMPT_AT": "X-Phantom-Next-Attempt-At",
+  "X_PHANTOM_ORDER": "X-Phantom-Order",
+  "X_PHANTOM_STATUS": "X-Phantom-Status",
+  "X_PHANTOM_SUGGESTED_POLL_AFTER": "X-Phantom-Suggested-Poll-After",
+  "X_PHANTOM_UID": "X-Phantom-Uid",
+  "X_PHANTOM_UPLOAD_ID": "X-Phantom-Upload-Id"
+}

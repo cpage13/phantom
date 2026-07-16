@@ -1,0 +1,89 @@
+{
+  "$defs": {
+    "ErrorBody": {
+      "additionalProperties": false,
+      "description": "The error body shape Phantom emits for every error response.",
+      "properties": {
+        "code": {
+          "description": "Stable enum value identifying the error.",
+          "enum": [
+            "envelope_invalid",
+            "envelope_duplicate",
+            "header_invalid",
+            "body_ref_missing",
+            "body_ref_orphan",
+            "body_ref_duplicate",
+            "body_too_large",
+            "template_unresolved",
+            "invalid_target",
+            "instance_unknown",
+            "lookup_not_configured",
+            "idempotency_replay",
+            "idempotency_key_conflict",
+            "chain_id_in_use",
+            "restore_noop",
+            "replay_body_discarded",
+            "replay_refused_attempting",
+            "multifile_cursor_conflict",
+            "key_value_match_invalid",
+            "bulk_delete_filter_empty",
+            "request_invalid",
+            "saturation_cap",
+            "disk_pressure",
+            "storage_unavailable",
+            "auth_token_missing",
+            "upstream_unreachable",
+            "internal_error",
+            "not_found",
+            "storage_corruption",
+            "codec_round_trip_drift"
+          ],
+          "title": "Code",
+          "type": "string"
+        },
+        "details": {
+          "additionalProperties": true,
+          "description": "Code-specific context.",
+          "title": "Details",
+          "type": "object"
+        },
+        "instance_id": {
+          "description": "The InstanceCfg.id that produced the error, or 'unrouted'.",
+          "title": "Instance Id",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable description.",
+          "title": "Message",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Per-request correlation id from logging middleware.",
+          "title": "Request Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "instance_id",
+        "request_id"
+      ],
+      "title": "ErrorBody",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Outer wrapper for every error response body: ``{\"error\": ErrorBody}``.",
+  "properties": {
+    "error": {
+      "$ref": "#/$defs/ErrorBody",
+      "description": "The error body."
+    }
+  },
+  "required": [
+    "error"
+  ],
+  "title": "ErrorEnvelope",
+  "type": "object"
+}
