@@ -996,13 +996,33 @@ asserts a structural invariant:
   interpolated quoted JSON path), so the old-SQLite quote-escape
   version skew cannot return. Run per PR.
 
+### Cross-implementation conformance (ADR-035)
+
+Python is the primary and reference implementation; a Go port of
+phantom-service trails it (footprint motive). Two repository mechanisms
+make the port a gated follower rather than a parallel effort:
+
+- **`contracts/`** — the committed, language-neutral contracts, generated
+  FROM the Python source of truth by `scripts/export_contracts.py`: JSON
+  Schemas for the chain envelope/response, the wire error envelope, and
+  `Settings`; the admin OpenAPI document; the `X-Phantom-*` header
+  constants; and golden fixtures. Never hand-edited; the `contracts-drift`
+  CI job regenerates and byte-compares per PR, so a model change cannot
+  silently outrun the artifacts.
+- **The conformance gate** — `conformance`-marked e2e modules assert only
+  over the config file, HTTP/UDS, on-disk artifacts, and the emulator
+  (never Python-internal behavior), and the subprocess harness launches
+  whatever `E2E_SERVICE_CMD` names. The port's acceptance gate is
+  `E2E_SERVICE_CMD=<binary> pytest -m conformance`. The emulator, the
+  Python client SDK, and the e2e suite stay Python permanently.
+
 ### CI pipeline (Phase 0 + Phase 5)
 
 Three workflows under `.github/workflows/`:
 
 | File | Trigger | Jobs |
 |---|---|---|
-| `per_pr.yml` | every PR + push to main | (1) `ruff check` + `ruff format --check`; (2) per-package `mypy --strict` via `scripts/precommit/run_mypy_per_package.sh`; (3) per-package unit tests (+ emulator smoke); (4) workspace integration + contract tests; (5) the e2e-core job, excluding the `load`, `perf`, `stress`, and `docker` markers; (6) a separate e2e-load job running `-m load`; (7) the e2e-docker job (`-m docker`): builds both images from the repo Dockerfiles and drives the compose named-volume replacement matrix (`tests/e2e/docker/compose.yml`); (8) the falsifiability scripts above. |
+| `per_pr.yml` | every PR + push to main | (1) `ruff check` + `ruff format --check`; (2) per-package `mypy --strict` via `scripts/precommit/run_mypy_per_package.sh`; (3) per-package unit tests (+ emulator smoke); (4) workspace integration + contract tests; (5) the e2e-core job, excluding the `load`, `perf`, `stress`, and `docker` markers; (6) a separate e2e-load job running `-m load`; (7) the e2e-docker job (`-m docker`): builds both images from the repo Dockerfiles and drives the compose named-volume replacement matrix (`tests/e2e/docker/compose.yml`); (8) the falsifiability scripts above; (9) the contracts-drift job (regenerates `contracts/` and byte-compares; see *Cross-implementation conformance*). |
 | `nightly_stress.yml` | nightly cron + manual dispatch | `pytest tests/e2e/ -m stress`: the high-volume burst tier. |
 | `perf.yml` | manual only (`workflow_dispatch`) | `pytest tests/e2e/ -m perf`: latency/throughput budgets on a quiet runner (they false-fail on loaded shared runners). |
 

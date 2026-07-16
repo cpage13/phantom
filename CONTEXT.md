@@ -103,6 +103,13 @@ The wire header for the credential cache axis is `X-Phantom-Uid`. The admin URL 
 - **`MachineFacts`**: frozen dataclass holding the result of `probe_machine()`. Inputs to `compute_defaults()` → `ResolvedDefaults`.
 - **`ResolvedDefaults`**: frozen dataclass with every probe-derived knob (`max_in_flight`, `max_in_flight_bytes`, `max_disk_bytes`, `large_body_threshold_bytes`, `max_large_in_flight`, `ram_ceiling_bytes`, `body_size_threshold_bytes`, `worker_count`).
 
+### Cross-implementation (ADR-035)
+
+- **Primary implementation**: the Python service is the permanent reference; every change lands and hardens there first, then is applied to the trailing **Go port** (phantom-service only). Avoid the alias "rewrite"; Python is not being replaced. -> [docs/adr/035-python-primary-trailing-go-port.md](docs/adr/035-python-primary-trailing-go-port.md).
+- **Contracts artifacts (`contracts/`)**: the committed language-neutral wire/admin/config contracts, GENERATED from the Python models by `scripts/export_contracts.py` and drift-gated in CI. Never hand-edited.
+- **Conformance suite**: the `conformance`-marked e2e modules (implementation-blind assertions only) driven through the subprocess harness's `E2E_SERVICE_CMD` seam. The port's acceptance gate: `E2E_SERVICE_CMD=<binary> pytest -m conformance`.
+- **Implementation identity**: `GET /v1/admin/status` reports `implementation` + `service_version`, so operators can tell which binary answered.
+
 ## Captured-values redaction
 
 `ChainCapture.sensitive: bool` is the wire-visible structural mechanism for marking a captured value as containing credential-grade data. The upstream `upload_url` (presigned PUT, 7-day TTL) is `sensitive=True`; `file_information` is not.
