@@ -9,7 +9,13 @@ owns:
 3. Auth injection — looks up ``token_cache.get(endpoint, uid)`` when the
    route is ``phantom_bearer``.
 4. Idempotency-header injection per the step's ``idempotency_header``.
-5. The HTTP send through :class:`UpstreamClient`.
+5. The HTTP send through :class:`UpstreamClient`, with EXACTLY ONE framing
+   mechanism on the wire: hop-by-hop, framing and connection-scoped headers
+   (plus whatever ``Connection`` names) are stripped from every step, so the
+   only framing is the ``Content-Length`` the transport computes over the
+   bytes actually forwarded. ``Content-Encoding: aws-chunked`` and
+   ``x-amz-decoded-content-length`` describe the BODY, not the hop, and are
+   forwarded.
 6. Capture extraction from the response (JSONPath, first-match).
 7. Result classification (Succeeded / 4xx / 5xx / FailedAuth /
    FailedNetwork / TemplateUnresolved / CaptureExpiredStored /
@@ -23,7 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, assert_never
@@ -65,6 +71,62 @@ logger = logging.getLogger(__name__)
 # that put X-Phantom-* into a chain step's headers would otherwise see
 # them leak through).
 _PHANTOM_RESERVED_HEADER_PREFIX = "x-phantom-"
+
+# Headers that describe the CONNECTION Phantom terminated rather than the
+# MESSAGE Phantom forwards. Three groups, named so a reader checking the RFC
+# against this comment does not find it wrong:
+#   * RFC 7230 section 6.1 hop-by-hop: connection, keep-alive,
+#     proxy-authenticate, proxy-authorization, te, trailer, upgrade.
+#   * Framing uvicorn has already consumed or the transport recomputes:
+#     transfer-encoding, content-length.
+#   * Peer negotiation and host rewriting: expect, host.
+# Forwarding any of them produces a request whose framing or addressing
+# contradicts the message, and because the header is persisted, every retry
+# reproduces it. Content-Encoding: aws-chunked and x-amz-decoded-content-length
+# are deliberately NOT here: they describe the BODY, which is forwarded
+# byte-identically. See the task's per-header determination before adding to
+# this set.
+_HOP_BY_HOP_HEADERS: frozenset[str] = frozenset(
+    {
+        "connection",
+        "content-length",
+        "expect",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+
+def _hop_by_hop_names(headers: Mapping[str, str]) -> frozenset[str]:
+    """Return the hop-by-hop set plus the tokens this request's Connection names.
+
+    RFC 7230 makes every header listed in ``Connection`` hop-by-hop for that
+    connection, so ``Connection: keep-alive, X-Custom-Hop`` makes
+    ``X-Custom-Hop`` connection-scoped too. Forwarding a header the client
+    marked connection-scoped is the same class of error as forwarding the
+    framing itself.
+
+    Args:
+        headers: The inbound or persisted header mapping. ``Mapping``, not
+            ``dict``: the catch-all calls this with starlette's
+            ``request.headers``.
+
+    Returns:
+        The lower-cased names to drop for this one request.
+    """
+    listed: set[str] = set()
+    for name, value in headers.items():
+        if name.lower() != "connection":
+            continue
+        listed.update(token.strip().lower() for token in value.split(",") if token.strip())
+    return _HOP_BY_HOP_HEADERS | listed
+
 
 # Placeholder written into ``RouteUnresolved.host`` when the step URL carries
 # no parseable host. NEVER substitute the raw URL here: the URL is
@@ -402,12 +464,21 @@ class ChainExecutor:
                 step_name=step.name, site="url", unresolved=_placeholder_names(step.url)
             )
         substituted_headers: dict[str, str] = {}
+        hop_by_hop = _hop_by_hop_names(step.headers)
         for name, value in step.headers.items():
+            lowered = name.lower()
             # Phantom's reserved header namespace (``X-Phantom-*``)
             # must not be forwarded to upstream — transparent-proxy
             # invariant. Strip case-insensitively.
-            if name.lower().startswith(_PHANTOM_RESERVED_HEADER_PREFIX):
+            if lowered.startswith(_PHANTOM_RESERVED_HEADER_PREFIX):
                 logger.debug("stripping reserved phantom header from upstream: %s", name)
+                continue
+            if lowered in hop_by_hop:
+                # F9: framing and connection-scoped headers describe the hop
+                # Phantom terminated, not the message it forwards. A persisted
+                # ``Transfer-Encoding: chunked`` would make h11 emit chunked
+                # framing over a fixed-length body on EVERY retry.
+                logger.debug("stripping hop-by-hop header from upstream: %s", name)
                 continue
             rendered, header_ok = substitute(value, self._captures_as_dict(row.captured_values))
             if not header_ok:

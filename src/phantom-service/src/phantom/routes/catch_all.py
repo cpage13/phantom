@@ -28,8 +28,14 @@ header it signed with throwaway credentials; it knows nothing of Phantom's
 
 * TASK 1.2 — the raw→envelope adapter. A 1-step :class:`ChainEnvelope` is
   synthesized around the resolved URL, the request method, the raw body,
-  and the forwarded headers (Phantom's reserved ``X-Phantom-*`` markers and
-  the host-rewriting hop headers stripped). The shared
+  and the forwarded headers. Phantom's reserved ``X-Phantom-*`` markers are
+  stripped, and so is the full hop-by-hop set: RFC 7230 section 6.1's seven
+  connection headers, the two framing headers (``Transfer-Encoding``,
+  ``Content-Length``), the two connection-scoped ones (``Expect``, ``Host``),
+  and whatever this request's ``Connection`` header names.
+  ``Content-Encoding: aws-chunked`` and ``x-amz-decoded-content-length``
+  are deliberately KEPT, because they describe the body bytes rather than
+  the hop and the body is forwarded byte-identically. The shared
   :func:`phantom.routes.send.resolve_and_admit` prelude then runs the
   identical degraded-guard → dispatch → :func:`admit_chain` tail that
   ``POST /v1/send`` uses, so the synthesized envelope is buffered exactly
@@ -46,7 +52,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request, Response
 
-from phantom.chain.executor import _PHANTOM_RESERVED_HEADER_PREFIX
+from phantom.chain.executor import _PHANTOM_RESERVED_HEADER_PREFIX, _hop_by_hop_names
 from phantom.chain.query import filter_raw_query
 from phantom.config.settings import InstanceCfg
 from phantom.instances.dispatcher import InstanceDispatcher
@@ -89,18 +95,32 @@ _RESERVED_FIRST_SEGMENTS: frozenset[str] = frozenset(
     {"v1", "v2", "oauth", "control", ".well-known"}
 )
 
-# Hop-by-hop / host-rewriting request headers that must never be copied onto
-# the synthesized upstream step. ``Host`` would re-introduce Phantom's own
-# bind host (re-creating the forward loop the destination resolver exists to
+# Hop-by-hop / framing / host-rewriting request headers that must never be
+# copied onto the synthesized upstream step. The set itself lives in
+# ``chain/executor.py`` and is imported here, because the executor's strip is
+# the actual guarantee (it covers the envelope path too) and the rule must
+# have exactly ONE definition. ``Host`` would re-introduce Phantom's own bind
+# host (re-creating the forward loop the destination resolver exists to
 # prevent); ``Content-Length`` is recomputed by the transport at forward time
-# and a stale value would corrupt the upstream request. (``Authorization`` is
-# deliberately NOT here: it is forwarded as-is. A header-signed client
-# signature therefore reaches the upstream untouched, and since F4 so does the
-# QUERY that carries a presigned signature, which is where a presigned
-# credential actually lives. The one exception is an ``aws_sigv4`` route,
-# where Phantom's own signature supersedes the client's and the executor
-# strips the presigned parameter set before signing.)
-_HOP_BY_HOP_HEADERS: frozenset[str] = frozenset({"host", "content-length"})
+# and a stale value would corrupt the upstream request; ``Transfer-Encoding``
+# describes framing uvicorn has already consumed, and forwarding it makes h11
+# emit chunked framing over a fixed-length body on every retry; ``Expect`` is
+# a negotiation uvicorn already answered. ``Connection``'s own listed tokens
+# are hop-by-hop too (RFC 7230) and are expanded per request by
+# ``_hop_by_hop_names``.
+#
+# ``Content-Encoding: aws-chunked`` and ``x-amz-decoded-content-length`` are
+# deliberately NOT stripped: they describe the BODY BYTES, which Phantom
+# forwards byte-identically and never de-chunks, so dropping them would make
+# the upstream read chunk-size lines and per-chunk signatures as object
+# content. Do not "tidy up" by adding them to the set.
+#
+# (``Authorization`` is not stripped either: it is forwarded as-is. A
+# header-signed client signature therefore reaches the upstream untouched, and
+# since F4 so does the QUERY that carries a presigned signature, which is
+# where a presigned credential actually lives. The one exception is an
+# ``aws_sigv4`` route, where Phantom's own signature supersedes the client's
+# and the executor strips the presigned parameter set before signing.)
 
 # Phantom's reserved query-parameter carrier, reserved exactly the way the
 # ``X-Phantom-*`` header namespace is: a raw-intake request may not use a
@@ -218,14 +238,26 @@ def _resolve_destination(
 
 
 def _forwarded_headers(request: Request) -> dict[str, str]:
-    """Copy the inbound headers minus Phantom markers and host-rewriting hops.
+    """Copy the inbound headers minus Phantom markers and hop-by-hop headers.
 
     Drops every ``X-Phantom-*`` header (those are routing INPUTS to the
-    catch-all, not upstream headers) and the hop-by-hop / host-rewriting set
-    (``Host``, ``Content-Length``). ``Authorization`` is kept so the client's
-    presigned / SigV4 signature is forwarded as-is. The executor applies the
-    same ``x-phantom-*`` strip again at forward time as a backstop; stripping
-    here keeps the persisted envelope honest.
+    catch-all, not upstream headers) and the full hop-by-hop set: RFC 7230
+    section 6.1's seven connection headers, the two framing headers
+    (``Transfer-Encoding``, ``Content-Length``), the two connection-scoped
+    ones (``Expect``, ``Host``), and every header this request's
+    ``Connection`` names, which RFC 7230 makes hop-by-hop for that connection.
+    The set and the expansion rule both come from
+    :func:`phantom.chain.executor._hop_by_hop_names`, so there is exactly one
+    definition of them.
+
+    ``Content-Encoding: aws-chunked`` and ``x-amz-decoded-content-length``
+    are KEPT: they describe the body bytes, which are forwarded
+    byte-identically. ``Authorization`` is kept so the client's header-signed
+    signature is forwarded as-is.
+
+    The executor applies the same two strips again at forward time, and THAT
+    is the guarantee (it also covers the envelope path, which never comes
+    through here); stripping here keeps the persisted envelope honest.
 
     Args:
         request: The inbound raw-intake request.
@@ -234,12 +266,13 @@ def _forwarded_headers(request: Request) -> dict[str, str]:
         The forwarded-header mapping for the synthesized step (original
         header casing preserved).
     """
+    hop_by_hop = _hop_by_hop_names(request.headers)
     forwarded: dict[str, str] = {}
     for name, value in request.headers.items():
         lowered = name.lower()
         if lowered.startswith(_PHANTOM_RESERVED_HEADER_PREFIX):
             continue
-        if lowered in _HOP_BY_HOP_HEADERS:
+        if lowered in hop_by_hop:
             continue
         forwarded[name] = value
     return forwarded

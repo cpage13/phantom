@@ -644,6 +644,39 @@ def test_no_query_produces_no_trailing_question_mark() -> None:
     assert "?" not in resolved
 
 
+@pytest.mark.asyncio
+async def test_catch_all_does_not_persist_framing_headers(tmp_path: Path) -> None:
+    """The persisted envelope is honest too, not just the egress.
+
+    Objective: the executor's strip is the guarantee, but a persisted
+    ``Transfer-Encoding: chunked`` would still be a lie about the message in
+    the durable record an operator reads. Success: the synthesized step's
+    headers carry neither framing header nor the negotiation header, while a
+    benign header survives.
+    """
+    app, ctx = await _build_app(tmp_path, default_target=_DEFAULT_TARGET)
+    client = TestClient(app)
+    response = client.put(
+        "/mybucket/framing-key",
+        content=b"abc",
+        headers={
+            "Transfer-Encoding": "chunked",
+            "Expect": "100-continue",
+            "X-Custom": "keep",
+        },
+    )
+    assert response.status_code == 202, response.text
+    row = await ctx.store.get(UUID(response.headers["X-Phantom-Upload-Id"]))
+    assert row is not None
+    from phantom.models.chain import ChainEnvelope
+
+    env = ChainEnvelope.model_validate_json(row.chain_envelope_json)
+    lowered = {name.lower() for name in env.steps[0].headers}
+    assert "transfer-encoding" not in lowered
+    assert "expect" not in lowered
+    assert "x-custom" in lowered
+
+
 def test_only_the_phantom_carrier_produces_no_trailing_question_mark() -> None:
     """Counter-test for the strip: an empty survivor emits no separator.
 

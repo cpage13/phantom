@@ -420,6 +420,38 @@ show up as `503 saturation_cap` on fresh ingress.
 **Mode notes.** Mode-independent: the classification is a routing decision, not
 a storage one.
 
+## 1.11 A raw upload arrives with chunked transfer framing
+
+**Trigger.** A stock client streams its upload, so the request reaches Phantom
+with `Transfer-Encoding: chunked` (any client handed a generator body does
+this), or a producer-authored chain declares a framing header on a step
+directly. uvicorn de-frames the body before the handler sees it and hands the
+handler the assembled bytes, but the raw header is still visible, and the
+catch-all used to copy it onto the synthesized step.
+
+**What happens.** Framing, connection and negotiation headers are now stripped
+from every step at egress: RFC 7230 section 6.1's set, plus
+`Transfer-Encoding`, `Content-Length`, `Expect`, `Host`, and whatever the
+request's own `Connection` header names. Exactly one framing mechanism reaches
+the wire, the `Content-Length` the transport computes over the bytes actually
+forwarded. `Content-Encoding: aws-chunked` and `x-amz-decoded-content-length`
+are deliberately kept, because they describe the body bytes rather than the
+hop and the body is forwarded byte-identically. The upload delivers normally.
+
+**What you observe.** Nothing, which is the point. Before this fix the
+persisted `Transfer-Encoding: chunked` took precedence over the transport's
+computed framing, so the outbound request carried BOTH framing headers over a
+fixed-length body; the upstream rejected it, and because the header was baked
+into the persisted envelope every retry reproduced it identically until the
+row exhausted its budget. The operator saw a permanently undeliverable upload
+whose payload was fine, with nothing in `last_error` pointing at framing.
+
+**Mode notes.** Mode-independent: the strip is a header decision, not a storage
+one. One known unsupported combination survives and is not caused by this: an
+aws-chunked payload on an `aws_sigv4` route cannot validate upstream, because
+the per-chunk signatures chain from the client's seed signature that Phantom
+replaces.
+
 ---
 
 # Part 2. Contributor-facing: failure-mode → proving-test map
