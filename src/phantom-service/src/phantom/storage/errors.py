@@ -22,6 +22,17 @@ class BodyMissingError(Exception):
     cover the legitimate "body deliberately deleted" cases; an
     unexpected miss in the sender's load path is a real corruption
     signal.
+
+    TWO triggers construct this, both inside ``Sender._load_body_refs``:
+
+    1. The whole-directory ``KeyError`` out of ``body_store.get_all``
+       (a vanished chain directory, or a file lost mid-traversal).
+       ``missing`` is then every declared ref.
+    2. The declared-versus-returned shortfall (F2): the store returned a
+       dict smaller than ``row.body_hashes``, because the chain directory
+       was already partial or already empty when it was listed. ``missing``
+       is the sorted set difference. ADR-014 treats a body as an atomic
+       unit, so an incomplete body is a missing body.
     """
 
     def __init__(self, chain_id: UUID, missing: list[str]) -> None:

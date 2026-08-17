@@ -169,7 +169,16 @@ class Sender:
     async def _load_body_refs(self, row: UploadRow) -> dict[str, bytes]:
         """Load and verify body_refs for ``row``.
 
-        Per body_ref:
+        Step 0, before any per-ref work (F2): every ref declared in
+        ``row.body_hashes`` must be present in the store's return. A shortfall
+        raises :class:`BodyMissingError` with the complete missing set, before
+        any hashing or decoding is spent on a body already known incomplete.
+        The rule is enforced at the SEND BOUNDARY ONLY: the three admin body
+        reads in ``routes/admin.py`` (the two admin body-read surfaces and the
+        bulk export path) deliberately do not enforce it, so a partially lost
+        body can still be served or exported truncated from those.
+
+        Then per body_ref:
 
         1. Read stored bytes from the body store.
         2. Compute SHA-256; compare to row.body_hashes[name].storage_hash.
@@ -213,6 +222,23 @@ class Sender:
             # effective data loss disguised as a successful upload.
             missing = list(row.body_hashes.keys())
             raise BodyMissingError(row.chain_id, missing) from exc
+        declared = set(row.body_hashes)
+        returned = set(raw_refs)
+        missing_refs = declared - returned
+        if missing_refs:
+            # F2: ``get_all`` returns whatever the store HAS. A partial
+            # return (one file of a multipart body lost) or an intact but
+            # empty chain directory is not a happy path: it would forward
+            # truncated bytes stamped ``succeeded``, or terminate ``failed``
+            # blaming the producer's template for a storage fault. Per
+            # ADR-014 the body is an atomic unit, so an incomplete body is a
+            # missing body and routes to ``corrupted`` through the same
+            # ``BodyMissingError`` the whole-directory ``KeyError`` above
+            # raises. This is the rule the boot recovery sweep already
+            # applies per declared ref (``workers/recovery.py``), asserted
+            # once at send time instead. ``sorted`` keeps ``last_error``
+            # deterministic.
+            raise BodyMissingError(row.chain_id, sorted(missing_refs))
         codec = build_codec_for_algorithm(row.storage_encoding)
         decoded: dict[str, bytes] = {}
         for name, stored_bytes in raw_refs.items():

@@ -233,13 +233,20 @@ tree. The restore workflow lives in the operator playbook
 external `rm`, a janitor race, a vanished mount, or a directory entry
 that did not survive a crash.
 
-**What happens.** The body-store load raises `BodyMissingError`; the
-sender transitions the row to `corrupted` with
+**What happens.** Two shapes are detected at different points, and both
+end the same way. A **whole-directory** loss surfaces as `KeyError` from
+the body store, which the sender re-raises as `BodyMissingError`. A
+**partial or empty** chain directory returns quietly from the body store
+(it returns what it holds; it never sees the row's declared refs), so the
+sender's own declared-versus-returned check catches it and raises the same
+`BodyMissingError` carrying the complete sorted missing set. Either way
+the sender transitions the row to `corrupted` with
 `last_error="storage_corruption:body_missing_in_sender:<missing body_refs>"`
 and does not retry. The worker does **not** crash: a missing body is a
-row-level terminal outcome, not a process-level fault. (A body found
-missing by the boot-time recovery sweep of §1.1 instead quarantines
-with reason `ram_body_lost_on_restart` or
+row-level terminal outcome, not a process-level fault. The check runs at
+the send boundary only; the admin body-read and bulk-export surfaces do
+not enforce it. (A body found missing by the boot-time recovery sweep of
+§1.1 instead quarantines with reason `ram_body_lost_on_restart` or
 `file_body_missing_on_recovery`.)
 
 **What you observe.** The affected row is `corrupted`; the service and
@@ -458,7 +465,7 @@ contention tests are the highest-value durability coverage.
 | Failure mode | Proving test | What it proves |
 |---|---|---|
 | At-rest / in-transit body corruption (dual-hash) | [`tests/e2e/test_multipart_corrupted.py`](../tests/e2e/test_multipart_corrupted.py) | A storage-hash or body-hash mismatch sends the row to `corrupted`; bad bytes are never forwarded (ADR-014). |
-| Body file vanishes before send (`BodyMissingError`) | [`tests/e2e/test_files_lost_midway.py`](../tests/e2e/test_files_lost_midway.py) | A missing body is a row-level `corrupted` outcome, not a worker crash. |
+| Body file vanishes before send (`BodyMissingError`) | [`tests/e2e/test_files_lost_midway.py`](../tests/e2e/test_files_lost_midway.py), [`tests/e2e/test_multipart_corrupted.py`](../tests/e2e/test_multipart_corrupted.py) (`test_multipart_single_missing_ref_transitions_to_corrupted`) | A missing body is a row-level `corrupted` outcome, not a worker crash. The multipart test proves the PARTIAL case: one ref of three deleted is caught by the sender's declared-versus-returned check, and the deleted ref's bytes never reach the upstream. |
 | `all_ram` orphan body left by a prior disk-backed mode | [`src/phantom-service/tests/unit/test_f2_all_ram_orphan_sweep.py`](../src/phantom-service/tests/unit/test_f2_all_ram_orphan_sweep.py) | The mode-flip guard and orphan handling for a populated body-store root. |
 | Naive-local timestamps labelled UTC | [`src/phantom-service/tests/unit/test_a2_utc_timestamps_regression.py`](../src/phantom-service/tests/unit/test_a2_utc_timestamps_regression.py) | Cold-backup and quarantine timestamps are truthfully UTC under a non-UTC `TZ`. |
 | SIGKILL mid integrity-quarantine (crash-atomic) | [`src/phantom-service/tests/unit/test_r36_sigkill_mid_quarantine_allram.py`](../src/phantom-service/tests/unit/test_r36_sigkill_mid_quarantine_allram.py) | A crash between the quarantine moves still recovers on next boot in every mode. |

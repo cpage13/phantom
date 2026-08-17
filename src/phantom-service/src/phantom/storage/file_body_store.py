@@ -226,10 +226,18 @@ class FileBodyStore:
     async def get_all(self, chain_id: UUID) -> dict[str, bytes]:
         """Read every body_ref for ``chain_id`` as ``{name: bytes}``.
 
-        A missing upload directory (the body files for a row that is
-        expected to have a body are gone) raises :class:`KeyError`, never
-        a raw ``FileNotFoundError`` / ``NotADirectoryError``. The sender's
-        ``_load_body_refs`` catches ``KeyError`` and re-raises
+        This returns whatever the chain directory HOLDS. It does not
+        guarantee completeness against the row's declared ``body_hashes``,
+        and it cannot: it takes only a ``chain_id`` and never sees the row.
+        Two absence shapes surface as :class:`KeyError` here, never as a raw
+        ``FileNotFoundError`` / ``NotADirectoryError``: a missing upload
+        directory, and a file that vanishes mid-traversal. A directory that
+        was ALREADY partial or ALREADY empty when it was listed returns a
+        short dict quietly. Proving the return covers every declared ref is
+        the SENDER's check, in ``Sender._load_body_refs`` (F2), which raises
+        :class:`BodyMissingError` on a shortfall.
+
+        The sender's ``_load_body_refs`` catches ``KeyError`` and re-raises
         :class:`BodyMissingError`, which ``_drive_one`` routes to the
         ``corrupted`` terminal state (the H8 / ADR-014 path) — so a
         vanished body directory quarantines the row rather than crashing
