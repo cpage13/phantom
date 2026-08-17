@@ -1,4 +1,12 @@
-"""Pure builder for the ``X-Phantom-*`` response header set (plan §5.3)."""
+"""Pure builder for the ``X-Phantom-*`` response header set (plan §5.3).
+
+TWO production callers, and they are the complete set: the envelope ingress
+(``routes/send.py``) and the raw-intake catch-all (``routes/catch_all.py``).
+The raw-intake arm used to hand-build two of the six headers, which the SDK's
+strict ``ResponseHeaders`` model could not parse, so a successful upload
+raised at the client. Anything that acks an admission builds its headers HERE;
+a third hand-built ack is the defect this note exists to prevent.
+"""
 
 from __future__ import annotations
 

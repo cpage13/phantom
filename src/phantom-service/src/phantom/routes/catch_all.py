@@ -57,7 +57,9 @@ from phantom.chain.query import filter_raw_query
 from phantom.config.settings import InstanceCfg
 from phantom.instances.dispatcher import InstanceDispatcher
 from phantom.models.chain import ChainBodyRef, ChainEnvelope, ChainStep
+from phantom.routes.envelope import build_response_headers
 from phantom.routes.send import (
+    SUGGESTED_POLL_AFTER_SECONDS,
     _BodyTooLargeError,
     _check_content_length,
     _error_response,
@@ -343,7 +345,11 @@ async def raw_intake(
     → Content-Length precheck → body read (capped) → raw→envelope synthesis
     → the shared :func:`resolve_and_admit` prelude (degraded guard, dispatch,
     :func:`admit_chain`). Returns the same 202 + ``X-Phantom-*`` response a
-    producer-supplied chain receives, or the canonical error envelope.
+    producer-supplied chain receives, or the canonical error envelope. The
+    full canonical SIX headers come from the shared
+    :func:`phantom.routes.envelope.build_response_headers`, the same builder
+    the envelope ingress calls, so the ack parses with the SDK's strict
+    ``ResponseHeaders`` model rather than being a hand-built subset of it.
 
     Args:
         phantom_path: The object path after the host (e.g. ``bucket/key``).
@@ -447,11 +453,17 @@ async def raw_intake(
     if isinstance(result, Response):
         return result
 
-    chain_resp_headers = {
-        "X-Phantom-Upload-Id": str(result.row.chain_id),
-        "X-Phantom-Status": result.row.state,
-    }
-    return Response(status_code=result.status_code, headers=chain_resp_headers)
+    return Response(
+        status_code=result.status_code,
+        headers=build_response_headers(
+            upload_id=result.row.chain_id,
+            group_id=result.row.group_id,
+            state=result.row.state,
+            attempts=result.row.attempts,
+            next_attempt_at=result.row.next_attempt_at,
+            suggested_poll_after_seconds=SUGGESTED_POLL_AFTER_SECONDS,
+        ),
+    )
 
 
 @router.api_route("/{phantom_path:path}", methods=["GET", "HEAD", "DELETE", "OPTIONS"])

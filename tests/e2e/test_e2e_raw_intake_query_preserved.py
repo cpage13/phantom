@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from phantom_client.models.envelope import parse_response_headers
 
 from .helpers.stack import E2EStack, boot_stack
 from .helpers.timing import await_until
@@ -131,5 +132,46 @@ async def test_raw_intake_forwards_the_query_string_to_the_upstream() -> None:
             "the inbound query must reach the upstream byte-for-byte; "
             f"expected {FORWARDED_QUERY!r}, got {raw.query!r}"
         )
+    finally:
+        await stack.tear_down()
+
+
+@pytest.mark.e2e
+async def test_raw_intake_ack_is_sdk_parseable() -> None:
+    """CL8: the live raw-intake 202 parses with the SDK's strict header model.
+
+    Objective: end-to-end proof over the real wire that the raw-intake ack
+    carries the canonical six rather than the hand-built two. The SDK's
+    ``ResponseHeaders`` is strict and forbids extras, so before CL8 a
+    SUCCESSFUL upload made ``parse_response_headers`` raise. Success: the live
+    ack parses and its ``group_id`` equals its ``upload_id``, because a stock
+    client sends no grouping header.
+
+    ``resp.headers`` is passed rather than ``dict(resp.headers)``:
+    ``parse_response_headers`` looks up canonical mixed-case names with a
+    plain ``.get``, so its case-insensitivity comes from the caller's mapping.
+    ``httpx.Headers`` is case-insensitive; a plain dict built from it is
+    lower-cased and would raise whatever the service does.
+    """
+    stack = await boot_stack(
+        config_overrides=_forward_as_is_overrides("{EMULATOR_URL}/raw"),
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.put(
+                f"{stack.phantom_url}/ackbucket/sdk-parseable.bin",
+                content=QUERY_PAYLOAD,
+            )
+        assert resp.status_code == INTAKE_ACCEPTED_STATUS, (
+            f"expected {INTAKE_ACCEPTED_STATUS} intake ack, got {resp.status_code}: {resp.text!r}"
+        )
+
+        parsed = parse_response_headers(resp.headers)
+
+        assert parsed.upload_id == parsed.group_id, (
+            "a raw upload is a group of one, so the ack's group id is its upload id"
+        )
+        assert parsed.status == "queued"
+        assert parsed.attempts == 0
     finally:
         await stack.tear_down()

@@ -501,6 +501,80 @@ async def _store_is_empty(ctx: InstanceContext) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# CL8: the raw-intake ack carries the canonical six, from the shared builder.
+# ---------------------------------------------------------------------------
+
+# The canonical response-header set ``routes/envelope.build_response_headers``
+# emits. The raw-intake arm hand-built two of them, so an SDK client raised
+# PhantomEnvelopeError on a SUCCESSFUL upload.
+_CANONICAL_ACK_HEADERS = (
+    "X-Phantom-Upload-Id",
+    "X-Phantom-Group-Id",
+    "X-Phantom-Status",
+    "X-Phantom-Attempts",
+    "X-Phantom-Suggested-Poll-After",
+    "X-Phantom-Next-Attempt-At",
+)
+
+
+@pytest.mark.asyncio
+async def test_raw_intake_ack_carries_all_six_canonical_headers(tmp_path: Path) -> None:
+    """The raw-intake ack emits the full canonical set, not a hand-built pair.
+
+    Objective: the handler's own docstring claims the ack matches what a
+    producer-supplied chain receives, and it did not. Success: all six
+    canonical headers are present on the 202.
+    """
+    app, _ = await _build_app(tmp_path, default_target=_DEFAULT_TARGET)
+    client = TestClient(app)
+
+    response = client.put("/mybucket/ack-key", content=b"abc")
+
+    assert response.status_code == 202, response.text
+    missing = [name for name in _CANONICAL_ACK_HEADERS if name not in response.headers]
+    assert not missing, f"the raw-intake ack is missing canonical headers: {missing}"
+
+
+@pytest.mark.asyncio
+async def test_raw_intake_ack_group_id_equals_chain_id(tmp_path: Path) -> None:
+    """The raw-intake ack's group id is the chain id.
+
+    Objective: pin the raw-intake-specific value. A stock client sends no
+    ``X-Phantom-Group-Id``, so admission falls back to ``chain_id`` and every
+    raw upload is a group of one. Success: the two headers are equal.
+    """
+    app, _ = await _build_app(tmp_path, default_target=_DEFAULT_TARGET)
+    client = TestClient(app)
+
+    response = client.put("/mybucket/group-key", content=b"abc")
+
+    assert response.status_code == 202, response.text
+    assert response.headers["X-Phantom-Group-Id"] == response.headers["X-Phantom-Upload-Id"]
+
+
+@pytest.mark.asyncio
+async def test_raw_intake_ack_is_purely_additive(tmp_path: Path) -> None:
+    """The two headers the ack already emitted are byte-for-byte unchanged.
+
+    Objective: pin the safety claim rather than asserting it in prose. The
+    change is safe precisely because no existing header moves: a stock S3
+    client that ignores unknown response headers is unaffected, and an SDK
+    client goes from raising to parsing. Success: the upload id and the status
+    still carry exactly the row's values, alongside the four additions.
+    """
+    app, ctx = await _build_app(tmp_path, default_target=_DEFAULT_TARGET)
+    client = TestClient(app)
+
+    response = client.put("/mybucket/additive-key", content=b"abc")
+
+    assert response.status_code == 202, response.text
+    row = await ctx.store.get(UUID(response.headers["X-Phantom-Upload-Id"]))
+    assert row is not None
+    assert response.headers["X-Phantom-Upload-Id"] == str(row.chain_id)
+    assert response.headers["X-Phantom-Status"] == row.state
+
+
+# ---------------------------------------------------------------------------
 # F4: query-string preservation on both destination carriers.
 # ---------------------------------------------------------------------------
 
