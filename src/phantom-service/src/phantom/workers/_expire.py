@@ -139,19 +139,21 @@ async def expire_row(
     # in ``expired`` (we just flipped it), so the discard CAS guards on that.
     # The body is discarded in BOTH paths; only the slot release below differs.
     outcome = await store.discard_body_and_zero_accounting(row.chain_id, expected_state="expired")
-    # RELEASE only on path A (``release_saturation``), AND only if THIS call
-    # zeroed the slot (``outcome.flipped``), using the OUTCOME's pre-zero size.
-    # ``outcome.flipped`` alone is NOT enough: a path-B ``auth_expired`` row's
-    # body is still present at sweep time, so the discard DOES flip — but its
-    # saturation slot was already released at park (``_on_auth_failure``), so
-    # releasing here would double-free. ``release_saturation`` distinguishes the
-    # holds-a-slot path (A) from the already-released park path (B); the
-    # ``flipped`` guard still defends path A against a concurrent mover.
     if not outcome.flipped:
         # Another owner moved or already stamped this row between the state
         # flip and here (an admin replay, a concurrent kicker tick, or a
-        # reaper discard). Whoever stamped it owns its bytes. Touch nothing.
+        # reaper discard). Whoever stamped it owns its bytes, so neither the
+        # release below nor the delete after it may run. This guard also
+        # defends path A's release against a concurrent mover, which is what
+        # it did before F3 gave it the byte delete to guard as well.
         return
+    # RELEASE only on path A (``release_saturation``), using the OUTCOME's
+    # pre-zero size. Reaching here is NOT enough on its own: a path-B
+    # ``auth_expired`` row's body is still present at sweep time, so its
+    # discard DOES flip, yet its saturation slot was already released at park
+    # (``_on_auth_failure``), so releasing again would double-free.
+    # ``release_saturation`` is what distinguishes the holds-a-slot path (A)
+    # from the already-released park path (B).
     if release_saturation:
         await saturation.release(outcome.body_size_bytes)
     # F3: the bytes themselves, not just the accounting. ADR-032 says an
