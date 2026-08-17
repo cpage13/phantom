@@ -10,11 +10,14 @@ ADR-015 one-writer-per-effect discipline (exactly one ``new_state="expired"``
 call site) while spanning the two callers.
 
 This module is intentionally dependency-light: it depends only on the
-:class:`~phantom.storage.interface.UploadStore` protocol and the
-:class:`~phantom.workers.saturation.SaturationGate`, both of which every caller
-already holds via its :class:`InstanceContext`. :mod:`phantom.workers.sender`
-does not import the kickers and the kickers do not import the sender, so a leaf
-module imported by all three creates no cycle.
+:class:`~phantom.storage.interface.UploadStore` and
+:class:`~phantom.storage.interface.BodyStore` protocols and the
+:class:`~phantom.workers.saturation.SaturationGate`, all of which every caller
+already holds via its :class:`InstanceContext`. Both protocols live in the same
+``storage.interface`` module, so adding the body store costs no new dependency
+edge. :mod:`phantom.workers.sender` does not import the kickers and the kickers
+do not import the sender, so a leaf module imported by all three creates no
+cycle.
 
 The send-deadline TRANSITION sites that CALL this writer (the executor gate and
 the parked-``auth_expired`` sweeps) are added separately; until they land,
@@ -31,7 +34,7 @@ from __future__ import annotations
 import logging
 
 from phantom.models.upload import UploadRow, UploadState
-from phantom.storage.interface import UploadStore
+from phantom.storage.interface import BodyStore, UploadStore
 from phantom.workers.saturation import SaturationGate
 
 logger = logging.getLogger(__name__)
@@ -40,6 +43,7 @@ logger = logging.getLogger(__name__)
 async def expire_row(
     store: UploadStore,
     saturation: SaturationGate,
+    body_store: BodyStore,
     row: UploadRow,
     *,
     expected_state: UploadState,
@@ -51,9 +55,28 @@ async def expire_row(
 
     UNLIKE ``_record_stored`` (which RETAINS the body and deliberately HOLDS
     the saturation slot for replay), ``expired`` is terminal-dead: it discards
-    the body (design §6.3 / ADR-032) in BOTH caller paths. The saturation
-    release, however, depends on whether the row STILL HOLDS its slot at the
-    moment it expires, and that differs by path:
+    the body (design §6.3 / ADR-032) in BOTH caller paths. The discard is two
+    halves and both happen here: the row-side stamp plus accounting zero
+    through ``discard_body_and_zero_accounting``, and the byte-side
+    ``body_store.delete``. Before F3 only the first half ran, so a RAM body
+    survived for the process lifetime while the row said it was gone,
+    unreachable by the reaper (its body pass filters on the stamp), by
+    ``RamBodyStore.list_orphans`` (it returns ``[]``), and by the
+    ``PersistController`` (it skips stamped rows).
+
+    ORDERING: stamp first, delete only after a confirmed flip, mirroring the
+    reaper's R9-5 leg and the sender's R10-1 leg. Never delete bytes this call
+    did not stamp. The crash window between the two is bounded and accepted: a
+    crash frees a RAM body outright, and a disk body's files stay invisible to
+    both reclaim mechanisms only until the metadata-retention pass deletes the
+    row, after which the orphan janitor reclaims them. Those bytes are still
+    counted against the disk ceiling by the store's live tree walk, so the
+    ENOSPC gate is not fooled. The alternative ordering is worse in kind: a
+    delete that crashes before the stamp leaves an UNSTAMPED row with no bytes,
+    which the next claim lands in a false ``corrupted``.
+
+    The saturation release depends on whether the row STILL HOLDS its slot at
+    the moment it expires, and that differs by path:
 
     * **Path A (executor give-up gate).** The row is ``attempting`` — it still
       holds the slot it was admitted with. Expiring it must RELEASE that slot
@@ -74,6 +97,10 @@ async def expire_row(
     Args:
         store: The upload store owning the row's metadata.
         saturation: The instance saturation gate to release on body discard.
+        body_store: The instance's mode-selected body store, whose
+            ``delete`` frees the bytes themselves. ``delete`` is idempotent on
+            both halves of :class:`HybridBodyStore`, so this covers ``ram`` and
+            ``file`` ``body_location`` without branching.
         row: The claimed/parked row being expired.
         expected_state: The CAS pre-state the ``record_attempt_result`` UPDATE
             guards on — ``"attempting"`` for the executor give-up path, or
@@ -120,5 +147,22 @@ async def expire_row(
     # releasing here would double-free. ``release_saturation`` distinguishes the
     # holds-a-slot path (A) from the already-released park path (B); the
     # ``flipped`` guard still defends path A against a concurrent mover.
-    if release_saturation and outcome.flipped:
+    if not outcome.flipped:
+        # Another owner moved or already stamped this row between the state
+        # flip and here (an admin replay, a concurrent kicker tick, or a
+        # reaper discard). Whoever stamped it owns its bytes. Touch nothing.
+        return
+    if release_saturation:
         await saturation.release(outcome.body_size_bytes)
+    # F3: the bytes themselves, not just the accounting. ADR-032 says an
+    # expired row's body is discarded at the transition; before this fix
+    # only the row-side stamp happened, so RAM bodies survived for the
+    # process lifetime, unreachable by the reaper (it filters on the stamp),
+    # by RamBodyStore.list_orphans (it returns []), and by the
+    # PersistController (it skips stamped rows). Delete is idempotent on
+    # both halves of HybridBodyStore, so this covers ram and file
+    # body_location without branching. Released BEFORE the delete because a
+    # delete that raises (a permission fault inside the disk half's _rm_rf)
+    # would otherwise leak a slot permanently, which eventually 503s all
+    # ingress; leaking bytes instead is bounded by the retention windows.
+    await body_store.delete(row.chain_id)

@@ -699,6 +699,7 @@ class Sender:
         await expire_row(
             store,
             self._instance.saturation,
+            self._instance.body_store,
             row,
             expected_state="attempting",
             last_error=f"send_deadline:{result.deadline_seconds}s",

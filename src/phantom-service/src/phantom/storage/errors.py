@@ -46,10 +46,12 @@ class ReplayBodyDiscardedError(Exception):
 
     Cycle-7 phase 7 pre-round defender fix. ``body_discarded_at`` is
     stamped by the ONE discard owner
-    (``discard_body_and_zero_accounting``), on either trigger: the
-    sender's immediate leg (``succeeded_body_seconds == 0``, the
-    default) or the reaper's scheduled leg when a retention window
-    elapses. Once stamped, the bytes are gone and the row's own
+    (``discard_body_and_zero_accounting``), on any of its three
+    triggers: the sender's immediate leg (``succeeded_body_seconds ==
+    0``, the default), the reaper's scheduled leg when a retention
+    window elapses, or the shared ``expire_row`` writer's send-deadline
+    give-up (``workers/_expire.py``, ADR-032). Once stamped, the bytes
+    are gone and the row's own
     accounting says so (``body_size_bytes`` zeroed by the same
     operation). Re-queuing such a row cannot possibly succeed: the
     sender's next claim finds no body and lands the row in the

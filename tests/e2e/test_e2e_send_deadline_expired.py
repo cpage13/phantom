@@ -30,8 +30,18 @@ The assertions are the backstop's contract:
 
 * terminal ``expired`` (a member of ``TERMINAL_STATES``);
 * ``last_error == "send_deadline:1s"`` — the sweep's fingerprint, written ONLY by
-  ``expire_row`` on the deadline transition, which is also the observable proof
-  the body was discarded;
+  ``expire_row`` on the deadline transition. It is the proof the TRANSITION was
+  the deadline sweep. It is NOT proof the body was discarded, and the header
+  used to claim it was: before F3 ``expire_row`` stamped ``body_discarded_at``
+  and zeroed the row's accounting without ever calling ``body_store.delete``, so
+  the bytes survived while the row said they were gone. The observable proof is
+  the RAM measurement below;
+* ``ram_body_store_bytes`` (``GET /v1/admin/observability/ram-pressure``) rises
+  above its pre-submission baseline while the row is parked with its body
+  retained, then returns EXACTLY to that baseline once the row reaches
+  ``expired``. The rise is what stops the fall from passing vacuously: if the
+  deployment were not RAM-backed, the rise fails loudly instead of leaving the
+  fall meaningless;
 * ``attempts == 1`` — exactly the single park attempt; the sweep is a terminal
   transition, not a send, so a second attempt would mean the backstop did NOT
   fire and the row was re-queued instead;
@@ -76,8 +86,8 @@ AUTH_EXPIRED_STATE: str = "auth_expired"
 
 # The exact ``last_error`` the shared ``expire_row`` writer stamps on the
 # deadline transition (``f"send_deadline:{deadline}s"``). Asserting it pins the
-# transition to the deadline SWEEP (not some other terminal path) and is the
-# admin-observable proof the body was discarded.
+# transition to the deadline SWEEP rather than some other terminal path. It says
+# nothing about the bytes; the RAM measurement is what proves the discard.
 DEADLINE_LAST_ERROR: str = f"send_deadline:{SEND_DEADLINE_SECONDS}s"
 
 # Exactly one send attempt is ever made: the credential-less park records one
@@ -127,11 +137,19 @@ def _deadline_overrides() -> dict[str, object]:
     SigV4 sink — though delivery never happens here, the route still resolves to
     the emulator host so the kicker can route the persisted endpoint.
 
+    ``persist_trigger.body_size_threshold_bytes = 0`` pins the configuration the
+    RAM assertions depend on: it disables size-aware persistence, which is the
+    documented meaning of 0. Left unpinned the threshold is probe-filled from
+    host RAM, so on a host whose probe yields a very small threshold admission
+    would enqueue an immediate RAM-to-disk migration and the "RAM rose above
+    baseline" assertion would fail for a purely environmental reason.
+
     Returns:
         The overlay mapping for :func:`boot_stack`'s ``config_overrides``.
     """
     return {
         "phantom_default_target": "{EMULATOR_URL}",
+        "storage": {"persist_trigger": {"body_size_threshold_bytes": 0}},
         "instances": [
             {
                 "id": "primary",
@@ -206,6 +224,12 @@ async def test_send_deadline_sweeps_parked_row_to_expired() -> None:
     """
     stack = await boot_stack(config_overrides=_deadline_overrides())
     try:
+        # F3 baseline: RAM body bytes BEFORE anything is buffered. The expired
+        # transition must return to exactly this number.
+        baseline = (
+            await stack.phantom_client.get_observability_ram_pressure()
+        ).ram_body_store_bytes
+
         # No credential push: the route's destination host has NO signer slot, so
         # the first forward attempt parks the row in auth_expired with nothing
         # sent upstream — the "re-push never comes" setup.
@@ -226,6 +250,17 @@ async def test_send_deadline_sweeps_parked_row_to_expired() -> None:
         )
         assert stack.emulator.s3_object(BUCKET, KEY) is None, (
             "a credential-less park makes no upstream call, so no object can be stored at the sink"
+        )
+        # F3: the parked row RETAINS its body, so RAM must be above baseline
+        # here. This assertion is what keeps the post-expiry one honest: if the
+        # body never lived in RAM, this fails loudly rather than making the
+        # return-to-baseline vacuous.
+        parked_ram = (
+            await stack.phantom_client.get_observability_ram_pressure()
+        ).ram_body_store_bytes
+        assert parked_ram > baseline, (
+            f"a parked auth_expired row retains its body, so RAM body bytes must exceed the "
+            f"{baseline}-byte baseline; got {parked_ram}"
         )
 
         # Checkpoint 2: with NO credential re-push, the real 1s deadline elapses
@@ -255,6 +290,19 @@ async def test_send_deadline_sweeps_parked_row_to_expired() -> None:
         # The row gave up while parked — it never reached the emulator sink.
         assert stack.emulator.s3_object(BUCKET, KEY) is None, (
             "an expired (given-up) row must never have delivered its body upstream"
+        )
+        # F3, the load-bearing observation: the expired transition deletes the
+        # BYTES, not just the row-side stamp. Before F3 ``expire_row`` stamped
+        # ``body_discarded_at`` and zeroed the accounting while the RAM body
+        # survived for the process lifetime, unreachable by the reaper (it
+        # filters on the stamp), by RamBodyStore.list_orphans (it returns []),
+        # and by the PersistController (it skips stamped rows).
+        expired_ram = (
+            await stack.phantom_client.get_observability_ram_pressure()
+        ).ram_body_store_bytes
+        assert expired_ram == baseline, (
+            f"the expired transition must free the body bytes, returning RAM to the "
+            f"{baseline}-byte baseline; got {expired_ram}"
         )
 
         # Checkpoint 3: terminal STABILITY. Give at least one more kicker rescan

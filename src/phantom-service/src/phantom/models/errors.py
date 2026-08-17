@@ -124,9 +124,11 @@ STATUS_FOR_CODE: dict[ErrorCode, int] = {
     "restore_noop": 409,
     # POST /v1/admin/chains/{chain_id}/replay named a row whose body was
     # already discarded per the row's own accounting (body_discarded_at
-    # stamped by the ONE discard owner, discard_body_and_zero_accounting:
-    # the sender's immediate leg at succeeded_body_seconds == 0 or the
-    # reaper's scheduled leg). A replay re-queue would hand the sender a
+    # stamped by the ONE discard owner, discard_body_and_zero_accounting,
+    # on any of its three triggers: the sender's immediate leg at
+    # succeeded_body_seconds == 0, the reaper's scheduled leg, or the
+    # shared expire_row send-deadline give-up per ADR-032). A replay
+    # re-queue would hand the sender a
     # row with no bytes to send, laundering the operator action into a
     # scary 'corrupted' terminal on the next claim (cycle-7 phase 7
     # pre-round defender fix). 409 Conflict: the request conflicts with

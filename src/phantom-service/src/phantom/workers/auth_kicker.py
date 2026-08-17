@@ -158,6 +158,7 @@ class AuthKicker:
                 await expire_row(
                     self._instance.store,
                     self._instance.saturation,
+                    self._instance.body_store,
                     row,
                     expected_state="auth_expired",
                     last_error=f"send_deadline:{deadline}s",

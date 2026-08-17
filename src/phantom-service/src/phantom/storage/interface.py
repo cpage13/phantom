@@ -566,14 +566,15 @@ class UploadStore(Protocol):
         :class:`DiscardOutcome` whose ``flipped`` reports whether THIS
         call stamped the row and whose ``body_size_bytes`` is the
         in-transaction pre-zero size (the ``stored``-slot release
-        basis). Exactly two callers, split by configuration - the
-        sender's immediate discard (``succeeded_body_seconds == 0``)
-        and the reaper's scheduled discard (non-zero window elapsed) -
-        and BOTH stamp first, deleting body files only after a
-        confirmed flip (R9-5 for the reaper, R10-1 for the sender): a
-        crash between stamp and file delete leaves a stamped row whose
-        files the metadata-retention pass and the orphan janitor
-        converge.
+        basis). Exactly three callers: the sender's immediate discard
+        (``succeeded_body_seconds == 0``), the reaper's scheduled
+        discard (non-zero window elapsed), and the shared
+        ``expire_row`` writer (``workers/_expire.py``, ADR-032). All
+        three stamp first and delete body files only after a confirmed
+        flip (R9-5 for the reaper, R10-1 for the sender, F3 for
+        ``expire_row``). A crash between stamp and file delete leaves a
+        stamped row whose files the metadata-retention pass and the
+        orphan janitor converge.
         """
         ...
 

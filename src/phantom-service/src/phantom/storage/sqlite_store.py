@@ -1906,14 +1906,14 @@ class SqliteUploadStore:
         (the guard mismatches; nothing is touched), a row another path
         already stamped or removed is a no-op, and the returned size is
         the exact release basis for a ``stored`` row's slot. Exactly
-        TWO callers, split by configuration - the sender's immediate
-        discard on the chain-done success branch
-        (``succeeded_body_seconds == 0``) and the reaper's scheduled
-        discard (non-zero window elapsed) - and BOTH stamp first,
-        deleting body files only after a confirmed flip (R9-5 for the
-        reaper, R10-1 for the sender); a crash in between leaves a
-        stamped row whose files the metadata pass and the orphan
-        janitor converge.
+        three callers: the sender's immediate discard on the chain-done
+        success branch (``succeeded_body_seconds == 0``), the reaper's
+        scheduled discard (non-zero window elapsed), and the shared
+        ``expire_row`` writer (``workers/_expire.py``, ADR-032). All
+        three stamp first, deleting body files only after a confirmed
+        flip (R9-5 for the reaper, R10-1 for the sender, F3 for
+        ``expire_row``); a crash in between leaves a stamped row whose
+        files the metadata pass and the orphan janitor converge.
         """
         conn = self._require_conn()
         now_iso = datetime.now(tz=UTC).isoformat()
