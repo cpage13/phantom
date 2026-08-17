@@ -627,3 +627,162 @@ async def test_x_phantom_headers_stripped_from_upstream() -> None:
     # Every X-Phantom-* header is stripped, case-insensitively.
     leaked = [k for k in sent if k.lower().startswith("x-phantom-")]
     assert not leaked, f"X-Phantom-* leaked: {leaked}"
+
+
+# -------- Q3: TemplateUnresolved carries identifiers, never template text ----
+
+# A step URL that carries BOTH an unresolvable placeholder and a presigned
+# credential. Since F4 preserves the raw-intake query string, this is the
+# shape an ordinary object key produces, and the whole URL used to be
+# persisted verbatim into ``last_error``.
+_LEAKY_URL = "https://up.example/bucket/a{{b.c}}d?X-Amz-Signature=SECRET"
+
+
+def _envelope_blob(*, step_name: str, url: str, headers: str = "", body: str = "") -> str:
+    """Build a one-step envelope JSON blob for the persisted-envelope column.
+
+    The parser's static placeholder pass rejects an unresolvable ``{{a.b}}``
+    at admission, so these envelopes are written straight into the row's
+    ``chain_envelope_json`` (which the executor re-validates for SHAPE only)
+    rather than through ``parse_json_request``.
+
+    Args:
+        step_name: The single step's name.
+        url: The step URL, which may carry a placeholder.
+        headers: An optional ``,"headers":{...}`` JSON fragment.
+        body: An optional ``,"body":{...}`` JSON fragment.
+
+    Returns:
+        The envelope as a JSON string.
+    """
+    return (
+        '{"chain_id":"'
+        + str(uuid4())
+        + '","idempotency_key":"k","steps":[{"name":"'
+        + step_name
+        + '","method":"PUT","url":"'
+        + url
+        + '"'
+        + headers
+        + body
+        + "}]}"
+    )
+
+
+def _row_for(envelope_json: str) -> UploadRow:
+    """Build an ``attempting`` row around a hand-written envelope blob."""
+    chain_id = uuid4()
+    now = datetime.now(tz=UTC)
+    return UploadRow(
+        chain_id=chain_id,
+        instance_id="primary",
+        group_id=chain_id,
+        multifile_id=chain_id,
+        send_order=0,
+        route_name="r",
+        state="attempting",
+        body_location="ram",
+        received_at=now,
+        updated_at=now,
+        endpoint="up.example",
+        uid="u",
+        chain_envelope_json=envelope_json,
+        captured_values=CapturedValues(),
+        current_step_index=0,
+        idempotency_key="k",
+        capture_reexecution_active=False,
+    )
+
+
+def _q3_executor() -> ChainExecutor:
+    """An executor over one forward-as-is route matching ``up.example``."""
+    return ChainExecutor(
+        token_cache=FakeTokenCache(),
+        upstream_client=FakeUpstreamClient(),
+        resolve_route=resolve_route,
+        clock=lambda: datetime.now(tz=UTC),
+        instance=_instance([RouteCfg(name="up", hosts=["up.example"], auth_mode="none")]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_unresolved_url_template_reports_names_not_the_url() -> None:
+    """The F4-created leak is closed at the source: no URL reaches the variant.
+
+    Objective: ``TemplateUnresolved`` used to carry ``step.url`` verbatim, and
+    the sender writes the variant straight into ``last_error``, which
+    ``GET /v1/admin/chains/{chain_id}`` surfaces and the logs echo. Since F4
+    preserves the query string, that URL can carry a full presigned
+    credential. Success: the result names the step, the site and the
+    placeholder NAMES, and no field carries the URL or the secret.
+    """
+    row = _row_for(_envelope_blob(step_name="upload", url=_LEAKY_URL))
+
+    result = await _q3_executor().execute_one_step(row, body_refs={})
+
+    # FIRST assertion, and deliberately field-name independent: it must be
+    # reachable on the pre-fix tree, where the variant has no ``site`` or
+    # ``unresolved`` attribute to read.
+    assert "SECRET" not in repr(result)
+    assert isinstance(result, TemplateUnresolved)
+    assert result.site == "url"
+    assert result.step_name == "upload"
+    assert result.unresolved == ("b.c",)
+    for leaked in ("SECRET", "?", "X-Amz"):
+        assert leaked not in repr(result), f"the variant must not carry {leaked!r}"
+
+
+@pytest.mark.asyncio
+async def test_unresolved_header_template_reports_the_name_not_the_value() -> None:
+    """The header arm reports the header NAME and never its value.
+
+    Objective: a producer-authored header value can carry credential material
+    beside a placeholder (``Authorization: Basic <literal>{{login.suffix}}``),
+    and the old variant embedded ``header[<name>]=<value>``. The header NAME is
+    safe (admission rejects any name that is not an RFC 7230 token), the value
+    is not. Success: the typed shape names the header, the rendered token
+    matches the documented form, and no field carries the value.
+    """
+    row = _row_for(
+        _envelope_blob(
+            step_name="upload",
+            url="https://up.example/o",
+            headers=',"headers":{"Authorization":"Bearer {{login.token}}"}',
+        )
+    )
+
+    result = await _q3_executor().execute_one_step(row, body_refs={})
+
+    assert isinstance(result, TemplateUnresolved)
+    assert result.site == "header"
+    assert result.header_name == "Authorization"
+    assert result.unresolved == ("login.token",)
+    assert result.token() == "upload:header[Authorization]:login.token"
+    assert "Bearer" not in repr(result)
+    assert "Bearer" not in result.token()
+
+
+@pytest.mark.asyncio
+async def test_body_template_failure_still_classifies() -> None:
+    """Counter-test: the already-safe body arm keeps working and now reports names.
+
+    Objective: the body site was never a leak (it carried only the step name),
+    so the restructure must not change WHEN it fires, only what it says. The
+    other half of this test's claim, that the row still terminates ``failed``,
+    is asserted against a real store in
+    ``test_template_unresolved_token.py``, which drives the sender.
+    """
+    row = _row_for(
+        _envelope_blob(
+            step_name="upload",
+            url="https://up.example/o",
+            body=',"body":{"kind":"text","value":"hello {{c.d}}"}',
+        )
+    )
+
+    result = await _q3_executor().execute_one_step(row, body_refs={})
+
+    assert isinstance(result, TemplateUnresolved)
+    assert result.site == "body"
+    assert result.step_name == "upload"
+    assert result.unresolved == ("c.d",)

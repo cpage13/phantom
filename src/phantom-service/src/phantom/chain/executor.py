@@ -13,7 +13,10 @@ owns:
 6. Capture extraction from the response (JSONPath, first-match).
 7. Result classification (Succeeded / 4xx / 5xx / FailedAuth /
    FailedNetwork / TemplateUnresolved / CaptureExpiredStored /
-   RouteUnresolved / InlineBodyInvalid).
+   RouteUnresolved / InlineBodyInvalid). ``TemplateUnresolved`` carries
+   IDENTIFIERS ONLY (step, site, placeholder names): it is persisted into
+   ``last_error``, which the admin API surfaces, and a step URL or a header
+   value can carry credential material.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, assert_never
+from typing import Any, Literal, assert_never
 from urllib.parse import urlparse
 
 import httpx
@@ -179,9 +182,65 @@ class CaptureExpiredRewind:
 
 @dataclass(frozen=True)
 class TemplateUnresolved:
-    """A placeholder did not resolve at execution time."""
+    """A ``{{step.capture}}`` placeholder did not resolve at execution time.
 
-    placeholder: str
+    Carries IDENTIFIERS ONLY, never template text. ``step.url`` and header
+    values are producer-controlled and, since F4 preserves the raw-intake
+    query string, a URL can carry a presigned ``X-Amz-Signature`` and
+    ``X-Amz-Credential``. This variant is rendered verbatim into
+    ``last_error``, which ``GET /v1/admin/chains/{chain_id}`` surfaces and the
+    logs echo, so putting the template into it is a credential disclosure. The
+    same rule and the same reasoning as ``RouteUnresolved``'s token (F1).
+
+    The ``body`` site is also reached by a ``ChainBodyRef`` whose bytes are
+    absent, which is a missing-body condition rather than a template failure;
+    it would render an EMPTY name list. F2's declared-versus-returned check in
+    the sender raises ``BodyMissingError`` before ``execute_one_step`` is
+    called, so that arm is unreachable for a real row. If a path is later found
+    that still reaches it, give the missing-ref case its own ``site`` member
+    rather than letting it borrow ``body``.
+
+    Attributes:
+        step_name: The step whose template did not resolve. Regex-constrained
+            to ``^[a-z][a-z0-9_]*$`` by ``ChainStep``, so it cannot carry a
+            URL fragment.
+        site: WHICH PART of the step failed, as a closed ``Literal``:
+            ``"url"``, ``"header"`` or ``"body"``. A closed member rather than
+            a formatted string, per the repo's enums-not-strings rule.
+        unresolved: The ``producing_step.capture_name`` pairs the failing
+            template references, in template order. Both halves are bounded by
+            ``_PLACEHOLDER_RE``'s ``[a-z][a-z0-9_]*`` groups, so neither can
+            carry URL text.
+        header_name: The header whose value failed, and ``None`` for the
+            ``url`` and ``body`` sites. Safe to include because admission
+            rejects any header name that is not an RFC 7230 token
+            (``routes/admission.py`` header-name validation), so it contains
+            no ``?``, ``&``, ``/`` or whitespace. The header VALUE is never
+            included.
+    """
+
+    step_name: str
+    site: Literal["url", "header", "body"]
+    unresolved: tuple[str, ...]
+    header_name: str | None = None
+
+    def token(self) -> str:
+        """Render the operator-visible ``last_error`` payload.
+
+        THE single formatter. Putting it on the variant rather than in the
+        sender makes the redaction guarantee total: no consumer anywhere can
+        format this type a different way, which is the same reasoning that
+        put the guarantee in the type instead of in the callers.
+
+        Returns:
+            ``"<step>:<site>:<names>"``, with the header site rendered as
+            ``header[<name>]``. Examples:
+            ``upload:url:b.c``,
+            ``upload:header[Authorization]:login.token``,
+            ``upload:body:``.
+        """
+        where = f"header[{self.header_name}]" if self.site == "header" else self.site
+        return f"{self.step_name}:{where}:{','.join(self.unresolved)}"
 
 
 @dataclass(frozen=True)
@@ -339,7 +398,9 @@ class ChainExecutor:
         # (b) Substitute placeholders in URL, headers, body.
         substituted_url, ok = substitute(step.url, self._captures_as_dict(row.captured_values))
         if not ok:
-            return TemplateUnresolved(placeholder=step.url)
+            return TemplateUnresolved(
+                step_name=step.name, site="url", unresolved=_placeholder_names(step.url)
+            )
         substituted_headers: dict[str, str] = {}
         for name, value in step.headers.items():
             # Phantom's reserved header namespace (``X-Phantom-*``)
@@ -350,7 +411,12 @@ class ChainExecutor:
                 continue
             rendered, header_ok = substitute(value, self._captures_as_dict(row.captured_values))
             if not header_ok:
-                return TemplateUnresolved(placeholder=f"header[{name}]={value}")
+                return TemplateUnresolved(
+                    step_name=step.name,
+                    site="header",
+                    unresolved=_placeholder_names(value),
+                    header_name=name,
+                )
             substituted_headers[name] = rendered
 
         try:
@@ -367,7 +433,12 @@ class ChainExecutor:
             )
             return InlineBodyInvalid(step_name=exc.step_name, reason=exc.reason)
         if not sub_ok:
-            return TemplateUnresolved(placeholder=f"body of step {step.name!r}")
+            body_template = self._body_as_template(step)
+            return TemplateUnresolved(
+                step_name=step.name,
+                site="body",
+                unresolved=_placeholder_names(body_template) if body_template else (),
+            )
         if body_content_type is not None and "Content-Type" not in substituted_headers:
             substituted_headers["Content-Type"] = body_content_type
 
@@ -825,6 +896,21 @@ def _hostname(url: str) -> str:
     """Hostname helper used by the executor for cache lookups."""
     parsed = urlparse(url)
     return (parsed.hostname or url).lower()
+
+
+def _placeholder_names(template: str) -> tuple[str, ...]:
+    """Return the ``step.capture`` names a template references, in order.
+
+    Identifiers only. Used to describe a template failure without persisting
+    the template, which can carry a presigned URL since F4.
+
+    Args:
+        template: The raw template text that failed to resolve.
+
+    Returns:
+        The ``producing_step.capture_name`` pairs, in template order.
+    """
+    return tuple(f"{producing}.{capture}" for producing, capture in find_placeholders(template))
 
 
 def default_clock() -> datetime:

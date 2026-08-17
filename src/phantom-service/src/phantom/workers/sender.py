@@ -298,7 +298,7 @@ class Sender:
             return
         if isinstance(result, TemplateUnresolved):
             await self._on_terminal_failure(
-                store, row, last_error=f"template_unresolved:{result.placeholder}"
+                store, row, last_error=f"template_unresolved:{result.token()}"
             )
             return
         if isinstance(result, RouteUnresolved):
