@@ -1,4 +1,4 @@
-"""N1 — one decode rule for inline base64, enforced at admission and at send.
+"""N1: one decode rule for inline base64, enforced at admission and at send.
 
 ``ChainBodyBytes.value_b64`` carried no validation beyond being a string, and
 the executor decoded it with a bare ``base64.b64decode``. The decoder raises two

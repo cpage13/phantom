@@ -1,4 +1,4 @@
-"""F2 — a PARTIAL body is a missing body, caught at the sender's load boundary.
+"""F2: a PARTIAL body is a missing body, caught at the sender's load boundary.
 
 ``Sender._load_body_refs`` reads the body store and then iterates only what the
 store RETURNED. Nothing checked that every ref declared in ``row.body_hashes``

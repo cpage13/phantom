@@ -260,7 +260,7 @@ async def test_start_purge_is_idempotent_on_clean_tmp(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------
-# F10 — every directory level this store CREATES must have its parent
+# F10: every directory level this store CREATES must have its parent
 # fsynced before ``put()`` returns. A directory entry is durable only
 # once the directory HOLDING it has been fsynced, and ``makedirs``
 # leaves new entries in their parents' dirty page cache. Before F10 only

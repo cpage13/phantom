@@ -1,4 +1,4 @@
-"""F1 — an unroutable step is CLASSIFIED, and the sender parks the row in ``stored``.
+"""F1: an unroutable step is CLASSIFIED, and the sender parks the row in ``stored``.
 
 ``phantom.routing.resolve_route`` raises ``ValueError`` when no configured
 ``RouteCfg`` host pattern matches. Admission route-checks only the FIRST step's

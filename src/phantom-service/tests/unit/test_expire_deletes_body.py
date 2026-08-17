@@ -1,4 +1,4 @@
-"""F3 — ``expire_row`` deletes the BYTES it says it discarded, not just the stamp.
+"""F3: ``expire_row`` deletes the BYTES it says it discarded, not just the stamp.
 
 ``workers/_expire.py`` is the single writer of ``new_state="expired"`` (ADR-032).
 It stamped ``body_discarded_at`` and zeroed the row's accounting through
