@@ -11,7 +11,9 @@ decodable inline base64 bodies. The placeholder pass is CONDITIONAL on
 the envelope's ``templated`` flag: a chain marked literal declares that
 its brace spans are content, so running the reference check over it
 would reject exactly the chains the marker exists to admit. Every other
-pass, the base64 one included, runs unconditionally. This module also owns the ONE definition
+pass, the base64 one included, runs unconditionally.
+
+This module also owns the ONE definition
 of how Phantom decodes an inline base64 body,
 :func:`decode_inline_body_b64`, plus its exception, so admission and the
 executor cannot drift apart on either the decode rule or its failure
