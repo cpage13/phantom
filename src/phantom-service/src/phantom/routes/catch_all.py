@@ -19,9 +19,12 @@ header it signed with throwaway credentials; it knows nothing of Phantom's
   URL must be rewritten to a REAL upstream BEFORE dispatch, or Phantom
   would forward the request back to itself in an infinite loop. Two
   carriers (first hit wins): an explicit ``?phantom=<full-url>`` query
-  parameter, then a configured ``Settings.phantom_default_target``. When
-  neither names a destination (and on an empty path) the request is
-  rejected 421 ``invalid_target`` BEFORE any durable write.
+  parameter, then a configured ``Settings.phantom_default_target``. Both
+  carriers preserve the inbound query byte-for-byte, minus the reserved
+  ``phantom`` parameter, so query-addressed operations (``?partNumber=``,
+  ``?uploadId=``, ``?uploads``, a presigned credential set) survive the
+  rewrite. When neither names a destination (and on an empty path) the
+  request is rejected 421 ``invalid_target`` BEFORE any durable write.
 
 * TASK 1.2 — the raw→envelope adapter. A 1-step :class:`ChainEnvelope` is
   synthesized around the resolved URL, the request method, the raw body,
@@ -44,6 +47,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Request, Response
 
 from phantom.chain.executor import _PHANTOM_RESERVED_HEADER_PREFIX
+from phantom.chain.query import filter_raw_query
 from phantom.config.settings import InstanceCfg
 from phantom.instances.dispatcher import InstanceDispatcher
 from phantom.models.chain import ChainBodyRef, ChainEnvelope, ChainStep
@@ -90,12 +94,72 @@ _RESERVED_FIRST_SEGMENTS: frozenset[str] = frozenset(
 # bind host (re-creating the forward loop the destination resolver exists to
 # prevent); ``Content-Length`` is recomputed by the transport at forward time
 # and a stale value would corrupt the upstream request. (``Authorization`` is
-# deliberately NOT here — it is forwarded as-is so the client's presigned /
-# SigV4 signature reaches the upstream untouched, Phase-1 forward-as-is.)
+# deliberately NOT here: it is forwarded as-is. A header-signed client
+# signature therefore reaches the upstream untouched, and since F4 so does the
+# QUERY that carries a presigned signature, which is where a presigned
+# credential actually lives. The one exception is an ``aws_sigv4`` route,
+# where Phantom's own signature supersedes the client's and the executor
+# strips the presigned parameter set before signing.)
 _HOP_BY_HOP_HEADERS: frozenset[str] = frozenset({"host", "content-length"})
+
+# Phantom's reserved query-parameter carrier, reserved exactly the way the
+# ``X-Phantom-*`` header namespace is: a raw-intake request may not use a
+# query parameter of this name for its own purposes, because Phantom consumes
+# it as the destination carrier and strips it before forwarding.
+_PHANTOM_QUERY_CARRIER = "phantom"
 
 
 router = APIRouter()
+
+
+def _with_forwarded_query(url: str, request: Request) -> str:
+    """Attach the inbound query, minus Phantom's carrier, to ``url``.
+
+    Byte-preserving by construction: the raw query text is split on ``&`` and
+    the surviving segments are reassembled verbatim, so percent-encoding, ``+``
+    versus ``%20``, parameter order and repeated keys all survive exactly. An
+    S3 presigned signature is computed over the canonical query string, so a
+    ``parse_qsl``/``urlencode`` round trip would silently invalidate it.
+
+    The carrier comparison applies ``unquote_plus`` to each raw key because
+    DETECTION runs on the parsed view: starlette builds ``QueryParams`` with
+    ``parse_qsl(..., keep_blank_values=True)``, which percent-decodes and
+    plus-decodes the KEY. Without the same normalisation here an inbound
+    ``?%70hantom=<url>`` would select the destination through the parsed view
+    AND survive the raw strip, so Phantom's own control parameter would reach
+    the upstream and be folded into any signature it validates. The strip must
+    be the exact inverse of the detection.
+
+    Fragments are handled before the join. ``url`` is producer-supplied on the
+    explicit-carrier path and may carry a ``#``; appending the query after it
+    would put the whole surviving query inside the fragment, which the
+    transport drops, silently losing exactly what F4 exists to preserve.
+
+    The INBOUND half is starlette's, not Phantom's: ``request.url.query`` comes
+    from a parsed view rather than the raw ``query_string``, so a ``#`` in the
+    request target truncates the query before this function runs
+    (``query_string=b"a=1#frag&b=2"`` yields ``"a=1"``). A ``#`` is not a legal
+    part of a request target, so this is the client's error rather than
+    Phantom's; nothing after it is forwarded. A percent-encoded ``%23`` is
+    data, not a delimiter, and it survives byte for byte.
+
+    Args:
+        url: The resolved destination, which may already carry its own query
+            and may carry a fragment.
+        request: The inbound raw-intake request.
+
+    Returns:
+        ``url`` unchanged when no query survives, otherwise ``url`` with the
+        surviving query joined after ``?`` or ``&`` as appropriate and any
+        fragment re-attached at the end. Never emits a bare trailing ``?``.
+    """
+    kept = filter_raw_query(request.url.query, keep=lambda key: key != _PHANTOM_QUERY_CARRIER)
+    if not kept:
+        return url
+    base, hash_sep, fragment = url.partition("#")
+    separator = "&" if "?" in base else "?"
+    joined = f"{base}{separator}{kept}"
+    return f"{joined}{hash_sep}{fragment}" if hash_sep else joined
 
 
 def _resolve_destination(
@@ -107,12 +171,20 @@ def _resolve_destination(
 
     Phase-1 carriers, first hit wins (``id_routes`` is deferred):
 
-    1. ``?phantom=<full-url>`` query parameter — used verbatim (the explicit
-       carrier always wins, including on an empty path). Phase 1 accepts a
-       FULL URL only; bare ids are not resolved here.
+    1. ``?phantom=<full-url>`` query parameter: the carrier's value names the
+       destination (the explicit carrier always wins, including on an empty
+       path). Phase 1 accepts a FULL URL only; bare ids are not resolved here.
     2. A configured ``Settings.phantom_default_target`` — the path is
        appended (``{default}/{phantom_path}``) for the single-upstream
        convenience case.
+
+    BOTH carriers preserve the rest of the inbound query byte-for-byte
+    (:func:`_with_forwarded_query`), so a query-addressed operation such as a
+    multipart part upload reaches the upstream as that operation rather than as
+    a whole-object overwrite. The ``phantom`` parameter itself is Phantom's own
+    control channel and is always stripped; the comparison that strips it is
+    ``unquote_plus``-normalised, so it is the exact inverse of the parsed-view
+    detection that consumed the carrier here.
 
     An empty / slash-only ``phantom_path`` with no ``?phantom=`` carrier is
     "no address" — a stock object PUT always names a bucket/key, so an empty
@@ -127,18 +199,20 @@ def _resolve_destination(
             or ``None`` when unset.
 
     Returns:
-        The resolved full upstream URL, or ``None`` when nothing names a
-        real destination.
+        The resolved full upstream URL (query preserved), or ``None`` when
+        nothing names a real destination.
     """
-    explicit = request.query_params.get("phantom")
+    explicit = request.query_params.get(_PHANTOM_QUERY_CARRIER)
     if explicit:
-        return explicit
+        return _with_forwarded_query(explicit, request)
 
     if phantom_path.strip("/") == "":
         return None
 
     if phantom_default_target:
-        return phantom_default_target.rstrip("/") + "/" + phantom_path
+        return _with_forwarded_query(
+            phantom_default_target.rstrip("/") + "/" + phantom_path, request
+        )
 
     return None
 

@@ -223,6 +223,20 @@ Re-signing is what lets a producer push to S3 with a stock S3 SDK
 quick start. The destination is resolved from `phantom_default_target`
 (or a per-request `?phantom=<url>` carrier). See ADR-033.
 
+Both carriers preserve the rest of the inbound query byte-for-byte, so
+query-addressed operations (`?partNumber=`, `?uploadId=`, `?uploads`,
+`?tagging`) reach the upstream as the operation the client asked for.
+`phantom` is a reserved query-parameter name: Phantom consumes it as the
+destination carrier and strips it before forwarding, so a client whose own
+API uses a parameter of that name cannot address it through raw intake.
+
+On an `aws_sigv4` route Phantom's signature is authoritative, so an inbound
+presigned credential (`X-Amz-Signature` and its companions in the query) is
+superseded material and is stripped before signing; the strip emits one INFO
+record naming the chain id and the destination host, never a parameter value.
+If you want an inbound presigned request honoured as-is, declare that route
+`auth_mode: none`.
+
 The route declaration that turns on re-signing:
 
 ```yaml

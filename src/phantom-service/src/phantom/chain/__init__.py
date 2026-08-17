@@ -5,6 +5,7 @@ Modules:
 * :mod:`phantom.chain.jsonpath` — JSONPath compile/extract/scan helpers.
 * :mod:`phantom.chain.parser` — envelope+body_refs parser.
 * :mod:`phantom.chain.executor` — one-step execution primitive.
+* :mod:`phantom.chain.query`: the byte-preserving query-string fold.
 """
 
 from __future__ import annotations

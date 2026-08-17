@@ -34,6 +34,7 @@ from phantom.chain.parser import (
     decode_inline_body_b64,
     envelope_from_persistence_json,
 )
+from phantom.chain.query import filter_raw_query
 from phantom.chain.sigv4_signer import SigV4SigningError, sign_sigv4
 from phantom.config.settings import InstanceCfg
 from phantom.models.chain import (
@@ -68,6 +69,55 @@ _PHANTOM_RESERVED_HEADER_PREFIX = "x-phantom-"
 # credentials, and ``RouteUnresolved.host`` is persisted verbatim into
 # ``last_error``, which the admin API surfaces.
 _NO_HOST_TOKEN = "<no-host>"
+
+# The AWS SigV4 query-string ("presigned") credential set, lower-cased. A
+# client that presigned its request carries its whole credential here rather
+# than in a header. On an ``aws_sigv4`` route Phantom's own signature is
+# authoritative (ADR-033), so this set is superseded material and is stripped
+# before signing; every other parameter survives byte-for-byte.
+_SIGV4_PRESIGN_QUERY_PARAMS: frozenset[str] = frozenset(
+    {
+        "x-amz-algorithm",
+        "x-amz-credential",
+        "x-amz-date",
+        "x-amz-expires",
+        "x-amz-security-token",
+        "x-amz-signature",
+        "x-amz-signedheaders",
+    }
+)
+
+
+def _strip_presigned_query(url: str) -> str:
+    """Return ``url`` with the AWS SigV4 presigned parameter set removed.
+
+    ADR-033 makes Phantom's host-keyed signature authoritative on an
+    ``aws_sigv4`` route, so a client's presigned credential in the query is
+    superseded material; forwarding both earns a 4xx for presenting two
+    authentication mechanisms. The exact analogue of F7's superseded-header
+    removal, in the other carrier. The whole set is removed rather than only
+    ``x-amz-signature``, because botocore signs the canonical query string it
+    is handed and orphaned ``X-Amz-Credential`` and ``X-Amz-Date`` parameters
+    would put the client's credential identifiers inside Phantom's signature.
+
+    Every non-presigned parameter survives byte-for-byte through
+    :func:`filter_raw_query`. A fragment is split off before the query span and
+    re-attached after it.
+
+    Args:
+        url: The absolute step URL about to be signed and forwarded.
+
+    Returns:
+        ``url`` with the presigned parameters removed, and with no bare
+        trailing ``?`` when nothing survives.
+    """
+    head, hash_sep, fragment = url.partition("#")
+    base, question, raw = head.partition("?")
+    if not question:
+        return url
+    kept = filter_raw_query(raw, keep=lambda key: key.lower() not in _SIGV4_PRESIGN_QUERY_PARAMS)
+    out = f"{base}?{kept}" if kept else base
+    return f"{out}{hash_sep}{fragment}" if hash_sep else out
 
 
 @dataclass(frozen=True)
@@ -362,6 +412,21 @@ class ChainExecutor:
                 return FailedAuth(status=401, observed_at=self._clock())
             substituted_headers["Authorization"] = slot.bearer
         elif resolved.auth_mode == "aws_sigv4":
+            # F4 precedence: Phantom's signature is authoritative on this route
+            # (ADR-033), so a client's presigned query credential is superseded.
+            # REBIND rather than pass a stripped copy to the signer: full_url is
+            # read again at the UpstreamRequest below, and signing one URL while
+            # forwarding another is a canonical-query mismatch that earns a 403
+            # SignatureDoesNotMatch on every presigned upload.
+            stripped = _strip_presigned_query(full_url)
+            if stripped != full_url:
+                logger.info(
+                    "stripped client presigned credentials on aws_sigv4 route for "
+                    "chain_id=%s dest_host=%s",
+                    row.chain_id,
+                    _hostname(full_url),
+                )
+            full_url = stripped
             # SigV4 signer arm (COPY of the bearer arm above): the host-keyed
             # CredentialStore slot is the refreshable slot, the analogue of the
             # (endpoint, uid) token slot. A missing/bad credential — including

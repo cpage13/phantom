@@ -36,6 +36,8 @@ from phantom.storage import FileBodyStore, RamBodyStore, SqliteTokenCache, Sqlit
 from phantom.strategies import FixedIntervalsStrategy
 from phantom.transport import UpstreamRequest, UpstreamResponse
 from phantom.workers.saturation import SaturationGate
+from starlette.datastructures import Headers
+from starlette.requests import Request
 
 from .conftest import make_snapshot, snapshot_thunk, track_instance
 
@@ -496,3 +498,160 @@ async def _store_is_empty(ctx: InstanceContext) -> bool:
     """True when the instance's upload store holds no rows."""
     chain_ids = await ctx.store.list_all_chain_ids()
     return len(chain_ids) == 0
+
+
+# ---------------------------------------------------------------------------
+# F4: query-string preservation on both destination carriers.
+# ---------------------------------------------------------------------------
+
+
+def _query_req(query: str) -> Request:
+    """Build the minimal ``Request`` ``_resolve_destination`` needs.
+
+    Copies the scope shape the resolver-precedence test above uses.
+    ``request.url.query`` works on this minimal scope because starlette
+    rebuilds the URL from the path and appends ``query_string``.
+
+    Args:
+        query: The raw query text with no leading ``?``.
+
+    Returns:
+        A bare ``Request`` carrying that query on a fixed ``PUT /b/k``.
+    """
+    scope = {
+        "type": "http",
+        "method": "PUT",
+        "path": "/b/k",
+        "query_string": query.encode(),
+        "headers": Headers({}).raw,
+    }
+    return Request(scope)
+
+
+def test_default_target_carrier_preserves_the_query() -> None:
+    """The common case: a stock client's query survives the path join.
+
+    Objective: a query-addressed raw upload (a multipart part PUT) must reach
+    the upstream as that operation, not as a whole-object overwrite. Success
+    is the synthesized step URL ending with the inbound query intact.
+    """
+    resolved = catch_all_routes._resolve_destination(
+        "bucket/key", _query_req("partNumber=3&uploadId=ABC"), "https://default.example.com"
+    )
+    assert resolved == "https://default.example.com/bucket/key?partNumber=3&uploadId=ABC"
+
+
+def test_explicit_carrier_strips_only_the_phantom_parameter() -> None:
+    """The control parameter is consumed; every other parameter is forwarded.
+
+    Objective: ``phantom`` is Phantom's own routing input, exactly as the
+    ``X-Phantom-*`` header namespace is, so it must not reach the upstream or
+    be folded into a signature it validates. Success is a forwarded query that
+    keeps ``partNumber`` and carries no ``phantom=`` substring.
+    """
+    resolved = catch_all_routes._resolve_destination(
+        "bucket/key",
+        _query_req("phantom=https://up.example/obj&partNumber=3"),
+        None,
+    )
+    assert resolved == "https://up.example/obj?partNumber=3"
+    assert "phantom=" not in resolved
+
+
+def test_percent_encoded_carrier_key_is_detected_and_stripped() -> None:
+    """The raw strip is the exact inverse of the parsed-view detection.
+
+    Objective: starlette builds ``QueryParams`` with ``parse_qsl``, which
+    percent-decodes the KEY, so ``?%70hantom=`` selects the destination
+    through the parsed view. A raw literal comparison in the strip would let
+    that same segment survive into the forwarded query, handing Phantom's own
+    control parameter to the upstream. This test guards the FIX against a
+    naive literal comparison rather than reproducing the original defect: it
+    is unreachable pre-fix, because pre-fix no query is forwarded at all.
+    Success is a forwarded query of exactly ``partNumber=3`` and no ``hantom``
+    substring anywhere in the URL.
+    """
+    resolved = catch_all_routes._resolve_destination(
+        "bucket/key",
+        _query_req("%70hantom=https://up.example/obj&partNumber=3"),
+        None,
+    )
+    assert resolved == "https://up.example/obj?partNumber=3"
+    assert "hantom" not in resolved
+
+
+def test_explicit_carrier_merges_with_a_query_the_target_already_has() -> None:
+    """The join rule when the explicit target is itself a presigned URL.
+
+    Objective: pin that a destination carrying its own query gets the
+    surviving inbound parameters appended with ``&``, never a second ``?``.
+    Success is both queries present and exactly one ``?`` in the URL.
+    """
+    resolved = catch_all_routes._resolve_destination(
+        "bucket/key",
+        _query_req("phantom=https://up.example/obj?X-Amz-Signature=abc&partNumber=3"),
+        None,
+    )
+    assert resolved == "https://up.example/obj?X-Amz-Signature=abc&partNumber=3"
+    assert resolved.count("?") == 1
+
+
+def test_fragment_in_the_target_does_not_swallow_the_query() -> None:
+    """A fragment in the target must not absorb the forwarded query.
+
+    Objective: appending after a ``#`` would put the whole surviving query
+    inside the fragment, which the transport drops, silently losing exactly
+    what F4 exists to preserve. The carrier value is sent percent-encoded
+    because a raw ``#`` in the request target truncates the inbound query
+    string before Phantom ever sees it. Success is the query landing before
+    the ``#``.
+    """
+    resolved = catch_all_routes._resolve_destination(
+        "bucket/key",
+        _query_req("phantom=https://up.example/obj%23frag&partNumber=3"),
+        None,
+    )
+    assert resolved == "https://up.example/obj?partNumber=3#frag"
+
+
+def test_query_is_preserved_byte_for_byte() -> None:
+    """The forwarded query is the inbound text, not a re-encoding of it.
+
+    Objective: an S3 presigned signature is computed over the canonical query
+    string, so a ``parse_qsl``/``urlencode`` round trip (which normalises
+    percent-encoding and rewrites ``+`` versus ``%20``) would silently turn a
+    working presigned upload into a 403. Success is STRING equality against
+    the exact inbound text, not parsed equality, which is why the assertion
+    is written this way: parsed equality would pass for a re-encoded query.
+    """
+    raw = "a=x%20y&a=second&b=p+q&c=&d=k%23v&X-Amz-Signature=DEADBEEF"
+    resolved = catch_all_routes._resolve_destination(
+        "bucket/key", _query_req(raw), "https://default.example.com"
+    )
+    assert resolved == f"https://default.example.com/bucket/key?{raw}"
+
+
+def test_no_query_produces_no_trailing_question_mark() -> None:
+    """Counter-test: a request with no query is unchanged.
+
+    Objective: the join must never emit a bare trailing ``?``. Success is a
+    resolved URL with no ``?`` at all.
+    """
+    resolved = catch_all_routes._resolve_destination(
+        "bucket/key", _query_req(""), "https://default.example.com"
+    )
+    assert resolved == "https://default.example.com/bucket/key"
+    assert "?" not in resolved
+
+
+def test_only_the_phantom_carrier_produces_no_trailing_question_mark() -> None:
+    """Counter-test for the strip: an empty survivor emits no separator.
+
+    Objective: when ``phantom`` is the only inbound parameter the surviving
+    query is empty, so the carrier value must come back exactly as supplied.
+    Success is equality with the carrier value.
+    """
+    resolved = catch_all_routes._resolve_destination(
+        "bucket/key", _query_req("phantom=https://up.example/obj"), None
+    )
+    assert resolved == "https://up.example/obj"

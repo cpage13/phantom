@@ -98,6 +98,28 @@ The admin surface exposes credential STATUS only, never secret material, and
 there is no GET/LIST credential endpoint today (relates to ADR-004: admin is
 loopback, no auth; and ADR-003: persistent at rest).
 
+### An inbound presigned credential is superseded and stripped
+
+Replacement is the whole point of re-signing, and a presigned request carries
+the producer's signature in the QUERY (`X-Amz-Signature`, `X-Amz-Credential`,
+`X-Amz-Date`, `X-Amz-Expires`, `X-Amz-Security-Token`, `X-Amz-SignedHeaders`,
+`X-Amz-Algorithm`) rather than in a header. On an `aws_sigv4` route the
+executor removes that whole parameter set from the step URL before signing, so
+Phantom's fresh signature is the only credential on the wire. Forwarding both
+would present two authentication mechanisms and earn a 4xx, and orphaned
+`X-Amz-Credential` / `X-Amz-Date` parameters would put the client's credential
+identifiers inside Phantom's own canonical query string. Every other query
+parameter survives byte-for-byte. This is the query-carrier analogue of
+rebuilding the outbound header map from the signed set.
+
+The strip is ROUTE-scoped, not carrier-scoped: it applies to any step Phantom
+sends on an `aws_sigv4` route, including a producer-authored chain. The other
+two auth modes keep the presigned set, because there Phantom replaces no
+signature: `none` IS the forward-as-is presigned case, and a `phantom_bearer`
+route pairs two unrelated credential systems rather than two signatures. An
+operator who wants an inbound presigned credential honoured declares the route
+`auth_mode: none`.
+
 ### Re-signing preserves the body bytes
 
 Re-signing replaces only the auth headers; the body bytes Phantom forwards are

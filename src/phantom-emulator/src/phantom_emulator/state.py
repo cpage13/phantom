@@ -209,6 +209,11 @@ class RawBody:
         method: The inbound HTTP verb that stored it — one of the forwarded
             upload verbs (``PUT``/``POST``/``PATCH``). Captured so the e2e
             can assert the verb round-trips through the catch-all to the sink.
+        query: The inbound query string with no leading ``?``, or ``""`` when
+            the request carried none. The ``:path`` convertor never captures
+            the query, so without this field a query-preserving forward and a
+            query-dropping one produce the same record and F4 is unobservable
+            from the sink.
         body: Raw bytes the unsigned, tokenless upload stored (byte-identical).
         content_type: The request ``Content-Type``, or ``None``.
         all_headers: Every inbound header (lowercased keys, original
@@ -218,6 +223,7 @@ class RawBody:
 
     path: str
     method: str
+    query: str
     body: bytes
     content_type: str | None
     all_headers: dict[str, str]

@@ -52,7 +52,9 @@ async def put_raw(path: str, request: Request, state: StateDep) -> Response:
     deliberately-naked Phase-1 sink. The ``{path:path}`` convertor captures the
     whole forwarded path (slash-bearing keys included) as the
     :attr:`EmulatorState.raw_bodies` key; the inbound verb is recorded in
-    :attr:`RawBody.method`.
+    :attr:`RawBody.method` and the inbound query string, which the convertor
+    never captures, in :attr:`RawBody.query` so a test can observe whether the
+    forwarder preserved it.
 
     Returns ``200`` (empty body) on store; ``413`` when the body exceeds the
     reused ``upstream.body_max_bytes`` cap (checked before the store so an
@@ -65,6 +67,7 @@ async def put_raw(path: str, request: Request, state: StateDep) -> Response:
     state.raw_bodies[path] = RawBody(
         path=path,
         method=request.method,
+        query=request.url.query,
         body=body,
         content_type=request.headers.get("content-type"),
         all_headers=all_headers,
