@@ -235,7 +235,14 @@ async def _push_credential(stack: E2EStack, *, secret_access_key: str) -> None:
     )
 
 
-async def _raw_put(stack: E2EStack, *, path: str, body: bytes, method: str = "PUT") -> UUID:
+async def _raw_put(
+    stack: E2EStack,
+    *,
+    path: str,
+    body: bytes,
+    method: str = "PUT",
+    headers: dict[str, str] | None = None,
+) -> UUID:
     """Drive a stock upload through Phantom's catch-all, return the chain id.
 
     A producer that knows nothing of SigV4 (or of Phantom's
@@ -251,13 +258,18 @@ async def _raw_put(stack: E2EStack, *, path: str, body: bytes, method: str = "PU
         body: The raw request body.
         method: The upload verb to send (``PUT`` default; the per-verb test
             also drives ``POST`` / ``PATCH``).
+        headers: Optional extra request headers, for the F7 arm that seeds a
+            client-supplied ``Authorization`` the way a client-signed upload
+            does.
 
     Returns:
         The minted chain id (parsed from ``X-Phantom-Upload-Id``) — the handle
         the admin API polls for the row state.
     """
     async with httpx.AsyncClient() as client:
-        resp = await client.request(method, f"{stack.phantom_url}/{path}", content=body)
+        resp = await client.request(
+            method, f"{stack.phantom_url}/{path}", content=body, headers=headers
+        )
     assert resp.status_code == INTAKE_ACCEPTED_STATUS, (
         f"raw intake expected {INTAKE_ACCEPTED_STATUS} ack, got {resp.status_code}: {resp.text!r}"
     )
@@ -338,6 +350,77 @@ async def test_sigv4_resign_round_trip_keystone() -> None:
         assert stored.all_headers.get("x-amz-content-sha256") == expected_sha256, (
             "the re-signed PUT must carry x-amz-content-sha256 == the real body hash; "
             f"got {stored.all_headers.get('x-amz-content-sha256')!r}"
+        )
+    finally:
+        await stack.tear_down()
+
+
+# A throwaway SigV4 Authorization in exactly the shape a client-signed upload
+# sends. Starlette lower-cases it to ``authorization`` on the way in, which is
+# what used to collide with botocore's canonical-cased ``Authorization``.
+_CLIENT_AUTHORIZATION = (
+    "AWS4-HMAC-SHA256 "
+    "Credential=AKIACLIENTTHROWAWAY/20260101/us-east-1/s3/aws4_request, "
+    "SignedHeaders=host;x-amz-date, "
+    "Signature=00000000000000000000000000000000000000000000000000000000deadbeef"
+)
+
+
+@pytest.mark.e2e
+async def test_sigv4_resign_replaces_a_client_supplied_authorization() -> None:
+    """F7: a client-signed upload leaves exactly ONE Authorization on the wire.
+
+    Objective: this is the real-world trigger. A stock S3 client signs its own
+    request, so the raw intake arrives carrying ``authorization``
+    (starlette lower-cases inbound names). botocore's map is case-insensitive
+    and re-adds the header canonical-cased, so a key-by-key copy-back left the
+    client's stale line beside Phantom's fresh one and the wire carried two.
+    S3 answers 403 SignatureDoesNotMatch, which Phantom classifies as a bad
+    credential for the whole destination.
+
+    Success: the row still reaches ``succeeded`` (the emulator's sink
+    validates the signature it recomputes, so it stores only on a faithful
+    single signature), and the stored object records exactly one
+    ``authorization`` value, which is Phantom's re-signature rather than the
+    client's. The sink joins multi-value headers with ``", "``, so a duplicate
+    would be observable as one value carrying two AWS4-HMAC-SHA256
+    credentials.
+    """
+    key = "nested/client-signed.bin"
+    stack = await boot_stack(config_overrides=_sigv4_overrides())
+    try:
+        await _push_credential(stack, secret_access_key=SECRET_ACCESS_KEY)
+
+        chain_id = await _raw_put(
+            stack,
+            path=f"{BUCKET}/{key}",
+            body=PAYLOAD,
+            headers={"Authorization": _CLIENT_AUTHORIZATION},
+        )
+
+        detail = await assert_chain_reaches_state(
+            stack.phantom_client,
+            chain_id,
+            state="succeeded",
+            timeout_seconds=SUCCEEDED_BUDGET_SECONDS,
+        )
+        assert detail.state == "succeeded"
+
+        stored = stack.emulator.s3_object(BUCKET, key)
+        assert stored is not None, (
+            f"no S3 object stored under {BUCKET}/{key!r}; the re-signed PUT was not validated"
+        )
+        authorization = stored.all_headers.get("authorization")
+        assert authorization is not None, "the forwarded request carried no Authorization"
+        assert authorization.count("AWS4-HMAC-SHA256") == 1, (
+            "exactly one Authorization must reach the upstream; the sink joins duplicates "
+            f"with ', ', and it recorded {authorization!r}"
+        )
+        assert "AKIACLIENTTHROWAWAY" not in authorization, (
+            "the client's superseded signature reached the upstream"
+        )
+        assert ACCESS_KEY_ID in authorization, (
+            f"the forwarded Authorization must be Phantom's re-signature; got {authorization!r}"
         )
     finally:
         await stack.tear_down()

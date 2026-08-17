@@ -61,8 +61,16 @@ precisely because S3 requires `x-amz-content-sha256` and base `SigV4Auth` never
 emits it. `sign_sigv4(*, method, url, headers, body, credential)` mutates the
 caller's `headers` in place; the botocore signer's `add_auth(request)`
 populates `Authorization`, `X-Amz-Date`, `x-amz-content-sha256`, and (when an
-STS session token is present) `X-Amz-Security-Token`, which a copy-back loop
-merges onto the caller's dict. Adding a future service is a new `SigningService`
+STS session token is present) `X-Amz-Security-Token`. The caller's mapping is
+then REBUILT from botocore's signed view rather than merged key by key: that
+view is case-insensitive and the caller's dict is not, so a merge left the
+caller's lowercase original beside every name botocore rewrote, and a
+client-signed request arrives lower-cased (starlette lower-cases inbound
+names). Two `Authorization` lines on the wire earn a 403
+SignatureDoesNotMatch. Rebuilding makes a duplicate structurally impossible
+for every header botocore rewrites, known or future; nothing is lost, because
+the view was seeded from the caller's own mapping and `add_auth` only adds and
+replaces. Adding a future service is a new `SigningService`
 member plus a `_SERVICE_SIGNERS` entry, not a redesign.
 
 ### The credential store keys on the destination host alone (`HostCredKey`)

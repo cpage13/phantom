@@ -95,11 +95,26 @@ async def sign_sigv4(
 
     The credential's :class:`~phantom.models.credential.SigningService` selects
     the botocore signer class via ``_SERVICE_SIGNERS``; for S3 that is
-    ``S3SigV4Auth``, which emits + signs ``x-amz-content-sha256``. Mutates
-    ``headers`` by adding the SigV4 ``Authorization`` header, the ``X-Amz-Date``
-    timestamp, the signed ``x-amz-content-sha256``, and (when the credential
-    carries a session token) ``X-Amz-Security-Token``. The request body is left
-    untouched.
+    ``S3SigV4Auth``, which emits + signs ``x-amz-content-sha256``.
+
+    REPLACES the contents of ``headers`` with botocore's signed view, in
+    place. That view is a superset of what the caller supplied: it was seeded
+    from this same mapping, and ``add_auth`` adds and replaces without
+    removing anything, so every unsigned header survives with its original
+    casing and value while the SigV4 ``Authorization``, the ``X-Amz-Date``
+    timestamp, the signed ``x-amz-content-sha256`` and (when the credential
+    carries a session token) ``X-Amz-Security-Token`` arrive canonical-cased.
+
+    The guarantee callers depend on is that NO header name appears twice
+    case-insensitively afterwards. botocore's map is case-insensitive and the
+    caller's dict is not, so merging the signed view back key by key would
+    leave the caller's lowercase original beside every name botocore rewrote,
+    and starlette lower-cases inbound names. Two ``Authorization`` lines on
+    the wire earn a 403 SignatureDoesNotMatch, which the executor classifies
+    as a bad credential for the whole destination.
+
+    The mapping object itself is never rebound, because the executor reads it
+    back after the call. The request body is left untouched.
 
     Args:
         method: The HTTP method (e.g. ``"PUT"``).
@@ -128,12 +143,21 @@ async def sign_sigv4(
     if signer_class is None:
         raise SigV4SigningError(f"no SigV4 signer registered for service {credential.service!r}")
     signer_class(botocore_creds, credential.service, region).add_auth(request)
-    # ``add_auth`` mutates ``request.headers`` (a case-insensitive map). Copy the
-    # signed headers back onto the caller's plain dict so the Authorization /
-    # X-Amz-* values reach the transport. ``request.headers`` was seeded from the
-    # same dict, so unsigned headers round-trip unchanged.
-    for name, value in request.headers.items():
-        headers[name] = value
+    # F7: REBUILD rather than merge. ``request.headers`` is botocore's
+    # case-INSENSITIVE map, seeded from this same dict, so it holds every
+    # unsigned header unchanged plus the signed ones canonical-cased.
+    # Assigning into the caller's case-SENSITIVE dict would leave the
+    # lowercase originals of every header botocore deleted and re-added
+    # (starlette lower-cases inbound names, so a client-signed raw-intake
+    # request arrives with ``authorization``), putting TWO Authorization
+    # lines on the wire and earning a 403 SignatureDoesNotMatch. Clearing
+    # first makes the outbound map exactly botocore's signed view, so a
+    # duplicate is structurally impossible for EVERY header botocore
+    # rewrites, not only the three we know it rewrites today. Mutate in
+    # place, never rebind: the executor reads this same object back.
+    signed = dict(request.headers.items())
+    headers.clear()
+    headers.update(signed)
 
 
 async def _resolve_credentials(
