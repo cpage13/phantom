@@ -745,7 +745,12 @@ OR rows accumulate in `auth_expired` state.
 `Authorization` header on a `phantom_bearer` route and no cached
 token exists for the `(endpoint, uid)` slot. Have the producer push a
 token via the `Authorization` header on any subsequent request, or
-via `PUT /v1/admin/tokens/{endpoint}/{uid}` on the admin API.
+via `PUT /v1/admin/tokens/{endpoint}/{uid}` on the admin API. Ingress
+caching of a client-supplied `Authorization` happens ONLY on
+`phantom_bearer` routes: on an `aws_sigv4` or `none` route (and when the
+first step matches no route at all) the header is forwarded or superseded
+per the route's mode but is never written to the token cache, so no slot
+appears for those hosts.
 
 **Cause path 2: cached token rejected.** Upstream returned 401 to
 Phantom; sender marked the token `bad` and parked the row in

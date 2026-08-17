@@ -805,7 +805,9 @@ A producer process wants to upload a file.
     | 2. encode bodies via configured codec; compute body_hash (raw) +
     |    storage_hash (encoded) - before the gate so it admits the STORED size
     | 3. saturation gate admits or refuses (typed AdmissionResult; 503 on refusal)
-    | 4. row preparation: auth header -> token cache write; ingress dedup key
+    | 4. row preparation: auth header -> token cache write, but ONLY when the
+    |    first step resolves to a phantom_bearer route (D3/F11: an aws_sigv4
+    |    or none route, and an unroutable first step, cache nothing); ingress dedup key
     |    (X-Phantom-Idempotency-Key, or minted str(chain_id) when absent);
     |    mode-aware body_location
     | 5. persist: chain_id_in_use pre-check -> chain_id namespace clear (R11-1:

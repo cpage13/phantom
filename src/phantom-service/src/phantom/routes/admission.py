@@ -62,7 +62,7 @@ from phantom.models.upload import (
     StorageHash,
     UploadRow,
 )
-from phantom.routing import resolve_route
+from phantom.routing import ResolvedRoute, resolve_route
 from phantom.storage.interface import InsertClaimOutcome
 from phantom.storage.sqlite_store import is_transient_lock_error
 from phantom.workers.saturation import (
@@ -215,6 +215,27 @@ def _hostname(url: str) -> str:
     return (parsed.hostname or url).lower()
 
 
+def _resolved_route_or_none(url: str, instance_ctx: InstanceContext) -> ResolvedRoute | None:
+    """Resolve ``url``'s route, or ``None`` when no route matches.
+
+    ``resolve_route`` raises ``ValueError`` on a miss. Admission deliberately
+    tolerates a miss (a chain whose first step matches no route is still
+    admitted; the executor classifies it at send time, F1), so both admission
+    consumers need the non-raising form.
+
+    Args:
+        url: The absolute URL to resolve, normally the chain's first step.
+        instance_ctx: The owning instance, whose ``cfg`` carries the routes.
+
+    Returns:
+        The resolved route, or ``None`` on a miss.
+    """
+    try:
+        return resolve_route(url, instance_ctx.cfg)
+    except ValueError:
+        return None
+
+
 def _route_name(url: str, instance_ctx: InstanceContext) -> str:
     """Resolve route name; fall back to ``unknown`` on miss.
 
@@ -225,11 +246,8 @@ def _route_name(url: str, instance_ctx: InstanceContext) -> str:
     ``RouteUnresolved`` and parks the row in ``stored`` for operator repair
     (F1). The ``"unknown"`` fallback is therefore recorded, not unchecked.
     """
-    try:
-        resolved = resolve_route(url, instance_ctx.cfg)
-        return resolved.route_name
-    except ValueError:
-        return "unknown"
+    resolved = _resolved_route_or_none(url, instance_ctx)
+    return resolved.route_name if resolved is not None else "unknown"
 
 
 def _sha256_hex(b: bytes) -> str:
@@ -626,12 +644,40 @@ async def _build_row(
     instance_ctx: InstanceContext,
     encoded: _EncodedBodies,
 ) -> _PreparedRow:
-    """Build the upload row and its dedup key; cache inbound auth.
+    """Build the upload row and its dedup key; cache inbound auth on bearer routes.
 
     The one side effect is deliberate and stated: when the submission
-    carries an ``Authorization`` header, it is written to the token cache
-    (keyed by the resolved first-step endpoint + uid) before the row is
-    constructed, exactly as the monolithic flow did.
+    carries an ``Authorization`` header AND the first step resolves to a
+    route whose ``auth_mode`` is ``phantom_bearer``, it is written to the
+    token cache (keyed by the resolved first-step endpoint + uid) before the
+    row is constructed.
+
+    The ``auth_mode`` gate is D3 (F11). The four cases are exhaustive over
+    ``AuthMode`` plus the no-route miss:
+
+    * ``phantom_bearer``: CACHE. The only mode where Phantom injects a
+      bearer at egress, so the only mode where a cached bearer is ever read.
+      Raw intake on a bearer route still caches, which is the documented
+      pilot behaviour.
+    * ``aws_sigv4``: DO NOT CACHE. The inbound ``Authorization`` is an AWS
+      SigV4 credential string bound to one request's canonical form. It is
+      useless as a bearer, and caching it overwrites a real bearer for that
+      slot, flips a ``bad`` slot back to ``fresh`` in the operator's own
+      token view, and fires the kickers' wake handlers on every raw PUT. At
+      egress this route re-signs from the host-keyed credential store and
+      never reads the token cache.
+    * ``none``: DO NOT CACHE. Forward-as-is injects nothing at egress, so
+      the value can never be read back; writing it can only cause the same
+      wake-and-churn side effects with no upside.
+    * No route matches: DO NOT CACHE. Admission deliberately admits such a
+      chain (F1's premise) and the executor classifies it at send time.
+      Caching a bearer for a destination Phantom has no route to cannot help
+      delivery, and the write would wake parked rows on that slot for
+      nothing.
+
+    The row's ``endpoint`` column is set from the first step's hostname on
+    EVERY path, gate or no gate: it records where the row was headed, and it
+    is not a cache-key decision.
 
     Args:
         inputs: The parsed admission inputs.
@@ -643,7 +689,8 @@ async def _build_row(
     """
     first_step_url = _resolve_first_step_url(inputs.envelope)
     endpoint = _hostname(first_step_url)
-    if inputs.authorization:
+    resolved = _resolved_route_or_none(first_step_url, instance_ctx)
+    if inputs.authorization and resolved is not None and resolved.auth_mode == "phantom_bearer":
         await instance_ctx.token_cache.set(
             endpoint=endpoint,
             uid=inputs.uid_header,
