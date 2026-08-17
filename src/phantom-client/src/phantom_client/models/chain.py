@@ -312,6 +312,21 @@ class ChainEnvelope(BaseModel):
             "this; if it's a full URL, this is ignored."
         ),
     )
+    templated: bool = Field(
+        True,
+        description=(
+            "Whether ``{{step_name.capture_name}}`` placeholder substitution "
+            "runs for this chain. True (the default) is the authored-chain "
+            "behaviour: URLs, header values and text/JSON bodies are treated "
+            "as templates and resolved against captured values at send time. "
+            "False marks the chain as literal: no substitution runs, no "
+            "capture-TTL gate runs, and a brace span in any field is "
+            "forwarded verbatim. Phantom's raw-intake catch-all sets False, "
+            "because a synthesized chain has no captures and its URL carries "
+            "a producer-supplied object key that may contain braces. A "
+            "producer submitting literal chains may set it too."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod

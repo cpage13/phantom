@@ -7,7 +7,11 @@ typed errors with ADR-010 error codes.
 Both entry points run the same static validation passes through
 :func:`_post_validate`: no duplicate step names, compilable capture
 JSONPaths, statically resolvable ``{{step.var}}`` placeholders, and
-decodable inline base64 bodies. This module also owns the ONE definition
+decodable inline base64 bodies. The placeholder pass is CONDITIONAL on
+the envelope's ``templated`` flag: a chain marked literal declares that
+its brace spans are content, so running the reference check over it
+would reject exactly the chains the marker exists to admit. Every other
+pass, the base64 one included, runs unconditionally. This module also owns the ONE definition
 of how Phantom decodes an inline base64 body,
 :func:`decode_inline_body_b64`, plus its exception, so admission and the
 executor cannot drift apart on either the decode rule or its failure
@@ -259,8 +263,15 @@ def _post_validate(envelope: ChainEnvelope) -> None:
     """Run every static validation pass on a parsed envelope."""
     _validate_no_duplicate_step_names(envelope)
     _validate_jsonpath_syntax(envelope)
-    _validate_static_placeholders(envelope)
     _validate_inline_body_base64(envelope)
+    if envelope.templated:
+        # N3: a literal chain declares that brace spans are content, not
+        # placeholders. Running the static reference check over it would
+        # reject exactly the chains the marker exists to admit. The base64
+        # pass above stays OUTSIDE this gate deliberately: a literal chain's
+        # inline body is still real base64 and still reaches b64decode at
+        # send, so skipping it would reopen N1's crash loop.
+        _validate_static_placeholders(envelope)
 
 
 async def parse_json_request(

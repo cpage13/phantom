@@ -6,6 +6,10 @@ owns:
 
 1. The capture-TTL gate (ADR-011) — checked first.
 2. ``{{step.var}}`` placeholder substitution in URL, headers, and JSON body.
+   Skipped ENTIRELY for a chain marked ``templated=False`` (N3): no
+   substitution runs and the capture-TTL gate returns immediately, so a
+   brace span is forwarded as content. The raw-intake catch-all sets that
+   marker, because an object key may legally contain braces.
 3. Auth injection — looks up ``token_cache.get(endpoint, uid)`` when the
    route is ``phantom_bearer``.
 4. Idempotency-header injection per the step's ``idempotency_header``.
@@ -457,8 +461,11 @@ class ChainExecutor:
         if ttl_check is not None:
             return ttl_check
 
-        # (b) Substitute placeholders in URL, headers, body.
-        substituted_url, ok = substitute(step.url, self._captures_as_dict(row.captured_values))
+        # (b) Substitute placeholders in URL, headers, body. A chain marked
+        # ``templated=False`` (N3) passes every template through verbatim.
+        substituted_url, ok = self._substitute_or_literal(
+            step.url, row.captured_values, templated=envelope.templated
+        )
         if not ok:
             return TemplateUnresolved(
                 step_name=step.name, site="url", unresolved=_placeholder_names(step.url)
@@ -480,7 +487,9 @@ class ChainExecutor:
                 # framing over a fixed-length body on EVERY retry.
                 logger.debug("stripping hop-by-hop header from upstream: %s", name)
                 continue
-            rendered, header_ok = substitute(value, self._captures_as_dict(row.captured_values))
+            rendered, header_ok = self._substitute_or_literal(
+                value, row.captured_values, templated=envelope.templated
+            )
             if not header_ok:
                 return TemplateUnresolved(
                     step_name=step.name,
@@ -492,7 +501,7 @@ class ChainExecutor:
 
         try:
             body_bytes, body_content_type, sub_ok = self._render_body(
-                step, row.captured_values, body_refs
+                step, row.captured_values, body_refs, templated=envelope.templated
             )
         except InlineBodyDecodeError as exc:
             logger.warning(
@@ -740,7 +749,16 @@ class ChainExecutor:
         If any referenced capture is missing/expired:
           - ``row.capture_reexecution_active is False`` → ``CaptureExpiredStored``.
           - True → rewind to the producing step (``CaptureExpiredRewind``).
+
+        A chain marked ``templated=False`` (N3) returns ``None`` immediately:
+        its brace spans are content, not capture references, so reading them
+        as expired ones would be wrong. This gate already no-ops for every
+        synthesized raw-intake chain (which carries no captured values at
+        all), so the early return is about keeping the marker's meaning
+        coherent, namely that no brace span is INTERPRETED anywhere.
         """
+        if not envelope.templated:
+            return None
         placeholders: list[tuple[str, str]] = []
         placeholders.extend(find_placeholders(step.url))
         for v in step.headers.values():
@@ -779,6 +797,30 @@ class ChainExecutor:
         return None
 
     @staticmethod
+    def _substitute_or_literal(
+        template: str, captured: CapturedValues, *, templated: bool
+    ) -> tuple[str, bool]:
+        """Substitute placeholders, or pass the text through for a literal chain.
+
+        The ONE place the ``ChainEnvelope.templated`` flag is honoured. A
+        literal chain (N3) resolves to ``(template, True)``: a brace span in a
+        raw-intake object key is content, not a capture reference, and treating
+        it as one terminated a valid upload as ``failed`` with a template error
+        it never had a template for.
+
+        Args:
+            template: The raw text, which may contain ``{{step.capture}}``.
+            captured: The chain's captured values.
+            templated: The envelope's marker. ``False`` short-circuits.
+
+        Returns:
+            ``(rendered_or_verbatim, all_resolved)``.
+        """
+        if not templated:
+            return template, True
+        return substitute(template, ChainExecutor._captures_as_dict(captured))
+
+    @staticmethod
     def _captures_as_dict(
         captured: CapturedValues,
     ) -> dict[str, dict[str, Any]]:
@@ -799,8 +841,19 @@ class ChainExecutor:
         step: ChainStep,
         captured: CapturedValues,
         body_refs: dict[str, bytes],
+        *,
+        templated: bool,
     ) -> tuple[bytes, str | None, bool]:
         """Produce the outbound body bytes + Content-Type for ``step``.
+
+        Args:
+            step: The step whose body is being rendered.
+            captured: The chain's captured values.
+            body_refs: The rehydrated body bytes, keyed by ref name.
+            templated: The envelope's ``templated`` marker. ``_render_body``
+                does not receive the envelope, so the flag is passed down; a
+                literal chain (N3) forwards a brace span in a text or JSON
+                body verbatim.
 
         Returns:
             ``(bytes, content_type_or_None, all_resolved)``.
@@ -809,12 +862,16 @@ class ChainExecutor:
             return b"", None, True
         if isinstance(step.body, ChainBodyJson):
             value_template = json.dumps(step.body.value)
-            rendered, ok = substitute(value_template, self._captures_as_dict(captured))
+            rendered, ok = self._substitute_or_literal(
+                value_template, captured, templated=templated
+            )
             if not ok:
                 return b"", None, False
             return rendered.encode("utf-8"), "application/json", True
         if isinstance(step.body, ChainBodyText):
-            rendered, ok = substitute(step.body.value, self._captures_as_dict(captured))
+            rendered, ok = self._substitute_or_literal(
+                step.body.value, captured, templated=templated
+            )
             if not ok:
                 return b"", None, False
             return rendered.encode("utf-8"), step.body.content_type, True

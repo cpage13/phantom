@@ -40,7 +40,11 @@ header it signed with throwaway credentials; it knows nothing of Phantom's
   identical degraded-guard → dispatch → :func:`admit_chain` tail that
   ``POST /v1/send`` uses, so the synthesized envelope is buffered exactly
   like a producer-supplied one. Forwarding is AS-IS — Phantom does not
-  re-sign in Phase 1 (the ``aws_sigv4`` signer is Phase 2).
+  re-sign in Phase 1 (the ``aws_sigv4`` signer is Phase 2). The
+  synthesized chain is marked LITERAL (``templated=False``): it has no
+  captures, and its URL carries an object key that may legally contain a
+  ``{{...}}`` span, which would otherwise fail substitution at send time
+  and terminate a valid upload.
 """
 
 from __future__ import annotations
@@ -297,6 +301,17 @@ def _synthesize_envelope(
     when the request actually carried a body — a :class:`ChainBodyRef`
     naming the constant ``payload`` ref.
 
+    The chain is marked LITERAL (``templated=False``, N3). A synthesized
+    chain has no captures, and its URL carries a producer-supplied object key
+    that may legally contain a ``{{...}}`` span, so treating the URL as a
+    template made substitution fail and terminated a valid upload as
+    ``failed`` with a template error it never had a template for. The marker
+    turns off every interpretation of a brace span for this chain: the
+    parser's static pass, the capture-TTL gate, and all four substitution
+    sites. Escaping the key instead was rejected because it would rewrite the
+    request line Phantom forwards, which breaks the transparent-proxy promise
+    for the URI and invalidates any client signature over the true path.
+
     Args:
         resolved_url: The real upstream URL (TASK 1.3 resolution result).
         method: The request method (``PUT`` / ``POST`` / ``PATCH``).
@@ -325,6 +340,7 @@ def _synthesize_envelope(
     return ChainEnvelope(  # type: ignore[call-arg]
         chain_id=uuid4(),
         steps=[step],
+        templated=False,
     )
 
 

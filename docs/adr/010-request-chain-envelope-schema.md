@@ -41,7 +41,27 @@ class ChainEnvelope(BaseModel):
         None,
         description="Optional default target URL applied to steps that don't specify one. If a step's `url` is a path (e.g., '/v2/files') it's appended to this; if it's a full URL, this is ignored.",
     )
+    templated: bool = Field(
+        True,
+        description="Whether {{step_name.capture_name}} placeholder substitution runs for this chain. False marks the chain literal: no substitution, no capture-TTL gate, and a brace span in any field is forwarded verbatim.",
+    )
 ```
+
+`templated` was added by the review-08-12 cycle (finding N3). The default is
+`True`, so every previously-valid submission means exactly what it meant
+before, and a persisted envelope written without the key deserializes as
+templated (a field WITH a default is omissible), so there is no migration.
+The reason it is an ENVELOPE field rather than a row column is exactly that:
+the marker describes the chain, so it lives on the chain, and the persisted
+JSON carries it without a DDL change.
+
+Phantom's raw-intake catch-all sets `templated: false` on the chain it
+synthesizes. An object key is arbitrary bytes and may contain a `{{...}}`
+span; treating that as a placeholder made substitution fail at send time and
+terminated a valid upload as `failed` with a template error it never had a
+template for. Escaping the key instead was rejected: it would rewrite the
+request line Phantom forwards, which breaks the transparent-proxy promise for
+the URI and invalidates a client signature computed over the true path.
 
 ## Step
 
@@ -164,6 +184,7 @@ Exactly one substitution form is supported: `{{step_name.capture_name}}`.
 - Substitution is string-level: the placeholder is replaced with the captured value's string representation. For values captured as objects (e.g., a nested JSON), the substitution context (URL / header / JSON body string field) determines serialization.
 - No nested templates. No expressions. No auth-fields-from-Phantom (no `{{auth.bearer}}`, no `{{now}}`). The caller supplies everything else explicitly.
 - Unresolved placeholders at execution time cause the step (and the chain) to fail fast with a 4xx-shaped admin error — they do not retry.
+- Substitution is CONDITIONAL on the envelope's `templated` flag. A chain marked `templated: false` interprets no brace span anywhere: the parser's static placeholder pass is skipped at admission, the capture-TTL gate returns immediately, and all four substitution sites (URL, header values, JSON body, text body) pass their text through verbatim.
 
 ## phantom-client method
 

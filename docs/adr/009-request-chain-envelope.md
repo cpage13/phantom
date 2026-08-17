@@ -15,5 +15,17 @@ both the upstream's identity/idempotency behavior and compatible capability
 renewal or lifetime. `ChainCapture.ttl_seconds` drives Phantom's observation
 clock; it is not proof of actual upstream capability expiry.
 
+## Amendment (2026-08-17): substitution is conditional on `templated`
+
+The paragraph above describes substitution as a property of the mechanism,
+which it no longer is unconditionally. The envelope carries a `templated`
+marker (ADR-010's schema; finding N3 of the review-08-12 cycle). It defaults
+to `true`, so every chain the paragraph describes behaves exactly as written.
+A chain marked `templated: false` declares that its brace spans are content:
+no substitution runs, the capture-TTL gate does not run, and the parser's
+static placeholder pass is skipped at admission. Phantom's raw-intake
+catch-all sets it, because a stock object key may legally contain a `{{...}}`
+span and interpreting one destroyed a valid upload.
+
 Status: Accepted
 Date: 2026-05-12

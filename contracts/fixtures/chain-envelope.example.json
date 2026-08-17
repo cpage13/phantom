@@ -40,5 +40,6 @@
       "name": "upload_body",
       "url": "{{create_file.upload_url}}"
     }
-  ]
+  ],
+  "templated": true
 }
