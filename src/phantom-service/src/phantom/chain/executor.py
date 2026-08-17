@@ -13,12 +13,11 @@ owns:
 6. Capture extraction from the response (JSONPath, first-match).
 7. Result classification (Succeeded / 4xx / 5xx / FailedAuth /
    FailedNetwork / TemplateUnresolved / CaptureExpiredStored /
-   RouteUnresolved).
+   RouteUnresolved / InlineBodyInvalid).
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 from collections.abc import Callable
@@ -30,7 +29,11 @@ from urllib.parse import urlparse
 import httpx
 
 from phantom.chain.jsonpath import extract, find_placeholders, substitute
-from phantom.chain.parser import envelope_from_persistence_json
+from phantom.chain.parser import (
+    InlineBodyDecodeError,
+    decode_inline_body_b64,
+    envelope_from_persistence_json,
+)
 from phantom.chain.sigv4_signer import SigV4SigningError, sign_sigv4
 from phantom.config.settings import InstanceCfg
 from phantom.models.chain import (
@@ -188,6 +191,27 @@ class RouteUnresolved:
     step_name: str
 
 
+@dataclass(frozen=True)
+class InlineBodyInvalid:
+    """A step's inline base64 body cannot be decoded (N1).
+
+    Admission rejects malformed ``value_b64`` with a 422 since N1, so this
+    classifies rows admitted before that guard existed, or through any other
+    insertion path: ``envelope_from_persistence_json`` re-validates the
+    envelope's SHAPE but not its base64. Terminal, because the payload is
+    producer data that can never become valid; no operator action and no
+    replay can fix it.
+
+    Attributes:
+        step_name: The step whose inline body failed to decode.
+        reason: The decoder's own description of the defect. Logged, not
+            persisted, so ``last_error`` stays a short stable token.
+    """
+
+    step_name: str
+    reason: str
+
+
 ExecuteStepResult = (
     Succeeded
     | FailedAuth
@@ -200,6 +224,7 @@ ExecuteStepResult = (
     | CaptureIncomplete
     | SendDeadlineExpired
     | RouteUnresolved
+    | InlineBodyInvalid
 )
 
 
@@ -278,9 +303,19 @@ class ChainExecutor:
                 return TemplateUnresolved(placeholder=f"header[{name}]={value}")
             substituted_headers[name] = rendered
 
-        body_bytes, body_content_type, sub_ok = self._render_body(
-            step, row.captured_values, body_refs
-        )
+        try:
+            body_bytes, body_content_type, sub_ok = self._render_body(
+                step, row.captured_values, body_refs
+            )
+        except InlineBodyDecodeError as exc:
+            logger.warning(
+                "step %r of chain_id=%s carries undecodable inline base64 (%s); "
+                "terminating the row as failed",
+                exc.step_name,
+                row.chain_id,
+                exc.reason,
+            )
+            return InlineBodyInvalid(step_name=exc.step_name, reason=exc.reason)
         if not sub_ok:
             return TemplateUnresolved(placeholder=f"body of step {step.name!r}")
         if body_content_type is not None and "Content-Type" not in substituted_headers:
@@ -577,8 +612,12 @@ class ChainExecutor:
                 return b"", None, False
             return rendered.encode("utf-8"), step.body.content_type, True
         if isinstance(step.body, ChainBodyBytes):
+            # Raises InlineBodyDecodeError, which execute_one_step classifies.
+            # The parser owns the decode rule AND its exception taxonomy, so
+            # this arm does not have to know which library exceptions the
+            # decoder absorbs; it catches exactly one name.
             return (
-                base64.b64decode(step.body.value_b64),
+                decode_inline_body_b64(step.body.value_b64, step_name=step.name),
                 step.body.content_type,
                 True,
             )

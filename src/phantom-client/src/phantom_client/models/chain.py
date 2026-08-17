@@ -111,7 +111,16 @@ class ChainBodyBytes(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     kind: Literal["bytes"] = Field("bytes", description="Discriminator tag.")
-    value_b64: str = Field(..., description="Base64-encoded body bytes.")
+    value_b64: str = Field(
+        ...,
+        description=(
+            "Base64-encoded body bytes. Validated as decodable base64 at "
+            "admission: a malformed value is rejected with a 422 "
+            "envelope_invalid and no chain is admitted. Standard "
+            "(non-urlsafe) base64; newline-wrapped MIME-style input decodes "
+            "normally."
+        ),
+    )
     content_type: str = Field(
         "application/octet-stream",
         description="Content-Type header value sent to the upstream for this step.",

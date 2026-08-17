@@ -18,7 +18,7 @@
           "type": "string"
         },
         "value_b64": {
-          "description": "Base64-encoded body bytes.",
+          "description": "Base64-encoded body bytes. Validated as decodable base64 at admission: a malformed value is rejected with a 422 envelope_invalid and no chain is admitted. Standard (non-urlsafe) base64; newline-wrapped MIME-style input decodes normally.",
           "title": "Value B64",
           "type": "string"
         }

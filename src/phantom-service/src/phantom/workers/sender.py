@@ -46,6 +46,7 @@ from phantom.chain.executor import (
     Failed5xx,
     FailedAuth,
     FailedNetwork,
+    InlineBodyInvalid,
     RouteUnresolved,
     SendDeadlineExpired,
     Succeeded,
@@ -302,6 +303,18 @@ class Sender:
             return
         if isinstance(result, RouteUnresolved):
             await self._on_route_unresolved(store, row, result)
+            return
+        if isinstance(result, InlineBodyInvalid):
+            # Terminal ``failed``, NOT F1's ``stored``: the two cases are
+            # opposites. An unroutable row is undeliverable because of operator
+            # CONFIG, which the operator can fix, so its body and slot are kept
+            # and the row stays replayable. An undecodable inline body is
+            # producer DATA that can never become valid; replay re-runs the same
+            # decode and fails identically, so retaining the body and the slot
+            # would leak both.
+            await self._on_terminal_failure(
+                store, row, last_error=f"inline_body_invalid:{result.step_name}"
+            )
             return
         if isinstance(result, FailedAuth):
             await self._on_auth_failure(store, row, result)

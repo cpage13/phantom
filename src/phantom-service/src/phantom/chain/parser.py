@@ -3,10 +3,20 @@
 Accepts raw bytes (JSON path) or Starlette multipart parts
 (multipart path) and produces ``(ChainEnvelope, body_refs)`` plus
 typed errors with ADR-010 error codes.
+
+Both entry points run the same static validation passes through
+:func:`_post_validate`: no duplicate step names, compilable capture
+JSONPaths, statically resolvable ``{{step.var}}`` placeholders, and
+decodable inline base64 bodies. This module also owns the ONE definition
+of how Phantom decodes an inline base64 body,
+:func:`decode_inline_body_b64`, plus its exception, so admission and the
+executor cannot drift apart on either the decode rule or its failure
+taxonomy.
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
@@ -14,7 +24,13 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from phantom.chain.jsonpath import find_placeholders, validate_path
-from phantom.models.chain import ChainBodyJson, ChainBodyRef, ChainBodyText, ChainEnvelope
+from phantom.models.chain import (
+    ChainBodyBytes,
+    ChainBodyJson,
+    ChainBodyRef,
+    ChainBodyText,
+    ChainEnvelope,
+)
 from phantom.models.errors import ErrorCode
 
 logger = logging.getLogger(__name__)
@@ -45,6 +61,73 @@ class ParserError(Exception):
         self.code: ErrorCode = code
         self.message = message
         self.details: dict[str, Any] = details or {}
+
+
+class InlineBodyDecodeError(Exception):
+    """A ``ChainBodyBytes.value_b64`` payload is not decodable base64.
+
+    The ONE exception either layer catches. ``base64.b64decode`` raises
+    ``binascii.Error`` for malformed base64 and a bare ``ValueError`` for
+    non-ASCII input, and both must be treated identically: unhandled, either
+    one escapes the sender's worker loop and permanently crash-loops the
+    service. Wrapping them here means neither caller has to know which
+    library exception the decoder emits, and a future decoder change cannot
+    silently widen the escape surface.
+
+    Attributes:
+        step_name: The chain step whose inline body failed to decode.
+        reason: The underlying decoder message. Safe to log: neither
+            exception type echoes the offending input.
+    """
+
+    def __init__(self, step_name: str, reason: str) -> None:
+        """Construct the wrapper.
+
+        Args:
+            step_name: The chain step whose inline body failed to decode.
+            reason: The underlying decoder message.
+        """
+        super().__init__(f"step {step_name!r}: {reason}")
+        self.step_name = step_name
+        self.reason = reason
+
+
+def decode_inline_body_b64(value_b64: str, *, step_name: str) -> bytes:
+    """Decode a ``ChainBodyBytes.value_b64`` payload.
+
+    The ONE definition of how Phantom decodes an inline base64 body. Admission
+    calls it to validate at ingress and the executor calls it to render the
+    outbound body, so a payload that admission accepts is exactly a payload the
+    executor can render.
+
+    Standard (non-urlsafe) base64 with default validation: non-alphabet
+    characters are discarded rather than rejected, so MIME-style
+    newline-wrapped input from ``base64.encodebytes`` decodes normally, while a
+    genuinely malformed length or padding raises. Do NOT add
+    ``validate=True``: it would reject newline-wrapped base64, which is
+    legitimate producer output.
+
+    The ``except ValueError`` is deliberately wider than the library's own
+    malformed-base64 error, which it subclasses, because non-ASCII input raises
+    the bare parent class. Widening is safe here: it wraps a single library
+    call whose only failure mode is a bad input, not a whole dispatch path
+    where an unrelated bug could hide.
+
+    Args:
+        value_b64: The producer-supplied base64 text.
+        step_name: The owning step, for the raised error's context.
+
+    Returns:
+        The decoded body bytes.
+
+    Raises:
+        InlineBodyDecodeError: When the input is not decodable base64, for
+            either underlying reason.
+    """
+    try:
+        return base64.b64decode(value_b64)
+    except ValueError as exc:
+        raise InlineBodyDecodeError(step_name, str(exc)) from exc
 
 
 class MultipartPart(Protocol):
@@ -139,11 +222,45 @@ def _validate_jsonpath_syntax(envelope: ChainEnvelope) -> None:
                 ) from exc
 
 
+def _validate_inline_body_base64(envelope: ChainEnvelope) -> None:
+    """Reject envelopes whose inline ``bytes`` bodies are not valid base64.
+
+    Unvalidated ``value_b64`` reaches the decoder in the executor's
+    ``_render_body`` at send time, where the raised ``ValueError`` escapes the
+    sender's worker loop, kills the TaskGroup, and is re-claimed first on every
+    restart: one malformed payload is a permanent service crash loop.
+    Rejecting at ingress means no such row is ever durably admitted.
+
+    Catching :class:`InlineBodyDecodeError` rather than a library exception is
+    what makes this layer complete: a non-ASCII ``value_b64`` raises the bare
+    parent class, which would propagate out of ``_post_validate`` and out of
+    the parse entry point into ``routes/send.py``'s body handler, which catches
+    only its own size error and :class:`ParserError`. The producer would get an
+    untyped 5xx instead of the 422 this pass promises.
+
+    The message and details deliberately do NOT echo the offending value: it is
+    producer data of unbounded size and potentially sensitive. The decoder's
+    own message describes the defect without quoting the input.
+    """
+    for step in envelope.steps:
+        if not isinstance(step.body, ChainBodyBytes):
+            continue
+        try:
+            decode_inline_body_b64(step.body.value_b64, step_name=step.name)
+        except InlineBodyDecodeError as exc:
+            raise ParserError(
+                "envelope_invalid",
+                f"Invalid base64 in step {step.name!r} body.value_b64",
+                {"step": step.name, "reason": exc.reason},
+            ) from exc
+
+
 def _post_validate(envelope: ChainEnvelope) -> None:
     """Run every static validation pass on a parsed envelope."""
     _validate_no_duplicate_step_names(envelope)
     _validate_jsonpath_syntax(envelope)
     _validate_static_placeholders(envelope)
+    _validate_inline_body_base64(envelope)
 
 
 async def parse_json_request(
