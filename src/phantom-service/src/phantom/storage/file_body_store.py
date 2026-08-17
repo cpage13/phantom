@@ -6,6 +6,28 @@ via ``asyncio.to_thread(os.fsync)``, then renamed into place. A
 parent-directory fsync (also off-loop) follows the rename on Linux —
 NTFS journals metadata so this is a no-op on Windows.
 
+The full durability contract, which callers rely on for the
+commit-last-column invariant (F10): every directory level this store
+CREATES has its own parent fsynced while the leaf is new, and each chain
+directory is fsynced after its body files are renamed in. So the entire
+link chain from the store root down to each body file is durable before
+``put()`` returns, which is before admission commits
+``body_location='file'``. A directory entry is durable only once the
+directory holding it has been fsynced, and ``makedirs`` leaves new
+entries in their parents' dirty page cache, so creating the levels is
+not enough on its own.
+
+The ancestor sweep in ``_makedirs_durable`` is UNCONDITIONAL whenever
+the leaf is new, rather than filtered to the levels the call observed as
+missing, because that observation is a time-of-check window: two
+concurrent puts run in separate ``asyncio.to_thread`` workers, so one
+can create a shard and be descheduled before its root fsync while the
+other sees the shard already present, fsyncs one level, writes its
+bodies and returns. A power cut then loses the shard's entry in the root
+and every body underneath it. Sweeping unconditionally means whichever
+caller goes on to write bodies has itself made the whole ancestor chain
+durable, depending on no other caller's fsync.
+
 All blocking file system calls (``os.fsync``, parent-dir fsync) run
 via ``asyncio.to_thread``; ``aiofiles`` covers open/write/close.
 
@@ -50,6 +72,43 @@ def _sync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _makedirs_durable(leaf: Path, boundary: Path) -> None:
+    """Create ``leaf`` and fsync the parent of every level down from ``boundary``.
+
+    A directory entry is durable only once the directory HOLDING it has been
+    fsynced. ``os.makedirs`` creates each missing level but leaves the new
+    entries in their parents' dirty page cache, so a power cut after the body
+    files themselves are fsynced can still lose the links that make them
+    reachable.
+
+    When ``leaf`` did not exist on entry, this fsyncs the parent of EVERY
+    level between ``boundary`` (exclusive) and ``leaf`` (inclusive),
+    shallowest first, without conditioning on which levels this call
+    happened to observe as missing. That unconditional sweep is what makes
+    the helper safe under concurrent puts; see the module docstring. When
+    ``leaf`` already existed, no level was created by anyone in this call and
+    nothing is fsynced.
+
+    Args:
+        leaf: The directory to create. Must be under ``boundary``.
+        boundary: The deepest directory the caller guarantees already exists.
+            This helper fsyncs the boundary directory itself when it creates
+            the first level beneath it, and it never creates or modifies
+            anything above the boundary.
+
+    Raises:
+        ValueError: If ``leaf`` is not under ``boundary``.
+    """
+    relative = leaf.relative_to(boundary)
+    levels = [boundary.joinpath(*relative.parts[: i + 1]) for i in range(len(relative.parts))]
+    leaf_existed = leaf.exists()
+    os.makedirs(leaf, exist_ok=True)
+    if leaf_existed:
+        return
+    for level in levels:
+        _sync_directory(level.parent)
 
 
 def _fsync_file(fd: int) -> None:
@@ -129,9 +188,9 @@ class FileBodyStore:
         NOT touched — that's the body-orphan janitor's steady-state
         responsibility (plan § 2.3.14).
         """
-        await aiofiles.os.makedirs(self._root, exist_ok=True)
+        await asyncio.to_thread(_makedirs_durable, self._root, self._root.parent)
         tmp_dir = self._tmp_dir()
-        await aiofiles.os.makedirs(tmp_dir, exist_ok=True)
+        await asyncio.to_thread(_makedirs_durable, tmp_dir, self._root)
         await asyncio.to_thread(_purge_tmp_orphans, tmp_dir)
 
     async def stop(self) -> None:
@@ -176,11 +235,21 @@ class FileBodyStore:
         that needs a clean namespace deletes first, as admission's
         R11-1 namespace clear does.
 
+        DURABILITY (F10): on return, every link from the store root down to
+        each body file written here is durable. The directory levels are
+        created and their parents fsynced first, then each body file is
+        written, fsynced, and renamed into place, then the chain directory is
+        fsynced once so the renamed FILE entries are durable too. Callers rely
+        on this for the commit-last-column invariant: admission flips
+        ``body_location='file'`` and acks the producer only after ``put()``
+        returns, so anything left unsynced here is an acknowledged upload that
+        a power cut can lose.
+
         Returns:
             Total bytes written.
         """
         upload_dir = self._path_for(chain_id)
-        await aiofiles.os.makedirs(upload_dir, exist_ok=True)
+        await asyncio.to_thread(_makedirs_durable, upload_dir, self._root.parent)
         total = 0
         for name, data in body_refs.items():
             total += await self._put_one(chain_id, name, data)

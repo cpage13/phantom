@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from unittest import mock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from phantom.storage.file_body_store import FileBodyStore
@@ -257,3 +257,197 @@ async def test_start_purge_is_idempotent_on_clean_tmp(tmp_path: Path) -> None:
     assert (tmp_path / ".tmp").is_dir()
     assert list((tmp_path / ".tmp").iterdir()) == []
     await s.stop()
+
+
+# ---------------------------------------------------------------------
+# F10 — every directory level this store CREATES must have its parent
+# fsynced before ``put()`` returns. A directory entry is durable only
+# once the directory HOLDING it has been fsynced, and ``makedirs``
+# leaves new entries in their parents' dirty page cache. Before F10 only
+# the per-chain directory was fsynced (making the body FILE entries
+# durable), so the entry linking that chain directory into its shard,
+# and the entry linking a fresh shard into the root, were never made
+# durable: in ``all_disk`` mode admission commits ``body_location='file'``
+# and acks 202 immediately after the put, so a power cut could persist
+# the database write and lose the directory entry, and recovery would
+# then quarantine an acknowledged row to ``corrupted``.
+#
+# A real power cut cannot be staged in the suite, so these assert the
+# fsync call SET at the seam, in the same spirit as
+# ``scripts/check_persist_ordering.py`` asserting call order at the
+# source level. ``_makedirs_durable`` must call the module-level
+# ``_sync_directory`` rather than ``os.fsync`` directly precisely so this
+# seam exists.
+# ---------------------------------------------------------------------
+
+
+def _record_syncs(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Patch ``_sync_directory`` with a recorder that still calls through.
+
+    Both ``_makedirs_durable`` and ``put`` resolve the name as a module
+    global, so patching the module attribute intercepts both.
+
+    Args:
+        monkeypatch: pytest's monkeypatch fixture.
+
+    Returns:
+        The live list of fsynced paths, in call order.
+    """
+    from phantom.storage import file_body_store as module
+
+    recorded: list[Path] = []
+    real = module._sync_directory
+
+    def _recorder(path: Path) -> None:
+        recorded.append(path)
+        real(path)
+
+    monkeypatch.setattr(module, "_sync_directory", _recorder)
+    return recorded
+
+
+@pytest.mark.asyncio
+async def test_put_fsyncs_root_shard_and_chain_directories_on_first_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every newly created directory level's parent is made durable.
+
+    Objective: close the F10 hole. On a first write the root, the shard, and the
+    chain directory are all created, so all three must be fsynced (each one
+    making its own new child entry durable), plus the root's parent.
+
+    Success: the recorded fsync paths include the root's parent, the root, the
+    shard, and the chain directory. Asserted on set membership rather than an
+    exact call count, so a harmless duplicate fsync does not make this brittle.
+    """
+    root = tmp_path / "bodies"
+    recorded = _record_syncs(monkeypatch)
+    s = FileBodyStore(root, shard_prefix_chars=2)
+    await s.start()
+    uid = uuid4()
+    await s.put(uid, {"body": b"x"})
+
+    shard = root / str(uid)[:2]
+    chain_dir = shard / str(uid)
+    for expected in (root.parent, root, shard, chain_dir):
+        assert expected in recorded, (
+            f"{expected} was never fsynced; its child's directory entry is not durable. "
+            f"Recorded: {recorded}"
+        )
+    await s.stop()
+
+
+@pytest.mark.asyncio
+async def test_put_fsyncs_parents_before_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shallowest first: fsyncing a child before its parent's entry proves nothing.
+
+    Objective: pin the ordering. A chain directory made durable inside a shard
+    whose own entry is still in the root's dirty page cache is still reachable
+    only by luck.
+
+    Success: in the recorded sequence the root precedes the shard, and the shard
+    precedes the chain directory.
+    """
+    root = tmp_path / "bodies"
+    recorded = _record_syncs(monkeypatch)
+    s = FileBodyStore(root, shard_prefix_chars=2)
+    await s.start()
+    uid = uuid4()
+    await s.put(uid, {"body": b"x"})
+
+    shard = root / str(uid)[:2]
+    chain_dir = shard / str(uid)
+    assert recorded.index(root) < recorded.index(shard)
+    assert recorded.index(shard) < recorded.index(chain_dir)
+    await s.stop()
+
+
+@pytest.mark.asyncio
+async def test_new_chain_directory_syncs_the_full_ancestor_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ancestor sweep is UNCONDITIONAL whenever the leaf is new.
+
+    Objective: pin the property that makes the helper safe under concurrent
+    creates. A form that filtered the sweep by a pre-``makedirs`` existence
+    probe would pass every other test in this section and still lose the shard
+    link under interleaving: put B creates the shard and is descheduled before
+    its root fsync, put A then sees the shard present, concludes only its own
+    chain directory was created, and returns after fsyncing one level. With
+    ``shard_prefix_chars`` defaulting to 2 there are only 256 shards, so
+    fresh-shard collisions on a cold store are common rather than exotic.
+
+    Success: the second put, into an ALREADY-EXISTING shard, still records the
+    root AND the shard AND its own new chain directory.
+    """
+    root = tmp_path / "bodies"
+    s = FileBodyStore(root, shard_prefix_chars=2)
+    await s.start()
+    # Two chain ids sharing the first two hex characters, constructed
+    # explicitly rather than generated until they collide.
+    first = UUID("ab000000-0000-4000-8000-000000000001")
+    second = UUID("ab000000-0000-4000-8000-000000000002")
+    await s.put(first, {"body": b"x"})
+
+    recorded = _record_syncs(monkeypatch)
+    await s.put(second, {"body": b"y"})
+
+    shard = root / "ab"
+    second_dir = shard / str(second)
+    for expected in (root, shard, second_dir):
+        assert expected in recorded, (
+            f"{expected} was not fsynced on the second put; the ancestor sweep must not be "
+            f"filtered by a pre-makedirs existence probe. Recorded: {recorded}"
+        )
+    await s.stop()
+
+
+@pytest.mark.asyncio
+async def test_reput_into_an_existing_chain_directory_syncs_only_that_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The steady-state path stays cheap.
+
+    Objective: the ancestor sweep runs only when the leaf is new. A re-put into
+    an existing chain directory created no level, so it must fsync only that
+    directory, which is the pre-existing per-chain fsync that makes the new body
+    FILE entries durable.
+
+    Success: the recorded paths for the second put are exactly the chain
+    directory.
+    """
+    root = tmp_path / "bodies"
+    s = FileBodyStore(root, shard_prefix_chars=2)
+    await s.start()
+    uid = uuid4()
+    await s.put(uid, {"body": b"x"})
+
+    recorded = _record_syncs(monkeypatch)
+    await s.put(uid, {"second": b"y"})
+
+    chain_dir = root / str(uid)[:2] / str(uid)
+    assert recorded == [chain_dir], (
+        f"a re-put creates no directory level, so only the chain directory may be fsynced; "
+        f"recorded {recorded}"
+    )
+    await s.stop()
+
+
+def test_makedirs_durable_rejects_a_leaf_outside_its_boundary(tmp_path: Path) -> None:
+    """The boundary contract is enforced rather than silently ignored.
+
+    Objective: ``_makedirs_durable`` promises never to create or fsync anything
+    above its boundary, and it computes its level list with ``relative_to``. A
+    leaf outside the boundary must be refused rather than producing an empty or
+    nonsensical sweep.
+
+    Success: ``ValueError``. The import is inside the test body on purpose: this
+    module must stay collectible on a tree where the helper does not exist yet,
+    so the witness test above can run and fail behaviourally.
+    """
+    from phantom.storage.file_body_store import _makedirs_durable
+
+    with pytest.raises(ValueError):
+        _makedirs_durable(Path("/some/other/tree"), tmp_path)

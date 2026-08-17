@@ -20,7 +20,14 @@ Two enforced constraints:
    commit-last-column ordering (plan § 0.5) — fsync body files BEFORE
    flipping ``body_location='file'`` — is enforced by FileBodyStore's
    contract; this script ensures the call order at the source level so
-   a refactor that reorders the calls is caught at pre-commit.
+   a refactor that reorders the calls is caught at pre-commit. That
+   deferred half lives in two places inside
+   ``phantom/storage/file_body_store.py``: ``_makedirs_durable``, which
+   fsyncs the parent of every directory level the store creates, and the
+   per-chain ``_sync_directory`` call after the renames, which makes the
+   body FILE entries durable. Together they make the whole link chain
+   from the store root to each body file durable before ``put()``
+   returns.
 
 The script walks the AST of the persist_controller.py module + a
 greppable forbid-pass over the rest of src/.

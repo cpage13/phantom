@@ -261,7 +261,8 @@ column on each `uploads` row records where its body bytes live; the
 `HybridBodyStore` consults this on every read. RAM bodies live in a
 `RamBodyStore` (a `dict[ChainId, dict[name, bytes]]`); disk bodies
 live under `bodies/<shard>/<chain_id>/` via `FileBodyStore` (atomic
-rename through `.tmp/`, fsync on file AND parent dir). The
+rename through `.tmp/`, fsync of the file, of the chain directory, and
+of every directory level the store creates). The
 `PersistController` is the SOLE writer of the `'ram' → 'file'`
 transition (invariant #6).
 
