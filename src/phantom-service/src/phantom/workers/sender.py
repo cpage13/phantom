@@ -46,6 +46,7 @@ from phantom.chain.executor import (
     Failed5xx,
     FailedAuth,
     FailedNetwork,
+    RouteUnresolved,
     SendDeadlineExpired,
     Succeeded,
     TemplateUnresolved,
@@ -105,6 +106,8 @@ class Sender:
         # * body_missing_total — bumped when the body store has no
         #   bytes for a row that declared body_hashes (H8 corrupted
         #   route landed in Phase 2).
+        # * route_unresolved_total: bumped when a step's host matches no
+        #   configured route and the row parks in ``stored`` (F1).
         self._metrics = metrics_registry if metrics_registry is not None else MetricsRegistry()
         self._no_op_total = self._metrics.register_counter(
             "record_attempt_result_no_op_total",
@@ -113,6 +116,10 @@ class Sender:
         self._body_missing_total = self._metrics.register_counter(
             "body_missing_total",
             "BodyMissingError events caught in the sender (H8).",
+        )
+        self._route_unresolved_total = self._metrics.register_counter(
+            "route_unresolved_total",
+            "Rows parked in 'stored' because no route matched a step's host.",
         )
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -266,6 +273,9 @@ class Sender:
             await self._on_terminal_failure(
                 store, row, last_error=f"template_unresolved:{result.placeholder}"
             )
+            return
+        if isinstance(result, RouteUnresolved):
+            await self._on_route_unresolved(store, row, result)
             return
         if isinstance(result, FailedAuth):
             await self._on_auth_failure(store, row, result)
@@ -500,6 +510,29 @@ class Sender:
             no_op_context="_on_stored",
         )
 
+    async def _on_route_unresolved(
+        self, store: UploadStore, row: UploadRow, result: RouteUnresolved
+    ) -> None:
+        """Park a row whose step targets a host with no configured route.
+
+        The row is undeliverable until an operator repairs the instance's
+        route config, so it goes to terminal ``stored``: body retained,
+        saturation slot retained (``stored`` is in ``SLOT_HOLDING_STATES``),
+        never re-claimed by ``claim_due``, and replay-eligible once the
+        config is fixed. Attempts are NOT incremented because the row never
+        reached the upstream. The counter bumps on DETECTION, not on a
+        confirmed transition, matching ``body_missing_total``.
+        """
+        await self._route_unresolved_total.inc()
+        await self._record_stored(
+            store,
+            row,
+            attempts=row.attempts,
+            last_error=f"route_unresolved:{result.host}:{result.step_name}",
+            upstream_status=None,
+            no_op_context="_on_route_unresolved",
+        )
+
     async def _record_stored(
         self,
         store: UploadStore,
@@ -512,9 +545,10 @@ class Sender:
     ) -> None:
         """Perform the stored transition (cycle-7 task 2.6, finding D7).
 
-        The SINGLE writer of ``new_state="stored"``: both paths that
+        The SINGLE writer of ``new_state="stored"``: all three paths that
         park a row in ``stored`` (capture expired via ``_on_stored``,
-        retry budget exhausted via ``_on_retryable_failure``) run
+        retry budget exhausted via ``_on_retryable_failure``, no matching
+        route via ``_on_route_unresolved``) run
         through this helper, so the literal has exactly one call site
         (one-writer-per-effect; pinned by
         ``tests/unit/test_stored_single_writer.py``).
@@ -525,9 +559,11 @@ class Sender:
         Args:
             store: The instance's upload store.
             row: The claimed row to park.
-            attempts: The attempts value to persist (the two callers
+            attempts: The attempts value to persist (the three callers
                 differ: capture-expired keeps ``row.attempts``, budget
-                exhaustion has already counted the failed attempt).
+                exhaustion has already counted the failed attempt, and
+                route-unresolved also keeps ``row.attempts`` because the
+                row never reached the upstream).
             last_error: Typed error token for the operator.
             upstream_status: Last upstream status code, when one exists.
             no_op_context: Caller tag for the rowcount=0 log line.

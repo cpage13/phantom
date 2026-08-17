@@ -550,8 +550,10 @@ For live RAM-pressure visualization without scraping.
 stopped advancing on their own and are waiting for an operator decision
 or an external event. Two states make it up:
 
-- **`stored`** (terminal): the retry budget was exhausted but the body is
-  still recoverable on the producer (you can inspect or re-drive it).
+- **`stored`** (terminal): the body is retained and recoverable (you can
+  inspect or re-drive it). Three paths produce it: the retry budget was
+  exhausted, a referenced capture's TTL expired, or no configured route
+  matched a step's host. Read `last_error` to tell them apart.
 - **`auth_expired`** (non-terminal): the cached token 401'd without a
   successful refresh, so the row is waiting for a fresh token (the
   `AuthKicker` re-queues it the moment one lands).
@@ -570,8 +572,22 @@ curl -s http://127.0.0.1:8080/v1/admin/stats
 
 Alert on `parked_total` climbing: a rising `auth_expired_count` means a
 credential slot needs attention (see § 5 *Auth failures*); a rising
-`by_state.stored` means uploads are exhausting their retries (a sick
-upstream, or retry params too tight). `parked_total` pairs with the
+`by_state.stored` needs one more read before you act, because the state
+has three producers. Fetch an affected row and branch on its
+`last_error`:
+
+- A `route_unresolved:` prefix means a step's host matches no configured
+  route on that instance. The token carries the unmatched hostname and
+  the step name. Repair the instance's `routes` block, restart (routes
+  are restart-required), then replay the parked rows. **Replay restarts
+  the chain at step 0** and re-delivers any step that already succeeded,
+  which is safe when the upstream honours the step's
+  `idempotency_header` and unsafe when it does not; check that before
+  replaying a multi-step chain.
+- Anything else means uploads are exhausting their retries (a sick
+  upstream, or retry params too tight) or a capture TTL expired.
+
+`parked_total` pairs with the
 `max_rows` backstop (§ 2.1): the parked states are the forever-retained
 ones that drive table growth, so watch both together.
 

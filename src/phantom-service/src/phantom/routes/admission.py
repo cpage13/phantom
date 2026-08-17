@@ -216,7 +216,15 @@ def _hostname(url: str) -> str:
 
 
 def _route_name(url: str, instance_ctx: InstanceContext) -> str:
-    """Resolve route name; fall back to ``unknown`` on miss."""
+    """Resolve route name; fall back to ``unknown`` on miss.
+
+    The miss is deliberately TOLERATED here rather than refused. Admission
+    route-checks only the FIRST step's URL, so refusing on a miss would still
+    admit a chain whose later step has no route; the complete check is the
+    executor's, which classifies an unmatched host at send time as
+    ``RouteUnresolved`` and parks the row in ``stored`` for operator repair
+    (F1). The ``"unknown"`` fallback is therefore recorded, not unchecked.
+    """
     try:
         resolved = resolve_route(url, instance_ctx.cfg)
         return resolved.route_name

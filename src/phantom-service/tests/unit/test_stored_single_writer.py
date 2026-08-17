@@ -1,12 +1,14 @@
 """Single-writer stored transition (cycle-7 task 2.6, finding D7).
 
-Two sender paths write the ``stored`` state: ``_on_stored`` (capture
-expired) and the budget-exhausted leg of ``_on_retryable_failure``.
+Three sender paths write the ``stored`` state: ``_on_stored`` (capture
+expired), the budget-exhausted leg of ``_on_retryable_failure``, and
+``_on_route_unresolved`` (no configured route matches a step's host, F1).
 They converge on ONE private helper so the ``new_state="stored"``
 literal has exactly one call site (one-writer-per-effect). These tests
-pin that both paths still reach ``stored`` with their historical row
+pin that the paths still reach ``stored`` with their historical row
 effects, that the rowcount=0 no-op path never clobbers a row taken by
-admin cancel/replay, and that the literal stays single-sited.
+admin cancel/replay, and that the literal stays single-sited. F1's own
+path is covered by ``test_route_unresolved_parks.py``.
 """
 
 from __future__ import annotations

@@ -12,7 +12,8 @@ owns:
 5. The HTTP send through :class:`UpstreamClient`.
 6. Capture extraction from the response (JSONPath, first-match).
 7. Result classification (Succeeded / 4xx / 5xx / FailedAuth /
-   FailedNetwork / TemplateUnresolved / CaptureExpiredStored).
+   FailedNetwork / TemplateUnresolved / CaptureExpiredStored /
+   RouteUnresolved).
 """
 
 from __future__ import annotations
@@ -57,6 +58,13 @@ logger = logging.getLogger(__name__)
 # that put X-Phantom-* into a chain step's headers would otherwise see
 # them leak through).
 _PHANTOM_RESERVED_HEADER_PREFIX = "x-phantom-"
+
+# Placeholder written into ``RouteUnresolved.host`` when the step URL carries
+# no parseable host. NEVER substitute the raw URL here: the URL is
+# post-substitution producer data that can carry a query string with presigned
+# credentials, and ``RouteUnresolved.host`` is persisted verbatim into
+# ``last_error``, which the admin API surfaces.
+_NO_HOST_TOKEN = "<no-host>"
 
 
 @dataclass(frozen=True)
@@ -156,6 +164,30 @@ class SendDeadlineExpired:
     deadline_seconds: int
 
 
+@dataclass(frozen=True)
+class RouteUnresolved:
+    """No configured route matches this step's absolute URL.
+
+    Admission route-checks only the FIRST step's URL and records
+    ``route_name='unknown'`` on a miss (``routes/admission.py``), so a chain
+    whose LATER step targets a host with no ``RouteCfg`` is durably admitted
+    with a 202 and only discovers the miss here, at send time.
+    ``resolve_route`` raises ``ValueError`` on no match. Letting that escape
+    kills the sender's TaskGroup and, through the composition root, the
+    process; recovery then re-claims this row first on every restart, so the
+    service crash-loops and the whole backlog is stranded. Classifying the
+    miss lets the sender park the row instead.
+
+    Attributes:
+        host: The lower-cased hostname that matched no route. The operator
+            needs exactly this to repair the instance's route config.
+        step_name: The chain step whose URL carried that host.
+    """
+
+    host: str
+    step_name: str
+
+
 ExecuteStepResult = (
     Succeeded
     | FailedAuth
@@ -167,6 +199,7 @@ ExecuteStepResult = (
     | TemplateUnresolved
     | CaptureIncomplete
     | SendDeadlineExpired
+    | RouteUnresolved
 )
 
 
@@ -259,7 +292,24 @@ class ChainExecutor:
         # ResolvedRoute.auth_mode (if/elif/else + assert_never) so adding a new
         # auth mode without an arm is a mypy error, not a silent no-auth
         # fall-through (the prior bare ``if`` would have behaved like ``none``).
-        resolved = self._resolve_route(full_url, self._instance)
+        try:
+            resolved = self._resolve_route(full_url, self._instance)
+        except ValueError:
+            # Sanitised host for the persisted token. NOT ``_hostname``: that
+            # helper returns the WHOLE INPUT when urlparse finds no host
+            # (``chain/executor.py`` ``_hostname``), and a step URL legitimately
+            # can be a bare path, so reusing it would splice the path and its
+            # query string into ``last_error``.
+            parsed_host = urlparse(full_url).hostname
+            unrouted_host = parsed_host.lower() if parsed_host else _NO_HOST_TOKEN
+            logger.warning(
+                "no route matches host %s for step %r of chain_id=%s; "
+                "parking the row in 'stored' for operator repair",
+                unrouted_host,
+                step.name,
+                row.chain_id,
+            )
+            return RouteUnresolved(host=unrouted_host, step_name=step.name)
 
         # (a') Send-deadline gate (ADR-032) — the give-up backstop, independent
         # of the retry strategy. Placed here (after ``resolved`` exists, before

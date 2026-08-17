@@ -380,6 +380,39 @@ guarantees are unchanged; only auth headers differ.
 **What you observe.** Rows sit visibly in `auth_expired` until the credential is
 corrected; no retry budget is burned while parked.
 
+## 1.10 A chain step targets a host with no route
+
+**Trigger.** A step's URL resolves to a hostname that matches no `RouteCfg`
+`hosts` pattern on the instance holding the row: a route removed or renamed in
+config, or a producer chain whose later step points somewhere the deployment
+never configured. Admission route-checks only the **first** step's URL and
+tolerates a miss on it, so a chain whose later step is unrouted is durably
+admitted and acked `202`; the miss is discovered at send time.
+
+**What happens.** The executor classifies the miss instead of raising. The
+sender parks the row in terminal `stored` with
+`last_error="route_unresolved:<host>:<step>"`, keeping the body and the
+saturation slot, leaving `attempts` untouched (the row never reached an
+upstream), and never re-claiming it. The service stays up and the rest of the
+backlog keeps draining: before this fix the unguarded `ValueError` killed the
+sender's task group, and startup recovery re-claimed the same row first on every
+restart, so one row crash-looped the process and stranded the whole backlog.
+
+**What you observe.** The affected rows sit in `stored` with a
+`route_unresolved:` `last_error` naming the unmatched hostname and the step. The
+token deliberately carries no URL, path, or query string, so a presigned
+destination cannot leak through the admin API. The operator repair is to add or
+correct the route, restart (routes are restart-required), then replay the parked
+rows. **Replay restarts the chain at step 0** and re-delivers any step that
+already succeeded, which is safe on upstreams that honour the step's
+`idempotency_header` and unsafe on those that do not. Rows left parked hold
+their saturation slots until the `stored` retention window or the `max_rows` cap
+releases them, so a config error that strands a large backlog will eventually
+show up as `503 saturation_cap` on fresh ingress.
+
+**Mode notes.** Mode-independent: the classification is a routing decision, not
+a storage one.
+
 ---
 
 # Part 2. Contributor-facing: failure-mode → proving-test map
