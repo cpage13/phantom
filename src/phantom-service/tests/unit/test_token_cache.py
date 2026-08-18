@@ -74,14 +74,6 @@ async def test_mark_all_bad_preserves_every_slot(cache: SqliteTokenCache) -> Non
 
 
 @pytest.mark.asyncio
-async def test_delete_then_list(cache: SqliteTokenCache) -> None:
-    """``delete`` removes a slot entirely."""
-    await cache.set("e", "u", "Bearer abc", source="inbound_request")
-    await cache.delete("e", "u")
-    assert await cache.list_slots() == []
-
-
-@pytest.mark.asyncio
 async def test_list_slots_filter_by_endpoint(cache: SqliteTokenCache) -> None:
     """``list_slots(endpoint=...)`` scopes results."""
     await cache.set("e1", "u", "x", source="inbound_request")

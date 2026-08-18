@@ -989,14 +989,6 @@ class TokenCache(Protocol):
         """Return slot metadata only — never the bearer (ADR-004)."""
         ...
 
-    async def delete(self, endpoint: str, uid: str) -> None:
-        """Hard delete one slot."""
-        ...
-
-    async def delete_all(self) -> int:
-        """Hard delete every slot. Returns the count."""
-        ...
-
     def register_wake_handler(self, handler: WakeHandler) -> None:
         """Register a callback invoked on every ``set()``."""
         ...

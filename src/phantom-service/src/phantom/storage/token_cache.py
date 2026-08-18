@@ -241,24 +241,6 @@ class SqliteTokenCache:
                 fetched = await cur.fetchall()
         return [_row_to_slot(r) for r in fetched]
 
-    async def delete(self, endpoint: str, uid: str) -> None:
-        """Hard delete one slot."""
-        conn = self._require_conn()
-        async with self._write_txn(conn):
-            await conn.execute(
-                "DELETE FROM token_cache WHERE endpoint = ? AND uid = ?",
-                (endpoint, uid),
-            )
-            await conn.commit()
-
-    async def delete_all(self) -> int:
-        """Hard delete every slot. Returns the count."""
-        conn = self._require_conn()
-        async with self._write_txn(conn):
-            cursor = await conn.execute("DELETE FROM token_cache")
-            await conn.commit()
-        return cursor.rowcount
-
     def register_wake_handler(self, handler: WakeHandler) -> None:
         """Register a callback invoked on every ``set()``."""
         self._wake_handlers.append(handler)
