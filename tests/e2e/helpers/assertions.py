@@ -23,7 +23,7 @@ import aiofiles  # type: ignore[import-untyped]  # types-aiofiles not in workspa
 import aiofiles.os  # type: ignore[import-untyped]  # types-aiofiles not in workspace dev deps
 from phantom_client import ChainAdminDetail, PhantomClient
 from phantom_client.models.chain import ChainState
-from phantom_emulator.routers.control import ReceivedEntry
+from phantom_emulator.control_models import ReceivedEntry
 
 from .stack import E2EStack, EmulatorControl
 from .timing import (

@@ -44,12 +44,12 @@ from phantom_emulator import Server as EmulatorServer
 from phantom_emulator.app import create_app as emulator_create_app
 from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.config import load_config as load_emulator_config
+from phantom_emulator.control_models import ReceivedEntry
 from phantom_emulator.failure.injection import (
     ErrorRate5xxEvent,
     FailurePolicy,
     FailureScope,
 )
-from phantom_emulator.routers.control import ReceivedEntry
 from phantom_emulator.state import EmulatorState, RawBody, S3Object, UpstreamEvent
 
 logger = logging.getLogger(__name__)
