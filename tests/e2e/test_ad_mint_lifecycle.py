@@ -5,7 +5,7 @@ the minter's OAuth wire and cache write in isolation. This module is the
 deferred lifecycle arm: the real ``python -m phantom`` child, configured with
 an ``ad_mint`` block and NO pushed token, parks a submitted row for auth,
 autonomously mints against a trusted-HTTPS authority (invalid primary secret,
-valid secondary), wakes the row through the AuthKicker, delivers, refreshes to
+valid secondary), wakes the row through the bearer kicker, delivers, refreshes to
 a DIFFERENT token, and delivers again — plus the two failure-posture arms the
 audit names (fail-fast supervision with an empty outage schedule; bounded
 retry without false success with a schedule).
@@ -186,7 +186,7 @@ async def test_park_mint_wake_deliver_refresh_deliver(tmp_path: Path) -> None:
     Objective: an unauthenticated submission parks (no token anywhere, no
     push); releasing the authority gate lets the real minter run
     rejected-primary-then-accepted-secondary; the cache slot appears with
-    source=plugin_mint; the AuthKicker wakes the row and it delivers; the
+    source=plugin_mint; the bearer kicker wakes the row and it delivers; the
     refresh cycle mints a DIFFERENT token and a second upload rides it.
     """
     authority, cert_path = await _boot_authority(tmp_path)

@@ -1477,7 +1477,7 @@ class SqliteUploadStore:
           migration that raced the reaper's body-discard must NOT flip
           the row to ``'file'`` and resurrect policy-discarded bytes
           (every other H4 consumer — recovery, the InvariantAuditor,
-          replay, the AuthKicker — already guards the stamp).
+          replay, the kicker wake path - already guards the stamp).
 
         Returns:
             The UPDATE rowcount: 1 when the flip committed, 0 when a

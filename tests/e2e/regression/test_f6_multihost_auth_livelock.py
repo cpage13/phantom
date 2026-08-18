@@ -7,7 +7,7 @@ match and the defect is invisible. On a multi-host chain they differ:
 
 1. Step 2's host has no usable credential slot, so the executor returns
    ``FailedAuth`` and the sender parks the row in ``auth_expired``.
-2. The ``AuthKicker`` rescans at 1 Hz, probes step 1's host, finds it FRESH,
+2. The bearer ``Kicker`` rescans at 1 Hz, probes step 1's host, finds it FRESH,
    and re-queues the row.
 3. The sender drives step 2 against the same bad slot. Go to 1.
 
@@ -188,7 +188,7 @@ async def test_a_multihost_chain_does_not_livelock_on_the_wrong_hosts_token() ->
     ``localhost`` as the blocked host; and pushing a token for ``localhost``
     drives the chain to ``succeeded``.
 
-    Pre-fix observable: the two readings DIFFER, because the ``AuthKicker``
+    Pre-fix observable: the two readings DIFFER, because the bearer ``Kicker``
     re-queues the row against ``127.0.0.1``'s fresh slot at its 1 Hz rescan and
     the sender re-parks it each time. That is the livelock, and the final leg
     is never reached.

@@ -648,7 +648,7 @@ or an external event. Two states make it up:
   matched a step's host. Read `last_error` to tell them apart.
 - **`auth_expired`** (non-terminal): the cached token 401'd without a
   successful refresh, so the row is waiting for a fresh token. The
-  `AuthKicker` re-queues it the moment one lands **for the host that
+  bearer `Kicker` re-queues it the moment one lands **for the host that
   actually blocked it**, which on a multi-host chain is not the chain's
   `endpoint`. Read that host from `auth_blocked_host` on
   `GET /v1/admin/chains/{chain_id}`; a token pushed to any other host
@@ -855,7 +855,7 @@ appears for those hosts.
 **Cause path 2: cached token rejected.** Upstream returned 401 to
 Phantom; sender marked the token `bad` and parked the row in
 `auth_expired`. When a fresh token lands **for the host recorded in that
-row's `auth_blocked_host`**, the `AuthKicker` wakes the row. Check that
+row's `auth_blocked_host`**, the bearer `Kicker` wakes the row. Check that
 field first on a multi-step chain: the chain's `endpoint` is its FIRST
 step's host, and a later step can be blocked on a different one.
 Diagnose via:
@@ -883,8 +883,8 @@ the credential it has was rejected.
 credential from the credential store. If none is provisioned for the
 destination host, or the stored one is marked `bad`, the sender parks the row
 in `auth_expired` and waits. When a fresh credential lands **for the host
-recorded in that row's `auth_blocked_host`**, the `CredentialKicker` (the SigV4
-analogue of the `AuthKicker`) wakes the row. On a multi-host chain that host is
+recorded in that row's `auth_blocked_host`**, the sigv4 `Kicker` (the SigV4
+analogue of the bearer flavour) wakes the row. On a multi-host chain that host is
 not the chain's `endpoint`, so read it off
 `GET /v1/admin/chains/{chain_id}` before pushing. Provision or correct the credential with the admin push (resolved
 literals; `204 No Content`, the secret is never echoed back):

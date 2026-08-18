@@ -208,7 +208,7 @@ async def test_reloaded_auth_mode_does_not_split_the_readers_view(
     which is what the executor will inject.
 
     Pre-fix both read ``aws_sigv4`` while the executor injects a bearer:
-    the AuthKicker stops claiming the parked rows, the CredentialKicker
+    the bearer kicker stops claiming the parked rows, the sigv4 kicker
     claims them, the upstream 401s, and the row cycles forever (F6-shaped
     livelock with an operator fix that never lands).
     """

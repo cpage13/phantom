@@ -83,8 +83,8 @@ credential id), so the `uid` axis has no value to carry and is dropped. ADR-002
 is untouched: `uid` stays inert under `aws_sigv4`. The executor looks the
 credential up by `HostCredKey(_hostname(full_url))`; a missing or failed
 credential marks the slot bad and parks the row `auth_expired` (ADR-032), which
-the `CredentialKicker` (the SigV4 analogue of the `AuthKicker`) wakes on a fresh
-push. The store is persistent at rest, surviving restart (mirrors ADR-003).
+the sigv4-flavoured `Kicker` (the SigV4 analogue of the bearer flavour) wakes
+on a fresh push. The store is persistent at rest, surviving restart (mirrors ADR-003).
 
 ### Two provisioning routes; the secret is never echoed
 
@@ -163,8 +163,8 @@ is the SHA-256 of those same unchanged bytes.
 - `phantom.config.settings`: `RouteCfg.auth_mode` (the 3-valued selector),
   `SigV4CredentialCfg` (the boot-time config arm), and `phantom_default_target`.
 - `phantom.routes.admin`: `PUT /v1/admin/credentials/{dest_host}` (the runtime
-  push); `phantom.workers.credential_kicker.CredentialKicker` (the parked-row
-  waker).
+  push); `phantom.workers.kicker.Kicker` in its `AWS_SIGV4_FLAVOUR` (the
+  parked-row waker).
 - ADR-001: opaque core with pluggable refresh strategies (the model
   `aws_sigv4` extends).
 - ADR-002: token cache keyed by `(endpoint, uid)`; this ADR's host-alone key

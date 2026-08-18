@@ -12,7 +12,7 @@ the 2026-06-23 directive. These tests prove the acceptance criteria:
   forward-time lookup key (the silent-miss class is closed);
 * the push FIRES the credential-store wake handler end-to-end: a parked
   ``aws_sigv4`` row for that host is woken (``auth_expired → queued``) by the
-  :class:`~phantom.workers.credential_kicker.CredentialKicker` that registered
+  sigv4-flavoured :class:`~phantom.workers.kicker.Kicker` that registered
   on the store;
 * a bearer-only deployment (``signer_creds is None``) does not crash — the push
   is a graceful no-op ``204``.
@@ -45,7 +45,7 @@ from phantom.storage import (
 )
 from phantom.storage.credential_store import SqliteCredentialStore
 from phantom.storage.hybrid_body_store import HybridBodyStore
-from phantom.workers.credential_kicker import CredentialKicker
+from phantom.workers.kicker import AWS_SIGV4_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
 from pydantic import ValidationError
 
@@ -253,7 +253,7 @@ async def test_push_fires_wake_and_requeues_parked_sigv4_row() -> None:
     """The HTTP push fires the store wake → a parked ``aws_sigv4`` row is requeued.
 
     End-to-end loop-closing proof: a row parked in ``auth_expired`` for the host
-    is woken to ``queued`` by the CredentialKicker that registered on the store,
+    is woken to ``queued`` by the sigv4 kicker that registered on the store,
     purely as a side effect of the admin push's ``set``.
     """
     import tempfile
@@ -270,7 +270,7 @@ async def test_push_fires_wake_and_requeues_parked_sigv4_row() -> None:
         assert sat.in_flight == 0
 
         # The kicker registers its wake handler on the store at construction.
-        cred_kicker = CredentialKicker(instance=instance)
+        cred_kicker = Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)
         stop_event = asyncio.Event()
         task = asyncio.create_task(cred_kicker.run(stop_event))
 

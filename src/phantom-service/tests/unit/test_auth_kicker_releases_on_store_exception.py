@@ -1,9 +1,9 @@
-"""The AuthKicker releases its admitted slot when the wake write raises (R10-2).
+"""The bearer kicker releases its admitted slot when the wake write raises (R10-2).
 
 Invariant #16 (the saturation ledger balances) requires exactly one gate
 charge per row in the in-flight set, and a release on every path that
 removes a row's claim to a slot. The kicker's wake is admit-then-write:
-``saturation.admit`` (``workers/auth_kicker.py``) charges the gate, then
+``saturation.admit`` (``workers/kicker.py``) charges the gate, then
 the guarded ``record_attempt_result(expected_state="auth_expired")``
 re-queues the row. R9-3 closed the rowcount-0 leg of that window (the row
 moved out of ``auth_expired`` before the write); R10-2 (fixed this round)
@@ -16,7 +16,7 @@ busy_timeout, or a genuine ``SQLITE_IOERR`` on flaky SD storage (the
 Pi-class posture) - propagated straight out of ``_rescan`` with the slot
 admitted one await earlier never released, while the replay route wrapped
 its store call and released on ANY exception (``routes/admin.py``
-replay_upload). The leak COMPOUNDED: ``AuthKicker.run`` catches the
+replay_upload). The leak COMPOUNDED: ``Kicker.run`` catches the
 exception and continues the loop, the failed write committed nothing (the
 row stayed ``auth_expired`` with a fresh cache slot), so the next rescan
 (every second, AND on every cache write) woke the SAME row, admitted
@@ -31,7 +31,7 @@ continues): both refusal legs of the admit->write window - rowcount 0 and
 exception - now share one posture, the slot returning on every outcome
 except a confirmed wake.
 
-The test drives the REAL AuthKicker rescan over a REAL SqliteUploadStore,
+The test drives the REAL bearer kicker rescan over a REAL SqliteUploadStore,
 SqliteTokenCache, and SaturationGate. A store wrapper raises a transient
 ``OperationalError`` on the kicker's FIRST re-queue write,
 deterministically inside the admit->write window. After the rescan
@@ -64,7 +64,7 @@ from phantom.storage import (
 )
 from phantom.storage.hybrid_body_store import HybridBodyStore
 from phantom.strategies import FixedIntervalsStrategy
-from phantom.workers.auth_kicker import AuthKicker
+from phantom.workers.kicker import PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
 
 from .conftest import track_instance
@@ -205,9 +205,9 @@ async def test_wake_write_exception_returns_the_admitted_slot(tmp_path: Path) ->
     )
     real_store = instance.store
     instance.store = _RaiseOnRequeueStore(real_store)  # type: ignore[assignment]
-    kicker = AuthKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
 
-    # The store write raises; AuthKicker.run() would catch this and
+    # The store write raises; Kicker.run() would catch this and
     # continue (auth_kicker.py:83-86). Model one rescan iteration by
     # catching the propagated fault here.
     raised = False

@@ -378,9 +378,9 @@ catches and parks the row in `auth_expired`: exactly like a bearer 401, and
 the same non-terminal, non-evicted state (§1.7: `auth_expired` rows are never
 reaped by the row-count cap). The credential store is persistent (ADR-003), so
 the park survives a restart and resumes against the last known credential. When
-an operator pushes a fresh credential for that host, the `CredentialKicker`
-wakes every row parked ON THAT HOST back to `queued` (the SigV4 analogue of the
-auth kicker). "On that host" is the row's recorded `auth_blocked_host`, the
+an operator pushes a fresh credential for that host, the sigv4-flavoured
+`Kicker` wakes every row parked ON THAT HOST back to `queued` (the SigV4
+analogue of the bearer flavour). "On that host" is the row's recorded `auth_blocked_host`, the
 host whose credential actually rejected it, which on a multi-host chain is not
 the row's `endpoint` (D2/F6). This is not a new failure class: `auth_expired` already covers the
 `aws_sigv4` park (ADR-032).

@@ -107,9 +107,9 @@ src/phantom/
 ├── instances/             # InstanceContext / InstanceDispatcher /
 │                          # InstanceSettingsSnapshot / SettingsHolder
 ├── workers/               # All supervised by app.py's lifespan TaskGroup:
-│                          #   Sender, Reaper, AuthKicker (bearer), VacuumScheduler,
-│                          #   CredentialKicker (credential_kicker.py: wakes
-│                          #   auth_expired aws_sigv4 rows on a fresh cred push),
+│                          #   Sender, Reaper, VacuumScheduler, Kicker
+│                          #   (kicker.py: one flavour-parameterised waker for
+│                          #   auth_expired rows, bearer and aws_sigv4),
 │                          #   SaturationGate, PersistController (sole
 │                          #   body_location='file' writer per invariant #6),
 │                          #   RamPressureWatcher, BodyOrphanJanitor,

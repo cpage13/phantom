@@ -2,13 +2,13 @@
 
 Proves (plan §2.3 / §2.5):
 
-* the ``CredentialKicker`` wakes a parked ``aws_sigv4`` row when its cred slot
+* the sigv4 ``Kicker`` wakes a parked ``aws_sigv4`` row when its cred slot
   goes fresh, re-queuing ``auth_expired → queued`` through the saturation gate;
-* the two kickers do NOT fight — the ``AuthKicker`` skips ``aws_sigv4`` rows and
-  the ``CredentialKicker`` skips ``phantom_bearer`` rows;
+* the two flavours do NOT fight: the bearer ``Kicker`` skips ``aws_sigv4`` rows and
+  the sigv4 ``Kicker`` skips ``phantom_bearer`` rows;
 * an un-routable parked row is SKIPPED (not aborting the rescan pass), so a
   routable row ordered behind it is still processed;
-* the ``CredentialKicker`` is an inert no-op when ``signer_creds is None``.
+* the sigv4 ``Kicker`` is an inert no-op when ``signer_creds is None``.
 """
 
 from __future__ import annotations
@@ -31,8 +31,7 @@ from phantom.storage import (
     SqliteUploadStore,
 )
 from phantom.storage.credential_store import SqliteCredentialStore
-from phantom.workers.auth_kicker import AuthKicker
-from phantom.workers.credential_kicker import CredentialKicker
+from phantom.workers.kicker import AWS_SIGV4_FLAVOUR, PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
 
 from .conftest import make_snapshot, snapshot_thunk, track_instance, track_started
@@ -165,7 +164,7 @@ async def test_credential_set_wakes_parked_sigv4_row(tmp_path: Path) -> None:
     await instance.store.insert(row)
     assert sat.in_flight == 0
 
-    cred_kicker = CredentialKicker(instance=instance)
+    cred_kicker = Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)
     stop_event = asyncio.Event()
     task = asyncio.create_task(cred_kicker.run(stop_event))
     # Fresh creds land for the SigV4 host → fires the wake handler.
@@ -192,7 +191,7 @@ async def test_credential_kicker_skips_bad_cred_slot(tmp_path: Path) -> None:
     await signer_creds.set(HostCredKey(_SIGV4_HOST), _sigv4_creds(), source="admin_push")
     await signer_creds.mark_bad(HostCredKey(_SIGV4_HOST))
 
-    cred_kicker = CredentialKicker(instance=instance)
+    cred_kicker = Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)
     await cred_kicker._rescan()
 
     fresh = await instance.store.get(row.chain_id)
@@ -202,10 +201,10 @@ async def test_credential_kicker_skips_bad_cred_slot(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_credential_kicker_skips_phantom_bearer_row(tmp_path: Path) -> None:
-    """The CredentialKicker does NOT wake a ``phantom_bearer`` row (no fight).
+    """The sigv4 kicker does NOT wake a ``phantom_bearer`` row (no fight).
 
     Even with a fresh cred slot present (and reachable), the guard skips the
-    bearer-routed row — that row is the AuthKicker's to wake.
+    bearer-routed row, because that row is the bearer kicker's to wake.
     """
     instance, signer_creds = await _build(tmp_path)
     assert signer_creds is not None
@@ -215,7 +214,7 @@ async def test_credential_kicker_skips_phantom_bearer_row(tmp_path: Path) -> Non
     # it; the guard must reject on auth_mode, not on slot absence.
     await signer_creds.set(HostCredKey(_BEARER_HOST), _sigv4_creds(), source="admin_push")
 
-    cred_kicker = CredentialKicker(instance=instance)
+    cred_kicker = Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)
     await cred_kicker._rescan()
 
     fresh = await instance.store.get(bearer_row.chain_id)
@@ -225,19 +224,19 @@ async def test_credential_kicker_skips_phantom_bearer_row(tmp_path: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_auth_kicker_skips_sigv4_row(tmp_path: Path) -> None:
-    """The AuthKicker does NOT wake an ``aws_sigv4`` row (no fight).
+    """The bearer kicker does NOT wake an ``aws_sigv4`` row (no fight).
 
     Even with a fresh BEARER token cached for the SigV4 host, the guard skips
-    the SigV4-routed row — that row is the CredentialKicker's to wake.
+    the SigV4-routed row, because that row is the sigv4 kicker's to wake.
     """
     instance, _ = await _build(tmp_path)
     sigv4_row = _parked_row(endpoint=_SIGV4_HOST)
     await instance.store.insert(sigv4_row)
-    # A fresh bearer token for the SigV4 host would let a guard-less AuthKicker
+    # A fresh bearer token for the SigV4 host would let a guard-less bearer kicker
     # wake it; the guard must reject on auth_mode.
     await instance.token_cache.set(_SIGV4_HOST, "user-1", "Bearer abc", source="inbound_request")
 
-    kicker = AuthKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
     await kicker._rescan()
 
     fresh = await instance.store.get(sigv4_row.chain_id)
@@ -255,8 +254,8 @@ async def test_two_kickers_do_not_fight(tmp_path: Path) -> None:
     await instance.store.insert(bearer_row)
     await instance.store.insert(sigv4_row)
 
-    auth_kicker = AuthKicker(instance=instance)
-    cred_kicker = CredentialKicker(instance=instance)
+    auth_kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
+    cred_kicker = Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)
 
     # Push a fresh BEARER token for the bearer host, then run BOTH rescans.
     await instance.token_cache.set(_BEARER_HOST, "user-1", "Bearer abc", source="inbound_request")
@@ -298,7 +297,7 @@ async def test_unroutable_row_skipped_not_aborting_pass(tmp_path: Path) -> None:
     await instance.store.insert(sigv4_row)
     await signer_creds.set(HostCredKey(_SIGV4_HOST), _sigv4_creds(), source="admin_push")
 
-    cred_kicker = CredentialKicker(instance=instance)
+    cred_kicker = Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)
     # A single rescan: must not raise out, must process the second row.
     await cred_kicker._rescan()
 
@@ -322,7 +321,7 @@ async def test_credential_kicker_noop_when_no_signer_creds(tmp_path: Path) -> No
     row = _parked_row(endpoint=_SIGV4_HOST)
     await instance.store.insert(row)
 
-    cred_kicker = CredentialKicker(instance=instance)
+    cred_kicker = Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)
     # Direct rescan returns early — no store, no work.
     await cred_kicker._rescan()
 

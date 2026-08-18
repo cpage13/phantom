@@ -14,7 +14,7 @@ admin actions land inside it routinely.
 
 Two harms, one root:
 
-* An admin replay (or the AuthKicker's wake - the same TOCTOU defeats
+* An admin replay (or the bearer kicker's wake - the same TOCTOU defeats
   both H4 guards, which check a stamp that does not exist yet) re-queues
   the listed ``stored`` row inside the window. The reaper then deletes
   the LIVE row's body files, stamps it, and zeroes its accounting: the

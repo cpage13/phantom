@@ -49,8 +49,7 @@ from phantom.storage.credential_store import SqliteCredentialStore
 from phantom.storage.hybrid_body_store import HybridBodyStore
 from phantom.strategies import FixedIntervalsStrategy
 from phantom.transport import UpstreamRequest, UpstreamResponse
-from phantom.workers.auth_kicker import AuthKicker
-from phantom.workers.credential_kicker import CredentialKicker
+from phantom.workers.kicker import AWS_SIGV4_FLAVOUR, PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
 from phantom.workers.sender import Sender
 
@@ -115,7 +114,7 @@ async def _build_instance(
             route covering both hosts, which is the multi-host shape F6 is
             about.
         with_signer_creds: When True, attach a started credential store, which
-            the ``aws_sigv4`` arm and the CredentialKicker need.
+            the ``aws_sigv4`` arm and the sigv4 kicker need.
 
     Returns:
         ``(instance, signer_creds_or_None)``.
@@ -514,7 +513,7 @@ async def test_auth_kicker_probes_the_recorded_host_not_the_endpoint(tmp_path: P
     await instance.store.insert(row)
     await instance.token_cache.set(FIRST_HOST, UID, "Bearer good", source="inbound_request")
 
-    await AuthKicker(instance=instance)._rescan()
+    await Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)._rescan()
 
     after = await instance.store.get(row.chain_id)
     assert after is not None
@@ -550,7 +549,7 @@ async def test_credential_kicker_probes_the_recorded_host_not_the_endpoint(
     await instance.store.insert(row)
     await signer_creds.set(HostCredKey(FIRST_HOST), _sigv4_creds(), source="admin_push")
 
-    await CredentialKicker(instance=instance)._rescan()
+    await Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)._rescan()
 
     after = await instance.store.get(row.chain_id)
     assert after is not None
@@ -569,10 +568,10 @@ async def test_a_cross_route_chain_is_owned_by_the_blocked_hosts_kicker(tmp_path
     host. Routes carry per-route ``auth_mode`` and admission route-checks only
     the FIRST step, so a chain whose step 1 is on a bearer route and whose step
     2 is on a sigv4 route is legal config. Resolving on the endpoint would hand
-    that row to the AuthKicker, which probes a token cache the sigv4 host's
+    that row to the bearer kicker, which probes a token cache the sigv4 host's
     credential never lives in.
 
-    Success: the CredentialKicker claims and wakes the row; the AuthKicker
+    Success: the sigv4 kicker claims and wakes the row; the bearer kicker
     skips it.
     """
     instance, signer_creds = await _build_instance(
@@ -588,19 +587,19 @@ async def test_a_cross_route_chain_is_owned_by_the_blocked_hosts_kicker(tmp_path
     await instance.store.insert(row)
     await signer_creds.set(HostCredKey(BLOCKED_HOST), _sigv4_creds(), source="admin_push")
 
-    await AuthKicker(instance=instance)._rescan()
+    await Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)._rescan()
     after_bearer = await instance.store.get(row.chain_id)
     assert after_bearer is not None
     assert after_bearer.state == "auth_expired", (
-        "the AuthKicker must skip a row whose BLOCKED host is on a sigv4 route; "
+        "the bearer kicker must skip a row whose BLOCKED host is on a sigv4 route; "
         f"the row moved to {after_bearer.state!r}"
     )
 
-    await CredentialKicker(instance=instance)._rescan()
+    await Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)._rescan()
     after_cred = await instance.store.get(row.chain_id)
     assert after_cred is not None
     assert after_cred.state == "queued", (
-        "the CredentialKicker owns the row, because the host actually blocking it is "
+        "the sigv4 kicker owns the row, because the host actually blocking it is "
         f"on the sigv4 route; the row is {after_cred.state!r}"
     )
 
@@ -619,13 +618,13 @@ async def test_a_fresh_token_on_the_blocked_host_still_wakes_the_row(tmp_path: P
     await instance.store.insert(row)
     await instance.token_cache.set(FIRST_HOST, UID, "Bearer good", source="inbound_request")
 
-    await AuthKicker(instance=instance)._rescan()
+    await Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)._rescan()
     still_parked = await instance.store.get(row.chain_id)
     assert still_parked is not None
     assert still_parked.state == "auth_expired"
 
     await instance.token_cache.set(BLOCKED_HOST, UID, "Bearer good", source="inbound_request")
-    await AuthKicker(instance=instance)._rescan()
+    await Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)._rescan()
 
     woken = await instance.store.get(row.chain_id)
     assert woken is not None
@@ -652,7 +651,7 @@ async def test_a_null_blocked_host_falls_back_to_the_endpoint(tmp_path: Path) ->
     await instance.store.insert(row)
     await instance.token_cache.set(FIRST_HOST, UID, "Bearer good", source="inbound_request")
 
-    await AuthKicker(instance=instance)._rescan()
+    await Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)._rescan()
 
     woken = await instance.store.get(row.chain_id)
     assert woken is not None

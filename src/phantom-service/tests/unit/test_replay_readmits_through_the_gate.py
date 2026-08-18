@@ -4,7 +4,7 @@ Defender-found while fixing R8-4 (the admin cancel/delete slot leaks):
 the saturation ledger's rule is one charge per row in the in-flight
 set. Admission charges; the sender releases on terminal transitions
 (succeeded / failed / corrupted / cancelled) and on the auth_expired
-park (the AuthKicker re-admits through the gate on wake - the section
+park (the bearer kicker re-admits through the gate on wake - the section
 3.1 symmetry). ``POST /v1/admin/chains/{chain_id}/replay`` re-queues a
 row from any of those RELEASED states without re-admitting:
 
@@ -17,7 +17,7 @@ row from any of those RELEASED states without re-admitting:
 
 ``stored`` and ``queued`` replays are NOT affected (their slot is still
 held; replay must not double-charge them), which is exactly the
-AuthKicker's re-admit discriminator applied to replay's wider
+bearer kicker's re-admit discriminator applied to replay's wider
 pre-state set.
 
 The repro replays a ``succeeded`` (released) row through the REAL route
@@ -112,7 +112,7 @@ async def test_replay_of_succeeded_row_recharges_the_gate(
     so the gate idles at zero. The replay re-queues the row - it is in
     flight again and the sender will release it again on its next
     terminal transition - so the route must re-charge the gate exactly
-    as the AuthKicker does when it wakes a parked row.
+    as the bearer kicker does when it wakes a parked row.
     """
     instance = await _build_instance(tmp_path)
     dispatcher = InstanceDispatcher([instance])

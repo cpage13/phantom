@@ -377,7 +377,7 @@ async def test_token_expires_midflight_then_fresh_push_resumes(tmp_path: Path) -
     Models a token whose validity lapses while the upload is buffered:
     the upstream 401s and the chain parks in ``auth_expired``. The
     operator pushes a fresh token via ``PUT /v1/admin/tokens/{endpoint}/{uid}``
-    (the SDK ``push_token``, the correct verb), the AuthKicker re-queues
+    (the SDK ``push_token``, the correct verb), the bearer kicker re-queues
     the parked chain, and it reaches ``succeeded``. The buffered upload
     was never lost across the credential gap.
     """

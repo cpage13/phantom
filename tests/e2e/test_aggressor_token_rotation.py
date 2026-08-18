@@ -192,7 +192,7 @@ async def test_aggressor_auth_kicker_recovery_via_admin_push(
 
     Sub-case B variant: emulator returns 401 unconditionally, so the
     first attempt parks the chain in `auth_expired`. The admin then
-    pushes a fresh token + clears the failure policy. The AuthKicker
+    pushes a fresh token + clears the failure policy. The bearer kicker
     re-queues the parked chains and they reach succeeded.
 
     Mirrors the producer's safety net for AAD/v0-JWT outage windows: a

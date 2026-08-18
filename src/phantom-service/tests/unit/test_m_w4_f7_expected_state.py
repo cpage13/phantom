@@ -120,7 +120,7 @@ async def test_record_attempt_result_default_predicate_rejects_cancelled(
 async def test_record_attempt_result_explicit_predicate_for_auth_expired_wake(
     store: SqliteUploadStore, make_upload_row
 ) -> None:
-    """``expected_state='auth_expired'`` lets the AuthKicker wake the row."""
+    """``expected_state='auth_expired'`` lets the bearer kicker wake the row."""
     row = make_upload_row(state="auth_expired")
     await store.insert(row)
     rowcount = await store.record_attempt_result(

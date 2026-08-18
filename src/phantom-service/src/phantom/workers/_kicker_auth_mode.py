@@ -1,13 +1,12 @@
-"""Shared kicker helper: a parked row's blocked-host resolved route.
+"""Kicker helper: a parked row's blocked-host resolved route.
 
-Both :class:`phantom.workers.auth_kicker.AuthKicker` and
-:class:`phantom.workers.credential_kicker.CredentialKicker` walk the SAME
+Both flavours of :class:`phantom.workers.kicker.Kicker` walk the SAME
 ``auth_expired`` rows on the SAME shared saturation gate. To stop them fighting
-over each other's rows (plan §2.5), each kicker skips rows whose destination
-``auth_mode`` is not its kind; each kicker ALSO sweeps rows past their route's
+over each other's rows (plan §2.5), each flavour skips rows whose destination
+``auth_mode`` is not its kind; each ALSO sweeps rows past their route's
 send-deadline (ADR-032). Both checks key off the SAME resolved route, so this
-single helper resolves it ONCE per row — the kickers read ``.auth_mode`` for the
-guard and ``.send_deadline_seconds`` for the sweep off one resolve, never two.
+helper resolves it ONCE per row: the loop reads ``.auth_mode`` for the guard
+and ``.send_deadline_seconds`` for the sweep off one resolve, never two.
 """
 
 from __future__ import annotations

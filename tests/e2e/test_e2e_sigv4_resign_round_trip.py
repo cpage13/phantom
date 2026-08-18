@@ -5,7 +5,7 @@ emulator's path-style ``PUT /{bucket}/{key}`` SigV4 sink that recomputes the
 signature from the inbound request and compares — :mod:`phantom_emulator.routers.s3`),
 Phase 1 (the root catch-all + raw→envelope adapter), and Phase 2 (the
 ``aws_sigv4`` executor signer arm, the host-keyed :class:`CredentialStore`, the
-:class:`CredentialKicker`, and the admin cred-push) into one round-trip.
+sigv4 :class:`Kicker`, and the admin cred-push) into one round-trip.
 
 Unlike the Phase-1 forward-as-is gate (``auth_mode: none``, no re-signing,
 auth-free ``/raw`` sink), here the route's ``auth_mode`` is ``aws_sigv4``: a
@@ -37,7 +37,7 @@ Four legs:
   ``failed``), and nothing is stored upstream.
 
 * **THE LOOP** — a wrong secret parks the row → the admin RE-PUSHES the correct
-  creds → the credential-store ``set`` wakes the :class:`CredentialKicker`,
+  creds → the credential-store ``set`` wakes the sigv4 :class:`Kicker`,
   which re-queues the parked row → Phantom re-signs with the fresh creds → the
   sink validates → ``succeeded`` + byte-identical body. The closure is asserted
   as the ``auth_expired`` → ``succeeded`` transition GATED ON the re-push (the
@@ -155,7 +155,7 @@ def _sigv4_overrides() -> dict[str, object]:
     port-stripped hostname, so ``127.0.0.1`` matches the live
     ``http://127.0.0.1:PORT`` target.
 
-    The credential store and the CredentialKicker are wired unconditionally at
+    The credential store and the sigv4 kicker are wired unconditionally at
     boot, so no extra flag is needed — the ``aws_sigv4`` route is enough to make
     the signer arm fire and the kicker observe the parked rows.
 
@@ -209,7 +209,7 @@ async def _push_credential(stack: E2EStack, *, secret_access_key: str) -> None:
     Provisions the credential through ``PUT /v1/admin/credentials/{dest_host}``
     (loopback, no auth, ADR-004) so the executor's signer arm has a slot to
     sign with. ``set`` freshens the slot AND fires the credential-store wake
-    handler the :class:`CredentialKicker` registered — which is what makes a
+    handler the sigv4 :class:`Kicker` registered, which is what makes a
     re-push wake every parked row on that host (the loop-closing seam).
 
     Args:
@@ -516,13 +516,13 @@ async def test_sigv4_refresh_loop_wrong_then_correct_credential() -> None:
 
     The full closed loop: a wrong secret parks the row in ``auth_expired``; the
     admin RE-PUSHES the correct secret; the credential-store ``set`` wakes the
-    CredentialKicker, which re-queues the parked row; Phantom re-signs with the
+    sigv4 kicker, which re-queues the parked row; Phantom re-signs with the
     fresh creds; the sink validates and stores; the row reaches ``succeeded``
     with a byte-identical body.
 
     The proof of closure is the ``auth_expired`` → ``succeeded`` transition
     GATED ON the re-push: the row is verified parked in ``auth_expired`` BEFORE
-    the correct credential is pushed, and only a CredentialKicker wake plus a
+    the correct credential is pushed, and only a sigv4 kicker wake plus a
     successful re-sign on the fresh creds can drive a parked row to
     ``succeeded``. So ``succeeded`` after the re-push is itself proof the kicker
     fired and partitioned the ``aws_sigv4`` row correctly — a mis-partitioned
@@ -550,7 +550,7 @@ async def test_sigv4_refresh_loop_wrong_then_correct_credential() -> None:
         )
 
         # Operator re-pushes the CORRECT credential. ``set`` freshens the slot
-        # and fires the store's wake handler → the CredentialKicker re-queues
+        # and fires the store's wake handler → the sigv4 kicker re-queues
         # the parked row on this host.
         await _push_credential(stack, secret_access_key=SECRET_ACCESS_KEY)
 

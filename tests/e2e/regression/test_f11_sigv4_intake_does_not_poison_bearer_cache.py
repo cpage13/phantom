@@ -9,7 +9,7 @@ overwrites any real bearer for ``(host, uid)``, it creates or revives a
 the token cache's wake handlers on every raw PUT so both kickers rescan.
 
 The observable this test uses is the admin token surface, deliberately. The
-churn story cannot be built: the AuthKicker skips every row whose resolved
+churn story cannot be built: the bearer kicker skips every row whose resolved
 route is not ``phantom_bearer``, so on an ``aws_sigv4`` host no row wakes and
 a churn assertion is vacuous pre-fix; and if the raw intake targeted a parked
 row's own host, that host is a ``phantom_bearer`` route, where D3 says the

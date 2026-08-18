@@ -101,12 +101,15 @@ from phantom.storage.interface import BodyStore
 from phantom.storage.sqlite_store import SCHEMA_VERSION
 from phantom.strategies import build_retry_strategy
 from phantom.transport.httpx_client import HttpxUpstreamClient
-from phantom.workers.auth_kicker import AuthKicker
 from phantom.workers.body_orphan_janitor import BodyOrphanJanitor
 from phantom.workers.cold_backup import ColdBackupScheduler
-from phantom.workers.credential_kicker import CredentialKicker
 from phantom.workers.disk_pressure import DiskPressureProbe
 from phantom.workers.invariant_audit import InvariantAuditor
+from phantom.workers.kicker import (
+    AWS_SIGV4_FLAVOUR,
+    PHANTOM_BEARER_FLAVOUR,
+    Kicker,
+)
 from phantom.workers.persist_controller import PersistController
 from phantom.workers.ram_pressure import RamPressureWatcher
 from phantom.workers.reaper import Reaper
@@ -1448,14 +1451,15 @@ def create_app(
                         poll_interval_ms=settings.retry.poll_interval_ms,
                         metrics_registry=metrics_registry,
                     )
-                    kicker = AuthKicker(instance=ctx)
-                    # COPY of the AuthKicker wiring (plan §2.3 Step B). The
-                    # CredentialKicker reads the SAME ctx (which carries
-                    # ``signer_creds``); it registers no wake-handler and its
-                    # rescan is a no-op when ``ctx.signer_creds is None`` (the
-                    # bearer-only deployment), so spawning it on every
-                    # instance's TaskGroup is uniform and inert by default.
-                    cred_kicker = CredentialKicker(instance=ctx)
+                    kicker = Kicker(instance=ctx, flavour=PHANTOM_BEARER_FLAVOUR)
+                    # The SAME class in its other flavour (CL2). It reads the
+                    # SAME ctx (which carries ``signer_creds``); its oracle
+                    # reports itself unconfigured when ``ctx.signer_creds is
+                    # None`` (the bearer-only deployment), so it registers no
+                    # wake-handler and its rescan returns early. Spawning it on
+                    # every instance's TaskGroup is uniform and inert by
+                    # default.
+                    cred_kicker = Kicker(instance=ctx, flavour=AWS_SIGV4_FLAVOUR)
                     vacuum = VacuumScheduler(
                         instance=ctx, cron_spec=settings.storage.sqlite.vacuum_cron
                     )

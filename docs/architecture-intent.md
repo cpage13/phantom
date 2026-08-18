@@ -144,7 +144,7 @@ in dev/CI, the emulator.
 |   |  Background coroutines (asyncio.TaskGroup):     |                                |
 |   |   - Sender pool   (N workers, probe-derived)    |                                |
 |   |   - Reaper                                      |                                |
-|   |   - AuthKicker                                  |                                |
+|   |   - Kicker (bearer + sigv4)                     |                                |
 |   |   - VacuumScheduler                             |                                |
 |   |   - AdMinter.run() loop                         |                                |
 |   |       (only when cfg.ad_mint is set;            |                                |
@@ -198,8 +198,8 @@ the write-purpose against `uploads` per the single-writer manifest (plan
 | **BodyOrphanJanitor** | `workers/body_orphan_janitor.py` | Walks `FileBodyStore.list_orphans()` for files whose `chain_id` is absent from `uploads`; deletes them. Closes C1 + invariant #4. | None (body-store deletes only). | Periodic (`body_orphan_sweep_seconds`, default 3600). |
 | **InvariantAuditor** (Phase 3) | `workers/invariant_audit.py` | Periodic row walk. Actively asserts invariants #1 and #3 (see § 5 *Reliability invariants* below). Counters/gauges support the other five. | None (read-only). | Periodic (`invariant_audit_period_seconds`, default 300). |
 | **Reaper** | `workers/reaper.py` | Deletes terminal-state rows per the retention YAML. Iterates `succeeded`, `failed`, `cancelled`, `stored`, `corrupted`, `auth_expired`, `expired` on the same sweep. Trims `idempotency_index`. | UPDATE `body_discarded_at`; DELETE terminal rows past retention. | Periodic (`reaper_interval_seconds`, default 60). |
-| **AuthKicker** | `workers/auth_kicker.py` | Wakes `auth_expired` rows when a fresh token lands in the cache. Skips body-discarded rows (R6-3); re-admits through the saturation gate, returning the slot on every outcome except a confirmed wake (R9-3 / R10-2). | UPDATE the `auth_expired → queued` wake via the M-W4-F7-guarded `record_attempt_result(expected_state="auth_expired")`; the `CredentialKicker` drives the same guarded transition for `aws_sigv4` rows (doc correction 2026-06-12: this cell previously claimed no `uploads` writes). | `TokenCache.set` fires, plus a 1 s periodic rescan. |
-| **CredentialKicker** | `workers/credential_kicker.py` | The SigV4 analogue of the `AuthKicker`: wakes `auth_expired` `aws_sigv4` rows when a fresh destination credential lands in the host-keyed credential store (the `CredentialKicker` class lives HERE, not in the executor). | UPDATE the `auth_expired → queued` wake (same M-W4-F7-guarded transition the `AuthKicker` uses). | A credential push for the row's `dest_host`, plus a periodic rescan. |
+| **Kicker** (bearer flavour) | `workers/kicker.py` | Wakes `auth_expired` rows when a fresh token lands in the cache. Skips body-discarded rows (R6-3, via `is_deliverable`); re-admits through the saturation gate, returning the slot on every outcome except a confirmed wake (R9-3 / R10-2). | UPDATE the `auth_expired → queued` wake via the M-W4-F7-guarded `record_attempt_result(expected_state="auth_expired")`; the sigv4 flavour drives the same guarded transition for `aws_sigv4` rows (doc correction 2026-06-12: this cell previously claimed no `uploads` writes). | `TokenCache.set` fires, plus a 1 s periodic rescan. |
+| **Kicker** (`aws_sigv4` flavour) | `workers/kicker.py` | The SAME class under `AWS_SIGV4_FLAVOUR`: wakes `auth_expired` `aws_sigv4` rows when a fresh destination credential lands in the host-keyed credential store. Inert when the instance wires no credential store. | UPDATE the `auth_expired → queued` wake (the same M-W4-F7-guarded transition). | A credential push for the row's `dest_host`, plus a periodic rescan. |
 | **VacuumScheduler** | `workers/vacuum.py` | Cron-style scheduler for SQLite VACUUM. Only runs when `in_flight == 0`. | None (DDL only). | Cron tick (default Sunday 03:00). |
 | **AdMinter.run()** | `refresh/ad_client_credentials.py` | Background loop minting AD tokens before expiry, with `ad_outage_retry_seconds` backoff. Only spawned when an instance's `cfg.ad_mint` is set. Phase 2 H6 closure: supervised by the composition root's TaskGroup (no self-spawned `asyncio.create_task`). | None (touches token_cache only). | Scheduled per the snapshot's AD-mint timings. |
 | **DiskPressureProbe** | `workers/disk_pressure.py` | Background probe of `shutil.disk_usage(data_dir).free`; refuses admission via the saturation gate when the threshold is breached. Ported to the composition root TaskGroup in Phase 1. | None (signals saturation gate). | Periodic (every few seconds). |
@@ -392,9 +392,10 @@ unchanged: code continues to read `import phantom` /
   registry) + `instances.context.InstanceStoragePaths` (owns the live
   per-instance `uploads.db` / `bodies/` layout; the composition root
   and the quarantine/restore routes derive the same paths from it).
-- `workers/`: `Sender`, `Reaper`, `AuthKicker`, `CredentialKicker`
-  (`workers/credential_kicker.py`: wakes `auth_expired` `aws_sigv4` rows
-  on a fresh credential push; the SigV4 analogue of `AuthKicker`),
+- `workers/`: `Sender`, `Reaper`, `Kicker`
+  (`workers/kicker.py`: one flavour-parameterised waker; the bearer
+  flavour wakes `auth_expired` rows on a fresh token, the `aws_sigv4`
+  flavour on a fresh destination-credential push),
   `VacuumScheduler`, `SaturationGate` (returns `AdmissionResult` union),
   `run_recovery` (the boot sweep: reset `attempting → queued`, then one
   collect-then-write integrity walk that quarantines missing-body rows;
@@ -632,7 +633,7 @@ bugs.
     removal, whichever first; every row-removal path (admin cancel /
     delete / bulk delete, the reaper's three removal legs) releases on
     accounting captured atomically with the removal; every re-queue of
-    a released row (replay, the AuthKicker wake) re-admits through the
+    a released row (replay, the `Kicker` wake) re-admits through the
     gate. Boot recovery reconstructs those same charges from persisted rows
     before workers start. The gate idles at zero. (R8-4 / R8-6.)
 17. **Irreversible cross-worker effects confirm-then-act on live
@@ -640,7 +641,7 @@ bugs.
     truth at the decision instant instead of trusting a snapshot: the
     orphan janitor's two-sweep confirmation + live-row re-read (R6-1),
     `mark_persisted`'s H4 guard with the migration undo narrowed to its
-    own artifacts (R7-2 / R8-3), the AuthKicker's body-discarded skip
+    own artifacts (R7-2 / R8-3), the `Kicker`'s body-discarded skip
     (R6-3), the InvariantAuditor's live re-read on a body-ref miss
     (R5-1), BOTH body-discard legs' stamp-first order behind the
     in-transaction state+stamp guard with files deleted only after a
@@ -896,8 +897,8 @@ punch-list failure modes.
 | Upstream metadata POST returns 5xx | Sender classifies as `Failed5xx`. | State `attempting → queued` with `next_attempt_at` per the retry strategy. | `tests/e2e/regression/test_v5_retry_cadence_and_crash_survival.py`. |
 | S3 PUT returns 5xx (or network error) | Same as above on step 2. | Same. The captured presigned URL remains on the row; retry re-runs step 2 while Phantom's observation TTL remains live. Actual upstream capability expiry is a separate clock that Phantom cannot infer from the local TTL gate. | Same. |
 | Referenced capture's Phantom observation TTL elapses | Executor's capture-TTL gate; this does not prove that the upstream capability itself expired. | Per `row.capture_reexecution_active`: `False` → `stored`; `True` → executor rewinds to the producing step and renews Phantom's observation timestamp. A declared per-step idempotency header lets an honoring upstream preserve identity, but an exact cached response cannot revive an actually expired URL. Enabling this requires both verified identity/idempotency behavior and compatible upstream capability renewal or lifetime. Without an idempotency header, re-execution can create a distinct upstream object. See ADR-011. | `tests/e2e/test_e2e_06_capture_expiry.py` strictly proves keyed, unkeyed, and default-disabled behavior, at least one upload PUT rejected by the configured `error_rate_5xx` branch before rewind, and exact successful create-response/accepted-PUT events. |
-| Upstream returns 401 (token stale) | Sender classifies as `FailedAuth`. | `token_cache.mark_bad(endpoint, uid)`; row → `auth_expired` with `auth_blocked_host` recording the host that rejected it. `AdMinter` mints fresh when configured; `AuthKicker` wakes a row when a fresh token lands FOR ITS RECORDED HOST (D2/F6), not for the row's first-step `endpoint`. | `tests/e2e/test_e2e_04_auth_kicker.py`, `tests/e2e/test_e2e_36_token_expiry_recovery.py`. |
-| `aws_sigv4` credential missing or rejected | The executor's `aws_sigv4` arm raises `SigV4SigningError` (no credential for the host, or its service has no signer). | Sender marks the slot bad; row → `auth_expired` with `auth_blocked_host` recording that `dest_host` (NOT terminal). On a fresh credential push for the RECORDED host, the `CredentialKicker` wakes the row (the SigV4 analogue of the 401 cycle). Body bytes are never altered. | `tests/e2e/test_e2e_sigv4_resign_round_trip.py` (`test_sigv4_wrong_credential_parks_auth_expired`, `test_sigv4_refresh_loop_wrong_then_correct_credential`). |
+| Upstream returns 401 (token stale) | Sender classifies as `FailedAuth`. | `token_cache.mark_bad(endpoint, uid)`; row → `auth_expired` with `auth_blocked_host` recording the host that rejected it. `AdMinter` mints fresh when configured; the bearer `Kicker` wakes a row when a fresh token lands FOR ITS RECORDED HOST (D2/F6), not for the row's first-step `endpoint`. | `tests/e2e/test_e2e_04_auth_kicker.py`, `tests/e2e/test_e2e_36_token_expiry_recovery.py`. |
+| `aws_sigv4` credential missing or rejected | The executor's `aws_sigv4` arm raises `SigV4SigningError` (no credential for the host, or its service has no signer). | Sender marks the slot bad; row → `auth_expired` with `auth_blocked_host` recording that `dest_host` (NOT terminal). On a fresh credential push for the RECORDED host, the sigv4 `Kicker` wakes the row (the SigV4 analogue of the 401 cycle). Body bytes are never altered. | `tests/e2e/test_e2e_sigv4_resign_round_trip.py` (`test_sigv4_wrong_credential_parks_auth_expired`, `test_sigv4_refresh_loop_wrong_then_correct_credential`). |
 | Producer restart | Process loss. | RAM bodies lost; `body_location='file'` rows survive. Admission's atomic transaction (Phase 1 H7) ensures every committed row has an idempotency claim. RAM rows are quarantined by the recovery sweep. | `tests/e2e/crash_recovery/test_crash_recovery_idempotent.py`. |
 | Phantom container crashes mid-persist | The PersistController's commit-last-column ordering means: if the crash happens BEFORE the `body_location='file'` UPDATE commits, the row is still `'ram'`; the recovery sweep quarantines (the RAM body is gone after restart). If the crash happens AFTER, the row is `'file'` with a complete on-disk body file (fsync ran before the UPDATE). | Recovery sweep at startup: reset `attempting → queued`; quarantine stale `body_location='ram'` rows; verify `body_location='file'` rows have their body files (missing → `corrupted` subject to the invariant #1 carve-out). Sender only starts after recovery completes. | `tests/e2e/crash_recovery/test_crash_persist_controller.py`. |
 | Body file missing at sender attempt time (Phase 2 H8) | `HybridBodyStore.load_body_refs` raises `BodyMissingError`. | Sender's `_drive_one` cascade transitions the row to `corrupted` with `last_error="storage_corruption:bodies_missing"`. No retry. See ADR-014. | `src/phantom-service/tests/unit/test_h8_body_missing_corrupted.py`. |

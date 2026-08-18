@@ -32,7 +32,7 @@ loop fixed one round ago.
 
 The test drives the REAL ``replay_upload`` route over a REAL
 SqliteUploadStore, SqliteTokenCache, SaturationGate, and the REAL
-AuthKicker as the concurrent actor. A store wrapper lands the kicker's
+bearer kicker as the concurrent actor. A store wrapper lands the kicker's
 full wake (admit + guarded re-queue) deterministically inside the
 route's window (the established R7-2/R8-3 hook technique). After the
 dust settles exactly one live row is in flight, so the gate must hold
@@ -63,7 +63,7 @@ from phantom.storage import (
 )
 from phantom.storage.hybrid_body_store import HybridBodyStore
 from phantom.strategies import FixedIntervalsStrategy
-from phantom.workers.auth_kicker import AuthKicker
+from phantom.workers.kicker import PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
 
 from .conftest import track_instance
@@ -220,7 +220,7 @@ async def test_replay_racing_a_kicker_wake_charges_exactly_one_slot(
         source="inbound_request",
     )
     real_store = instance.store
-    kicker = AuthKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
 
     async def kicker_wakes_the_row() -> None:
         await kicker._rescan()

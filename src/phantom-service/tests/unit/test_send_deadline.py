@@ -12,8 +12,8 @@ both routing through the shared ``expire_row`` writer (``workers/_expire.py``):
 * **Path B — the kicker parked-row sweep (suspenders).** A row PARKED in
   ``auth_expired`` (which the executor gate never sees, since the sender only
   claims ``queued`` rows) past its deadline → the kicker's ``_rescan`` sweep →
-  ``expire_row`` → ``expired``. Both the ``CredentialKicker`` (``aws_sigv4``) and
-  the ``AuthKicker`` (``phantom_bearer``) carry the symmetric backstop.
+  ``expire_row`` → ``expired``. Both the sigv4 ``Kicker`` (``aws_sigv4``) and
+  the bearer ``Kicker`` (``phantom_bearer``) carry the symmetric backstop.
 
 Also pins the LOUD dispatch guard: the sender's ``isinstance`` result chain has
 no static ``assert_never``, so a forgotten arm would silently wedge the row;
@@ -43,8 +43,7 @@ from phantom.storage import (
 from phantom.storage.credential_store import SqliteCredentialStore
 from phantom.storage.hybrid_body_store import HybridBodyStore
 from phantom.strategies import FixedIntervalsStrategy
-from phantom.workers.auth_kicker import AuthKicker
-from phantom.workers.credential_kicker import CredentialKicker
+from phantom.workers.kicker import AWS_SIGV4_FLAVOUR, PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import (
     AdmissionGranted,
     AdmissionRefusedSaturation,
@@ -396,7 +395,7 @@ async def test_credential_kicker_sweeps_over_deadline_parked_row_to_expired(
     row = _parked_row(endpoint=_SIGV4_HOST, received_at=received)
     await instance.store.insert(row)
 
-    kicker = CredentialKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)
     await kicker._rescan()
 
     fresh = await instance.store.get(row.chain_id)
@@ -414,7 +413,7 @@ async def test_credential_kicker_does_not_sweep_within_deadline(tmp_path: Path) 
     row = _parked_row(endpoint=_SIGV4_HOST, received_at=datetime.now(tz=UTC))
     await instance.store.insert(row)
 
-    kicker = CredentialKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)
     await kicker._rescan()
 
     fresh = await instance.store.get(row.chain_id)
@@ -430,7 +429,7 @@ async def test_auth_kicker_sweeps_over_deadline_parked_bearer_row_to_expired(
     """Symmetric path B: a parked ``phantom_bearer`` row past its deadline → ``expired``.
 
     The bearer forever-park hole predates SigV4: a producer that never re-pushes
-    a token leaves the row parked indefinitely. The symmetric AuthKicker sweep
+    a token leaves the row parked indefinitely. The symmetric bearer kicker sweep
     closes it.
     """
     instance, _ = await _build_kicker_instance(
@@ -440,7 +439,7 @@ async def test_auth_kicker_sweeps_over_deadline_parked_bearer_row_to_expired(
     row = _parked_row(endpoint=_BEARER_HOST, received_at=received)
     await instance.store.insert(row)
 
-    kicker = AuthKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
     await kicker._rescan()
 
     fresh = await instance.store.get(row.chain_id)
@@ -476,8 +475,8 @@ async def test_kicker_does_not_wake_an_expired_row(tmp_path: Path) -> None:
     row = row.model_copy(update={"state": "expired"})
     await instance.store.insert(row)
 
-    cred_kicker = CredentialKicker(instance=instance)
-    auth_kicker = AuthKicker(instance=instance)
+    cred_kicker = Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)
+    auth_kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
     await cred_kicker._rescan()
     await auth_kicker._rescan()
 
@@ -569,7 +568,7 @@ async def test_credential_kicker_sweep_does_not_double_release_slot(tmp_path: Pa
     Scenario (the over-admission bug, fixed): one row is genuinely in flight
     (holding the only slot of a ``max_in_flight=1`` gate). A SECOND row sits
     parked in ``auth_expired`` — its slot was released back at park time, so it
-    holds NOTHING. When the ``CredentialKicker`` sweep expires the parked row,
+    holds NOTHING. When the sigv4 ``Kicker`` sweep expires the parked row,
     a spurious ``release`` would decrement ``in_flight`` from 1 to 0, falsely
     freeing the in-flight row's slot and admitting a third upload past the cap.
 
@@ -594,7 +593,7 @@ async def test_credential_kicker_sweep_does_not_double_release_slot(tmp_path: Pa
     parked = _parked_row(endpoint=_SIGV4_HOST, received_at=received)
     await instance.store.insert(parked)
 
-    kicker = CredentialKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=AWS_SIGV4_FLAVOUR)
     await kicker._rescan()
 
     fresh = await instance.store.get(parked.chain_id)
@@ -626,7 +625,7 @@ async def test_auth_kicker_sweep_does_not_double_release_slot(tmp_path: Path) ->
     parked = _parked_row(endpoint=_BEARER_HOST, received_at=received)
     await instance.store.insert(parked)
 
-    kicker = AuthKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
     await kicker._rescan()
 
     fresh = await instance.store.get(parked.chain_id)

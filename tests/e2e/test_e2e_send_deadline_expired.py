@@ -16,7 +16,7 @@ The path under test:
   ``auth_expired`` with exactly ONE attempt recorded and nothing sent upstream.
 
 * No credential is ever pushed. The route carries ``send_deadline_seconds = 1``.
-  The :class:`CredentialKicker` ``_rescan`` sweep (which reads WALL-CLOCK
+  The sigv4 :class:`Kicker` ``_rescan`` sweep (which reads WALL-CLOCK
   ``datetime.now(tz=UTC)`` — it is NOT clock-injectable, so a real short wait is
   required, not a monkeypatched clock) runs on its ``1.0``-second interval, sees
   the parked row's ``received_at`` is now past ``received_at + 1s``, and — BEFORE
@@ -50,7 +50,7 @@ The assertions are the backstop's contract:
 * terminal stability — a re-poll after a settle confirms the row stays
   ``expired`` with ``attempts == 1`` (it is not re-admitted on a later rescan).
 
-The ``aws_sigv4`` route is REQUIRED (not incidental): the ``CredentialKicker``
+The ``aws_sigv4`` route is REQUIRED (not incidental): the sigv4 ``Kicker``
 ``_rescan`` is inert unless the instance has a signer-credential store (an
 ``aws_sigv4`` route), and its deadline sweep only fires for rows whose resolved
 route's ``auth_mode`` is ``aws_sigv4``. The no-credential park is the cleanest
@@ -126,7 +126,7 @@ def _deadline_overrides() -> dict[str, object]:
 
     An ``aws_sigv4`` route pointed at the live emulator host, carrying a SHORT
     ``send_deadline_seconds``. The ``aws_sigv4`` ``auth_mode`` is load-bearing:
-    it wires the signer-credential store (so the :class:`CredentialKicker`
+    it wires the signer-credential store (so the sigv4 :class:`Kicker`
     ``_rescan`` is live rather than inert) and makes the kicker's deadline sweep
     own this route's parked rows. No credential is provisioned, so the first
     forward attempt parks the row in ``auth_expired``; the deadline then sweeps
@@ -218,7 +218,7 @@ async def test_send_deadline_sweeps_parked_row_to_expired() -> None:
     No credential is provisioned for an ``aws_sigv4`` route carrying
     ``send_deadline_seconds = 1``; a stock PUT parks in ``auth_expired`` with one
     attempt and no upstream call; after the real 1-second deadline elapses the
-    CredentialKicker sweep transitions the row to terminal ``expired`` (body
+    sigv4 kicker sweep transitions the row to terminal ``expired`` (body
     discarded, never re-queued). The body never reaches the sink, and the row
     stays ``expired`` on a subsequent rescan.
     """
@@ -311,7 +311,7 @@ async def test_send_deadline_sweeps_parked_row_to_expired() -> None:
         # genuine terminal give-up, not a transient a later sweep undoes.
         await settle_for(
             TERMINAL_STABILITY_SETTLE_SECONDS,
-            reason="let one more CredentialKicker rescan pass run; the row must stay expired",
+            reason="let one more sigv4 kicker rescan pass run; the row must stay expired",
         )
         still = await stack.phantom_client.get_upload(chain_id)
         assert still.state == EXPIRED_STATE, (

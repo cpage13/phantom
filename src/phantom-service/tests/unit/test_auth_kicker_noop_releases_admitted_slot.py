@@ -1,4 +1,4 @@
-"""The AuthKicker's no-op leg must release the slot it just admitted (R9-3).
+"""The bearer kicker's no-op leg must release the slot it just admitted (R9-3).
 
 Invariant #16 (the saturation ledger balances) requires exactly one
 gate charge per row in the in-flight set. The kicker's wake sequence is
@@ -8,7 +8,7 @@ that guarded UPDATE returns rowcount 0 - the row moved out of
 ``auth_expired`` between the kicker's list and its write, which the
 code comment itself attributes to "admin cancel/replay, or another
 kicker tick" - the kicker logs and skips WITHOUT releasing the slot it
-admitted one await earlier (``workers/auth_kicker.py``). The charge
+admitted one await earlier (``workers/kicker.py``). The charge
 then corresponds to no row forever.
 
 Compare the replay route, which handles its mirror-image store-side
@@ -26,7 +26,7 @@ up by one slot plus the row's bytes per occurrence, never returns, and
 eventually 503-refuses fresh ingress (``saturation_cap``) with no live
 row behind the count; only a process restart resets it.
 
-The test drives the REAL AuthKicker rescan over a REAL SqliteUploadStore,
+The test drives the REAL bearer kicker rescan over a REAL SqliteUploadStore,
 SqliteTokenCache, and SaturationGate. A store wrapper lands the admin
 cancel deterministically between the kicker's list and its re-queue
 write (the established R7-2/R8-3 hook technique). After the dust
@@ -57,7 +57,7 @@ from phantom.storage import (
 )
 from phantom.storage.hybrid_body_store import HybridBodyStore
 from phantom.strategies import FixedIntervalsStrategy
-from phantom.workers.auth_kicker import AuthKicker
+from phantom.workers.kicker import PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
 
 from .conftest import track_instance
@@ -74,7 +74,7 @@ _GATE_BYTE_CAP: int = 10_000_000
 _GATE_DISK_CAP: int = 10_000_000
 
 _R9_3_REASON: str = (
-    "R9-3: AuthKicker._rescan admits a saturation slot BEFORE its guarded "
+    "R9-3: Kicker._rescan admits a saturation slot BEFORE its guarded "
     "auth_expired->queued write; when that write no-ops (rowcount 0 - admin "
     "cancel/replay raced the wake, the comment's own enumeration) the kicker "
     "skips without releasing the slot it just admitted, so the gate drifts up "
@@ -211,7 +211,7 @@ async def test_noop_wake_returns_the_admitted_slot(tmp_path: Path) -> None:
         assert outcome.previous_state == "auth_expired"
 
     instance.store = _CancelBeforeRequeueStore(real_store, admin_cancels_the_parked_row)
-    kicker = AuthKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
     await kicker._rescan()
 
     final = await real_store.get(row.chain_id)

@@ -1118,7 +1118,7 @@ async def replay_upload(
     # R8-6: a replay re-queues the row into the in-flight set. A row
     # whose slot was RELEASED (the sender's terminal transitions; the
     # auth_expired park) must re-admit through the gate exactly as the
-    # AuthKicker does on wake; queued/stored rows still hold their slot
+    # Kicker does on wake; queued/stored rows still hold their slot
     # and must not double-charge. On any store-side refusal the row
     # never re-entered the in-flight set, so the slot is released
     # again. Refusing the replay outright when the gate is full keeps
@@ -1418,10 +1418,10 @@ async def push_credential_one(
     Each instance's :attr:`~phantom.instances.context.InstanceContext.signer_creds`
     store is ``set`` under that host key. ``set`` freshens the slot
     (``status='fresh'``) AND fires the store's wake handler, which the
-    :class:`~phantom.workers.credential_kicker.CredentialKicker` registered — so
+    sigv4-flavoured :class:`~phantom.workers.kicker.Kicker` registered, so
     an operator re-pushing fresh credentials for a host wakes every parked
     ``auth_expired`` row on that host (the loop-closing seam, mirroring the
-    token push waking the :class:`~phantom.workers.auth_kicker.AuthKicker`).
+    token push waking the same class in its bearer flavour).
 
     The :data:`CredentialPushBody` now declares a REQUIRED ``service`` (the AWS
     service the credential signs for, coerced to a

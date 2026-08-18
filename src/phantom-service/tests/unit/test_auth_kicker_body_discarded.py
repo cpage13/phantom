@@ -1,4 +1,4 @@
-"""AuthKicker vs a body-discarded ``auth_expired`` row (round 6, R6-3).
+"""The bearer kicker vs a body-discarded ``auth_expired`` row (round 6, R6-3).
 
 The H4 carve-out (``body_discarded_at IS NOT NULL``) marks a row whose
 body bytes were intentionally removed: the reaper's scheduled
@@ -16,7 +16,7 @@ of that carve-out respects it:
   - a clean 409 - because a re-queue would land the row in ``corrupted``
   on the sender's next claim (sqlite_store.py).
 
-The :class:`AuthKicker` is the lone consumer that does NOT guard
+The bearer :class:`Kicker` is the lone consumer that does NOT guard
 ``body_discarded_at``. ``auth_expired`` is non-terminal, so
 ``list_non_terminal`` returns a body-discarded ``auth_expired`` row, and
 ``_rescan`` re-queues it (``auth_expired -> queued``) the moment a fresh
@@ -63,7 +63,7 @@ from phantom.storage import (
     SqliteUploadStore,
 )
 from phantom.storage.hybrid_body_store import HybridBodyStore
-from phantom.workers.auth_kicker import AuthKicker
+from phantom.workers.kicker import PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
 
 from .conftest import make_snapshot, snapshot_thunk, track_instance
@@ -171,7 +171,7 @@ async def test_kicker_skips_body_discarded_auth_expired_row(tmp_path: Path) -> N
         source="inbound_request",
     )
 
-    kicker = AuthKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
     # Drive one rescan directly: deterministic, no polling.
     await kicker._rescan()
 

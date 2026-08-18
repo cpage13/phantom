@@ -186,7 +186,7 @@ re-signs each upload with AWS SigV4 for the real bucket.
   signed `x-amz-content-sha256`. Four legs: the happy round trip
   (`test_sigv4_resign_round_trip_keystone`), a wrong credential parking the row in
   `auth_expired` (`test_sigv4_wrong_credential_parks_auth_expired`), the
-  `CredentialKicker` refresh loop where a corrected credential push wakes the
+  sigv4 `Kicker` refresh loop where a corrected credential push wakes the
   parked row to success (`test_sigv4_refresh_loop_wrong_then_correct_credential`),
   and a directly-corrupted signature rejected `403`
   (`test_sigv4_corrupted_signature_direct_put_rejected_403`). A parametrized leg

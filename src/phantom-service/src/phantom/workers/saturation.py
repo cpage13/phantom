@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # States whose row currently holds a saturation slot (R8-4). Admission
 # charges the gate; the sender releases on the terminal transitions it
 # drives (succeeded / failed / corrupted / cancelled) and on the
-# auth_expired park (the AuthKicker re-admits through the gate on
+# auth_expired park (the Kicker re-admits through the gate on
 # wake). ``stored`` deliberately keeps its slot - the buffered body
 # still occupies space - until the body is discarded by retention
 # policy or the row is removed. Every path that REMOVES a row (admin

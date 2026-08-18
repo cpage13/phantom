@@ -6,7 +6,7 @@ act on a stale body guards the stamp - recovery skips it
 (``workers/recovery.py``), the InvariantAuditor skips it
 (``workers/invariant_audit.py``), ``replay`` refuses
 (``storage/sqlite_store.py``), and R6-3 added the same guard to the
-AuthKicker. :meth:`SqliteUploadStore.mark_persisted` - the
+bearer kicker. :meth:`SqliteUploadStore.mark_persisted` - the
 PersistController's RAM->disk commit point - is the lone writer that does
 NOT: its ``WHERE`` clause guards ``body_location = 'ram'`` only, not
 ``body_discarded_at IS NULL``.

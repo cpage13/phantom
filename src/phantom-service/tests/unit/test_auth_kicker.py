@@ -18,7 +18,7 @@ from phantom.storage import (
     SqliteTokenCache,
     SqliteUploadStore,
 )
-from phantom.workers.auth_kicker import AuthKicker
+from phantom.workers.kicker import PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
 
 from .conftest import make_snapshot, snapshot_thunk, track_instance
@@ -51,7 +51,7 @@ async def _build(
         data_dir="primary",
         # phantom_bearer: these tests exercise the bearer-wake path (a token
         # set() re-queues a parked row). With the §2.5 auth_mode guard the
-        # AuthKicker only wakes phantom_bearer rows, so the route the parked
+        # bearer kicker only wakes phantom_bearer rows, so the route the parked
         # row resolves to must be phantom_bearer for the scenario to be valid
         # (a "none" route would never have parked via the bearer path).
         routes=[RouteCfg(name="r", hosts=["*"], auth_mode="phantom_bearer")],
@@ -104,7 +104,7 @@ async def test_set_wakes_matching_rows(tmp_path: Path) -> None:
         capture_reexecution_active=False,
     )
     await instance.store.insert(row)
-    kicker = AuthKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
     stop_event = asyncio.Event()
     task = asyncio.create_task(kicker.run(stop_event))
     await instance.token_cache.set(
@@ -165,7 +165,7 @@ async def test_kick_admits_on_saturation_gate(tmp_path: Path) -> None:
     assert sat.in_flight == 0
     assert sat.in_flight_bytes == 0
 
-    kicker = AuthKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
     stop_event = asyncio.Event()
     task = asyncio.create_task(kicker.run(stop_event))
     await instance.token_cache.set(
@@ -228,7 +228,7 @@ async def test_kick_keeps_row_parked_on_saturation_refusal(tmp_path: Path) -> No
     )
     await instance.store.insert(row)
 
-    kicker = AuthKicker(instance=instance)
+    kicker = Kicker(instance=instance, flavour=PHANTOM_BEARER_FLAVOUR)
     stop_event = asyncio.Event()
     task = asyncio.create_task(kicker.run(stop_event))
     await instance.token_cache.set(
