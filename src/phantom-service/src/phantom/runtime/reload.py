@@ -8,10 +8,11 @@ One caller surface, two triggers: the SIGHUP handler installed by
 machine facts exactly as at boot, so the smart-defaults deployment
 posture survives reload; operator-pinned YAML always wins), builds
 fresh per-instance snapshots, swaps them under the
-:class:`SettingsHolder` lock, repoints each :class:`InstanceContext.cfg`
-at its freshly-loaded :class:`InstanceCfg`, rebuilds each instance's
-retry strategy, surfaces AD-mint config drift, and pushes new
-saturation caps into every gate. Worker coroutines read the live
+:class:`SettingsHolder` lock, rebuilds each instance's retry strategy,
+surfaces AD-mint and per-instance route-block config drift, and pushes
+new saturation caps into every gate. Each :class:`InstanceContext.cfg`
+is left exactly as booted: the per-instance route block is frozen so
+every reader resolves one snapshot (D1/F5). Worker coroutines read the live
 snapshot on each tick, so the change propagates without restarting the
 pool. Validation (including probe-fill resolution) completes inside
 ``Settings.reload_from_yaml`` BEFORE any swap, so a rejected reload
@@ -111,6 +112,44 @@ async def _reload_minter(
     )
 
 
+def _warn_on_restart_required_drift(live_cfg: InstanceCfg, new_cfg: InstanceCfg) -> None:
+    """Warn when a reload changes per-instance config that cannot be applied.
+
+    D1/ADR-013: ``routes``, ``host_prefixes`` and ``data_dir`` are frozen at
+    boot. The boot :class:`InstanceCfg` is the ONE snapshot every reader
+    resolves against (admission, the dispatcher, both kickers, the executor,
+    and the admin quarantine paths), and nothing rebinds it, so a reloaded
+    block in this set cannot take effect. This arm is what tells the operator
+    that, and it mirrors :func:`_reload_minter`'s ``ad_mint`` posture: warn,
+    change nothing, keep running.
+
+    Field NAMES are logged, never their values. A route table is unbounded
+    operator input and a step URL pattern is not something a WARNING should
+    splice into the log stream.
+
+    Args:
+        live_cfg: The instance's frozen boot config.
+        new_cfg: The freshly-loaded block for the same instance id.
+    """
+    drifted: list[str] = []
+    if live_cfg.routes != new_cfg.routes:
+        drifted.append("routes")
+    if live_cfg.host_prefixes != new_cfg.host_prefixes:
+        drifted.append("host_prefixes")
+    if live_cfg.data_dir != new_cfg.data_dir:
+        drifted.append("data_dir")
+    if not drifted:
+        return
+    logger.warning(
+        "Reload changed restart-required per-instance config (%s) for instance "
+        "%s; the change has NOT been applied and cannot take effect until the "
+        "process restarts (ADR-013: routes, host_prefixes and data_dir are "
+        "frozen at boot so every reader resolves one snapshot)",
+        ", ".join(drifted),
+        live_cfg.id,
+    )
+
+
 def make_sighup_handler(
     holder: SettingsHolder,
     settings_path: Path,
@@ -195,9 +234,11 @@ async def apply_reload(
     map under the holder's lock, then propagates the settings change to
     live state that workers don't read from snapshots on each tick:
 
-    * Per-instance :attr:`InstanceContext.cfg` is repointed at the new
-      :class:`InstanceCfg` (so route resolution + ``ad_mint`` reads see
-      the freshly-loaded values).
+    * Per-instance :attr:`InstanceContext.cfg` is NOT touched. The route
+      block (``routes``, ``host_prefixes``, ``data_dir``) is frozen at
+      boot so every reader resolves one snapshot (D1/F5); drift in that
+      set is surfaced as a restart-required WARNING via
+      :func:`_warn_on_restart_required_drift` and applied nowhere.
     * AD-mint config drift is surfaced as a restart-required WARNING
       via :func:`_reload_minter` (H6: the lifespan TaskGroup owns the
       minter; no reload-time swap).
@@ -294,10 +335,10 @@ async def apply_reload(
             logger.warning("Reload omitted instance %s; keeping previous config", ctx.cfg.id)
             continue
         await _reload_minter(ctx, new_cfg, ctx.token_cache)
-        ctx.cfg = new_cfg
+        _warn_on_restart_required_drift(ctx.cfg, new_cfg)
         # Rebuild the retry strategy from the freshly-loaded block so
         # reloaded retry parameters reach the sender's next scheduling
-        # decision (R5-2). Mirrors the ctx.cfg repoint above: a
+        # decision (R5-2). Mirrors the saturation cap push below: a
         # reload-time push for state the sender does not re-derive
         # from the snapshot per decision.
         ctx.retry_strategy = build_retry_strategy(new_settings.retry.default_strategy)

@@ -142,8 +142,10 @@ class CredentialKicker:
             # Placed AFTER the cheap state + body_discarded_at filters and
             # BEFORE the freshness gate. ``row_resolved_route`` resolves the
             # PERSISTED ``row.endpoint`` through ``resolve_route``, the only
-            # raising call in the copied loop (ValueError on no-match, e.g. a
-            # route removed by hot-reload between park and wake). Wrap it per
+            # raising call in the copied loop (ValueError on no-match; since
+            # F5 froze the route block at boot the cause is a chain admitted
+            # with a step whose host matches no route, not a route removed by
+            # hot-reload, which can no longer happen). Wrap it per
             # row and SKIP on raise: a single un-routable parked row must NOT
             # abort the rescan pass. One resolve feeds BOTH the auth_mode
             # partition and the deadline sweep.

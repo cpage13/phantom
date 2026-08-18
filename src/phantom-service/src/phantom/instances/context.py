@@ -86,11 +86,11 @@ class InstanceContext:
 
     The bundle is intentionally NOT frozen. The hot-reload path
     (:func:`phantom.app.create_app` / SIGHUP / ``POST /v1/admin/reload``)
-    may swap fields that participate in reload — today that is
-    :attr:`cfg` (when the instance's ``InstanceCfg`` block changes) and
-    :attr:`minter` (when the instance's ``ad_mint`` block changes). All
-    other fields are constructed once at startup and not reassigned;
-    workers must not mutate them.
+    may swap fields that participate in reload, and after F5 that is
+    :attr:`minter` alone (when the instance's ``ad_mint`` block changes).
+    :attr:`cfg` is explicitly NOT in that set: it is the frozen boot
+    snapshot (D1/ADR-013). All other fields are constructed once at
+    startup and not reassigned; workers must not mutate them.
 
     The dual ``memory_store`` / ``disk_store`` pair collapsed into the
     single :attr:`store` (one persistent SQLite). The body halves
@@ -103,6 +103,17 @@ class InstanceContext:
     """
 
     cfg: InstanceCfg
+    """The instance's IMMUTABLE boot config (D1/F5).
+
+    This is the one per-instance route snapshot every reader resolves
+    against: admission, the dispatcher, both kickers, the admin
+    quarantine paths and the admin status surfaces read it here, and
+    :class:`~phantom.chain.executor.ChainExecutor` holds the SAME object
+    from the composition root. Nothing may rebind it. ``apply_reload``
+    warns on drift in ``routes``, ``host_prefixes`` or ``data_dir`` and
+    applies none of it, and the model itself is frozen so an in-place
+    field assignment raises.
+    """
     store: UploadStore
     """The single persistent SQLite store (post-Phase-1 collapse).
 
@@ -158,7 +169,7 @@ class InstanceContext:
 
     Built by the composition root from ``retry.default_strategy`` and
     REBUILT by :func:`phantom.runtime.reload.apply_reload` on every hot
-    reload, mirroring the ``cfg`` repoint above, so reloaded retry
+    reload, mirroring the saturation-gate cap push, so reloaded retry
     parameters reach subsequent scheduling decisions (R5-2; ADR-013).
     """
     upstream_client: UpstreamClient

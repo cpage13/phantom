@@ -385,7 +385,7 @@ unchanged: code continues to read `import phantom` /
 - `routing/`: `resolve_route(url, instance_cfg) -> ResolvedRoute`
   function. No Protocol; one concrete implementation. `ResolvedRoute.auth_mode`
   is a 3-valued axis: `phantom_bearer` | `none` | `aws_sigv4`.
-- `instances/`: `InstanceContext` dataclass (mutable, so the hot-reload handler can swap `cfg`/`minter`; the docstring is the
+- `instances/`: `InstanceContext` dataclass (mutable, so the hot-reload handler can swap `minter`; `cfg` is the frozen boot route snapshot and is never rebound; the docstring is the
   contract that workers only read) + `InstanceDispatcher` (URL-prefix
   → `InstanceContext` lookup) + `InstanceSettingsSnapshot` (the
   per-tick hot-reloadable view) + `SettingsHolder` (the atomic-swap
@@ -595,10 +595,17 @@ bugs.
     mypy. See ADR-015.
 14. **Operational config is hot-reloadable.** Retention, saturation
     caps, codec choice, persist trigger, capture-re-execution flag,
-    retry params, AD-mint refresh timings all reload via SIGHUP or
-    `POST /v1/admin/reload`. Atomic snapshot swap via `SettingsHolder`.
-    Workers consult `InstanceContext.current_settings()` on each tick.
-    See ADR-013.
+    the per-instance `admin_lookup` binding and retry params all reload
+    via SIGHUP or `POST /v1/admin/reload`. Atomic snapshot swap via
+    `SettingsHolder`. Workers consult
+    `InstanceContext.current_settings()` on each tick. Every `ad_mint`
+    knob, refresh timings included, is restart-required (ADR-013);
+    an earlier version of this bullet claimed AD-mint refresh timings
+    reload, which the ADR-013 table and `_reload_minter`'s own docstring
+    have always contradicted. The per-instance route block (`routes`,
+    `host_prefixes`, `data_dir`) is restart-required and frozen at boot,
+    so every route reader resolves one snapshot and a reload refuses a
+    change with a WARNING. See ADR-013.
 15. **Composition root owns supervision (no unsupervised spawns).**
     Every long-lived coroutine is spawned by `app.py`'s lifespan under
     one `asyncio.TaskGroup` (`tg.create_task(...)`). The unsupervised
@@ -930,7 +937,11 @@ block starting work.
 4. **Hot reload of instance topology.** SIGHUP and the admin reload
    endpoint do NOT add or remove instances; the operator must
    restart for those. A warning logs the omission when the YAML's
-   instance list differs from the running set.
+   instance list differs from the running set. The same posture covers
+   an existing instance's route block: `routes`, `host_prefixes` and
+   `data_dir` are frozen at boot (D1/ADR-013), so a reload that edits
+   them warns and applies nothing. Topology and route config are two
+   separate items with one shape.
 
 ---
 

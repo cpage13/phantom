@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 from phantom.config.settings import (
+    AdminLookupCfg,
     BodyStoreCfg,
     CompressionCfg,
     PersistTriggerCfg,
@@ -53,6 +54,7 @@ def make_snapshot(
     compression: CompressionCfg | None = None,
     saturation: SaturationCfg | None = None,
     capture_reexecution: bool = False,
+    admin_lookup: AdminLookupCfg | None = None,
 ) -> InstanceSettingsSnapshot:
     """Build a populated :class:`InstanceSettingsSnapshot` for tests.
 
@@ -64,7 +66,9 @@ def make_snapshot(
     satisfies the validator's non-None invariant.
 
     Phase 1: removed ``default_tier`` kwarg (subsumed by
-    ``body_store.mode``); added ``body_store`` projection.
+    ``body_store.mode``); added ``body_store`` projection. F5 added
+    ``admin_lookup``, which moved onto the snapshot when the ``cfg``
+    repoint was deleted, so instance builders can wire a binding.
     """
     if persist_trigger is None:
         persist_trigger = PersistTriggerCfg()
@@ -85,6 +89,7 @@ def make_snapshot(
         compression=compression,
         saturation=saturation,
         capture_reexecution=capture_reexecution,
+        admin_lookup=admin_lookup,
     )
 
 

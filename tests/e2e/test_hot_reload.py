@@ -5,8 +5,9 @@ Hot reload exposes two triggers: SIGHUP on the process and
 same ``apply_reload`` helper in ``phantom.runtime.reload`` — re-read
 YAML (with the host probe skipped), build new per-instance snapshots, swap them
 atomically into the :class:`SettingsHolder`, propagate live-state
-changes (AD-mint loop swap, saturation cap update, per-instance
-``cfg`` repoint), return the reloaded instance list.
+changes (AD-mint drift warning, saturation cap update, retry-strategy
+rebuild), return the reloaded instance list. Since F5 the per-instance
+``cfg`` is NOT repointed: the route block is frozen at boot.
 
 This suite exercises six invariants:
 
@@ -424,20 +425,22 @@ async def test_in_flight_rows_keep_snapshotted_capture_reexecution(tmp_path: Pat
             resp = await client.post("/v1/admin/reload")
         assert resp.status_code == 200
 
-        # 4. Wait for the live ``ctx.cfg`` to repoint at the new
-        # InstanceCfg. The reload handler reassigns ``ctx.cfg``
-        # directly; the snapshot's ``capture_reexecution`` lives on
-        # ``InstanceCfg``, not :class:`InstanceSettingsSnapshot`.
+        # 4. Wait for the live snapshot to carry the new
+        # ``capture_reexecution``. It rides
+        # :class:`InstanceSettingsSnapshot`, which the reload swaps under
+        # the holder's lock; ``ctx.cfg`` is the frozen boot block and is
+        # never repointed (F5). The previous comment here claimed the
+        # opposite and was already false before that change.
         instance = stack.get_instance("primary")
 
-        async def _ctx_repointed() -> bool:
-            return bool(instance.cfg.capture_reexecution)
+        async def _snapshot_carries_capture_reexecution() -> bool:
+            return bool(instance.current_settings().capture_reexecution)
 
         await await_until(
-            _ctx_repointed,
+            _snapshot_carries_capture_reexecution,
             timeout_seconds=RELOAD_PROPAGATION_BUDGET_SECONDS,
             poll_interval_seconds=0.05,
-            message="instance.cfg.capture_reexecution never observed True after reload",
+            message=("snapshot capture_reexecution never observed True after reload"),
         )
 
         # 5. Inspect the old row directly via the disk/memory store.
@@ -502,9 +505,10 @@ async def test_reload_is_atomic(tmp_path: Path) -> None:
     Spawn 10 concurrent submissions while a reload is mid-flight. Each
     row's snapshot must be either the OLD ``capture_reexecution_active``
     or the NEW — never a half-applied blend (which the
-    :class:`SettingsHolder` lock and the per-instance ``cfg``
-    reassignment guarantee). Some rows will land before the reload,
-    some after; both buckets are acceptable.
+    :class:`SettingsHolder` lock guarantees on its own: the whole
+    snapshot map is replaced under that lock, and since F5 there is no
+    second per-instance write to race it). Some rows will land before
+    the reload, some after; both buckets are acceptable.
     """
     from phantom_emulator.failure.injection import FailurePolicy, FailureScope
 
@@ -736,9 +740,11 @@ async def test_reload_changes_admin_lookup_binding_without_restart(tmp_path: Pat
 
     Round 2 adversary seed: the hot-reload suite covered retention,
     saturation, and ad_mint but never the cycle-7 ``admin_lookup``
-    block. ``apply_reload`` repoints ``ctx.cfg`` and the lookup route
-    reads the binding per request, so all three legs must hold without
-    a restart: a reloaded json_path is consulted immediately (the
+    block. ``apply_reload`` swaps the instance's live settings snapshot,
+    which since F5 is where ``admin_lookup`` lives, and the lookup route
+    reads the binding off that snapshot per request, so all three legs
+    must hold without a restart: a reloaded json_path is consulted
+    immediately (the
     lookup follows the NEW path and honestly misses through a dangling
     one), removing the block restores the 400 ``lookup_not_configured``
     refusal, and re-adding it restores resolution.

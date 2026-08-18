@@ -1008,18 +1008,39 @@ class AdminLookupCfg(BaseModel):
 class InstanceCfg(BaseModel):
     """One configured instance (ADR-006)."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    # frozen=True is D1/F5, and it is deliberately MODEL-level rather than
+    # per field: model-level leaves the emitted JSON Schema byte-identical,
+    # while a field-level Field(frozen=True) would emit "readOnly": true and
+    # move the config contract for no behaviour change. The boot instance of
+    # this model is the ONE route snapshot every reader resolves against for
+    # the process lifetime (admission, the dispatcher, both kickers, the
+    # executor, the admin quarantine paths and the admin status surfaces all
+    # hold the same object), and nothing rebinds it, so an in-place field
+    # assignment would be a silent global change; this turns it into a
+    # pydantic error at the assignment site. model_copy still works, so the
+    # reload path's preservation patterns are unaffected. The three
+    # restart-required fields say so in their own descriptions, which DO
+    # export, so an operator reading contracts/settings.schema.json sees it.
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     id: str = Field(..., min_length=1, description="Stable instance id.")
     host_prefixes: list[str] = Field(
         ...,
         min_length=1,
-        description=("fnmatch host patterns this instance owns. First-match in declaration order."),
+        description=(
+            "fnmatch host patterns this instance owns. First-match in "
+            "declaration order. Restart-required: the boot value is frozen "
+            "and a reload refuses a change with a WARNING (ADR-013)."
+        ),
     )
     data_dir: str = Field(
         ...,
         min_length=1,
-        description="Subdirectory under storage.data_dir for this instance.",
+        description=(
+            "Subdirectory under storage.data_dir for this instance. "
+            "Restart-required: the store's paths are fixed at boot, so a "
+            "reload refuses a change with a WARNING (ADR-013)."
+        ),
     )
     capture_reexecution: bool = Field(
         False,
@@ -1028,7 +1049,10 @@ class InstanceCfg(BaseModel):
     routes: list[RouteCfg] = Field(
         default_factory=list,
         description=(
-            "Per-instance routes — declaration order is precedence. Catch-all routes go last."
+            "Per-instance routes. Declaration order is precedence and "
+            "catch-all routes go last. Restart-required: every reader "
+            "resolves the boot table, and a reload refuses a change with a "
+            "WARNING (ADR-013)."
         ),
     )
     ad_mint: AdMintConfig | None = Field(

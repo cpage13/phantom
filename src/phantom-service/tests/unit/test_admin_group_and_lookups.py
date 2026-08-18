@@ -43,6 +43,7 @@ from phantom.config.settings import (
 )
 from phantom.instances.context import InstanceContext
 from phantom.instances.dispatcher import InstanceDispatcher
+from phantom.instances.snapshot import InstanceSettingsSnapshot
 from phantom.models.upload import CapturedStepValues, CapturedValues, UploadRow
 from phantom.routes import admin as admin_routes
 from phantom.routing import resolve_route
@@ -57,7 +58,7 @@ from phantom.strategies import FixedIntervalsStrategy
 from phantom.transport import UpstreamRequest, UpstreamResponse
 from phantom.workers.saturation import SaturationGate
 
-from .conftest import make_snapshot, snapshot_thunk
+from .conftest import make_snapshot
 
 # The deployment-supplied binding the alpha instance carries: the
 # capturing step's key under the captured-values steps map, and the
@@ -97,8 +98,16 @@ async def _build_instance(
     instance_id: str,
     *,
     admin_lookup: AdminLookupCfg | None,
-) -> InstanceContext:
-    """One started instance context rooted under ``tmp_path/instance_id``."""
+) -> tuple[InstanceContext, list[InstanceSettingsSnapshot]]:
+    """One started instance context rooted under ``tmp_path/instance_id``.
+
+    Returns the context AND the one-element snapshot box its
+    ``current_settings`` thunk reads. F5 moved ``admin_lookup`` onto the
+    live snapshot, so a test that wants to simulate a reload swaps the
+    box's element; there is no ``SettingsHolder`` in this module to swap
+    and ``snapshot_thunk`` deliberately wraps a STATIC snapshot. The box
+    is constructed here, so it has to come back with the context.
+    """
     root = tmp_path / instance_id
     root.mkdir()
     store = SqliteUploadStore(str(root / "uploads.db"))
@@ -139,7 +148,13 @@ async def _build_instance(
 
     body_store = HybridBodyStore(ram=ram, disk=fbs)
     await body_store.start()
-    return InstanceContext(
+    snapshot_box: list[InstanceSettingsSnapshot] = [
+        make_snapshot(
+            persist_trigger=PersistTriggerCfg(body_size_threshold_bytes=0),
+            admin_lookup=admin_lookup,
+        )
+    ]
+    ctx = InstanceContext(
         cfg=cfg,
         store=store,
         ram_body_store=ram,
@@ -153,10 +168,9 @@ async def _build_instance(
         executor=executor,
         saturation=saturation,
         codec_factory=_passthrough_factory,
-        current_settings=snapshot_thunk(
-            make_snapshot(persist_trigger=PersistTriggerCfg(body_size_threshold_bytes=0))
-        ),
+        current_settings=lambda: snapshot_box[0],
     )
+    return ctx, snapshot_box
 
 
 @pytest.fixture
@@ -164,12 +178,12 @@ async def lookup_app(
     tmp_path: Path,
 ) -> Iterable[tuple[FastAPI, InstanceContext, InstanceContext]]:
     """Two-instance admin app: alpha configured for lookups, beta not."""
-    alpha = await _build_instance(
+    alpha, _alpha_box = await _build_instance(
         tmp_path,
         "alpha",
         admin_lookup=AdminLookupCfg(capture_name=_CAPTURE_NAME, json_path=_JSON_PATH),
     )
-    beta = await _build_instance(tmp_path, "beta", admin_lookup=None)
+    beta, _beta_box = await _build_instance(tmp_path, "beta", admin_lookup=None)
     dispatcher = InstanceDispatcher([alpha, beta])
     app = FastAPI()
     app.include_router(admin_routes.router)
@@ -865,24 +879,25 @@ async def test_lookup_fanout_racing_binding_removal_stays_honest(
     """An in-flight by-captured-id fan-out must not silently skip an instance.
 
     Round 2 adversary probe (R2-4; seed: an in-flight lookup racing the
-    reload snapshot swap). ``apply_reload`` repoints ``ctx.cfg``
-    per-instance with awaits between instances, and the route used to
-    re-read ``ctx.cfg.admin_lookup`` after its own awaits: the guard
-    saw both instances configured, the reload then removed the second
-    binding while the first store query was in flight, and the loop's
-    defensive ``continue`` silently skipped the instance that holds the
-    match. The honest outcomes are refusing (the 400 the post-reload
-    config implies) or answering with the guard-time bindings; a
-    found=false built from a silent skip matches neither boundary
-    state. The round 2 defender fix snapshots the bindings ONCE before
-    the unconfigured guard and fans out over the snapshot, so this race
-    now answers with the guard-time truth (``found=True`` here). The
-    simulation performs exactly the mutation apply_reload performs
-    (``ctx.cfg = new_cfg``), timed deterministically.
+    reload snapshot swap). ``apply_reload`` swaps each instance's live
+    settings snapshot with awaits between instances, and the route used
+    to re-read the binding after its own awaits: the guard saw both
+    instances configured, the reload then removed the second binding
+    while the first store query was in flight, and the loop's defensive
+    ``continue`` silently skipped the instance that holds the match. The
+    honest outcomes are refusing (the 400 the post-reload config implies)
+    or answering with the guard-time bindings; a found=false built from a
+    silent skip matches neither boundary state. The round 2 defender fix
+    snapshots the bindings ONCE before the unconfigured guard and fans
+    out over the snapshot, so this race now answers with the guard-time
+    truth (``found=True`` here). The simulation swaps the instance's
+    snapshot box for one built with ``admin_lookup=None``, which is what
+    a real reload does to that instance's live read after F5 moved the
+    binding off the frozen ``cfg``; the swap is timed deterministically.
     """
     binding = AdminLookupCfg(capture_name=_CAPTURE_NAME, json_path=_JSON_PATH)
-    left = await _build_instance(tmp_path, "left", admin_lookup=binding)
-    right = await _build_instance(tmp_path, "right", admin_lookup=binding)
+    left, _left_box = await _build_instance(tmp_path, "left", admin_lookup=binding)
+    right, right_box = await _build_instance(tmp_path, "right", admin_lookup=binding)
     try:
         dispatcher = InstanceDispatcher([left, right])
         match_row = make_upload_row(
@@ -906,8 +921,12 @@ async def test_lookup_fanout_racing_binding_removal_stays_honest(
         )
         await asyncio.wait_for(entered.wait(), timeout=_RACE_GATE_TIMEOUT_SECONDS)
         # The reload's exact live-state effect, deterministically timed:
-        # the operator's new YAML carries no admin_lookup for ``right``.
-        right.cfg = right.cfg.model_copy(update={"admin_lookup": None})
+        # the operator's new YAML carries no admin_lookup for ``right``,
+        # so its next live snapshot is built with the binding removed.
+        right_box[0] = make_snapshot(
+            persist_trigger=PersistTriggerCfg(body_size_threshold_bytes=0),
+            admin_lookup=None,
+        )
         release.set()
         try:
             response = await asyncio.wait_for(lookup_task, timeout=_RACE_GATE_TIMEOUT_SECONDS)

@@ -767,7 +767,7 @@ async def _build_row(
         current_step_index=0,
         idempotency_key=inputs.envelope.idempotency_key,
         chain_id_at_ingress=ingress_dedup_key,
-        capture_reexecution_active=instance_ctx.cfg.capture_reexecution,
+        capture_reexecution_active=snapshot.capture_reexecution,
         # The saturation basis (InvariantAuditor invariant #2): this is
         # the quantity the gate admitted (stage 3) and the sender will
         # release on a terminal transition — the STORED size. Zero when

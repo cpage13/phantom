@@ -732,23 +732,25 @@ async def lookup_by_captured_id(
 
     The bindings are snapshotted ONCE, before the unconfigured guard,
     and the fan-out runs entirely off that snapshot: a config reload
-    repointing ``ctx.cfg`` mid-request cannot make the loop's per-ctx
-    re-read skip the instance holding the match (the found=false lie
-    the round 2 adversary proved, finding R2-4). The answer is the
-    truth as of guard time; the reloaded bindings serve the next
-    request.
+    swapping the instance's live settings snapshot mid-request cannot
+    make the loop's per-ctx re-read skip the instance holding the match
+    (the found=false lie the round 2 adversary proved, finding R2-4).
+    The answer is the truth as of guard time; the reloaded bindings
+    serve the next request.
     """
     targets = _scope_instances(dispatcher, instance)
-    # ONE read of each instance's cfg, before any await (R2-4): the
-    # guard and the fan-out below must see the same bindings.
+    # ONE read of each instance's live settings snapshot, before any
+    # await (R2-4): the guard and the fan-out below must see the same
+    # bindings. F5 moved ``admin_lookup`` off the (now frozen) cfg and
+    # onto the snapshot, so this reads the one object a reload swaps.
     snapshot: list[tuple[InstanceContext, AdminLookupCfg]] = []
     unconfigured: list[str] = []
     for ctx in targets:
-        cfg = ctx.cfg
-        if cfg.admin_lookup is None:
-            unconfigured.append(cfg.id)
+        settings_snapshot = ctx.current_settings()
+        if settings_snapshot.admin_lookup is None:
+            unconfigured.append(ctx.cfg.id)
         else:
-            snapshot.append((ctx, cfg.admin_lookup))
+            snapshot.append((ctx, settings_snapshot.admin_lookup))
     if unconfigured:
         raise LookupNotConfiguredError(instance_ids=tuple(unconfigured))
     matches: list[UploadStatusSummary] = []
@@ -785,12 +787,15 @@ async def lookup_by_local_uuid(
     The per-instance ``admin_lookup`` bindings (used only for the
     best-effort ``captured_file_id`` surfacing field here) are
     snapshotted once before the fan-out, the same reload-race posture
-    as the by-captured-id route (R2-4).
+    as the by-captured-id route (R2-4): one read of each instance's
+    live settings snapshot, before any await, so a mid-request snapshot
+    swap cannot split the fan-out.
     """
     targets = _scope_instances(dispatcher, instance)
-    # One read of each instance's cfg before any await (R2-4 posture):
-    # the surfacing binding cannot change identity mid-request.
-    bindings = [(ctx, ctx.cfg.admin_lookup) for ctx in targets]
+    # One read of each instance's live settings snapshot before any await
+    # (R2-4 posture): the surfacing binding cannot change identity
+    # mid-request. F5 moved ``admin_lookup`` off the frozen cfg.
+    bindings = [(ctx, ctx.current_settings().admin_lookup) for ctx in targets]
     matches: list[UploadStatusSummary] = []
     for ctx, lookup in bindings:
         rows = await ctx.store.find_by_local_uuid(local_uuid)

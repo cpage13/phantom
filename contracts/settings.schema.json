@@ -274,13 +274,13 @@
           "type": "boolean"
         },
         "data_dir": {
-          "description": "Subdirectory under storage.data_dir for this instance.",
+          "description": "Subdirectory under storage.data_dir for this instance. Restart-required: the store's paths are fixed at boot, so a reload refuses a change with a WARNING (ADR-013).",
           "minLength": 1,
           "title": "Data Dir",
           "type": "string"
         },
         "host_prefixes": {
-          "description": "fnmatch host patterns this instance owns. First-match in declaration order.",
+          "description": "fnmatch host patterns this instance owns. First-match in declaration order. Restart-required: the boot value is frozen and a reload refuses a change with a WARNING (ADR-013).",
           "items": {
             "type": "string"
           },
@@ -295,7 +295,7 @@
           "type": "string"
         },
         "routes": {
-          "description": "Per-instance routes \u2014 declaration order is precedence. Catch-all routes go last.",
+          "description": "Per-instance routes. Declaration order is precedence and catch-all routes go last. Restart-required: every reader resolves the boot table, and a reload refuses a change with a WARNING (ADR-013).",
           "items": {
             "$ref": "#/$defs/RouteCfg"
           },

@@ -5,11 +5,14 @@ Workers consume the current snapshot via
 capturing fields at __init__. This is what makes hot reload safe
 (SIGHUP -> atomic swap of the snapshot reference).
 
-Static-at-startup fields (worker count, data_dir, instance list) do
-NOT live in the snapshot; they remain on InstanceContext directly.
-Reload-time pushes that do not flow through the snapshot (the
-``ctx.cfg`` repoint, the retry-strategy rebuild, the saturation-gate
-cap push) live in :func:`phantom.runtime.reload.apply_reload`.
+Static-at-startup fields (worker count, the per-instance route block,
+the instance list) do NOT live in the snapshot; they remain on
+InstanceContext directly and are frozen at boot (D1/ADR-013). Every
+per-instance knob that DOES reload rides this snapshot, ``admin_lookup``
+included. Reload-time pushes that do not flow through the snapshot (the
+retry-strategy rebuild, the saturation-gate cap push) live in
+:func:`phantom.runtime.reload.apply_reload`; F5 deleted the third one,
+the ``ctx.cfg`` repoint.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from phantom.config.settings import (
+    AdminLookupCfg,
     BodyStoreCfg,
     CompressionCfg,
     InstanceCfg,
@@ -48,6 +52,13 @@ class InstanceSettingsSnapshot:
     :func:`phantom.runtime.reload.apply_reload` retry-strategy rebuild;
     every ``ad_mint`` knob is restart-required (the minter reads its
     boot-time :class:`AdMintConfig` per cycle; ADR-013).
+
+    F5/D1: ``admin_lookup`` joined the snapshot when the ``ctx.cfg``
+    repoint was deleted. It and ``capture_reexecution`` are the two
+    per-instance knobs that stay reloadable; the rest of
+    :class:`InstanceCfg` (``routes``, ``host_prefixes``, ``data_dir``,
+    ``ad_mint``, ``id``) is restart-required and is read straight off the
+    frozen boot config.
     """
 
     persist_trigger: PersistTriggerCfg
@@ -56,6 +67,13 @@ class InstanceSettingsSnapshot:
     compression: CompressionCfg
     saturation: SaturationCfg
     capture_reexecution: bool
+    admin_lookup: AdminLookupCfg | None = None
+    """The by-captured-id lookup binding, or ``None`` when unconfigured.
+
+    Defaulted because the config field is itself optional and seven test
+    construction sites do not care about it; the one production builder
+    always passes it explicitly.
+    """
 
 
 def _build_snapshot(settings: Settings, cfg: InstanceCfg) -> InstanceSettingsSnapshot:
@@ -78,7 +96,9 @@ def _build_snapshot(settings: Settings, cfg: InstanceCfg) -> InstanceSettingsSna
     ``settings.retention``, ``settings.storage.compression``, and
     ``settings.saturation`` instances (not deep-copied). These are
     immutable Pydantic models, so sharing by reference is safe.
-    Per-instance variation comes from ``cfg.capture_reexecution``.
+    Per-instance variation comes from ``cfg.capture_reexecution`` and
+    ``cfg.admin_lookup``, the two reloadable knobs on
+    :class:`InstanceCfg`.
     """
     return InstanceSettingsSnapshot(
         persist_trigger=settings.storage.persist_trigger,
@@ -87,6 +107,7 @@ def _build_snapshot(settings: Settings, cfg: InstanceCfg) -> InstanceSettingsSna
         compression=settings.storage.compression,
         saturation=settings.saturation,
         capture_reexecution=cfg.capture_reexecution,
+        admin_lookup=cfg.admin_lookup,
     )
 
 

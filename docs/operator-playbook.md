@@ -202,9 +202,29 @@ capture re-execution, retry params, the admin lookup binding, and
 body-store tuning (linger, RAM ceiling, RAM-pressure poll).
 **Restart-required:** worker count, the instance list
 (adding/removing an instance), `body_store.mode`,
-`storage.max_buffered_bytes`, and every
+`storage.max_buffered_bytes`, every
 `ad_mint` knob including the refresh timings (the reload logs a
-WARNING when `ad_mint` changes). See ADR-013.
+WARNING when `ad_mint` changes), and the **per-instance route block**:
+`routes`, `host_prefixes` and the per-instance `data_dir`. See ADR-013.
+
+The route block is restart-required *and enforced*. The boot
+`InstanceCfg` is frozen, and admission, the dispatcher, both kickers,
+the executor, the admin quarantine paths and the admin status surfaces
+all resolve that one snapshot. So a reload that edits any of the three
+applies nothing and logs:
+
+```
+WARNING Reload changed restart-required per-instance config
+        (routes, host_prefixes) for instance producer-a; the change has
+        NOT been applied and cannot take effect until the process
+        restarts (...)
+```
+
+The record names the instance and the drifted field NAMES (never their
+values, because a route table is unbounded operator input), and it
+repeats on **every** reload until you restart. `GET /v1/admin/status`
+keeps reporting the boot `host_prefixes`, which is truthful: the boot
+list is what dispatch actually uses.
 
 ### 2.3 Service-based signing (`aws_sigv4`) and credentials
 
@@ -871,7 +891,10 @@ while Phantom is running normally.
   atomically and never drops rows; only the restart-required knobs
   listed in the § 2 *Hot reload* subsection (worker count, the
   instance list, `body_store.mode`, `storage.max_buffered_bytes`,
-  `ad_mint`) need a full restart.
+  `ad_mint`, and the per-instance route block: `routes`,
+  `host_prefixes`, `data_dir`) need a full restart. A reload that edits
+  a restart-required block still returns 200 and still drops no rows;
+  it warns and applies nothing.
 - **A recoverable mode switch** (selecting `all_ram` on a data dir that
   still holds disk bodies from a prior disk-backed run) does not destroy
   that data: the back-up-and-run guard (ADR-025) relocates the live DB

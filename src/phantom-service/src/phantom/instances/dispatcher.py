@@ -98,6 +98,13 @@ class InstanceDispatcher:
     def resolve(self, url: str, instance_header: str | None) -> InstanceContext:
         """Pick the owning instance.
 
+        Matches on ``ctx.cfg.host_prefixes``, which is the FROZEN boot
+        list (D1/F5): ``host_prefixes`` is restart-required, so a prefix
+        added or removed by a hot reload does not move dispatch and the
+        reload logs a restart-required WARNING naming the field. A prefix
+        and a route are two halves of one decision, so freezing one and
+        not the other would be the split-brain F5 removes.
+
         Args:
             url: The first-step URL of the chain.
             instance_header: Optional ``X-Phantom-Instance`` value

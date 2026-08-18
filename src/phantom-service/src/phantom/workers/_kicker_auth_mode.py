@@ -44,9 +44,12 @@ def row_resolved_route(row: UploadRow, instance: InstanceContext) -> ResolvedRou
         The destination :class:`~phantom.routing.ResolvedRoute`.
 
     Raises:
-        ValueError: When no route matches ``row.endpoint`` (e.g. a route was
-            removed by hot-reload between the row's park and the rescan). The
-            CALLER wraps this per row and SKIPS that row — it must NOT abort
+        ValueError: When no route matches ``row.endpoint``. Since F5 froze
+            the route block at boot, a route can no longer vanish from under
+            a parked row at reload time; what survives is a chain admitted
+            with a step whose host matches no route, because admission
+            route-checks only the FIRST step and tolerates a miss. The
+            CALLER wraps this per row and SKIPS that row: it must NOT abort
             the rescan pass.
     """
     return resolve_route(row.endpoint, instance.cfg)
