@@ -25,7 +25,8 @@ import io
 import json
 import logging
 import tarfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, get_args
@@ -1083,10 +1084,9 @@ async def replay_upload(
     M-W4-F7 audit closure: ``replay`` refuses when the row is currently
     ``attempting`` (a sender is actively driving it). The store raises
     :class:`ReplayRefusedAttemptingError` from its in-write-lock state
-    precheck; the app-registered
-    :func:`replay_refused_attempting_exception_handler` converts it
-    into the canonical 409 ``replay_refused_attempting`` envelope so
-    the operator can wait for the sender to finish (or cancel first).
+    precheck, and the route returns the canonical 409
+    ``replay_refused_attempting`` envelope so the operator can wait for the
+    sender to finish (or cancel first).
     Round 1 defender fix (R1-1): pre-fix this refusal escaped as
     FastAPI's raw ``{"detail": ...}`` body, which the SDK could not
     dispatch on.
@@ -1094,9 +1094,8 @@ async def replay_upload(
     Body-accounting refusal (cycle-7 phase 7 pre-round defender fix):
     the store raises :class:`ReplayBodyDiscardedError` when the row's
     ``body_discarded_at`` is stamped (the body is gone per the row's
-    own accounting, on either discard leg). The app-registered
-    :func:`replay_body_discarded_exception_handler` converts it into
-    the canonical 409 ``replay_body_discarded`` envelope; the row is
+    own accounting, on either discard leg), and the route returns the
+    canonical 409 ``replay_body_discarded`` envelope; the row is
     left exactly as it was (``sent_at`` preserved). Without the
     refusal, the re-queued row would land in ``corrupted`` on the
     sender's next claim, laundering an operator action into a
@@ -1802,8 +1801,8 @@ async def restore_quarantine_backup(
 class UnknownInstanceError(Exception):
     """Raised when ``?instance=<id>`` or a path-param names an unknown instance.
 
-    The :func:`unknown_instance_exception_handler` (registered on the
-    FastAPI app via ``app.add_exception_handler``) converts this into a
+    Its :data:`ADMIN_ERROR_SPECS` entry (registered on the FastAPI app by
+    :func:`register_admin_error_handlers`) converts this into a
     canonical 421 ``ErrorEnvelope`` (plan §5.6 / ADR-010), the same
     shape the SDK's :data:`EXCEPTION_FOR_CODE` machinery expects.
     """
@@ -1813,22 +1812,11 @@ class UnknownInstanceError(Exception):
         self.instance_id = instance_id
 
 
-async def unknown_instance_exception_handler(
-    _request: Any,  # FastAPI Request — typed as Any to keep imports light
-    exc: UnknownInstanceError,
-) -> Response:
-    """Translate :class:`UnknownInstanceError` into a 421 ``ErrorEnvelope``."""
-    return _admin_error(
-        "instance_unknown",
-        f"Instance {exc.instance_id!r} not configured",
-    )
-
-
 class NotFoundError(Exception):
     """Raised when an admin lookup names a resource (upload, body, slot) that doesn't exist.
 
-    The :func:`not_found_exception_handler` (registered on the FastAPI
-    app via ``app.add_exception_handler``) converts this into a canonical
+    Its :data:`ADMIN_ERROR_SPECS` entry (registered on the FastAPI app by
+    :func:`register_admin_error_handlers`) converts this into a canonical
     404 ``ErrorEnvelope`` with ``error.code='not_found'`` so phantom-client
     maps the response to :class:`PhantomNotFoundError` via the
     :data:`EXCEPTION_FOR_CODE` table. FastAPI's default 404 (``{"detail":
@@ -1838,14 +1826,6 @@ class NotFoundError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
-
-
-async def not_found_exception_handler(
-    _request: Any,  # FastAPI Request — typed as Any to keep imports light
-    exc: NotFoundError,
-) -> Response:
-    """Translate :class:`NotFoundError` into a 404 ``ErrorEnvelope``."""
-    return _admin_error("not_found", exc.message)
 
 
 class RestoreNoOpError(Exception):
@@ -1858,8 +1838,8 @@ class RestoreNoOpError(Exception):
     than return the success-shaped :class:`QuarantineRestoreResponse`
     (``restart_required=True``) and strand the buffered uploads behind a
     "looks fine" reply, the route fails loud. The
-    :func:`restore_noop_exception_handler` (registered on the FastAPI app via
-    ``app.add_exception_handler``) converts this into a canonical 409
+    :data:`ADMIN_ERROR_SPECS` entry (registered on the FastAPI app by
+    :func:`register_admin_error_handlers`) converts this into a canonical 409
     ``ErrorEnvelope`` (``error.code='restore_noop'``) so the SDK raises
     :class:`phantom_client.errors.PhantomConflictError` and the operator
     retries. The interim backup (when one was taken) is named in the
@@ -1896,30 +1876,6 @@ class RestoreNoOpError(Exception):
         self.detail = detail
 
 
-async def restore_noop_exception_handler(
-    _request: Any,  # FastAPI Request, typed as Any to keep imports light
-    exc: RestoreNoOpError,
-) -> Response:
-    """Translate :class:`RestoreNoOpError` into a 409 ``restore_noop`` envelope."""
-    return _admin_error(
-        "restore_noop",
-        (
-            f"Restore of backup {exc.backup_id} into instance {exc.instance_id} "
-            f"did not restore the backup: {exc.detail}. Retry the restore "
-            "(re-check GET /v1/admin/quarantine first). Any displaced live "
-            "data was preserved as an interim mode_switch backup."
-        ),
-        instance_id=exc.instance_id,
-        details={
-            "backup_id": str(exc.backup_id),
-            "instance_id": exc.instance_id,
-            "interim_backup_db": exc.interim_backup_db,
-            "interim_backup_body": exc.interim_backup_body,
-            "cause": exc.detail,
-        },
-    )
-
-
 class LookupNotConfiguredError(Exception):
     """Raised when the by-captured-id lookup targets an unbound instance.
 
@@ -1927,8 +1883,8 @@ class LookupNotConfiguredError(Exception):
     deployment supplied the per-instance ``admin_lookup`` binding
     (``capture_name`` + ``json_path``); Phantom never guesses where an
     upstream identifier lives inside the captured values. The
-    :func:`lookup_not_configured_exception_handler` (registered on the
-    FastAPI app via ``app.add_exception_handler``) converts this into
+    :data:`ADMIN_ERROR_SPECS` entry (registered on the FastAPI app by
+    :func:`register_admin_error_handlers`) converts this into
     the canonical 400 ``ErrorEnvelope`` with
     ``error.code='lookup_not_configured'`` (cycle-7 task 4.3).
 
@@ -1942,91 +1898,13 @@ class LookupNotConfiguredError(Exception):
         self.instance_ids = instance_ids
 
 
-async def lookup_not_configured_exception_handler(
-    _request: Any,  # FastAPI Request, typed as Any to keep imports light
-    exc: LookupNotConfiguredError,
-) -> Response:
-    """Translate :class:`LookupNotConfiguredError` into a 400 envelope."""
-    joined = ", ".join(exc.instance_ids)
-    return _admin_error(
-        "lookup_not_configured",
-        (
-            f"The by-captured-id lookup is not configured on instance(s) "
-            f"{joined}: the deployment supplies the per-instance "
-            "admin_lookup binding (capture_name + json_path); Phantom "
-            "never guesses where the upstream identifier lives."
-        ),
-        instance_id=exc.instance_ids[0] if exc.instance_ids else "unrouted",
-        details={"unconfigured_instances": list(exc.instance_ids)},
-    )
-
-
-async def replay_body_discarded_exception_handler(
-    _request: Any,  # FastAPI Request, typed as Any to keep imports light
-    exc: ReplayBodyDiscardedError,
-) -> Response:
-    """Translate :class:`ReplayBodyDiscardedError` into a 409 envelope.
-
-    Cycle-7 phase 7 pre-round defender fix. The store refuses to
-    re-queue a row whose ``body_discarded_at`` is stamped (the one
-    discard owner already deleted the bytes on the sender's immediate
-    leg or the reaper's scheduled leg); without the refusal the replay
-    would land the row in ``corrupted`` on the sender's next claim. The
-    409 ``replay_body_discarded`` envelope names the chain and the
-    discard instant; the row is left exactly as it was.
-    """
-    return _admin_error(
-        "replay_body_discarded",
-        (
-            f"Replay refused for chain {exc.chain_id}: its body was "
-            f"discarded at {exc.body_discarded_at.isoformat()} per the "
-            "retention policy, so a replay would have nothing to send. "
-            "The row is unchanged (sent_at preserved). Re-submit the "
-            "upload through POST /v1/send if it must run again."
-        ),
-        instance_id=exc.instance_id,
-        details={
-            "chain_id": str(exc.chain_id),
-            "body_discarded_at": exc.body_discarded_at.isoformat(),
-        },
-    )
-
-
-async def replay_refused_attempting_exception_handler(
-    _request: Any,  # FastAPI Request, typed as Any to keep imports light
-    exc: ReplayRefusedAttemptingError,
-) -> Response:
-    """Translate :class:`ReplayRefusedAttemptingError` into a 409 envelope.
-
-    Round 1 defender fix (R1-1). The store refuses to re-queue a row a
-    sender is actively driving (state ``attempting``, the M-W4-F7 audit
-    closure); pre-fix that refusal escaped as FastAPI's raw
-    ``{"detail": "replay_refused_attempting"}`` body, which the SDK's
-    ``raise_for_error_body`` could not dispatch on. The canonical 409
-    ``replay_refused_attempting`` envelope names the chain; the row is
-    left exactly as it was.
-    """
-    return _admin_error(
-        "replay_refused_attempting",
-        (
-            f"Replay refused for chain {exc.chain_id}: a sender is "
-            "actively driving the row (state 'attempting'), and a "
-            "re-queue would clobber the in-flight attempt. The row is "
-            "unchanged. Wait for the attempt to settle (or cancel the "
-            "chain first), then retry the replay."
-        ),
-        instance_id=exc.instance_id,
-        details={"chain_id": str(exc.chain_id)},
-    )
-
-
 class MultifileCursorConflictError(Exception):
     """Raised when ``GET /v1/admin/chains`` combines ``multifile_id`` with ``cursor``.
 
     The multifile listing is one-shot by design (ordered by
     ``send_order``, never paginated), so a cursor cannot apply to it.
-    The :func:`multifile_cursor_conflict_exception_handler` (registered
-    on the FastAPI app via ``app.add_exception_handler``) converts this
+    Its :data:`ADMIN_ERROR_SPECS` entry (registered on the FastAPI app by
+    :func:`register_admin_error_handlers`) converts this
     into the canonical 422 ``multifile_cursor_conflict`` envelope.
     Pre-fix the refusal escaped as FastAPI's raw ``{"detail": ...}``
     body via bare ``HTTPException`` (round 2 defender fix R2-2).
@@ -2042,31 +1920,11 @@ class MultifileCursorConflictError(Exception):
         self.cursor = cursor
 
 
-async def multifile_cursor_conflict_exception_handler(
-    _request: Any,  # FastAPI Request, typed as Any to keep imports light
-    exc: MultifileCursorConflictError,
-) -> Response:
-    """Translate :class:`MultifileCursorConflictError` into a 422 envelope."""
-    return _admin_error(
-        "multifile_cursor_conflict",
-        (
-            "cursor cannot be combined with multifile_id: multifile "
-            "results are ordered by send_order and are not paginated "
-            "(next_cursor is always null). Drop the cursor, or paginate "
-            "without the multifile_id filter."
-        ),
-        details={
-            "multifile_id": str(exc.multifile_id),
-            "cursor": exc.cursor,
-        },
-    )
-
-
 class KeyValueMatchInvalidError(Exception):
     """Raised when a ``?key_value_match=`` value does not parse as ``key:value``.
 
-    The :func:`key_value_match_invalid_exception_handler` (registered
-    on the FastAPI app via ``app.add_exception_handler``) converts this
+    Its :data:`ADMIN_ERROR_SPECS` entry (registered on the FastAPI app by
+    :func:`register_admin_error_handlers`) converts this
     into the canonical 422 ``key_value_match_invalid`` envelope.
     Pre-fix the refusal escaped as FastAPI's raw ``{"detail": ...}``
     body via bare ``HTTPException`` (round 2 defender fix R2-2).
@@ -2082,28 +1940,13 @@ class KeyValueMatchInvalidError(Exception):
         self.reason = reason
 
 
-async def key_value_match_invalid_exception_handler(
-    _request: Any,  # FastAPI Request, typed as Any to keep imports light
-    exc: KeyValueMatchInvalidError,
-) -> Response:
-    """Translate :class:`KeyValueMatchInvalidError` into a 422 envelope."""
-    return _admin_error(
-        "key_value_match_invalid",
-        (
-            f"key_value_match {exc.raw!r} is invalid: {exc.reason}. "
-            "Supply '<key>:<value>' with non-empty key and value."
-        ),
-        details={"key_value_match": exc.raw},
-    )
-
-
 class BulkDeleteFilterEmptyError(Exception):
     """Raised when ``DELETE /v1/admin/chains`` carries an all-None filter body.
 
     An empty filter would mean "delete every row", which the bulk
     surface refuses by design (ADR-004). The
-    :func:`bulk_delete_filter_empty_exception_handler` (registered on
-    the FastAPI app via ``app.add_exception_handler``) converts this
+    :data:`ADMIN_ERROR_SPECS` entry (registered on the FastAPI app by
+    :func:`register_admin_error_handlers`) converts this
     into the canonical 422 ``bulk_delete_filter_empty`` envelope.
     Pre-fix the refusal escaped as FastAPI's raw ``{"detail": ...}``
     body via bare ``HTTPException`` (round 2 defender fix R2-2).
@@ -2113,20 +1956,178 @@ class BulkDeleteFilterEmptyError(Exception):
         super().__init__("bulk delete requires a non-empty filter")
 
 
-async def bulk_delete_filter_empty_exception_handler(
-    _request: Any,  # FastAPI Request, typed as Any to keep imports light
-    _exc: BulkDeleteFilterEmptyError,
-) -> Response:
-    """Translate :class:`BulkDeleteFilterEmptyError` into a 422 envelope."""
-    return _admin_error(
-        "bulk_delete_filter_empty",
-        (
+@dataclass(frozen=True)
+class AdminErrorSpec[E: Exception]:
+    """How one typed admin exception becomes an ``ErrorEnvelope``.
+
+    The variation between the nine collapsed handlers was DATA, not logic: a
+    code, a message built from the exception's own attributes, an optional
+    details payload, and which instance the error concerns. Each handler was
+    otherwise the same four lines around one :func:`_admin_error` call, and
+    each needed its own ``type: ignore`` silencer because its narrow
+    signature did not match ``add_exception_handler``'s base-``Exception``
+    one.
+
+    **The class is GENERIC on purpose.** Every message callable reads a NARROW
+    attribute (``exc.instance_id``, ``exc.backup_id``, ``exc.instance_ids``),
+    so a field typed over the base ``Exception`` would infer each lambda's
+    parameter as ``Exception`` and reject the attribute access. Each entry in
+    the table below is constructed at its own concrete type, so the lambdas
+    check there; the table itself erases the parameter, because a mapping from
+    an exception type to its own spec is a higher-kinded relation Python's
+    type system cannot express.
+
+    Attributes:
+        code: The stable ADR-010 error code, which selects the HTTP status.
+        message: Builds the operator-facing message from the exception.
+        details: Builds the ADR-017 ``details`` payload, or ``None``.
+        instance_id: Names the instance the error concerns; ``"unrouted"``
+            when the error is not instance-scoped.
+    """
+
+    code: ErrorCode
+    message: Callable[[E], str]
+    details: Callable[[E], dict[str, Any] | None] = lambda _exc: None
+    instance_id: Callable[[E], str] = lambda _exc: "unrouted"
+
+
+ADMIN_ERROR_SPECS: dict[type[Exception], AdminErrorSpec[Any]] = {
+    UnknownInstanceError: AdminErrorSpec[UnknownInstanceError](
+        code="instance_unknown",
+        message=lambda exc: f"Instance {exc.instance_id!r} not configured",
+    ),
+    NotFoundError: AdminErrorSpec[NotFoundError](
+        code="not_found",
+        message=lambda exc: exc.message,
+    ),
+    RestoreNoOpError: AdminErrorSpec[RestoreNoOpError](
+        code="restore_noop",
+        message=lambda exc: (
+            f"Restore of backup {exc.backup_id} into instance {exc.instance_id} "
+            f"did not restore the backup: {exc.detail}. Retry the restore "
+            "(re-check GET /v1/admin/quarantine first). Any displaced live "
+            "data was preserved as an interim mode_switch backup."
+        ),
+        details=lambda exc: {
+            "backup_id": str(exc.backup_id),
+            "instance_id": exc.instance_id,
+            "interim_backup_db": exc.interim_backup_db,
+            "interim_backup_body": exc.interim_backup_body,
+            "cause": exc.detail,
+        },
+        instance_id=lambda exc: exc.instance_id,
+    ),
+    LookupNotConfiguredError: AdminErrorSpec[LookupNotConfiguredError](
+        code="lookup_not_configured",
+        message=lambda exc: (
+            f"The by-captured-id lookup is not configured on instance(s) "
+            f"{', '.join(exc.instance_ids)}: the deployment supplies the per-instance "
+            "admin_lookup binding (capture_name + json_path); Phantom "
+            "never guesses where the upstream identifier lives."
+        ),
+        details=lambda exc: {"unconfigured_instances": list(exc.instance_ids)},
+        instance_id=lambda exc: exc.instance_ids[0] if exc.instance_ids else "unrouted",
+    ),
+    ReplayBodyDiscardedError: AdminErrorSpec[ReplayBodyDiscardedError](
+        code="replay_body_discarded",
+        message=lambda exc: (
+            f"Replay refused for chain {exc.chain_id}: its body was "
+            f"discarded at {exc.body_discarded_at.isoformat()} per the "
+            "retention policy, so a replay would have nothing to send. "
+            "The row is unchanged (sent_at preserved). Re-submit the "
+            "upload through POST /v1/send if it must run again."
+        ),
+        details=lambda exc: {
+            "chain_id": str(exc.chain_id),
+            "body_discarded_at": exc.body_discarded_at.isoformat(),
+        },
+        instance_id=lambda exc: exc.instance_id,
+    ),
+    ReplayRefusedAttemptingError: AdminErrorSpec[ReplayRefusedAttemptingError](
+        code="replay_refused_attempting",
+        message=lambda exc: (
+            f"Replay refused for chain {exc.chain_id}: a sender is "
+            "actively driving the row (state 'attempting'), and a "
+            "re-queue would clobber the in-flight attempt. The row is "
+            "unchanged. Wait for the attempt to settle (or cancel the "
+            "chain first), then retry the replay."
+        ),
+        details=lambda exc: {"chain_id": str(exc.chain_id)},
+        instance_id=lambda exc: exc.instance_id,
+    ),
+    MultifileCursorConflictError: AdminErrorSpec[MultifileCursorConflictError](
+        code="multifile_cursor_conflict",
+        message=lambda _exc: (
+            "cursor cannot be combined with multifile_id: multifile "
+            "results are ordered by send_order and are not paginated "
+            "(next_cursor is always null). Drop the cursor, or paginate "
+            "without the multifile_id filter."
+        ),
+        details=lambda exc: {
+            "multifile_id": str(exc.multifile_id),
+            "cursor": exc.cursor,
+        },
+    ),
+    KeyValueMatchInvalidError: AdminErrorSpec[KeyValueMatchInvalidError](
+        code="key_value_match_invalid",
+        message=lambda exc: (
+            f"key_value_match {exc.raw!r} is invalid: {exc.reason}. "
+            "Supply '<key>:<value>' with non-empty key and value."
+        ),
+        details=lambda exc: {"key_value_match": exc.raw},
+    ),
+    BulkDeleteFilterEmptyError: AdminErrorSpec[BulkDeleteFilterEmptyError](
+        code="bulk_delete_filter_empty",
+        message=lambda _exc: (
             "Bulk delete requires a non-empty filter: set at least one "
             "of state, route, since, or instance. An empty filter would "
             "delete every buffered row, which this surface refuses by "
             "design; delete individual chains via "
             "DELETE /v1/admin/chains/{chain_id} instead."
         ),
+    ),
+}
+"""Every typed admin exception, and the envelope it becomes.
+
+THE source of truth: :func:`register_admin_error_handlers` registers exactly
+these keys, and :func:`_dispatch_admin_error` reads exactly these values, so a
+new admin exception is one entry rather than a handler plus a registration
+plus a silencer.
+"""
+
+
+async def _dispatch_admin_error(_request: Any, exc: Exception) -> Response:
+    """Translate any spec'd admin exception into its canonical envelope.
+
+    The ONE handler behind every entry in :data:`ADMIN_ERROR_SPECS`. Its
+    signature is the one ``add_exception_handler`` is typed for, which is why
+    the nine ``type: ignore`` silencers the bespoke handlers needed
+    are gone: they existed only because each narrow signature disagreed with
+    the registration's base-``Exception`` one.
+
+    The lookup walks the MRO exactly as Starlette's own handler lookup does,
+    so a subclass of a spec'd exception resolves to the same spec that got it
+    routed here.
+
+    Args:
+        _request: The FastAPI request, unused (typed ``Any`` to keep imports
+            light, as the bespoke handlers did).
+        exc: The raised admin exception.
+
+    Returns:
+        The canonical ``ErrorEnvelope`` response for that exception's code.
+    """
+    spec = next(
+        (ADMIN_ERROR_SPECS[klass] for klass in type(exc).__mro__ if klass in ADMIN_ERROR_SPECS),
+        None,
+    )
+    if spec is None:  # pragma: no cover - only registered types reach this handler.
+        raise exc
+    return _admin_error(
+        spec.code,
+        spec.message(exc),
+        instance_id=spec.instance_id(exc),
+        details=spec.details(exc),
     )
 
 
@@ -2166,53 +2167,27 @@ def register_admin_error_handlers(app: FastAPI) -> None:
     """Register every admin typed-error handler on ``app``.
 
     The single source of truth for the admin error-handler wiring
-    (round 3 defender fix R3-1). The production app factory
+    (round 3 defender fix R3-1), now in two halves that say which is
+    which: :data:`ADMIN_ERROR_SPECS` is the SOURCE (one entry per typed
+    admin exception, carrying its code, message, details and instance),
+    and the loop below is the WIRING (one registration per entry, all of
+    them behind :func:`_dispatch_admin_error`). Adding an admin error is
+    therefore one table entry, not a handler plus a registration plus a
+    ``type: ignore``. The production app factory
     (``phantom.app.create_app``), the contract admin conftest, and
     every test fixture that mounts :data:`router` call this helper
-    instead of registering handlers piecemeal, so a handler added
-    here reaches every tier at once and the registration sites
-    cannot drift apart. Each handler's own docstring carries the
-    rationale for its envelope code and HTTP status.
+    instead of registering handlers piecemeal, so an error added here
+    reaches every tier at once and the registration sites cannot drift
+    apart. ``RequestValidationError`` keeps its own bespoke handler: it
+    is FastAPI's, not one of Phantom's typed admin exceptions, and it
+    builds its details from ``exc.errors()`` rather than from a message
+    template.
 
     Args:
         app: The FastAPI application mounting :data:`router`.
     """
-    app.add_exception_handler(
-        UnknownInstanceError,
-        unknown_instance_exception_handler,  # type: ignore[arg-type]
-    )
-    app.add_exception_handler(
-        NotFoundError,
-        not_found_exception_handler,  # type: ignore[arg-type]
-    )
-    app.add_exception_handler(
-        RestoreNoOpError,
-        restore_noop_exception_handler,  # type: ignore[arg-type]
-    )
-    app.add_exception_handler(
-        LookupNotConfiguredError,
-        lookup_not_configured_exception_handler,  # type: ignore[arg-type]
-    )
-    app.add_exception_handler(
-        ReplayBodyDiscardedError,
-        replay_body_discarded_exception_handler,  # type: ignore[arg-type]
-    )
-    app.add_exception_handler(
-        ReplayRefusedAttemptingError,
-        replay_refused_attempting_exception_handler,  # type: ignore[arg-type]
-    )
-    app.add_exception_handler(
-        MultifileCursorConflictError,
-        multifile_cursor_conflict_exception_handler,  # type: ignore[arg-type]
-    )
-    app.add_exception_handler(
-        KeyValueMatchInvalidError,
-        key_value_match_invalid_exception_handler,  # type: ignore[arg-type]
-    )
-    app.add_exception_handler(
-        BulkDeleteFilterEmptyError,
-        bulk_delete_filter_empty_exception_handler,  # type: ignore[arg-type]
-    )
+    for exc_type in ADMIN_ERROR_SPECS:
+        app.add_exception_handler(exc_type, _dispatch_admin_error)
     app.add_exception_handler(
         RequestValidationError,
         request_validation_exception_handler,  # type: ignore[arg-type]

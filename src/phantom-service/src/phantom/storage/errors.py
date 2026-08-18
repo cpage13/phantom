@@ -60,9 +60,9 @@ class ReplayBodyDiscardedError(Exception):
     UP FRONT, inside the write transaction, leaving the row untouched
     (``sent_at`` and all other fields preserved).
 
-    The admin route lets this propagate to
-    ``replay_body_discarded_exception_handler`` (registered on the
-    FastAPI app), which converts it into the canonical 409
+    The admin route lets this propagate to its ``ADMIN_ERROR_SPECS``
+    entry (``routes/admin.py``, registered on the FastAPI app), which
+    converts it into the canonical 409
     ``ErrorEnvelope`` with ``error.code='replay_body_discarded'`` so
     the SDK raises :class:`phantom_client.errors.PhantomConflictError`.
 
@@ -110,9 +110,9 @@ class ReplayRefusedAttemptingError(Exception):
     cannot flip the row between check and write). The row is left
     untouched.
 
-    The admin route lets this propagate to
-    ``replay_refused_attempting_exception_handler`` (registered on the
-    FastAPI app), which converts it into the canonical 409
+    The admin route lets this propagate to its ``ADMIN_ERROR_SPECS``
+    entry (``routes/admin.py``, registered on the FastAPI app), which
+    converts it into the canonical 409
     ``ErrorEnvelope`` with ``error.code='replay_refused_attempting'``
     so the SDK raises
     :class:`phantom_client.errors.PhantomConflictError`.
