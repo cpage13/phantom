@@ -303,6 +303,12 @@ retry:
 # Phantom emits structured logs only (no metrics surface beyond the
 # in-process MetricsRegistry exposed at ``GET /v1/admin/observability/*``).
 
+# Both sinks carry the SAME formatter and the SAME redaction filters, so
+# the file is not a raw channel. The file is secondary rather than
+# exclusive: with log_to_stdout still true, a record reaches both.
+# Phantom never creates the parent directory and never rotates the file.
+# Both knobs are restart-required (ADR-013).
+
 observability:
   log_level: "INFO"                         # DEBUG | INFO | WARNING | ERROR
   log_to_stdout: true                       # stream to stdout (default)

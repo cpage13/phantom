@@ -116,7 +116,7 @@ The wire header for the credential cache axis is `X-Phantom-Uid`. The admin URL 
 
 Redaction contract:
 
-- **Log output**: the `SensitiveCaptureRedactor` log filter (in `phantom.observability.logging`) inspects records for `captures` and `sensitive_captures` extras; values marked sensitive are redacted in-place to `<redacted>` before the formatter sees them. The executor emits captures at DEBUG level only and gates the `extra=...` construction behind `logger.isEnabledFor(logging.DEBUG)` so production INFO deployments pay zero cost.
+- **Log output**: the `SensitiveCaptureRedactor` log filter (in `phantom.observability.logging`) inspects records for `captures` and `sensitive_captures` extras; values marked sensitive are redacted in-place to `<redacted>` before the formatter sees them. The executor emits captures at DEBUG level only and gates the `extra=...` construction behind `logger.isEnabledFor(logging.DEBUG)` so production INFO deployments pay zero cost. This holds for EVERY configured sink, the `observability.log_to_file` sink included: both filters are attached per handler rather than to the logger, and the no-sink case installs a `NullHandler` so there is never an unfiltered `logging.lastResort` fallback channel.
 - **Admin responses**: loopback only (per [docs/adr/004-admin-api-loopback-no-auth.md](docs/adr/004-admin-api-loopback-no-auth.md)). Admin responses surface the raw captured value; redaction is log-only. The justification is that admin callers are by construction on-host operators; the `sensitive` flag controls log-channel behavior, not the persisted record.
 
 ## Permitted `Any` sites

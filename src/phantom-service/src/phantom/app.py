@@ -1245,7 +1245,7 @@ def create_app(
     Returns:
         The configured :class:`FastAPI` application.
     """
-    configure_logging(settings.observability.log_level)
+    configure_logging(settings.observability)
     _warn_if_bound_non_loopback(settings)
 
     # Plan § 4.2 — one process-wide metrics registry. Threaded to every

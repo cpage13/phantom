@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import logging
 
+from phantom.config.settings import ObservabilityCfg
 from phantom.observability import (
     BearerRedactionFilter,
     SensitiveCaptureRedactor,
@@ -112,19 +113,25 @@ def test_bearer_still_redacted() -> None:
 
 
 def test_configure_logging_installs_both_filters() -> None:
-    """``configure_logging`` attaches both filters to the root handler."""
+    """``configure_logging`` attaches both filters to EVERY root handler.
+
+    Asserting on ``root.handlers[0]`` was correct only while there was
+    exactly one handler. F15 made the sink set configurable, so the
+    per-handler filter rule is now the thing that could silently regress:
+    a second sink added without the pair is a leak with the retention of
+    whatever it writes to.
+    """
     # Snapshot existing root state so the test is restorable.
     root = logging.getLogger()
     saved_handlers = list(root.handlers)
     saved_level = root.level
     try:
-        configure_logging("INFO")
-        # The newest handler is the one configure_logging installed.
+        configure_logging(ObservabilityCfg(log_level="INFO", log_to_stdout=True))
         assert root.handlers, "configure_logging must install at least one handler"
-        handler = root.handlers[0]
-        filter_classes = {type(f).__name__ for f in handler.filters}
-        assert "BearerRedactionFilter" in filter_classes
-        assert "SensitiveCaptureRedactor" in filter_classes
+        for handler in root.handlers:
+            filter_classes = {type(f).__name__ for f in handler.filters}
+            assert "BearerRedactionFilter" in filter_classes
+            assert "SensitiveCaptureRedactor" in filter_classes
     finally:
         root.handlers = saved_handlers
         root.setLevel(saved_level)

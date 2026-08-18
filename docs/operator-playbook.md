@@ -545,6 +545,41 @@ redacted by the `BearerRedactionFilter`; sensitive captured values
 (marked `sensitive=True` per ADR-009/010) are redacted by the
 `SensitiveCaptureRedactor`.
 
+**Where the records go.** Two sinks, both restart-required:
+
+- `observability.log_to_stdout` (default `true`) streams records to
+  **stdout**.
+- `observability.log_to_file: <path>` adds a **secondary** file sink. It
+  is secondary, not exclusive: with `log_to_stdout` still true a record
+  reaches both. The path is opened at startup and is **never created for
+  you**; an unopenable path is reported once at ERROR through whichever
+  sink did install and then skipped, so a typo in the log path never
+  stops the service from accepting uploads.
+- Both sinks carry the **same** formatter and the **same** redaction
+  pair. A file is not a raw channel.
+- Setting `log_to_stdout: false` with no `log_to_file` is a legal choice
+  and means real silence: the process installs a single `NullHandler`
+  and emits nothing. That is deliberate. Without it, Python's
+  `logging.lastResort` would print WARNING and above to stderr with no
+  formatter and no filters, which would make the one configuration that
+  looks like "no logs" the only one able to print an unredacted bearer.
+  The trade is that an operator who mistypes the file key gets no logs
+  and no warning about it, because the warning would have nowhere to go.
+
+**Phantom does not rotate the file.** `logging.FileHandler` appends for
+the process lifetime, so rotation is yours (`logrotate`, or a mounted
+volume you cycle). A copy-truncate rotation works. A rename-based one
+leaves Phantom writing to the moved inode until the next restart.
+
+**uvicorn keeps its own streams.** `configure_logging` owns the ROOT
+logger, which is where every `phantom.*` module logger propagates.
+uvicorn installs handlers on its own named loggers (`uvicorn` and
+`uvicorn.access`, both `propagate: false`) from its own default config,
+so its startup lines stay on stderr and its access lines stay on stdout
+regardless of `log_to_stdout`. If you split the two streams or read a
+raw container log, expect Phantom's records on the configured sinks and
+uvicorn's on uvicorn's.
+
 Key log lines to alert on (plain text; grep the message):
 
 | Log line (grep for) | Severity | What it means |

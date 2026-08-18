@@ -749,11 +749,20 @@ class ObservabilityCfg(BaseModel):
     )
     log_to_stdout: bool = Field(
         True,
-        description="Stream log records to stdout (default true).",
+        description=(
+            "Stream log records to stdout (default true). With this false "
+            "and no log_to_file, the process installs no log sink at all "
+            "and emits nothing."
+        ),
     )
     log_to_file: str | None = Field(
         None,
-        description="Optional path of a secondary log-file sink. None disables file output.",
+        description=(
+            "Optional path of a secondary log-file sink, carrying the same "
+            "redaction filters as the stdout sink. None disables file "
+            "output. The path is opened at startup and is never created "
+            "for you; an unopenable path is logged as an ERROR and skipped."
+        ),
     )
 
 
