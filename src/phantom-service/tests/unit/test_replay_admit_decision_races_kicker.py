@@ -3,8 +3,8 @@
 The R8-4 cancel fix documents the discipline: "The release decision
 uses the store's in-transaction ``previous_state`` (not the route's
 pre-fetch, which can race a sender/kicker transition)" - and
-``store.cancel`` returns ``CancelOutcome`` precisely so the route can
-decide on authoritative state. The R8-6 replay fix did NOT get that
+``store.cancel`` returns ``CancelOutcome`` precisely so the gate can
+settle on authoritative state (ADR-036). The R8-6 replay fix did NOT get that
 discipline: ``replay_upload`` computes ``needs_admit`` from the row
 returned by its up-front ``_find_upload_with_ctx`` lookup
 (``routes/admin.py``), then admits, then calls ``store.replay`` - and
@@ -62,6 +62,7 @@ from phantom.storage import (
     SqliteUploadStore,
 )
 from phantom.storage.hybrid_body_store import HybridBodyStore
+from phantom.storage.interface import AttemptWriteOutcome
 from phantom.strategies import FixedIntervalsStrategy
 from phantom.workers.kicker import PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
@@ -116,9 +117,9 @@ class _KickerWakesBeforeReplayStore:
         """Delegate the kicker's scan snapshot to the real store."""
         return await self._real.list_non_terminal()
 
-    async def record_attempt_result(self, *args: object, **kwargs: object) -> int:
+    async def record_attempt_result(self, *args: object, **kwargs: object) -> AttemptWriteOutcome:
         """Delegate the kicker's guarded re-queue write to the real store."""
-        result: int = await self._real.record_attempt_result(*args, **kwargs)
+        result: AttemptWriteOutcome = await self._real.record_attempt_result(*args, **kwargs)
         return result
 
     async def replay(self, chain_id: UUID) -> UploadRow | None:

@@ -95,7 +95,7 @@ async def _deliver_successfully(
        ``succeeded_body_seconds == 0``).
     3. ``discard_body_and_zero_accounting`` stamps ``body_discarded_at``.
     """
-    rowcount = await store.record_attempt_result(
+    write = await store.record_attempt_result(
         row.chain_id,
         new_state="succeeded",
         attempts=_DELIVERY_ATTEMPTS,
@@ -108,7 +108,7 @@ async def _deliver_successfully(
         last_step_completed="create",
         stamp_sent_at=True,
     )
-    assert rowcount == 1, "delivery UPDATE must hit the attempting row"
+    assert write.rowcount == 1, "delivery UPDATE must hit the attempting row"
     await body_store.delete(row.chain_id)
     await store.discard_body_and_zero_accounting(row.chain_id, expected_state="succeeded")
 

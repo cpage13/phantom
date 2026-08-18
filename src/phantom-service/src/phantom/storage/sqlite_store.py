@@ -62,6 +62,7 @@ from phantom.storage._connection import _DEFAULT_BUSY_TIMEOUT_MS
 from phantom.storage.errors import ReplayBodyDiscardedError, ReplayRefusedAttemptingError
 from phantom.storage.interface import (
     TERMINAL_STATES,
+    AttemptWriteOutcome,
     CancelOutcome,
     DeletedRowAccounting,
     DiscardOutcome,
@@ -975,7 +976,7 @@ class SqliteUploadStore:
         expected_state: UploadState = "attempting",
         stamp_sent_at: bool = False,
         auth_blocked_host: str | None = None,
-    ) -> int:
+    ) -> AttemptWriteOutcome:
         """Persist one attempt's result.
 
         M-W4-F7 audit closure (Phase 2 § 3.2.8): the UPDATE is guarded
@@ -983,7 +984,7 @@ class SqliteUploadStore:
         If a concurrent admin ``cancel`` or ``replay`` moved the row
         out of ``attempting`` between the sender's ``claim_due`` and
         the terminal UPDATE here, the UPDATE finds no rows. The caller
-        observes rowcount=0 and logs without overwriting.
+        observes ``outcome.landed`` False and logs without overwriting.
 
         ``stamp_sent_at`` (cycle-7 task 2.5): when True, the write-once
         CASE guard stamps ``sent_at = updated_at`` ONLY when the column
@@ -1008,11 +1009,29 @@ class SqliteUploadStore:
         ``auth_expired``, which is the only state either kicker reads it
         in; off-park it is inert history that no reader acts on.
 
-        Returns the number of rows updated (0 or 1).
+        The in-transaction pre-image SELECT above the UPDATE is the same
+        confirm-then-act pattern :meth:`replay`, :meth:`cancel` and
+        :meth:`bulk_delete` already use: one primary-key lookup inside
+        the transaction that already holds the write lock, so the
+        saturation crossing is computed from the state and stamp the
+        write itself saw (ADR-036). On a landed write the pre-image
+        state is provably ``expected_state`` (that is the UPDATE's own
+        guard), but the stamp and the size are not derivable from the
+        guard at all, and on a NON-landed write the pre-image is the
+        only account of what actually happened.
+
+        Returns:
+            An :class:`AttemptWriteOutcome` whose ``rowcount`` is the
+            number of rows updated (0 or 1), carrying that pre-image.
         """
         conn = self._require_conn()
         now_iso = datetime.now(tz=UTC).isoformat()
         async with self._write_txn(conn):
+            async with conn.execute(
+                "SELECT state, body_size_bytes, body_discarded_at FROM uploads WHERE chain_id = ?",
+                (str(chain_id),),
+            ) as pre_cur:
+                pre = await pre_cur.fetchone()
             cursor = await conn.execute(
                 """
                 UPDATE uploads SET
@@ -1052,7 +1071,18 @@ class SqliteUploadStore:
                 },
             )
             await conn.commit()
-        return cursor.rowcount
+        pre_discarded_at = (
+            datetime.fromisoformat(pre["body_discarded_at"])
+            if pre is not None and pre["body_discarded_at"]
+            else None
+        )
+        return AttemptWriteOutcome(
+            rowcount=cursor.rowcount,
+            new_state=new_state,
+            previous_state=pre["state"] if pre is not None else None,
+            previous_body_discarded_at=pre_discarded_at,
+            body_size_bytes=int(pre["body_size_bytes"]) if pre is not None else 0,
+        )
 
     async def list_uploads(
         self,
@@ -1776,25 +1806,37 @@ class SqliteUploadStore:
         row = await self.get(chain_id)
         if row is None:
             raise KeyError(f"No upload row for chain_id={chain_id}")
-        # R9-4: the in-transaction pre-state is the route's gate
-        # reconciliation input; a route-side pre-fetch races the kicker
-        # wake and the sender's terminal transitions in both directions.
+        # R9-4: the in-transaction pre-state is the gate's settlement
+        # input for the re-queue; a route-side pre-fetch races the
+        # kicker wake and the sender's terminal transitions in both
+        # directions. The route hands this outcome to
+        # ``SlotDelta.from_replay`` and the gate applies the predicate
+        # (ADR-036); the row below is a post-commit read and is never a
+        # predicate input.
         return ReplayOutcome(row=row, previous_state=accounting["state"])
 
     async def cancel(self, chain_id: UUID) -> CancelOutcome:
         """Transition to ``cancelled`` if non-terminal.
 
-        The pre-UPDATE state is captured inside the same write
-        transaction (R8-4): it is the state the row was actually
-        cancelled FROM, so the route's gate-release decision cannot
-        race a concurrent sender/kicker transition. ``previous_state``
-        is ``None`` when the row was already terminal (no transition).
+        The pre-UPDATE state AND the pre-UPDATE H4 stamp are captured
+        inside the same write transaction (R8-4): they are what the row
+        was actually cancelled FROM, so the gate's settlement of the
+        cancel cannot race a concurrent sender/kicker transition
+        (ADR-036). Both are ``None`` when the row was already terminal
+        (no transition).
+
+        The stamp is in the SELECT because this UPDATE's guard admits
+        ``stored``, and ``stored`` is the one state
+        :func:`phantom.workers.saturation.row_holds_slot` consults the
+        stamp for. Unlike :meth:`replay`, cancel has no stamped-row
+        refusal, so a stamped ``stored`` row reaches the UPDATE and the
+        stamp decides whether it was still holding a slot.
         """
         conn = self._require_conn()
         now_iso = datetime.now(tz=UTC).isoformat()
         async with self._write_txn(conn):
             async with conn.execute(
-                "SELECT state FROM uploads WHERE chain_id = ?",
+                "SELECT state, body_discarded_at FROM uploads WHERE chain_id = ?",
                 (str(chain_id),),
             ) as cur:
                 fetched = await cur.fetchone()
@@ -1808,11 +1850,20 @@ class SqliteUploadStore:
                 (now_iso, str(chain_id)),
             )
             await conn.commit()
-        previous_state = fetched["state"] if fetched is not None and cursor.rowcount == 1 else None
+        previous_state: UploadState | None = None
+        previous_discarded_at: datetime | None = None
+        if fetched is not None and cursor.rowcount == 1:
+            previous_state = fetched["state"]
+            if fetched["body_discarded_at"]:
+                previous_discarded_at = datetime.fromisoformat(fetched["body_discarded_at"])
         row = await self.get(chain_id)
         if row is None:
             raise KeyError(f"No upload row for chain_id={chain_id}")
-        return CancelOutcome(row=row, previous_state=previous_state)
+        return CancelOutcome(
+            row=row,
+            previous_state=previous_state,
+            previous_body_discarded_at=previous_discarded_at,
+        )
 
     async def bulk_delete(
         self,
@@ -1901,7 +1952,11 @@ class SqliteUploadStore:
         files the metadata pass and the orphan janitor converge.
         """
         conn = self._require_conn()
-        now_iso = datetime.now(tz=UTC).isoformat()
+        # Bound as a datetime and derived to text, not the other way
+        # round: the UPDATE's parameter is unchanged while
+        # ``DiscardOutcome.discarded_at`` carries its declared type.
+        now = datetime.now(tz=UTC)
+        now_iso = now.isoformat()
         async with self._write_txn(conn):
             async with conn.execute(
                 "SELECT body_size_bytes FROM uploads "
@@ -1911,7 +1966,15 @@ class SqliteUploadStore:
                 fetched = await cur.fetchone()
             if fetched is None:
                 await conn.commit()
-                return DiscardOutcome(flipped=False, body_size_bytes=0)
+                # No pre-image on either side, which is what makes the
+                # non-flip a no-crossing delta with no adapter special
+                # case (ADR-036).
+                return DiscardOutcome(
+                    flipped=False,
+                    body_size_bytes=0,
+                    previous_state=None,
+                    discarded_at=None,
+                )
             await conn.execute(
                 """
                 UPDATE uploads
@@ -1922,7 +1985,14 @@ class SqliteUploadStore:
                 (now_iso, str(chain_id), expected_state),
             )
             await conn.commit()
-        return DiscardOutcome(flipped=True, body_size_bytes=int(fetched["body_size_bytes"]))
+        # The guard matched ``expected_state`` with the stamp NULL, so
+        # that IS the pre-image state and ``now`` IS the stamp written.
+        return DiscardOutcome(
+            flipped=True,
+            body_size_bytes=int(fetched["body_size_bytes"]),
+            previous_state=expected_state,
+            discarded_at=now,
+        )
 
     async def vacuum(self) -> None:
         """Run ``VACUUM`` on the store.

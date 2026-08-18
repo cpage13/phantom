@@ -63,6 +63,7 @@ from phantom.storage import (
     SqliteUploadStore,
 )
 from phantom.storage.hybrid_body_store import HybridBodyStore
+from phantom.storage.interface import AttemptWriteOutcome
 from phantom.strategies import FixedIntervalsStrategy
 from phantom.workers.kicker import PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
@@ -104,12 +105,12 @@ class _RaiseOnRequeueStore:
         """Delegate the kicker's scan snapshot to the real store."""
         return await self._real.list_non_terminal()
 
-    async def record_attempt_result(self, *args: Any, **kwargs: Any) -> int:
+    async def record_attempt_result(self, *args: Any, **kwargs: Any) -> AttemptWriteOutcome:
         """Raise a transient storage fault on the kicker's first write."""
         if not self._fired:
             self._fired = True
             raise sqlite3.OperationalError("disk I/O error")
-        result: int = await self._real.record_attempt_result(*args, **kwargs)
+        result: AttemptWriteOutcome = await self._real.record_attempt_result(*args, **kwargs)
         return result
 
 

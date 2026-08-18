@@ -366,7 +366,7 @@ class Sender:
         """
         attempts = row.attempts + 1
         if result.chain_done:
-            rowcount = await store.record_attempt_result(
+            write = await store.record_attempt_result(
                 row.chain_id,
                 new_state="succeeded",
                 attempts=attempts,
@@ -383,7 +383,7 @@ class Sender:
                 # makes it write-once, surviving operator replay.
                 stamp_sent_at=True,
             )
-            if rowcount == 0:
+            if not write.landed:
                 # M-W4-F7: admin cancel/replay took the row between
                 # claim_due and now. Do not release saturation or
                 # delete the body — those side-effects are tied to a
@@ -465,7 +465,7 @@ class Sender:
                         row.chain_id,
                     )
         else:
-            rowcount = await store.record_attempt_result(
+            write = await store.record_attempt_result(
                 row.chain_id,
                 new_state="queued",
                 attempts=0,
@@ -477,7 +477,7 @@ class Sender:
                 current_step_index=result.next_step_index,
                 last_step_completed=result.step_name,
             )
-            if rowcount == 0:
+            if not write.landed:
                 await self._no_op_total.inc()
                 logger.info(
                     "record_attempt_result no-op: chain_id=%s — "
@@ -501,7 +501,7 @@ class Sender:
         (codec library bug). The row never advances; saturation is
         released so the slot is reclaimed.
         """
-        rowcount = await store.record_attempt_result(
+        write = await store.record_attempt_result(
             row.chain_id,
             new_state="corrupted",
             attempts=row.attempts,
@@ -513,7 +513,7 @@ class Sender:
             current_step_index=None,
             last_step_completed=None,
         )
-        if rowcount == 0:
+        if not write.landed:
             await self._no_op_total.inc()
             logger.info(
                 "_on_corrupted no-op: chain_id=%s — admin cancel/replay "
@@ -527,7 +527,7 @@ class Sender:
         self, store: UploadStore, row: UploadRow, result: CaptureExpiredRewind
     ) -> None:
         """ADR-011 reexecute=True — rewind ``current_step_index`` and re-queue."""
-        rowcount = await store.record_attempt_result(
+        write = await store.record_attempt_result(
             row.chain_id,
             new_state="queued",
             attempts=0,
@@ -539,7 +539,7 @@ class Sender:
             current_step_index=result.rewind_to_step_index,
             last_step_completed=None,
         )
-        if rowcount == 0:
+        if not write.landed:
             await self._no_op_total.inc()
             logger.info(
                 "_on_rewind no-op: chain_id=%s — admin cancel/replay took the row from attempting",
@@ -620,7 +620,7 @@ class Sender:
             upstream_status: Last upstream status code, when one exists.
             no_op_context: Caller tag for the rowcount=0 log line.
         """
-        rowcount = await store.record_attempt_result(
+        write = await store.record_attempt_result(
             row.chain_id,
             new_state="stored",
             attempts=attempts,
@@ -632,7 +632,7 @@ class Sender:
             current_step_index=None,
             last_step_completed=None,
         )
-        if rowcount == 0:
+        if not write.landed:
             await self._no_op_total.inc()
             logger.info(
                 "%s no-op: chain_id=%s - admin cancel/replay took the row from attempting",
@@ -644,7 +644,7 @@ class Sender:
         self, store: UploadStore, row: UploadRow, *, last_error: str
     ) -> None:
         """Transition row to ``failed`` (terminal)."""
-        rowcount = await store.record_attempt_result(
+        write = await store.record_attempt_result(
             row.chain_id,
             new_state="failed",
             attempts=row.attempts + 1,
@@ -656,7 +656,7 @@ class Sender:
             current_step_index=None,
             last_step_completed=None,
         )
-        if rowcount == 0:
+        if not write.landed:
             await self._no_op_total.inc()
             logger.info(
                 "_on_terminal_failure no-op: chain_id=%s — admin cancel/replay "
@@ -676,7 +676,7 @@ class Sender:
         is not ``row.endpoint``, and it is the key both kickers probe when they
         decide whether the row can wake.
         """
-        rowcount = await store.record_attempt_result(
+        write = await store.record_attempt_result(
             row.chain_id,
             new_state="auth_expired",
             attempts=row.attempts + 1,
@@ -689,7 +689,7 @@ class Sender:
             last_step_completed=None,
             auth_blocked_host=result.blocked_host,
         )
-        if rowcount == 0:
+        if not write.landed:
             await self._no_op_total.inc()
             logger.info(
                 "_on_auth_failure no-op: chain_id=%s — admin cancel/replay "
@@ -789,7 +789,7 @@ class Sender:
             )
             return
         next_attempt_at = datetime.now(tz=UTC) + delay
-        rowcount = await store.record_attempt_result(
+        write = await store.record_attempt_result(
             row.chain_id,
             new_state="queued",
             attempts=attempts,
@@ -801,7 +801,7 @@ class Sender:
             current_step_index=None,
             last_step_completed=None,
         )
-        if rowcount == 0:
+        if not write.landed:
             await self._no_op_total.inc()
             logger.info(
                 "_on_retryable_failure(queued) no-op: chain_id=%s — "

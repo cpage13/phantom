@@ -44,17 +44,64 @@ class DeletedRowAccounting:
     """Saturation-relevant view of one row, captured atomically at removal.
 
     Returned by every row-REMOVING store method (single delete, bulk
-    delete, the reaper's retention deletion and count-cap eviction) so
-    the caller can release the gate for rows that still held a slot
-    (R8-4, via :func:`phantom.workers.saturation.row_holds_slot`).
-    Captured inside the same write transaction as the DELETE, so the
-    values cannot race a concurrent transition.
+    delete, the reaper's retention deletion and count-cap eviction) and
+    handed to :meth:`phantom.workers.saturation.SlotDelta.from_removal`,
+    which is where the R8-4 slot-holding predicate is applied. The
+    caller supplies the outcome and the release basis; the gate decides
+    whether the removal crossed the predicate (ADR-036). Captured inside
+    the same write transaction as the DELETE, so the values cannot race
+    a concurrent transition.
     """
 
     chain_id: UUID
     state: UploadState
     body_size_bytes: int
     body_discarded_at: datetime | None
+
+
+@dataclass(frozen=True)
+class AttemptWriteOutcome:
+    """Result of :meth:`UploadStore.record_attempt_result`.
+
+    Carries the in-transaction pre-image of the row the guarded UPDATE
+    targeted, so a caller settling the saturation ledger never has to
+    reason from a snapshot the write already invalidated. Same
+    discipline as :class:`DeletedRowAccounting` (R8-4),
+    :class:`ReplayOutcome` (R9-4) and :class:`CancelOutcome` (R8-4).
+
+    Attributes:
+        rowcount: Rows updated, 0 or 1. The exact value this method
+            returned before the type existed, kept so the store's
+            documented contract and its tests read unchanged.
+        new_state: The state the caller asked for, echoed so a delta
+            adapter needs no second argument.
+        previous_state: The row's state read in the SAME transaction
+            immediately before the UPDATE, or ``None`` when no row with
+            that ``chain_id`` existed. On a landed write this always
+            equals ``expected_state``, because the UPDATE is CAS-guarded
+            on it; on a NON-landed write it is the state that actually
+            beat the guard, which is information the bare rowcount threw
+            away.
+        previous_body_discarded_at: The row's H4 stamp from the same
+            read. ``record_attempt_result`` never writes that column, so
+            this is also the post-write value.
+        body_size_bytes: The row's size from the same read; 0 when no
+            row existed. This is NOT the release basis for every
+            caller. The four sender sites deliberately pass
+            ``row.body_size_bytes`` instead; see
+            :class:`phantom.workers.saturation.SlotDelta`.
+    """
+
+    rowcount: int
+    new_state: UploadState
+    previous_state: UploadState | None
+    previous_body_discarded_at: datetime | None
+    body_size_bytes: int
+
+    @property
+    def landed(self) -> bool:
+        """Whether the guarded UPDATE actually fired."""
+        return self.rowcount == 1
 
 
 @dataclass(frozen=True)
@@ -67,10 +114,26 @@ class DiscardOutcome:
     transaction, the release basis for a ``stored`` row's saturation
     slot (R9-5). A False outcome means another owner moved or already
     stamped the row; the caller must touch nothing.
+
+    Attributes:
+        flipped: Whether THIS call stamped the row.
+        body_size_bytes: The pre-zero size captured in the same
+            transaction.
+        previous_state: The state the in-transaction guard matched, so
+            ``expected_state`` on a flip and ``None`` otherwise. The
+            before-side input
+            :meth:`phantom.workers.saturation.SlotDelta.from_discard`
+            applies the slot predicate to; no pre-image means no
+            crossing, which is what lets that adapter carry no
+            special case for a non-flip.
+        discarded_at: The stamp this call wrote, or ``None`` when it
+            did not flip. The after-side stamp of the same crossing.
     """
 
     flipped: bool
     body_size_bytes: int
+    previous_state: UploadState | None
+    discarded_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -78,11 +141,13 @@ class ReplayOutcome:
     """Result of :meth:`UploadStore.replay` with atomic accounting truth.
 
     ``previous_state`` is the state the in-transaction precheck saw
-    immediately before the re-queue UPDATE (R9-4): the route's gate
-    decision (re-admit a released row; never double-charge a holding
-    one) must reconcile against THIS value, because a route-side
+    immediately before the re-queue UPDATE (R9-4): the gate's settlement
+    of the re-queue (re-admit a released row; never double-charge a
+    holding one) is computed from THIS value, because a route-side
     pre-fetch races the kicker's wake and the sender's terminal
-    transitions in both directions.
+    transitions in both directions. The route hands it to
+    :meth:`phantom.workers.saturation.SlotDelta.from_replay` and the
+    gate applies the predicate (ADR-036).
     """
 
     row: UploadRow
@@ -95,16 +160,31 @@ class CancelOutcome:
 
     ``previous_state`` is the cancellable state the in-transaction
     precheck saw immediately before the UPDATE, or ``None`` when the
-    row was already terminal and the cancel was a no-op. The route
-    releases the saturation gate iff the previous state held a slot
-    (R8-4); a route-side pre-fetched state cannot serve because the row
-    may transition between the fetch and the UPDATE (an ``auth_expired``
-    row woken and re-admitted by the kicker must release; a row the
-    sender terminalized, and therefore released, must not).
+    row was already terminal and the cancel was a no-op. The gate
+    settles the cancel against it (R8-4, ADR-036); a route-side
+    pre-fetched state cannot serve because the row may transition
+    between the fetch and the UPDATE (an ``auth_expired`` row woken and
+    re-admitted by the kicker must release; a row the sender
+    terminalized, and therefore released, must not).
+
+    Attributes:
+        row: The row as it reads AFTER the transaction commits. Its
+            ``body_size_bytes`` is the route's release basis; it is
+            never a slot-predicate input, because it is an
+            unsynchronised later read.
+        previous_state: The cancellable state the in-transaction
+            precheck saw, or ``None`` when the UPDATE did not land.
+        previous_body_discarded_at: The row's H4 stamp from that same
+            in-transaction read. Cancel is the one outcome that needs
+            it: its UPDATE guard admits ``stored``, which is the single
+            state :func:`phantom.workers.saturation.row_holds_slot`
+            consults the stamp for, and unlike :meth:`UploadStore.replay`
+            it has no stamped-row refusal at all.
     """
 
     row: UploadRow
     previous_state: UploadState | None
+    previous_body_discarded_at: datetime | None
 
 
 class InsertClaimOutcome(enum.Enum):
@@ -233,7 +313,7 @@ class UploadStore(Protocol):
         expected_state: UploadState = "attempting",
         stamp_sent_at: bool = False,
         auth_blocked_host: str | None = None,
-    ) -> int:
+    ) -> AttemptWriteOutcome:
         """Persist the result of one attempt against this row.
 
         M-W4-F7 audit closure: ``expected_state`` is a defensive
@@ -243,8 +323,8 @@ class UploadStore(Protocol):
         ``claim_due`` and the terminal UPDATE). If the row's state
         moved under the sender (admin cancel, admin replay, or a
         concurrent worker), the UPDATE finds no rows and returns
-        rowcount=0; the caller logs and continues without overwriting
-        the new state.
+        ``rowcount=0``; the caller logs and continues without
+        overwriting the new state.
 
         ``stamp_sent_at`` (cycle-7 task 2.5): when True, ``sent_at`` is
         stamped write-once (only while still NULL) with the same
@@ -265,7 +345,13 @@ class UploadStore(Protocol):
         while the row is in ``auth_expired`` (the only state either
         kicker reads it in); off-park it is inert history.
 
-        Returns the number of rows updated (0 or 1).
+        Returns:
+            An :class:`AttemptWriteOutcome` whose ``rowcount`` is the
+            number of rows updated (0 or 1) and whose remaining fields
+            are the row's in-transaction pre-image, read immediately
+            before the UPDATE in the same transaction. The gate settles
+            the saturation ledger from that pre-image (ADR-036), so no
+            caller reasons about the crossing from its own snapshot.
         """
         ...
 

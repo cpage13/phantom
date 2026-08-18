@@ -1102,7 +1102,7 @@ async def test_wake_storm_rollup_reads_stay_internally_consistent(
     member_ids = sorted(m.chain_id for m in members)
 
     async def _wake(chain_id: UUID) -> int:
-        return await file_store.record_attempt_result(
+        write = await file_store.record_attempt_result(
             chain_id,
             new_state="queued",
             attempts=0,
@@ -1115,6 +1115,7 @@ async def test_wake_storm_rollup_reads_stay_internally_consistent(
             last_step_completed=None,
             expected_state="auth_expired",
         )
+        return write.rowcount
 
     read_faults: list[str] = []
 

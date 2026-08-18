@@ -68,7 +68,7 @@ async def test_sent_at_stays_null_on_every_non_stamp_transition(
     for new_state in ("queued", "stored", "failed", "auth_expired", "corrupted"):
         row = make_upload_row(state="attempting")
         await store.insert(row)
-        rowcount = await store.record_attempt_result(
+        write = await store.record_attempt_result(
             row.chain_id,
             new_state=new_state,
             attempts=1,
@@ -80,7 +80,7 @@ async def test_sent_at_stays_null_on_every_non_stamp_transition(
             current_step_index=None,
             last_step_completed=None,
         )
-        assert rowcount == 1
+        assert write.rowcount == 1
         fresh = await store.get(row.chain_id)
         assert fresh is not None
         assert fresh.state == new_state
@@ -98,7 +98,7 @@ async def test_sent_at_set_exactly_once_at_confirmed_delivery(
     assert fetched is not None
     assert fetched.sent_at is None  # NULL until delivery
 
-    rowcount = await store.record_attempt_result(
+    write = await store.record_attempt_result(
         row.chain_id,
         new_state="succeeded",
         attempts=1,
@@ -111,7 +111,7 @@ async def test_sent_at_set_exactly_once_at_confirmed_delivery(
         last_step_completed=None,
         stamp_sent_at=True,
     )
-    assert rowcount == 1
+    assert write.rowcount == 1
     fresh = await store.get(row.chain_id)
     assert fresh is not None
     assert fresh.state == "succeeded"
@@ -161,7 +161,7 @@ async def test_replay_then_resucceed_preserves_original_sent_at(
     # Sender re-claims (queued to attempting) and resucceeds with the stamp.
     claimed = await store.claim_due(datetime.now(tz=UTC), limit=1)
     assert [r.chain_id for r in claimed] == [row.chain_id]
-    rowcount = await store.record_attempt_result(
+    write = await store.record_attempt_result(
         row.chain_id,
         new_state="succeeded",
         attempts=1,
@@ -174,7 +174,7 @@ async def test_replay_then_resucceed_preserves_original_sent_at(
         last_step_completed=None,
         stamp_sent_at=True,
     )
-    assert rowcount == 1
+    assert write.rowcount == 1
     fresh = await store.get(row.chain_id)
     assert fresh is not None
     assert fresh.state == "succeeded"
@@ -219,7 +219,7 @@ async def test_accidental_stamp_on_non_success_does_not_overwrite(
     assert await store.replay(row.chain_id) is not None
     claimed = await store.claim_due(datetime.now(tz=UTC), limit=1)
     assert [r.chain_id for r in claimed] == [row.chain_id]
-    rowcount = await store.record_attempt_result(
+    write = await store.record_attempt_result(
         row.chain_id,
         new_state="stored",
         attempts=1,
@@ -232,7 +232,7 @@ async def test_accidental_stamp_on_non_success_does_not_overwrite(
         last_step_completed=None,
         stamp_sent_at=True,
     )
-    assert rowcount == 1
+    assert write.rowcount == 1
     fresh = await store.get(row.chain_id)
     assert fresh is not None
     assert fresh.state == "stored"

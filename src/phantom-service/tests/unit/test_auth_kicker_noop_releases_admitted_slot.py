@@ -56,6 +56,7 @@ from phantom.storage import (
     SqliteUploadStore,
 )
 from phantom.storage.hybrid_body_store import HybridBodyStore
+from phantom.storage.interface import AttemptWriteOutcome
 from phantom.strategies import FixedIntervalsStrategy
 from phantom.workers.kicker import PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
@@ -105,12 +106,12 @@ class _CancelBeforeRequeueStore:
         """Delegate the kicker's scan snapshot to the real store."""
         return await self._real.list_non_terminal()
 
-    async def record_attempt_result(self, *args: Any, **kwargs: Any) -> int:
+    async def record_attempt_result(self, *args: Any, **kwargs: Any) -> AttemptWriteOutcome:
         """Land the racing cancel once, then delegate the kicker's write."""
         if not self._fired:
             self._fired = True
             await self._on_requeue()
-        result: int = await self._real.record_attempt_result(*args, **kwargs)
+        result: AttemptWriteOutcome = await self._real.record_attempt_result(*args, **kwargs)
         return result
 
 

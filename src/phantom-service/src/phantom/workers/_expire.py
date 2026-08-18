@@ -116,7 +116,7 @@ async def expire_row(
             ``"send_deadline:Ns"``).
         upstream_status: The most recent upstream status, or ``None``.
     """
-    rowcount = await store.record_attempt_result(
+    write = await store.record_attempt_result(
         row.chain_id,
         new_state="expired",
         attempts=row.attempts,
@@ -129,7 +129,7 @@ async def expire_row(
         last_step_completed=None,
         expected_state=expected_state,  # caller-correct CAS guard
     )
-    if rowcount == 0:
+    if not write.landed:
         # A concurrent admin cancel/replay or a kicker wake moved the row
         # between claim and this write; do NOT clobber the new state.
         logger.info("expire_row no-op: chain_id=%s — row moved under us", row.chain_id)

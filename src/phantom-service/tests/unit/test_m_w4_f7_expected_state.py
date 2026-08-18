@@ -66,7 +66,7 @@ async def test_record_attempt_result_default_predicate_matches_attempting(
     """The default ``expected_state='attempting'`` updates an attempting row."""
     row = make_upload_row(state="attempting")
     await store.insert(row)
-    rowcount = await store.record_attempt_result(
+    write = await store.record_attempt_result(
         row.chain_id,
         new_state="succeeded",
         attempts=1,
@@ -78,7 +78,7 @@ async def test_record_attempt_result_default_predicate_matches_attempting(
         current_step_index=None,
         last_step_completed=None,
     )
-    assert rowcount == 1
+    assert write.rowcount == 1
     fresh = await store.get(row.chain_id)
     assert fresh is not None
     assert fresh.state == "succeeded"
@@ -97,7 +97,7 @@ async def test_record_attempt_result_default_predicate_rejects_cancelled(
     """
     row = make_upload_row(state="cancelled")
     await store.insert(row)
-    rowcount = await store.record_attempt_result(
+    write = await store.record_attempt_result(
         row.chain_id,
         new_state="succeeded",
         attempts=1,
@@ -109,7 +109,7 @@ async def test_record_attempt_result_default_predicate_rejects_cancelled(
         current_step_index=None,
         last_step_completed=None,
     )
-    assert rowcount == 0
+    assert write.rowcount == 0
     fresh = await store.get(row.chain_id)
     assert fresh is not None
     # The cancelled state survives — no clobber.
@@ -123,7 +123,7 @@ async def test_record_attempt_result_explicit_predicate_for_auth_expired_wake(
     """``expected_state='auth_expired'`` lets the bearer kicker wake the row."""
     row = make_upload_row(state="auth_expired")
     await store.insert(row)
-    rowcount = await store.record_attempt_result(
+    write = await store.record_attempt_result(
         row.chain_id,
         new_state="queued",
         attempts=row.attempts,
@@ -136,7 +136,7 @@ async def test_record_attempt_result_explicit_predicate_for_auth_expired_wake(
         last_step_completed=None,
         expected_state="auth_expired",
     )
-    assert rowcount == 1
+    assert write.rowcount == 1
     fresh = await store.get(row.chain_id)
     assert fresh is not None
     assert fresh.state == "queued"

@@ -398,7 +398,7 @@ class Kicker:
             # later rescan stranded another slot until the gate saturated and
             # fresh ingress 503'd with no live row behind the count.
             try:
-                rowcount = await store.record_attempt_result(
+                write = await store.record_attempt_result(
                     row.chain_id,
                     new_state="queued",
                     attempts=row.attempts,
@@ -425,7 +425,7 @@ class Kicker:
                     row.chain_id,
                 )
                 raise
-            if rowcount == 0:
+            if not write.landed:
                 # The rowcount-0 refusal leg (R9-3): the wake never happened,
                 # and whoever moved the row owns its own accounting, so this
                 # release only undoes OUR admit. Then skip; the next
