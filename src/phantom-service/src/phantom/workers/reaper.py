@@ -36,7 +36,7 @@ from phantom.config.settings import RetentionCfg
 from phantom.instances.context import InstanceContext
 from phantom.models.upload import UploadState
 from phantom.observability.metrics import MetricsRegistry
-from phantom.workers.saturation import row_holds_slot
+from phantom.workers.saturation import SlotDelta
 
 logger = logging.getLogger(__name__)
 
@@ -223,8 +223,9 @@ class Reaper:
                     # the stamped row as slotless from now on). The
                     # other states in this pass released at their
                     # terminal transition or auth_expired park.
-                    if state == "stored":
-                        await instance.saturation.release(outcome.body_size_bytes)
+                    await instance.saturation.settle(
+                        SlotDelta.from_discard(outcome, size_bytes=outcome.body_size_bytes)
+                    )
                     await body_store.delete(row.chain_id)
                     await self._reaper_actions_total.inc(label_value=_REAPER_ACTION_BODY_DISCARDED)
             # Metadata-row deletion pass.
@@ -236,8 +237,9 @@ class Reaper:
                     # discarded (body window longer than the metadata
                     # window, or infinite) still holds its slot at
                     # deletion; release it with the row.
-                    if row_holds_slot(entry.state, entry.body_discarded_at):
-                        await instance.saturation.release(entry.body_size_bytes)
+                    await instance.saturation.settle(
+                        SlotDelta.from_removal(entry, size_bytes=entry.body_size_bytes)
+                    )
                 if removed:
                     await self._reaper_actions_total.inc(
                         label_value=_REAPER_ACTION_ROW_DELETED, n=len(removed)
@@ -282,8 +284,9 @@ class Reaper:
                     await body_store.delete(entry.chain_id)
                 # R8-4: same rule as the metadata pass - an evicted
                 # stored row still holding its slot releases it here.
-                if row_holds_slot(entry.state, entry.body_discarded_at):
-                    await instance.saturation.release(entry.body_size_bytes)
+                await instance.saturation.settle(
+                    SlotDelta.from_removal(entry, size_bytes=entry.body_size_bytes)
+                )
             if evicted:
                 await self._reaper_actions_total.inc(
                     label_value=_REAPER_ACTION_ROW_DELETED, n=len(evicted)

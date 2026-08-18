@@ -35,7 +35,7 @@ import logging
 
 from phantom.models.upload import UploadRow, UploadState
 from phantom.storage.interface import BodyStore, UploadStore
-from phantom.workers.saturation import SaturationGate, row_holds_slot
+from phantom.workers.saturation import SaturationGate, SlotDelta
 
 logger = logging.getLogger(__name__)
 
@@ -75,33 +75,38 @@ async def expire_row(
     which the next claim lands in a false ``corrupted``.
 
     The saturation release depends on whether the row STILL HOLDS its slot at
-    the moment it expires, and that differs by path. THIS WRITER decides it,
-    from ``row_holds_slot(row.state, row.body_discarded_at)`` on the row it
-    was handed (CL10). The caller passes no flag: the two paths are already
-    distinguishable from the row's own persisted state, and a hand-derived
-    boolean only offered a fourth caller the chance to pass the wrong one.
+    the moment it expires, and that differs by path. NOBODY HERE DECIDES IT:
+    the state write's own in-transaction pre-image goes to
+    :meth:`SaturationGate.settle` and the gate applies the predicate across
+    both sides of that write (ADR-036). The caller passes no flag and this
+    writer computes no boolean, so neither can be wrong about a row the write
+    had already invalidated.
 
     * **Path A (executor give-up gate).** The row is ``attempting``, which is
-      in ``SLOT_HOLDING_STATES``, so the predicate is True: it still holds the
-      slot it was admitted with and expiring it must RELEASE that slot. No
-      single existing terminal path both discards and releases in this shape,
-      so the two legs are composed here in the correct order: flip the state
-      under a CAS guard, discard the body, then release the slot off the
-      discard outcome's in-transaction pre-zero size (never the stale
-      ``row.body_size_bytes``).
+      in ``SLOT_HOLDING_STATES``, and ``expired`` is not, so the state write
+      CROSSES the predicate and the gate releases. No single existing terminal
+      path both discards and releases in this shape, so the legs are composed
+      here in the correct order: flip the state under a CAS guard, discard the
+      body, settle the crossing off the STATE write's own in-transaction size
+      (never the stale ``row.body_size_bytes`` snapshot), then delete the
+      bytes. The basis rides the write that made the crossing, so the slot and
+      its bytes both come back even on the interleaving where a racing stamper
+      wins the discard.
     * **Path B (kicker parked-row sweep).** The row is ``auth_expired``, which
-      is NOT in ``SLOT_HOLDING_STATES``, so the predicate is False: its slot
-      was ALREADY released at park time by ``_on_auth_failure`` (the body was
+      is NOT in ``SLOT_HOLDING_STATES``, and neither is ``expired``, so the
+      write crosses nothing and the gate releases nothing: its slot was
+      ALREADY released at park time by ``_on_auth_failure`` (the body was
       RETAINED, the accounting zeroed). Releasing again would double-free:
       ``SaturationGate.release`` floors at zero so the counters never go
       negative, but under a concurrent in-flight row the extra decrement
       transiently UNDER-counts ``in_flight``, briefly admitting one upload
-      past the saturation cap. The body is still discarded; only the slot
-      release is gated.
+      past the saturation cap. The body is still discarded; only the ledger
+      effect differs, and it differs by derivation rather than by a branch.
 
     Args:
         store: The upload store owning the row's metadata.
-        saturation: The instance saturation gate to release on body discard.
+        saturation: The instance saturation gate to settle the row's
+            transition on.
         body_store: The instance's mode-selected body store, whose
             ``delete`` frees the bytes themselves. ``delete`` is idempotent on
             both halves of :class:`HybridBodyStore`, so this covers ``ram`` and
@@ -134,31 +139,26 @@ async def expire_row(
         # between claim and this write; do NOT clobber the new state.
         logger.info("expire_row no-op: chain_id=%s — row moved under us", row.chain_id)
         return
-    # DISCARD FIRST — capture the in-transaction pre-zero size as the release
-    # basis (NEVER the stale ``row.body_size_bytes`` snapshot). The row is NOW
-    # in ``expired`` (we just flipped it), so the discard CAS guards on that.
-    # The body is discarded in BOTH paths; only the slot release below differs.
+    # DISCARD FIRST, because the row is NOW in ``expired`` (we just flipped
+    # it) and the discard CAS guards on that. The body is discarded in BOTH
+    # paths. The SLOT is settled just below, off the STATE write above, which
+    # is the write that crossed the predicate; the discard crosses nothing
+    # either way (``expired`` holds no slot before or after it). The caller's
+    # ``row.body_size_bytes`` snapshot is still NOT the basis.
     outcome = await store.discard_body_and_zero_accounting(row.chain_id, expected_state="expired")
+    # ABOVE the flip guard on purpose: the state write landed, so the crossing
+    # happened, and it must be settled whether or not this call is the one
+    # that won the discard. Under the guard it would be skipped on exactly the
+    # interleaving where a racing stamper or remover leaves nobody else to
+    # release, which is the leak this position closes.
+    await saturation.settle(SlotDelta.from_attempt(write, size_bytes=write.body_size_bytes))
     if not outcome.flipped:
         # Another owner moved or already stamped this row between the state
         # flip and here (an admin replay, a concurrent kicker tick, or a
-        # reaper discard). Whoever stamped it owns its bytes, so neither the
-        # release below nor the delete after it may run. This guard also
-        # defends path A's release against a concurrent mover, which is what
-        # it did before F3 gave it the byte delete to guard as well.
+        # reaper discard). Whoever stamped it owns its bytes, so the delete
+        # after it may not run. The slot is already settled above; only the
+        # BYTES are guarded here.
         return
-    # RELEASE only when the row STILL HOLDS a slot, using the OUTCOME's
-    # pre-zero size. Reaching here is NOT enough on its own: a path-B
-    # ``auth_expired`` row's body is still present at sweep time, so its
-    # discard DOES flip, yet its saturation slot was already released at park
-    # (``_on_auth_failure``), so releasing again would double-free.
-    # ``row_holds_slot`` is what distinguishes the holds-a-slot path (A) from
-    # the already-released park path (B): ``attempting`` is in
-    # ``SLOT_HOLDING_STATES`` and ``auth_expired`` is not. The predicate reads
-    # the row THIS call was handed, which is the same fact the three callers
-    # used to hand-derive and pass in as a boolean the callee could not check.
-    if row_holds_slot(row.state, row.body_discarded_at):
-        await saturation.release(outcome.body_size_bytes)
     # F3: the bytes themselves, not just the accounting. ADR-032 says an
     # expired row's body is discarded at the transition; before this fix
     # only the row-side stamp happened, so RAM bodies survived for the

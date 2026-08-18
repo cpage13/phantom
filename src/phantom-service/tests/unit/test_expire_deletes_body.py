@@ -216,7 +216,18 @@ async def test_expire_touches_no_bytes_when_the_stamp_does_not_flip(tmp_path: Pa
     discard's ``AND body_discarded_at IS NULL`` predicate then returns
     ``flipped=False``.
 
-    Success: the fresh bytes are still readable and the gate was not released.
+    Success: the fresh bytes are still readable.
+
+    **The gate assertions changed with ADR-036 and the change is Q9's
+    sanctioned delta, not a regression.** The slot no longer rides the
+    DISCARD; it rides the CAS-guarded STATE write two lines above, which
+    landed here. So the count comes back where it used to leak. The BYTES do
+    not, and that is honest rather than a miss: the direct discard in this
+    test's own setup zeroed ``body_size_bytes`` BEFORE the state write read
+    its pre-image, so the basis riding that write is 0. In the interleaving
+    Q9 is actually about (a racing stamper landing AFTER the state write) the
+    pre-image still carries the true size and both counters return; see
+    ``test_expire_releases_when_the_discard_did_not_flip.py``.
     """
     h = await _harness(tmp_path)
     row = _row(state="attempting", body_location="ram")
@@ -245,8 +256,14 @@ async def test_expire_touches_no_bytes_when_the_stamp_does_not_flip(tmp_path: Pa
         "a non-flipping discard means another owner holds these bytes; expire_row must not "
         "delete them"
     )
-    assert h.gate.in_flight == 1, "the slot must not be released on a non-flipping discard"
-    assert h.gate.in_flight_bytes == len(BODY_BYTES)
+    assert h.gate.in_flight == 0, (
+        "Q9/ADR-036: the release rides the CAS-guarded STATE write, which landed, so the "
+        "count comes back whether or not this call won the discard"
+    )
+    assert h.gate.in_flight_bytes == len(BODY_BYTES), (
+        "the basis is the STATE write's in-transaction size, which this test's own setup "
+        "already zeroed, so the bytes stay charged on THIS interleaving"
+    )
 
 
 def test_discard_owner_docstrings_name_three_callers() -> None:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -40,6 +40,24 @@ def _full_retention(**overrides: int) -> RetentionCfg:
     }
     defaults.update(overrides)
     return RetentionCfg(**defaults)  # type: ignore[arg-type]
+
+
+def _gate_double() -> MagicMock:
+    """A saturation-gate double whose async surface is actually awaitable.
+
+    ADR-036 makes ``settle`` UNCONDITIONAL at each of the reaper's three
+    sites: the crossing is computed inside the gate, so the caller no longer
+    skips the call for a row that holds no slot. A bare ``MagicMock`` used to
+    survive because the caller-side ``row_holds_slot`` guard skipped the
+    release for every ``succeeded`` / ``expired`` row these tests sweep; now
+    the call always happens and the double must be able to be awaited.
+    The ledger effect is unchanged either way, which is why no assertion in
+    this file moves.
+    """
+    gate = MagicMock()
+    gate.settle = AsyncMock()
+    gate.release = AsyncMock()
+    return gate
 
 
 async def _build(tmp_path: Path, *, retention: RetentionCfg | None = None) -> InstanceContext:
@@ -76,7 +94,7 @@ async def _build(tmp_path: Path, *, retention: RetentionCfg | None = None) -> In
         retry_strategy=MagicMock(),
         upstream_client=MagicMock(),
         executor=MagicMock(),
-        saturation=MagicMock(),
+        saturation=_gate_double(),
         codec_factory=MagicMock(),
         current_settings=snapshot_thunk(snapshot),
     )

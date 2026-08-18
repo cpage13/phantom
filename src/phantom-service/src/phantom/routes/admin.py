@@ -91,7 +91,12 @@ from phantom.storage.integrity import (
 )
 from phantom.storage.interface import StateTally
 from phantom.storage.sqlite_store import PHANTOM_LOCAL_UUID_METADATA_KEY
-from phantom.workers.saturation import AdmissionGranted, row_holds_slot
+from phantom.workers.saturation import (
+    AdmissionGranted,
+    SlotDelta,
+    SlotReservation,
+    row_holds_slot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1118,11 +1123,16 @@ async def replay_upload(
     # whose slot was RELEASED (the sender's terminal transitions; the
     # auth_expired park) must re-admit through the gate exactly as the
     # Kicker does on wake; queued/stored rows still hold their slot
-    # and must not double-charge. On any store-side refusal the row
-    # never re-entered the in-flight set, so the slot is released
-    # again. Refusing the replay outright when the gate is full keeps
-    # the ledger truthful: re-queueing without a slot is the drift.
+    # and must not double-charge. Refusing the replay outright when the
+    # gate is full keeps the ledger truthful: re-queueing without a
+    # slot is the drift.
+    #
+    # This is one of the TWO surviving direct ``row_holds_slot``
+    # consultations (ADR-036): it is a CURRENT-STATE question about a
+    # row this line is not transitioning, asked to decide whether to
+    # RESERVE at all. Every crossing below is settled by the gate.
     charged = not row_holds_slot(row.state, row.body_discarded_at)
+    reservation: SlotReservation | None = None
     if charged:
         admission = await ctx.saturation.admit(row.body_size_bytes)
         if not isinstance(admission, AdmissionGranted):
@@ -1133,42 +1143,38 @@ async def replay_upload(
                 "capacity frees.",
                 instance_id=ctx.cfg.id,
             )
+        reservation = admission.reservation
     try:
         outcome = await ctx.store.replay(chain_id)
     except Exception:
-        if charged:
-            await ctx.saturation.release(row.body_size_bytes)
+        # The write raised, so there is no outcome to settle against and
+        # the row never re-entered the in-flight set: the reservation
+        # goes straight back.
+        if reservation is not None:
+            await ctx.saturation.unwind(reservation)
         raise
     if outcome is None:
         # The row vanished between the lookup above and the store's
         # in-lock precheck (a delete race); same answer as the up-front
-        # miss.
-        if charged:
-            await ctx.saturation.release(row.body_size_bytes)
+        # miss, and the same unwind: no write, no outcome.
+        if reservation is not None:
+            await ctx.saturation.unwind(reservation)
         raise NotFoundError(f"chain {chain_id} not found")
-    # R9-4: the admit decision above used the PRE-FETCHED state, which
-    # races the kicker's wake (charges + re-queues) and the sender's
-    # terminal transitions (release) in both directions. Reconcile
-    # against the store's in-transaction previous_state, the state the
-    # row was actually re-queued FROM:
-    # - charged here AND the row was already holding at the txn -> the
-    #   wake (or another actor) owns the live charge; return ours.
-    # - did not charge AND the row had been released by the txn -> the
-    #   re-queued row is live with no charge; add the missing one via
-    #   the no-caps reconciliation admit (the row is already queued, so
-    #   refusing now cannot un-queue it; the overshoot is bounded by
-    #   one row on a microsecond race).
-    # The hard-coded None for body_discarded_at is safe ONLY because
-    # replay refuses stamped rows up front (ReplayBodyDiscardedError is
-    # raised inside the store before any UPDATE), so a row that reached
-    # this reconcile can never have been holding-but-stamped; passing
-    # the route's pre-fetched stamp here would re-open the stale-read
-    # race this in-transaction outcome exists to close (C5).
-    truth_needs_charge = not row_holds_slot(outcome.previous_state, None)
-    if charged and not truth_needs_charge:
-        await ctx.saturation.release(row.body_size_bytes)
-    elif truth_needs_charge and not charged:
-        await ctx.saturation.reconcile_admit(outcome.row.body_size_bytes)
+    # R9-4: the reservation above was taken against the PRE-FETCHED
+    # state, which races the kicker's wake (charges + re-queues) and the
+    # sender's terminal transitions (release) in both directions. The
+    # gate settles both questions at once from the store's
+    # in-transaction previous_state, the state the row was actually
+    # re-queued FROM: a charge crossing consumes the reservation (or,
+    # when none was taken, charges uncapped because the row is already
+    # queued and refusing now could not un-queue it), and a no-crossing
+    # result gives the reservation back. That replaces the four
+    # hand-written arms this route used to run, and it is why the second
+    # ``row_holds_slot`` consultation is gone.
+    await ctx.saturation.settle(
+        SlotDelta.from_replay(outcome, size_bytes=outcome.row.body_size_bytes),
+        consumes=reservation,
+    )
     return outcome.row
 
 
@@ -1179,22 +1185,21 @@ async def cancel_upload(
 ) -> UploadRow:
     """Transition the row to ``cancelled`` if non-terminal.
 
-    The cancel path OWNS the gate release for the row it cancels
-    (R8-4): the sender's M-W4-F7 no-op deliberately skips release when
-    its in-flight UPDATE finds the state changed, deferring to whoever
-    changed it. The release decision uses the store's in-transaction
-    ``previous_state`` (not the route's pre-fetch, which can race a
-    sender/kicker transition) through the one shared
-    :func:`row_holds_slot` predicate.
+    The cancel path OWNS the gate accounting for the row it cancels
+    (R8-4): the sender's M-W4-F7 no-op deliberately skips its own
+    settlement when its in-flight UPDATE finds the state changed,
+    deferring to whoever changed it. The decision is made from the
+    store's in-transaction ``previous_state`` and stamp (not the
+    route's pre-fetch, which can race a sender/kicker transition),
+    which the gate settles through :meth:`SaturationGate.settle`.
     """
     ctx, row = await _find_upload_with_ctx(dispatcher, chain_id)
     if ctx is None or row is None:
         raise NotFoundError(f"chain {chain_id} not found")
     outcome = await ctx.store.cancel(chain_id)
-    if outcome.previous_state is not None and row_holds_slot(
-        outcome.previous_state, outcome.row.body_discarded_at
-    ):
-        await ctx.saturation.release(outcome.row.body_size_bytes)
+    await ctx.saturation.settle(
+        SlotDelta.from_cancel(outcome, size_bytes=outcome.row.body_size_bytes)
+    )
     return outcome.row
 
 
@@ -1205,16 +1210,22 @@ async def delete_upload(
 ) -> Response:
     """Hard delete one chain + its body.
 
-    Releases the saturation gate when the deleted row still held a slot
-    (R8-4), using the accounting captured atomically with the DELETE.
+    Settles the saturation gate against the removal (R8-4), using the
+    accounting captured atomically with the DELETE.
     """
     ctx, row = await _find_upload_with_ctx(dispatcher, chain_id)
     if ctx is None or row is None:
         raise NotFoundError(f"chain {chain_id} not found")
     await ctx.body_store.delete(chain_id)
     accounting = await ctx.store.delete(chain_id)
-    if accounting is not None and row_holds_slot(accounting.state, accounting.body_discarded_at):
-        await ctx.saturation.release(accounting.body_size_bytes)
+    # ``accounting is None`` is a MISSING-ROW answer, not a crossing:
+    # ``store.delete`` returns ``DeletedRowAccounting | None`` and no
+    # adapter has a None arm, so the guard survives while the slot
+    # predicate folds into ``from_removal``.
+    if accounting is not None:
+        await ctx.saturation.settle(
+            SlotDelta.from_removal(accounting, size_bytes=accounting.body_size_bytes)
+        )
     return Response(status_code=204)
 
 
@@ -1264,9 +1275,9 @@ async def bulk_delete_uploads(
         # C1 closure: delete the corresponding body files alongside the
         # rows. Previously body files were leaked until the orphan
         # janitor's next sweep; the operator's "delete these uploads"
-        # expectation includes the bodies. R8-4: rows that still held a
-        # saturation slot release it here, per the accounting captured
-        # atomically with the DELETE.
+        # expectation includes the bodies. R8-4: the gate settles each
+        # removal here, per the accounting captured atomically with the
+        # DELETE, and releases for the rows that still held a slot.
         #
         # R10-D1 (the R8-3 family): the row DELETE above legalized a
         # same-chain_id re-POST at any later instant, so each late body
@@ -1288,14 +1299,15 @@ async def bulk_delete_uploads(
         # delete sliver (a re-POST whose put has run but whose row has
         # not yet committed when the re-read sees no owner) is the
         # documented irreducible residual file deletion always
-        # carries - unchanged by R11-1. The release stays keyed on the
-        # OLD row's atomically captured accounting, which no
+        # carries - unchanged by R11-1. The settlement stays keyed on
+        # the OLD row's atomically captured accounting, which no
         # re-admission can touch.
         for entry in removed:
             if await ctx.store.get(entry.chain_id) is None:
                 await ctx.body_store.delete(entry.chain_id)
-            if row_holds_slot(entry.state, entry.body_discarded_at):
-                await ctx.saturation.release(entry.body_size_bytes)
+            await ctx.saturation.settle(
+                SlotDelta.from_removal(entry, size_bytes=entry.body_size_bytes)
+            )
         deleted += len(removed)
     return BulkDeleteResponse(deleted=deleted)
 

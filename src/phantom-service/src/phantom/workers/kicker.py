@@ -44,7 +44,7 @@ from phantom.routing import AuthMode
 from phantom.storage.interface import CredentialStore, TokenCache
 from phantom.workers._expire import expire_row
 from phantom.workers._kicker_auth_mode import row_resolved_route
-from phantom.workers.saturation import AdmissionGranted, is_deliverable
+from phantom.workers.saturation import AdmissionGranted, SlotDelta, is_deliverable
 
 logger = logging.getLogger(__name__)
 
@@ -377,6 +377,7 @@ class Kicker:
                     row.chain_id,
                 )
                 continue
+            reservation = result.reservation
             self._log_wake(row.chain_id, probe_host, row.uid)
             # M-W4-F7 (Phase 2 § 3.2.8): the kicker writes from
             # auth_expired -> queued. Pass the expected_state explicitly so
@@ -384,19 +385,20 @@ class Kicker:
             # the kicker is the only allowed mover of the auth_expired ->
             # queued transition.
             #
-            # ONE refusal posture spans the admit->write window: the slot
-            # admitted above returns on EVERY outcome except a confirmed wake
-            # (invariant #16). Two refusal legs exist: the guarded write
-            # no-ops (rowcount 0: admin cancel/replay or another kicker tick
-            # moved the row first; R9-3), or the write RAISES (a transient
-            # storage fault, SQLITE_BUSY past the busy_timeout, or an I/O
-            # error on flaky SD storage; R10-2), and both release before
-            # yielding, mirroring the replay route's release-on-exception
-            # (routes/admin.py replay_upload). Pre-R10-2 the exception leg
-            # propagated with the slot stranded; run() logs and continues
-            # while the row stays auth_expired with a fresh token, so every
-            # later rescan stranded another slot until the gate saturated and
-            # fresh ingress 503'd with no live row behind the count.
+            # ONE refusal posture spans the admit->write window: the
+            # reservation taken above comes back on EVERY outcome except a
+            # confirmed wake (invariant #16). Two refusal legs exist: the
+            # guarded write no-ops (rowcount 0: admin cancel/replay or
+            # another kicker tick moved the row first; R9-3), or the write
+            # RAISES (a transient storage fault, SQLITE_BUSY past the
+            # busy_timeout, or an I/O error on flaky SD storage; R10-2), and
+            # both return the reservation before yielding, mirroring the
+            # replay route's unwind-on-exception (routes/admin.py
+            # replay_upload). Pre-R10-2 the exception leg propagated with the
+            # slot stranded; run() logs and continues while the row stays
+            # auth_expired with a fresh token, so every later rescan stranded
+            # another slot until the gate saturated and fresh ingress 503'd
+            # with no live row behind the count.
             try:
                 write = await store.record_attempt_result(
                     row.chain_id,
@@ -412,11 +414,12 @@ class Kicker:
                     expected_state="auth_expired",
                 )
             except Exception:
-                # Release FIRST, then surface the fault. The failed write
-                # committed nothing, so the row is untouched and the next
-                # rescan retries the wake; run() owns the traceback
-                # (logger.exception) and this line adds the chain_id context.
-                await self._instance.saturation.release(row.body_size_bytes)
+                # Unwind FIRST, then surface the fault. The failed write
+                # committed nothing, so there is no outcome to settle
+                # against, the row is untouched and the next rescan retries
+                # the wake; run() owns the traceback (logger.exception) and
+                # this line adds the chain_id context.
+                await self._instance.saturation.unwind(reservation)
                 logger.warning(
                     "%s wake write failed for chain_id=%s; "
                     "admitted slot returned, row stays auth_expired "
@@ -425,12 +428,27 @@ class Kicker:
                     row.chain_id,
                 )
                 raise
+            # ONE settle covers all three post-write legs, because the gate's
+            # arms already distinguish them: a confirmed wake is a CHARGE
+            # crossing that CONSUMES the reservation (so the admit above
+            # stands and nothing is charged twice), and the rowcount-0
+            # refusal leg (R9-3) is a no-crossing result that gives the
+            # reservation back. Making the success path call the gate is
+            # deliberate: it used to make no call at all, so a dropped
+            # reservation and a leaked one looked identical. Placed ABOVE the
+            # R9-3 log line, preserving today's return-before-log order.
+            # ``size_bytes`` is inert here (only the charge arm reads it, and
+            # the reservation consumes that arm) and is passed truthfully
+            # rather than as a zero that would be a lie about the row.
+            await self._instance.saturation.settle(
+                SlotDelta.from_attempt(write, size_bytes=row.body_size_bytes),
+                consumes=reservation,
+            )
             if not write.landed:
                 # The rowcount-0 refusal leg (R9-3): the wake never happened,
-                # and whoever moved the row owns its own accounting, so this
-                # release only undoes OUR admit. Then skip; the next
+                # and whoever moved the row owns its own accounting, so the
+                # unwind above only undoes OUR admit. Then skip; the next
                 # event/poll picks up any further waking work.
-                await self._instance.saturation.release(row.body_size_bytes)
                 logger.info(
                     "%s no-op: chain_id=%s - row state changed "
                     "from auth_expired before update; admitted slot "

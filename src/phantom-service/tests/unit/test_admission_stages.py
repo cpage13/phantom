@@ -61,7 +61,7 @@ from phantom.storage.hybrid_body_store import HybridBodyStore
 from phantom.storage.interface import InsertClaimOutcome
 from phantom.strategies import FixedIntervalsStrategy
 from phantom.transport import UpstreamRequest, UpstreamResponse
-from phantom.workers.saturation import SaturationGate
+from phantom.workers.saturation import SaturationGate, SlotReservation
 
 from .conftest import make_snapshot, snapshot_thunk, track_instance
 
@@ -660,13 +660,13 @@ async def test_admitted_slot_direct_lifecycle() -> None:
         max_disk_bytes=_GATE_MAX_BYTES,
     )
     await gate.admit(_SLOT_BYTES)
-    slot = _AdmittedSlot(gate, _SLOT_BYTES)
+    slot = _AdmittedSlot(gate, SlotReservation(_SLOT_BYTES))
     async with slot:
         pass
     assert gate.in_flight == 0 and gate.in_flight_bytes == 0
 
     await gate.admit(_SLOT_BYTES)
-    slot = _AdmittedSlot(gate, _SLOT_BYTES)
+    slot = _AdmittedSlot(gate, SlotReservation(_SLOT_BYTES))
     slot.commit()
     async with slot:
         pass
@@ -674,7 +674,7 @@ async def test_admitted_slot_direct_lifecycle() -> None:
     await gate.release(_SLOT_BYTES)
 
     await gate.admit(_SLOT_BYTES)
-    slot = _AdmittedSlot(gate, _SLOT_BYTES)
+    slot = _AdmittedSlot(gate, SlotReservation(_SLOT_BYTES))
     async with slot:
         await slot.release_on_rejection()
     assert gate.in_flight == 0 and gate.in_flight_bytes == 0

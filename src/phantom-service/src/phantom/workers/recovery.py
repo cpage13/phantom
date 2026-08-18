@@ -266,17 +266,31 @@ async def run_recovery(
 
 
 async def reconcile_saturation(store: UploadStore, saturation: SaturationGate) -> None:
-    """Reconstruct the in-memory saturation ledger from recovered rows.
+    """SEED the in-memory saturation ledger from recovered rows.
+
+    A seed, not a transition, and that distinction is the reason this is
+    the one production caller of :meth:`SaturationGate.reconcile_admit`
+    (ADR-036). Every other gate mutation rides a WRITE: a row crosses
+    the slot predicate and the gate settles the crossing from the
+    write's own in-transaction pre-image. Here there is no write, no CAS
+    guard, no outcome and no crossing. The rows already exist and their
+    slot-holding status does not change; what changes is the LEDGER's
+    knowledge of it, on a gate that starts at zero because the counters
+    are in-process only. Expressing that as a landed transition would be
+    a fabrication about the row.
 
     Recovery has already reset ``attempting`` and quarantined missing bodies
     before this function runs. Collect charge sizes while the read cursor is
     open, then mutate only the in-memory gate after the cursor drains. The
-    shared :func:`row_holds_slot` predicate keeps boot reconstruction aligned
-    with sender, reaper, replay, and removal release ownership.
+    :func:`row_holds_slot` consultation below survives the ADR-036
+    conversion for the same reason: it asks a CURRENT-STATE question about a
+    row this pass is not transitioning, which keeps boot reconstruction
+    aligned with the ownership every settled write derives from the same
+    predicate.
 
     Args:
         store: Recovered persistent upload store.
-        saturation: Fresh per-process gate to reconstruct.
+        saturation: Fresh per-process gate to seed.
     """
     charge_sizes: list[int] = []
     async for row in store.iter_rows():

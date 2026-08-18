@@ -62,9 +62,10 @@ from phantom.storage.errors import (
     CodecRoundTripDriftError,
     StorageCorruptionError,
 )
-from phantom.storage.interface import UploadStore
+from phantom.storage.interface import AttemptWriteOutcome, UploadStore
 from phantom.storage.sqlite_store import is_transient_lock_error
 from phantom.workers._expire import expire_row
+from phantom.workers.saturation import SlotDelta
 
 logger = logging.getLogger(__name__)
 
@@ -355,6 +356,54 @@ class Sender:
         # so a forgotten handler is a visible failure, not a stuck row.
         raise AssertionError(f"unhandled ExecuteStepResult: {type(result).__name__}")
 
+    async def _settle_transition(
+        self, row: UploadRow, write: AttemptWriteOutcome, *, no_op_message: str
+    ) -> bool:
+        """Account for one attempt write and report whether it landed.
+
+        The saturation effect of a state write is a property of the
+        write, not of the handler that issued it: the gate derives it
+        from the outcome's in-transaction pre-image (ADR-036). This
+        helper is the sender's single point of contact with that rule,
+        so no handler decides whether its own transition releases. The
+        four terminal handlers that used to release and the four whose
+        crossing is a no-op now run the same two lines; the split is
+        derived from ``SLOT_HOLDING_STATES`` instead of written into
+        eight handler bodies.
+
+        The WRITE itself deliberately stays at its call site: each
+        ``record_attempt_result`` call passes its next-state literal
+        directly so ``tests/unit/test_transition_table.py`` can scan the
+        sender's AST for state-write call sites without chasing local
+        variable indirection. This helper folds the DECISION, not the
+        write.
+
+        Args:
+            row: The claimed row, whose ``body_size_bytes`` is this
+                site's release basis. Unchanged from the four handlers
+                that release today, and deliberately not taken from the
+                write outcome (ADR-036).
+            write: The outcome of this handler's
+                ``record_attempt_result`` call.
+            no_op_message: This site's own lazy log format, carrying one
+                ``%s`` for the chain_id. Each caller keeps its exact
+                existing literal.
+
+        Returns:
+            ``True`` when the write landed and the caller should
+            continue with its post-write work; ``False`` when the write
+            no-opped, in which case the counter and the log have already
+            fired and the caller returns.
+        """
+        await self._instance.saturation.settle(
+            SlotDelta.from_attempt(write, size_bytes=row.body_size_bytes)
+        )
+        if write.landed:
+            return True
+        await self._no_op_total.inc()
+        logger.info(no_op_message, row.chain_id)
+        return False
+
     async def _on_succeeded(self, store: UploadStore, row: UploadRow, result: Succeeded) -> None:
         """Persist a successful-step result.
 
@@ -383,19 +432,19 @@ class Sender:
                 # makes it write-once, surviving operator replay.
                 stamp_sent_at=True,
             )
-            if not write.landed:
-                # M-W4-F7: admin cancel/replay took the row between
-                # claim_due and now. Do not release saturation or
-                # delete the body — those side-effects are tied to a
-                # successful state transition.
-                await self._no_op_total.inc()
-                logger.info(
+            # M-W4-F7: when admin cancel/replay took the row between
+            # claim_due and now, the crossing is a no-op the gate
+            # computes, and the body is not deleted either. Both
+            # side-effects are tied to a successful state transition.
+            if not await self._settle_transition(
+                row,
+                write,
+                no_op_message=(
                     "record_attempt_result no-op: chain_id=%s — "
-                    "admin cancel/replay took the row from attempting",
-                    row.chain_id,
-                )
+                    "admin cancel/replay took the row from attempting"
+                ),
+            ):
                 return
-            await self._instance.saturation.release(row.body_size_bytes)
             # H4 audit closure — body-retention contract reconciliation.
             #
             # Sender deletes the body immediately ONLY when
@@ -477,13 +526,14 @@ class Sender:
                 current_step_index=result.next_step_index,
                 last_step_completed=result.step_name,
             )
-            if not write.landed:
-                await self._no_op_total.inc()
-                logger.info(
+            await self._settle_transition(
+                row,
+                write,
+                no_op_message=(
                     "record_attempt_result no-op: chain_id=%s — "
-                    "admin cancel/replay took the row from attempting (mid-chain step)",
-                    row.chain_id,
-                )
+                    "admin cancel/replay took the row from attempting (mid-chain step)"
+                ),
+            )
 
     async def _on_corrupted(
         self,
@@ -498,8 +548,8 @@ class Sender:
         Body verification failed — either the stored bytes don't match
         the recorded ``storage_hash`` (hardware / filesystem mutation)
         or the codec round-trip drifted from the recorded ``body_hash``
-        (codec library bug). The row never advances; saturation is
-        released so the slot is reclaimed.
+        (codec library bug). The row never advances; the gate settles
+        the transition and reclaims the slot.
         """
         write = await store.record_attempt_result(
             row.chain_id,
@@ -513,15 +563,14 @@ class Sender:
             current_step_index=None,
             last_step_completed=None,
         )
-        if not write.landed:
-            await self._no_op_total.inc()
-            logger.info(
+        await self._settle_transition(
+            row,
+            write,
+            no_op_message=(
                 "_on_corrupted no-op: chain_id=%s — admin cancel/replay "
-                "took the row from attempting",
-                row.chain_id,
-            )
-            return
-        await self._instance.saturation.release(row.body_size_bytes)
+                "took the row from attempting"
+            ),
+        )
 
     async def _on_rewind(
         self, store: UploadStore, row: UploadRow, result: CaptureExpiredRewind
@@ -539,12 +588,13 @@ class Sender:
             current_step_index=result.rewind_to_step_index,
             last_step_completed=None,
         )
-        if not write.landed:
-            await self._no_op_total.inc()
-            logger.info(
-                "_on_rewind no-op: chain_id=%s — admin cancel/replay took the row from attempting",
-                row.chain_id,
-            )
+        await self._settle_transition(
+            row,
+            write,
+            no_op_message=(
+                "_on_rewind no-op: chain_id=%s — admin cancel/replay took the row from attempting"
+            ),
+        )
 
     async def _on_stored(self, store: UploadStore, row: UploadRow, *, last_error: str) -> None:
         """Transition row to ``stored`` (recoverable via export.tar).
@@ -632,13 +682,14 @@ class Sender:
             current_step_index=None,
             last_step_completed=None,
         )
-        if not write.landed:
-            await self._no_op_total.inc()
-            logger.info(
-                "%s no-op: chain_id=%s - admin cancel/replay took the row from attempting",
-                no_op_context,
-                row.chain_id,
-            )
+        await self._settle_transition(
+            row,
+            write,
+            no_op_message=(
+                f"{no_op_context} no-op: chain_id=%s - "
+                "admin cancel/replay took the row from attempting"
+            ),
+        )
 
     async def _on_terminal_failure(
         self, store: UploadStore, row: UploadRow, *, last_error: str
@@ -656,15 +707,14 @@ class Sender:
             current_step_index=None,
             last_step_completed=None,
         )
-        if not write.landed:
-            await self._no_op_total.inc()
-            logger.info(
+        await self._settle_transition(
+            row,
+            write,
+            no_op_message=(
                 "_on_terminal_failure no-op: chain_id=%s — admin cancel/replay "
-                "took the row from attempting",
-                row.chain_id,
-            )
-            return
-        await self._instance.saturation.release(row.body_size_bytes)
+                "took the row from attempting"
+            ),
+        )
 
     async def _on_auth_failure(
         self, store: UploadStore, row: UploadRow, result: FailedAuth
@@ -689,20 +739,22 @@ class Sender:
             last_step_completed=None,
             auth_blocked_host=result.blocked_host,
         )
-        if not write.landed:
-            await self._no_op_total.inc()
-            logger.info(
+        # The park RETURNS the saturation accounting (§3.1), and the gate
+        # derives that from the crossing: ``attempting`` holds a slot and
+        # ``auth_expired`` does not. Without the return, every row that hits
+        # 401 permanently charges the gate's in_flight / bytes counters; an
+        # AD outage with N flapping rows accumulates N forever and eventually
+        # 503-rejects fresh ingress when actual in-flight is zero. The
+        # auth-kicker re-admits when the row wakes back to queued.
+        if not await self._settle_transition(
+            row,
+            write,
+            no_op_message=(
                 "_on_auth_failure no-op: chain_id=%s — admin cancel/replay "
-                "took the row from attempting",
-                row.chain_id,
-            )
+                "took the row from attempting"
+            ),
+        ):
             return
-        # Release saturation accounting on park (§3.1). Without this, every
-        # row that hits 401 permanently charges the gate's in_flight / bytes
-        # counters; an AD outage with N flapping rows accumulates N forever
-        # and eventually 503-rejects fresh ingress when actual in-flight is
-        # zero. The auth-kicker re-admits when the row wakes back to queued.
-        await self._instance.saturation.release(row.body_size_bytes)
         minter = self._instance.minter
         if minter is None:
             return
@@ -801,13 +853,14 @@ class Sender:
             current_step_index=None,
             last_step_completed=None,
         )
-        if not write.landed:
-            await self._no_op_total.inc()
-            logger.info(
+        if not await self._settle_transition(
+            row,
+            write,
+            no_op_message=(
                 "_on_retryable_failure(queued) no-op: chain_id=%s — "
-                "admin cancel/replay took the row from attempting",
-                row.chain_id,
-            )
+                "admin cancel/replay took the row from attempting"
+            ),
+        ):
             return
         # Retry-linger trigger (plan § 2.3.11 / § 2.3.18).
         # When the row has been in RAM longer than ``linger_seconds``

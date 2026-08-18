@@ -69,6 +69,7 @@ from phantom.workers.saturation import (
     AdmissionRefusedDiskPressure,
     AdmissionRefusedSaturation,
     SaturationGate,
+    SlotReservation,
 )
 
 
@@ -493,9 +494,10 @@ class _AdmittedSlot:
     D11). Exactly one of three things happens to an admitted slot, and
     each is a named operation instead of flag bookkeeping at a distance:
 
-    * :meth:`commit` (happy path) - ownership transfers to the sender,
-      which releases the slot when the row reaches a terminal state.
-      Exit then releases nothing.
+    * :meth:`commit` (happy path) - the reservation is CONSUMED by the
+      row's creation and ownership transfers to the sender, whose
+      terminal transition settles the slot through the gate. Exit then
+      returns nothing.
     * :meth:`release_on_rejection` (expected rejection: the collision
       branch) - the slot is released exactly once, immediately. Exit
       then releases nothing, even when the branch goes on to raise.
@@ -517,25 +519,33 @@ class _AdmittedSlot:
     half-decrement. Flag-first guarantees ZERO double-releases, the hard
     invariant (finding R3-1: a double release would steal accounting
     from a different live in-flight row, the over-release direction of
-    the H1 class). The release always uses ``admitted_bytes``, the same
-    unit the gate admitted (finding R3-8 unit-symmetry).
+    the H1 class). The unwind returns the :class:`SlotReservation` the
+    gate minted, which carries the admitted quantity itself, so finding
+    R3-8's unit-symmetry is STRUCTURAL rather than conventional: there
+    is no other basis this scope could return (ADR-036).
     """
 
-    def __init__(self, saturation: SaturationGate, admitted_bytes: int) -> None:
+    def __init__(self, saturation: SaturationGate, reservation: SlotReservation) -> None:
         """Take ownership of a slot the gate just granted.
 
         Args:
             saturation: The gate that granted the slot.
-            admitted_bytes: The byte quantity the gate admitted (the
-                STORED body size; the release must use the same unit).
+            reservation: The charge token the gate minted, carrying the
+                byte quantity it admitted (the STORED body size). It is
+                consumed by :meth:`commit` or returned by
+                :meth:`unwind`.
         """
         self._saturation = saturation
-        self._admitted_bytes = admitted_bytes
+        self._reservation = reservation
         self._committed = False
         self._released = False
 
     def commit(self) -> None:
-        """Happy path: a live row committed; the sender now owns the release."""
+        """Happy path: a live row committed, CONSUMING the reservation.
+
+        The sender now owns the slot and settles it through the gate at
+        the row's terminal transition.
+        """
         self._committed = True
 
     async def release_on_rejection(self) -> None:
@@ -549,7 +559,7 @@ class _AdmittedSlot:
         if self._released or self._committed:
             return
         self._released = True
-        await self._saturation.release(self._admitted_bytes)
+        await self._saturation.unwind(self._reservation)
 
     async def __aenter__(self) -> _AdmittedSlot:
         """Enter the ownership scope; the slot was admitted by the caller."""
@@ -570,7 +580,7 @@ class _AdmittedSlot:
         """
         if not self._committed and not self._released:
             self._released = True
-            await self._saturation.release(self._admitted_bytes)
+            await self._saturation.unwind(self._reservation)
 
 
 async def _admit_saturation_slot(
@@ -611,7 +621,7 @@ async def _admit_saturation_slot(
             headers={"Retry-After": str(_RETRY_AFTER_SECONDS)},
         )
     assert isinstance(result, AdmissionGranted)
-    return _AdmittedSlot(instance_ctx.saturation, admit_bytes)
+    return _AdmittedSlot(instance_ctx.saturation, result.reservation)
 
 
 @dataclass(frozen=True)
