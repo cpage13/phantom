@@ -202,6 +202,12 @@ def get_data_root() -> Path:
     raise NotImplementedError("data_root dependency must be overridden by app factory")
 
 
+# Indent for the export archive's ``manifest.json``. Two spaces, matching
+# ``scripts/export_contracts.py``'s ``_JSON_INDENT``, so every JSON this repo
+# writes for a human to read is shaped the same way; the manifest is read by
+# an operator unpacking a tar, not by a parser that would prefer it compact.
+_MANIFEST_JSON_INDENT = 2
+
 router = APIRouter(prefix=ADMIN_ROUTER_PREFIX)
 
 
@@ -1111,7 +1117,7 @@ async def _build_tar_stream(
                     info = tarfile.TarInfo(name=f"bodies/{row.chain_id}/{name}")
                     info.size = len(data)
                     tf.addfile(info, io.BytesIO(data))
-        manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
+        manifest_bytes = json.dumps(manifest, indent=_MANIFEST_JSON_INDENT).encode("utf-8")
         info = tarfile.TarInfo(name="manifest.json")
         info.size = len(manifest_bytes)
         tf.addfile(info, io.BytesIO(manifest_bytes))

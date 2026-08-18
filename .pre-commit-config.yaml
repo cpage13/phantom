@@ -15,7 +15,7 @@
 #   8. forbid-mixed-saturation-basis (greppable, best-effort)
 #   9. forbid-silent-keyerror-route (greppable, Phase 0 broad form)
 #  10. forbid-out-of-order-persist (greppable, Phase 0 placeholder form)
-#  11. forbid-bare-numeric-literals-in-production (greppable, informational in Phase 0)
+#  11. forbid-bare-numeric-literals-in-production (AST, hard gate since CL11)
 #
 # forbid-unsupervised-task-spawn-outside-composition (R-4, 2026-05-29):
 # fails on the UNSUPERVISED spawn primitives — asyncio.create_task(,
@@ -118,7 +118,12 @@ repos:
         pass_filenames: false
 
       - id: forbid-bare-numeric-literals-in-production
-        name: forbid bare numeric literals in production code (informational)
-        entry: bash scripts/precommit/forbid_bare_numeric_literals.sh
+        # CL11 — was an informational shell hook that could not fail: an
+        # unconditional exit 0, a regex blind to keyword arguments, no
+        # scripts/ coverage, and an invalid BSD-grep character range that
+        # made its own grep exit 2 into /dev/null. The replacement is an AST
+        # checker with a self-test, and it is a HARD gate.
+        name: forbid bare numeric literals in production code
+        entry: uv run python scripts/check_numeric_literals.py
         language: system
         pass_filenames: false

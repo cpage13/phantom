@@ -81,6 +81,13 @@ from phantom_client.transport import QueryParamValue, Transport
 
 _LOG = logging.getLogger(__name__)
 
+# Page size for the by-captured-value lookup, which returns EVERY match in one
+# call rather than exposing a cursor: the surface answers "which uploads carry
+# this value", and a caller that has to paginate an identity lookup has been
+# handed the wrong shape. 1000 is a ceiling on a pathological key rather than a
+# tuning knob, high enough that no realistic lookup truncates.
+_CAPTURED_VALUE_LOOKUP_LIMIT = 1000
+
 # Default read timeout used when the simple-constructor's ``timeout``
 # kwarg is set. The kwarg is ignored when a full ClientConfig is passed.
 _DEFAULT_READ_TIMEOUT_SECONDS = 30.0
@@ -361,7 +368,7 @@ class PhantomClient:
         rows, _ = await self.list_uploads(
             key_value_match=(key, value),
             instance=instance,
-            limit=1000,
+            limit=_CAPTURED_VALUE_LOOKUP_LIMIT,
         )
         return rows
 

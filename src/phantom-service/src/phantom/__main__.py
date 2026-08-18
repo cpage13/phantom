@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 # Default TCP port when ``bind_tcp`` carries no explicit ``:port`` suffix.
 # Mirrors the ``ServerCfg.bind_tcp`` default ("127.0.0.1:8080").
+# Indent for the ``--validate`` settings dump. Two spaces, matching
+# ``scripts/export_contracts.py``'s ``_JSON_INDENT``, so every JSON this repo
+# writes for a human to read is shaped the same way.
+_SETTINGS_DUMP_INDENT: int = 2
+
 _DEFAULT_TCP_PORT: int = 8080
 # Default bind host when ``bind_tcp`` is an empty string (no host segment).
 # Loopback, matching the same-machine-only deployment default.
@@ -91,7 +96,7 @@ def main() -> int:
         # rules (`logging.getLogger` instead of `print` for operational
         # output) — but `--validate` is a one-shot CLI tool, not operational
         # output. `sys.stdout.write` keeps the contract: stdout = the answer.
-        sys.stdout.write(settings.model_dump_json(indent=2) + "\n")
+        sys.stdout.write(settings.model_dump_json(indent=_SETTINGS_DUMP_INDENT) + "\n")
         return 0
 
     from pathlib import Path as _Path
