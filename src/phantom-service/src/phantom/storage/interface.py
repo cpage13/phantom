@@ -857,7 +857,14 @@ class BodyStore(Protocol):
         ...
 
     async def total_bytes(self) -> int:
-        """Saturation accounting — sum of stored body bytes."""
+        """Saturation accounting — sum of stored body bytes.
+
+        Describes the VALUE, not how an implementation arrives at it:
+        :class:`~phantom.storage.ram_body_store.RamBodyStore` and
+        :class:`~phantom.storage.file_body_store.FileBodyStore` both keep a
+        running counter, and the file store's is orphan-aware because its
+        boot seed is a tree walk (CL6, U11).
+        """
         ...
 
     async def list_chain_ids(self) -> list[UUID]:

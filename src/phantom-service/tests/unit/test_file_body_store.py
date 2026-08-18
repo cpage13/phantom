@@ -192,7 +192,12 @@ async def test_put_does_not_block_loop(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_total_bytes(tmp_path: Path) -> None:
-    """``total_bytes`` walks the data dir and sums file sizes."""
+    """``total_bytes`` reports the bytes two puts added to the store.
+
+    Objective: the running counter's put transition (CL6). Success is the
+    sum of the two written bodies, which is the same number the pre-CL6 tree
+    walk returned.
+    """
     s = FileBodyStore(tmp_path)
     await s.start()
     await s.put(uuid4(), {"body": b"x" * 100})

@@ -37,6 +37,12 @@ Protocol no longer carries it. :meth:`list_orphans` is unchanged.
 Phase 4 § 5.2.3 (WS-4 Finding 9): :meth:`start` purges ``.tmp/``
 orphan files left behind by a crash mid-write so subsequent
 admissions stage into a clean directory.
+
+The stored-byte total is a RUNNING COUNTER (CL6), not a query and not a
+per-read tree walk. :meth:`start` seeds it with one walk immediately after
+that purge, so it counts orphaned body files a SQL sum over ``uploads``
+would miss, and :meth:`put` and :meth:`delete` then adjust it by what the
+tree actually gained or lost.
 """
 
 from __future__ import annotations
@@ -121,16 +127,29 @@ def _replace(src: Path, dst: Path) -> None:
     os.replace(src, dst)
 
 
-def _rm_rf(path: Path) -> None:
-    """Recursively remove ``path``; tolerant of partial trees."""
+def _rm_rf(path: Path) -> int:
+    """Recursively remove ``path``; tolerant of partial trees.
+
+    Returns:
+        The summed size of the files actually unlinked, which is what
+        :meth:`FileBodyStore.delete` subtracts from the running total (CL6).
+        A file that vanished between the ``stat`` and the ``unlink`` counts
+        as zero rather than raising, matching the walk's own tolerance.
+    """
     if not path.exists():
-        return
+        return 0
     if path.is_file():
-        path.unlink()
-        return
+        try:
+            removed = path.stat().st_size
+        except OSError:  # vanished under us
+            removed = 0
+        path.unlink(missing_ok=True)
+        return removed
+    freed = 0
     for entry in path.iterdir():
-        _rm_rf(entry)
+        freed += _rm_rf(entry)
     path.rmdir()
+    return freed
 
 
 def _purge_tmp_orphans(tmp_dir: Path) -> None:
@@ -148,6 +167,9 @@ def _purge_tmp_orphans(tmp_dir: Path) -> None:
     for entry in tmp_dir.iterdir():
         try:
             if entry.is_dir():
+                # The freed size is discarded deliberately: this purge runs
+                # BEFORE the counter is seeded, and .tmp/ is outside the
+                # counter's scope in any case (CL6).
                 _rm_rf(entry)
             else:
                 entry.unlink()
@@ -174,6 +196,10 @@ class FileBodyStore:
         """
         self._root = Path(root)
         self._shard_chars = shard_prefix_chars
+        # Bytes under _root, excluding .tmp/. Seeded by start() from one walk
+        # and maintained by the two writers; see total_bytes for why the walk
+        # is the seed rather than the reader (CL6).
+        self._total_bytes: int = 0
 
     async def start(self) -> None:
         """Create the root and tmp directories if missing; purge .tmp/ orphans.
@@ -192,6 +218,11 @@ class FileBodyStore:
         tmp_dir = self._tmp_dir()
         await asyncio.to_thread(_makedirs_durable, tmp_dir, self._root)
         await asyncio.to_thread(_purge_tmp_orphans, tmp_dir)
+        # Seed the running total AFTER the purge, so the staged files it just
+        # deleted are not counted. This walk is the counter's whole
+        # orphan-awareness: a body file with no row is still occupying the
+        # disk the ENOSPC gate protects, and only a walk can see it.
+        self._total_bytes = await asyncio.to_thread(self._walk_total_bytes)
 
     async def stop(self) -> None:
         """No-op."""
@@ -251,14 +282,28 @@ class FileBodyStore:
         upload_dir = self._path_for(chain_id)
         await asyncio.to_thread(_makedirs_durable, upload_dir, self._root.parent)
         total = 0
+        grew = 0
         for name, data in body_refs.items():
-            total += await self._put_one(chain_id, name, data)
+            written, delta = await self._put_one(chain_id, name, data)
+            total += written
+            grew += delta
         # Parent-dir fsync once per upload, not per body_ref.
         await asyncio.to_thread(_sync_directory, upload_dir)
+        # The running total moves by the tree's GROWTH, not by the bytes
+        # written: put is additive and overwrites a same-named file, so a
+        # re-put of an existing ref adds nothing to the disk (CL6).
+        self._total_bytes += grew
         return total
 
-    async def _put_one(self, chain_id: UUID, name: str, data: bytes) -> int:
-        """Write one named body_ref via tmp + fsync + atomic rename."""
+    async def _put_one(self, chain_id: UUID, name: str, data: bytes) -> tuple[int, int]:
+        """Write one named body_ref via tmp + fsync + atomic rename.
+
+        Returns:
+            ``(written, delta)``: the bytes this call wrote, and the change in
+            the tree's size, which differ whenever the rename displaces an
+            existing file of the same name (CL6). The displaced size is read
+            with one extra ``stat`` on a path this method already touches.
+        """
         tmp_path = self._tmp_dir() / f"{chain_id}-{name}.tmp"
         final_path = self._path_for(chain_id, name)
         async with aiofiles.open(tmp_path, "wb") as fh:
@@ -269,8 +314,12 @@ class FileBodyStore:
             await fh.flush()
             fd = fh.fileno()
             await asyncio.to_thread(_fsync_file, fd)
+        try:
+            displaced = final_path.stat().st_size
+        except OSError:  # no file at that name yet
+            displaced = 0
         await asyncio.to_thread(_replace, tmp_path, final_path)
-        return len(data)
+        return len(data), len(data) - displaced
 
     async def get(self, chain_id: UUID, name: str) -> bytes:
         """Read one named body_ref.
@@ -350,28 +399,56 @@ class FileBodyStore:
         return await asyncio.to_thread(_read_all)
 
     async def delete(self, chain_id: UUID) -> None:
-        """Remove the per-upload directory tree. Idempotent."""
+        """Remove the per-upload directory tree. Idempotent.
+
+        The running total is reduced by what the removal actually unlinked
+        (CL6), so the janitor's and the reaper's deletions are accounted at
+        the time they happen rather than at the next boot.
+        """
         upload_dir = self._path_for(chain_id)
-        await asyncio.to_thread(_rm_rf, upload_dir)
+        freed = await asyncio.to_thread(_rm_rf, upload_dir)
+        self._total_bytes -= freed
+
+    def _walk_total_bytes(self) -> int:
+        """Sum every file size under the root, excluding ``.tmp/``.
+
+        The counter's BOOT SEED and nothing else: called once from
+        :meth:`start` (CL6). It is a full tree walk with a ``stat`` per file,
+        which is what :meth:`total_bytes` used to do on every disk-pressure
+        probe tick and every admin status read. A file that vanishes mid-walk
+        counts as zero rather than raising.
+        """
+        total = 0
+        for dirpath, _dirnames, filenames in os.walk(self._root):
+            # Skip the tmp staging directory.
+            if Path(dirpath) == self._tmp_dir():
+                continue
+            for f in filenames:
+                fp = Path(dirpath) / f
+                try:
+                    total += fp.stat().st_size
+                except OSError:  # file vanished mid-walk
+                    continue
+        return total
 
     async def total_bytes(self) -> int:
-        """Sum of file sizes under the store. Walks the root tree."""
+        """Bytes stored under the root, excluding ``.tmp/``.
 
-        def _walk() -> int:
-            total = 0
-            for dirpath, _dirnames, filenames in os.walk(self._root):
-                # Skip the tmp staging directory.
-                if Path(dirpath) == self._tmp_dir():
-                    continue
-                for f in filenames:
-                    fp = Path(dirpath) / f
-                    try:
-                        total += fp.stat().st_size
-                    except OSError:  # file vanished mid-walk
-                        continue
-            return total
+        Returns a RUNNING TOTAL rather than a tree walk (CL6). The counter is
+        seeded by :meth:`start` from one walk, so it counts orphaned body
+        files that no row claims, and is then adjusted by the two methods that
+        can move bytes: :meth:`put` by the delta its rename produced, and
+        :meth:`delete` by the size of the tree it unlinked. A SQL
+        ``SUM(body_size_bytes)`` cannot substitute, because it misses crash
+        orphans and rows already zeroed by a discard, and the consumer is an
+        ENOSPC gate where under-counting is the unsafe direction.
 
-        return await asyncio.to_thread(_walk)
+        Every mutation is applied on the event loop AFTER the filesystem work
+        returns from its thread, so ``+=`` cannot interleave and no lock is
+        needed. Any drift a running process accumulates is corrected by the
+        next boot's seed.
+        """
+        return self._total_bytes
 
     async def list_chain_ids(self) -> list[UUID]:
         """Return every chain_id that has at least one body_ref on disk."""

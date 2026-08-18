@@ -348,8 +348,9 @@ async def get_admin_status(
             )
         )
         total_backlog += len(rows)
-        # Sum body-file bytes per instance — see §6.1. Walks the tree at
-        # request time; cheap for hundreds of bodies and acceptable for v1.
+        # Sum body-file bytes per instance — see §6.1. Reads the store's
+        # running total (CL6), seeded by one walk at boot and maintained by
+        # the two writers, so the request does no filesystem work.
         total_disk_bytes += await ctx.file_body_store.total_bytes()
     return AdminStatusResponse(
         ready=True,
