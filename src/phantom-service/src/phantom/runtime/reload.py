@@ -44,6 +44,7 @@ from phantom.config.settings import InstanceCfg, Settings
 from phantom.instances.context import InstanceContext
 from phantom.instances.settings_holder import SettingsHolder
 from phantom.instances.snapshot import _build_snapshot
+from phantom.runtime.startup_checks import ConfigInvariantError, check_retention_floor
 from phantom.strategies import build_retry_strategy
 
 if TYPE_CHECKING:
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 RELOAD_FAILURE_ERRORS: Final[tuple[type[BaseException], ...]] = (
     yaml.YAMLError,
     ValidationError,
+    ConfigInvariantError,
     OSError,
     UnicodeDecodeError,
 )
@@ -69,8 +71,13 @@ route answers the 422 envelope. Beyond the parse pair (``yaml.YAMLError``
 + ``ValidationError``), the file READ itself can fail: ``OSError``
 (``FileNotFoundError`` when the YAML vanished mid-edit, permission
 flips) and ``UnicodeDecodeError`` (a non-UTF-8 byte from a hand edit;
-a ``ValueError`` subclass, NOT an ``OSError``). All of them strike
-before any snapshot swap, so the running config is unaffected.
+a ``ValueError`` subclass, NOT an ``OSError``). ``ConfigInvariantError``
+(F14) covers a CROSS-FIELD config invariant pydantic cannot express,
+re-checked between the load and the swap; the retention floor is its one
+current member, and it is listed explicitly because it subclasses
+``ValueError`` rather than ``ValidationError`` and would otherwise
+escape both consumers. All of them strike before any snapshot swap, so
+the running config is unaffected.
 """
 
 
@@ -186,8 +193,12 @@ async def _sighup_reload(
     """Run :func:`apply_reload` from the SIGHUP context, swallowing failures.
 
     Unlike the admin endpoint (which returns a 422 envelope on failure),
-    the SIGHUP path has no return surface — a parse or validation error
-    must not crash the process. Log and keep the previous snapshot.
+    the SIGHUP path has no return surface, so nothing in the shared
+    failure set may crash the process: a parse error, a validation error,
+    a read failure, or a config-invariant error (the retention floor,
+    F14). Log and keep the previous snapshot. The set is the one shared
+    ``RELOAD_FAILURE_ERRORS``, so this posture and the route's cannot
+    drift.
     """
     try:
         reloaded = await apply_reload(holder, settings_path, instances)
@@ -262,12 +273,27 @@ async def apply_reload(
     Raises:
         yaml.YAMLError: If the YAML payload is unparseable.
         pydantic.ValidationError: If the config fails validation.
+        ConfigInvariantError: If the freshly loaded config violates a
+            cross-field invariant pydantic cannot express. Today that is
+            the retention floor, re-checked here because the reaper
+            live-reads retention per sweep (F14). Like the other two,
+            it strikes before any snapshot swap, so the running config
+            is unaffected; every member of ``RELOAD_FAILURE_ERRORS``
+            shares that guarantee.
     """
     # Probe ON (the classmethod's default): omitted probe-fillable knobs
     # re-resolve from current machine facts, and Pydantic validation
     # completes BEFORE the swap below, so a refused reload never touches
     # the live snapshots (R7-1; ADR-013 atomicity).
     new_settings = Settings.reload_from_yaml(settings_path)
+    # The retention floor is a CROSS-FIELD invariant pydantic cannot express,
+    # so it rides here rather than in RetentionCfg: bodies must never outlive
+    # their row. The reaper reads retention from the live snapshot per sweep,
+    # so an inverted window installed by a reload takes effect on the next
+    # sweep and strands RAM bodies that RamBodyStore.list_orphans can never
+    # reclaim (F14). Boot runs the identical check (app.py); this is the
+    # second door, not a second rule.
+    check_retention_floor(new_settings)
     # R9-2: body_store.mode is restart-required (the store wiring is
     # composition-time per ADR-025/ADR-013), but _build_snapshot
     # projects the FULL BodyStoreCfg into the live snapshots and

@@ -153,6 +153,17 @@ This is bounded two ways:
 generously above steady-state so it only fires under pathological growth.
 It is hot-reloadable (lands on the next reaper sweep).
 
+The whole `retention` block is hot-reloadable on the same terms, with one
+guard. Every terminal state's `<state>_body_seconds` must be less than or
+equal to its `<state>_metadata_seconds`, because the reaper's metadata
+pass deletes the row without touching the body, so a body outliving its
+row is stranded (on disk the orphan janitor eventually reclaims it; in
+RAM nothing ever can). A reload carrying an inverted pair is **rejected
+whole**: `POST /v1/admin/reload` answers 422 with
+`error.code == "envelope_invalid"`, SIGHUP logs and keeps running, and
+the previous retention block stays live along with every other edit in
+that file. Fix the YAML and reload again.
+
 ### 2.2 Durability knob: `storage.sqlite.synchronous`
 
 `uploads.db` runs WAL with `synchronous: NORMAL` by default:
@@ -225,6 +236,18 @@ values, because a route table is unbounded operator input), and it
 repeats on **every** reload until you restart. `GET /v1/admin/status`
 keeps reporting the boot `host_prefixes`, which is truthful: the boot
 list is what dispatch actually uses.
+
+A reload can also be **rejected outright**, which is a different outcome
+from a refused block. A refused block means the YAML is valid and Phantom
+simply cannot apply that part while running. A rejection means the YAML
+is invalid, at runtime and after a restart alike, so nothing in it is
+applied. Today the one runtime-only rejection arm beyond YAML parse and
+schema validation is the retention floor (§ 2.1): an inverted
+`<state>_body_seconds` / `<state>_metadata_seconds` pair answers 422
+`envelope_invalid` on the endpoint, logs and keeps running on SIGHUP, and
+leaves the **whole** previous configuration live. Nothing is
+half-applied, so a rejected reload is always safe to fix and retry on the
+same process.
 
 ### 2.3 Service-based signing (`aws_sigv4`) and credentials
 

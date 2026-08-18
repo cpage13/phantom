@@ -1433,13 +1433,28 @@ async def post_reload(request: Request) -> Response:
 
     Mirrors SIGHUP: re-reads the YAML at ``app.state.settings_path``,
     builds fresh per-instance snapshots, swaps them in the
-    :class:`SettingsHolder`, restarts AD-mint loops whose config
-    changed, and pushes new saturation caps into every gate.
+    :class:`SettingsHolder`, rebuilds each instance's retry strategy,
+    and pushes new saturation caps into every gate.
+
+    A restart-required block that changed (``ad_mint``, and the
+    per-instance route block: ``routes``, ``host_prefixes``,
+    ``data_dir``) does NOT fail the reload. It is refused: nothing is
+    applied for that block, a WARNING names the instance and the drifted
+    fields, and this endpoint still answers 200. A REJECTED reload is a
+    different outcome, described below, and it applies nothing at all.
 
     Returns:
         200 ``{"reloaded_instances": [<id>, ...]}`` on success.
-        422 ``ErrorEnvelope`` (``envelope_invalid``) on YAML parse or
-        Pydantic validation failure.
+        422 ``ErrorEnvelope`` (``envelope_invalid``) on YAML parse
+        failure, Pydantic validation failure, or a cross-field config
+        invariant pydantic cannot express. The one such invariant today
+        is the retention floor (F14): for every terminal state,
+        ``retention.<state>_body_seconds`` must not exceed
+        ``<state>_metadata_seconds``, because the reaper's metadata pass
+        deletes rows without touching bodies and a body outliving its
+        row is unreclaimable in RAM. Every 422 arm strikes BEFORE any
+        snapshot swap, so the whole previous configuration keeps
+        running; nothing is half-applied.
         404 ``ErrorEnvelope`` (``not_found``) when hot reload is
         disabled because ``create_app`` was given no ``settings_path``.
     """
@@ -1452,8 +1467,9 @@ async def post_reload(request: Request) -> Response:
         reloaded = await apply_reload(holder, settings_path, instances)
     except RELOAD_FAILURE_ERRORS as exc:
         # One shared failure set with the SIGHUP path (R8-2): parse and
-        # validation failures plus file-read failures (vanished file,
-        # non-UTF-8 byte) all reject-and-keep-previous, in-envelope.
+        # validation failures, file-read failures (vanished file,
+        # non-UTF-8 byte) and cross-field config-invariant failures (the
+        # retention floor, F14) all reject-and-keep-previous, in-envelope.
         return _admin_error("envelope_invalid", f"Settings reload failed: {exc}")
     return Response(
         content=json.dumps({"reloaded_instances": reloaded}),

@@ -9,7 +9,10 @@ five startup behaviors that defend a Pi-class deployment:
   owner-only (``0o600`` / ``0o700``).
 * :func:`check_retention_floor` — process-wide config invariant
   (plan § 4.2.4): bodies must not be retained longer than their
-  metadata row, else a reaped row orphans its body file.
+  metadata row, else a reaped row orphans its body file. It is the one
+  guard here with a SECOND caller: ``apply_reload`` re-runs it between
+  the YAML load and the swap (F14), where a violation rejects the
+  reload rather than crashing the process.
 * :func:`check_instance_isolation` — process-wide config invariant
   (plan § 9.10.1): every configured instance must be *completely
   isolated* (unique id, its own storage partition, unambiguous
@@ -367,9 +370,19 @@ def check_retention_floor(settings: Settings) -> None:
     ``metadata_seconds``: the reaper drops the body file at
     ``body_seconds`` then the metadata row at ``metadata_seconds``, so
     a body outliving its row would orphan the body file after the row
-    vanished. Raises :class:`ConfigInvariantError` on any violation; the
-    exception propagates out and crashes startup before any worker
-    spawns.
+    vanished. Raises :class:`ConfigInvariantError` on any violation.
+
+    TWO callers, with two different consequences (F14). At BOOT
+    (``phantom.app``'s lifespan) the exception propagates out and
+    crashes startup before any worker spawns. At RELOAD
+    (:func:`phantom.runtime.reload.apply_reload`, between the YAML load
+    and any swap) it is a member of ``RELOAD_FAILURE_ERRORS``, so the
+    reload is rejected whole and the previous config keeps running: 422
+    ``envelope_invalid`` on the admin route, log-and-keep-previous on
+    SIGHUP. The second door exists because the reaper live-reads
+    retention on every sweep, so an inverted window installed by a
+    reload bites immediately, and the RAM bodies it strands are
+    unreclaimable.
 
     The ``-1`` sentinel means "forever": a ``-1`` metadata window is a
     forever-row, so any finite body window is fine; a ``-1`` body window
