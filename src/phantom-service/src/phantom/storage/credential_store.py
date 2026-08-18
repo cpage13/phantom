@@ -50,8 +50,8 @@ from phantom.models.credential import (
     SigningService,
     SigV4StaticCreds,
 )
+from phantom.storage._connection import open_store_connection
 from phantom.storage.interface import CredentialWakeHandler
-from phantom.storage.sqlite_store import _DEFAULT_BUSY_TIMEOUT_MS
 
 logger = logging.getLogger(__name__)
 
@@ -92,9 +92,13 @@ def _row_to_cache_row(row: aiosqlite.Row) -> CredCacheRow:
 class SqliteCredentialStore:
     """Disk-tier SQLite destination-credential store.
 
-    A COPY of :class:`SqliteTokenCache`. Optional ``sqlite_cfg`` carries the
-    parameterized ``busy_timeout_ms`` pragma value (shared with
-    :class:`SqliteUploadStore`). When omitted the default matches
+    Its connection plumbing is the SHARED one
+    (:func:`phantom.storage._connection.open_store_connection`), so the "A COPY
+    of :class:`SqliteTokenCache`" this docstring used to open with is true of
+    the DDL only, which ADR-030 sanctions: this store's primary key is the
+    destination host alone, dropping the token cache's uid axis. Optional
+    ``sqlite_cfg`` carries the parameterized ``busy_timeout_ms`` pragma value
+    (shared with :class:`SqliteUploadStore`). When omitted the default matches
     :class:`SqliteCfg` so unit tests need no explicit Settings to exercise the
     store; production threads ``settings.storage.sqlite``.
     """
@@ -112,28 +116,21 @@ class SqliteCredentialStore:
         self._cfg = sqlite_cfg
         self._conn: aiosqlite.Connection | None = None
         self._wake_handlers: list[CredentialWakeHandler] = []
-        # See SqliteTokenCache._write_lock / SqliteUploadStore._write_lock —
-        # every write path on a shared aiosqlite connection must atomicize its
-        # ``execute`` / ``commit`` pair so concurrent coroutines don't race the
-        # transaction state.
+        # Every write path on a shared aiosqlite connection must atomicize
+        # its ``execute`` / ``commit`` pair so concurrent coroutines don't
+        # race the transaction state. The lock stays per store because it
+        # guards THIS store's connection; the rationale it used to
+        # cross-reference two siblings for now lives on the shared opener.
         self._write_lock = asyncio.Lock()
 
-    def _busy_timeout_ms(self) -> int:
-        """Resolve the ``busy_timeout`` PRAGMA value (milliseconds)."""
-        if self._cfg is None:
-            return _DEFAULT_BUSY_TIMEOUT_MS
-        return self._cfg.busy_timeout_ms
-
     async def start(self) -> None:
-        """Open the store's own database file and apply its DDL."""
-        self._conn = await aiosqlite.connect(self._db_path)
-        self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode=WAL;")
-        await self._conn.execute("PRAGMA synchronous=FULL;")
-        await self._conn.execute("PRAGMA auto_vacuum=NONE;")
-        # busy_timeout — see SqliteCfg.busy_timeout_ms / _DEFAULT_BUSY_TIMEOUT_MS
-        # for the value rationale (R9-V6-1).
-        await self._conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms()};")
+        """Open the store's own database file and apply its DDL.
+
+        The connection and its four durability pragmas come from the shared
+        opener (U1); the DDL below stays here, because ADR-030 makes each
+        store's own schema deliberate.
+        """
+        self._conn = await open_store_connection(self._db_path, self._cfg)
         # The store owns this DDL in its own credential_store.db (one more
         # database per instance by design; see the module docstring). A COPY of
         # the token_cache DDL with the value + status columns swapped: the PK is

@@ -26,8 +26,8 @@ import aiosqlite
 from phantom.config.settings import SqliteCfg
 from phantom.models.admin import TokenSlot
 from phantom.models.token import TokenCacheRow, TokenSource
+from phantom.storage._connection import open_store_connection
 from phantom.storage.interface import WakeHandler
-from phantom.storage.sqlite_store import _DEFAULT_BUSY_TIMEOUT_MS
 
 logger = logging.getLogger(__name__)
 
@@ -76,28 +76,20 @@ class SqliteTokenCache:
         self._cfg = sqlite_cfg
         self._conn: aiosqlite.Connection | None = None
         self._wake_handlers: list[WakeHandler] = []
-        # See SqliteUploadStore._write_lock — every write path on a
-        # shared aiosqlite connection must atomicize its ``execute`` /
-        # ``commit`` pair so concurrent coroutines don't race the
-        # transaction state.
+        # Every write path on a shared aiosqlite connection must atomicize
+        # its ``execute`` / ``commit`` pair so concurrent coroutines don't
+        # race the transaction state. The lock stays per store because it
+        # guards THIS store's connection.
         self._write_lock = asyncio.Lock()
 
-    def _busy_timeout_ms(self) -> int:
-        """Resolve the ``busy_timeout`` PRAGMA value (milliseconds)."""
-        if self._cfg is None:
-            return _DEFAULT_BUSY_TIMEOUT_MS
-        return self._cfg.busy_timeout_ms
-
     async def start(self) -> None:
-        """Open the cache's own database file and apply its DDL."""
-        self._conn = await aiosqlite.connect(self._db_path)
-        self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode=WAL;")
-        await self._conn.execute("PRAGMA synchronous=FULL;")
-        await self._conn.execute("PRAGMA auto_vacuum=NONE;")
-        # busy_timeout — see SqliteCfg.busy_timeout_ms / _DEFAULT_BUSY_TIMEOUT_MS
-        # for the value rationale (R9-V6-1).
-        await self._conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms()};")
+        """Open the cache's own database file and apply its DDL.
+
+        The connection and its four durability pragmas come from the shared
+        opener (U1); the DDL below stays here, because ADR-030 makes each
+        store's own schema deliberate.
+        """
+        self._conn = await open_store_connection(self._db_path, self._cfg)
         # The cache owns this DDL: production wires the cache at its own
         # token_cache.db (two databases per instance by design; see the
         # module docstring). schema.sql declares the same table inside
