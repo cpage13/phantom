@@ -46,18 +46,23 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, assert_never
-from urllib.parse import urlparse
 
 import httpx
 
+from phantom.chain.auth_providers import (
+    AuthParked,
+    AuthSlotProvider,
+    BearerAuthProvider,
+    NoAuthProvider,
+    SigV4AuthProvider,
+    sanitised_host_for,
+)
 from phantom.chain.jsonpath import extract, find_placeholders, substitute, whole_placeholder
 from phantom.chain.parser import (
     InlineBodyDecodeError,
     decode_inline_body_b64,
     envelope_from_persistence_json,
 )
-from phantom.chain.query import filter_raw_query
-from phantom.chain.sigv4_signer import SigV4SigningError, sign_sigv4
 from phantom.config.settings import InstanceCfg
 from phantom.models.chain import (
     ChainBodyBytes,
@@ -67,9 +72,8 @@ from phantom.models.chain import (
     ChainEnvelope,
     ChainStep,
 )
-from phantom.models.credential import CredCacheRow, HostCredKey
 from phantom.models.upload import CapturedStepValues, CapturedValues, UploadRow
-from phantom.routing import ResolvedRoute, host_key_for
+from phantom.routing import AuthMode, ResolvedRoute, host_key_for
 from phantom.storage.interface import CredentialStore, TokenCache
 from phantom.transport.interface import UpstreamClient, UpstreamRequest
 
@@ -150,24 +154,6 @@ def _hop_by_hop_names(headers: Mapping[str, str]) -> frozenset[str]:
 # (D2/F6); the admin API surfaces both.
 _NO_HOST_TOKEN = "<no-host>"
 
-# The AWS SigV4 query-string ("presigned") credential set, lower-cased. A
-# client that presigned its request carries its whole credential here rather
-# than in a header. On an ``aws_sigv4`` route Phantom's own signature is
-# authoritative (ADR-033), so this set is superseded material and is stripped
-# before signing; every other parameter survives byte-for-byte.
-_SIGV4_PRESIGN_QUERY_PARAMS: frozenset[str] = frozenset(
-    {
-        "x-amz-algorithm",
-        "x-amz-credential",
-        "x-amz-date",
-        "x-amz-expires",
-        "x-amz-security-token",
-        "x-amz-signature",
-        "x-amz-signedheaders",
-    }
-)
-
-
 _TEXT_SCALARS: tuple[type, ...] = (str, int, float, bool)
 """Capture types that can be spliced into a TEXT context (F8).
 
@@ -180,38 +166,6 @@ retryable ``CaptureIncomplete`` before substitution runs.
 
 _CONTROL_CHARS = re.compile(r"[\r\n\x00]")
 """Characters that make a header value un-sendable: ``h11`` refuses them."""
-
-
-def _strip_presigned_query(url: str) -> str:
-    """Return ``url`` with the AWS SigV4 presigned parameter set removed.
-
-    ADR-033 makes Phantom's host-keyed signature authoritative on an
-    ``aws_sigv4`` route, so a client's presigned credential in the query is
-    superseded material; forwarding both earns a 4xx for presenting two
-    authentication mechanisms. The exact analogue of F7's superseded-header
-    removal, in the other carrier. The whole set is removed rather than only
-    ``x-amz-signature``, because botocore signs the canonical query string it
-    is handed and orphaned ``X-Amz-Credential`` and ``X-Amz-Date`` parameters
-    would put the client's credential identifiers inside Phantom's signature.
-
-    Every non-presigned parameter survives byte-for-byte through
-    :func:`filter_raw_query`. A fragment is split off before the query span and
-    re-attached after it.
-
-    Args:
-        url: The absolute step URL about to be signed and forwarded.
-
-    Returns:
-        ``url`` with the presigned parameters removed, and with no bare
-        trailing ``?`` when nothing survives.
-    """
-    head, hash_sep, fragment = url.partition("#")
-    base, question, raw = head.partition("?")
-    if not question:
-        return url
-    kept = filter_raw_query(raw, keep=lambda key: key.lower() not in _SIGV4_PRESIGN_QUERY_PARAMS)
-    out = f"{base}?{kept}" if kept else base
-    return f"{out}{hash_sep}{fragment}" if hash_sep else out
 
 
 @dataclass(frozen=True)
@@ -547,7 +501,23 @@ class ChainExecutor:
         row: UploadRow,
         body_refs: dict[str, bytes],
     ) -> ExecuteStepResult:
-        """Run one step of ``row``'s chain and classify the result."""
+        """Run one step of ``row``'s chain and classify the result.
+
+        The auth stage (c) resolves ONE provider from the route's
+        ``auth_mode`` and asks it to prepare the request. A provider either
+        readies it (mutating the header dict in place and reporting the URL to
+        send, which the sigv4 provider rewrites) or reports that the row must
+        park, carrying the status and the sanitised blocked host that
+        ``FailedAuth`` persists. The same provider marks its slot bad if the
+        upstream then answers 401 or 403.
+
+        Args:
+            row: The claimed upload row whose current step to run.
+            body_refs: The rehydrated body bytes, keyed by ref name.
+
+        Returns:
+            One member of the :data:`ExecuteStepResult` union.
+        """
         envelope = envelope_from_persistence_json(row.chain_envelope_json)
         step_index = row.current_step_index
         if step_index >= len(envelope.steps):
@@ -653,10 +623,8 @@ class ChainExecutor:
 
         full_url = self._absolute_url(substituted_url, envelope)
 
-        # (c) Inject auth via route policy. The dispatch is exhaustive over
-        # ResolvedRoute.auth_mode (if/elif/else + assert_never) so adding a new
-        # auth mode without an arm is a mypy error, not a silent no-auth
-        # fall-through (the prior bare ``if`` would have behaved like ``none``).
+        # Resolve the route first: it decides the auth provider at (c) below,
+        # and the send-deadline gate at (a') reads its deadline.
         try:
             resolved = self._resolve_route(full_url, self._instance)
         except ValueError:
@@ -664,9 +632,9 @@ class ChainExecutor:
             # helper (``phantom.routing``) returns the WHOLE INPUT when urlparse
             # finds no host, and a step URL legitimately can be a bare path, so
             # reusing it would splice the path and its query string into
-            # ``last_error``. Its own docstring states that contract.
-            parsed_host = urlparse(full_url).hostname
-            unrouted_host = parsed_host.lower() if parsed_host else _NO_HOST_TOKEN
+            # ``last_error``. ``sanitised_host_for`` is the form that may be
+            # persisted, and both docstrings state the split.
+            unrouted_host = sanitised_host_for(full_url)
             logger.warning(
                 "no route matches host %s for step %r of chain_id=%s; "
                 "parking the row in 'stored' for operator repair",
@@ -686,80 +654,33 @@ class ChainExecutor:
         if deadline_check is not None:
             return deadline_check
 
-        if resolved.auth_mode == "phantom_bearer":
-            # The host this row is authenticating against, SANITISED because it
-            # is PERSISTED (D2/F6): it rides ``FailedAuth.blocked_host`` into
-            # ``uploads.auth_blocked_host``, which the admin API surfaces on
-            # four paths. Neither ``host_key_for(full_url)`` nor ``dest_host``
-            # below is what it receives: both carry the raw-input fallback,
-            # which is fine for a CACHE KEY (never persisted) and forbidden
-            # here, because a hostless step URL would splice its path and its
-            # credential-bearing query string into the admin API. A hostless
-            # URL records the fixed ``_NO_HOST_TOKEN`` literal instead.
-            parsed_host = urlparse(full_url).hostname
-            blocked = parsed_host.lower() if parsed_host else _NO_HOST_TOKEN
-            slot = await self._cache.get(host_key_for(full_url), row.uid)
-            if slot is None or slot.status == "bad":
-                return FailedAuth(status=401, observed_at=self._clock(), blocked_host=blocked)
-            substituted_headers["Authorization"] = slot.bearer
-        elif resolved.auth_mode == "aws_sigv4":
-            # F4 precedence: Phantom's signature is authoritative on this route
-            # (ADR-033), so a client's presigned query credential is superseded.
-            # REBIND rather than pass a stripped copy to the signer: full_url is
-            # read again at the UpstreamRequest below, and signing one URL while
-            # forwarding another is a canonical-query mismatch that earns a 403
-            # SignatureDoesNotMatch on every presigned upload.
-            stripped = _strip_presigned_query(full_url)
-            if stripped != full_url:
-                logger.info(
-                    "stripped client presigned credentials on aws_sigv4 route for "
-                    "chain_id=%s dest_host=%s",
-                    row.chain_id,
-                    host_key_for(full_url),
-                )
-            full_url = stripped
-            # SigV4 signer arm (COPY of the bearer arm above): the host-keyed
-            # CredentialStore slot is the refreshable slot, the analogue of the
-            # (endpoint, uid) token slot. A missing/bad credential — including
-            # ``signer_creds is None`` (no store wired) and a ProfileRefCred
-            # whose botocore chain yields nothing — marks the slot bad (when a
-            # store exists) and returns FailedAuth, which PARKS the row in
-            # ``auth_expired`` (NOT terminal) to await a credential re-push.
-            dest_host = HostCredKey(host_key_for(full_url))
-            # The sanitised persisted host, same rule and same reason as the
-            # bearer arm above (D2/F6). ``dest_host`` is the credential-store
-            # KEY and keeps the raw-input fallback; ``blocked`` is what the row
-            # records. Stripping the presigned query span never touches the
-            # host, so this is the same host ``dest_host`` names.
-            parsed_host = urlparse(full_url).hostname
-            blocked = parsed_host.lower() if parsed_host else _NO_HOST_TOKEN
-            row_cred = await self._signer_creds_for(dest_host)
-            if row_cred is None or row_cred.status == "bad":
-                await self._mark_signer_creds_bad(dest_host)
-                return FailedAuth(status=401, observed_at=self._clock(), blocked_host=blocked)
-            try:
-                # Re-sign THIS request now (fresh X-Amz-Date) over the rehydrated
-                # body. botocore mutates ``substituted_headers`` in place; the
-                # body stays byte-identical (transparent-proxy invariant).
-                await sign_sigv4(
-                    method=step.method,
-                    url=full_url,
-                    headers=substituted_headers,
-                    body=body_bytes,
-                    credential=row_cred.credential,
-                )
-            except SigV4SigningError:
-                logger.warning(
-                    "aws_sigv4 credential resolution failed for host %s; "
-                    "marking slot bad and parking (auth_expired)",
-                    dest_host,
-                )
-                await self._mark_signer_creds_bad(dest_host)
-                return FailedAuth(status=401, observed_at=self._clock(), blocked_host=blocked)
-        elif resolved.auth_mode == "none":
-            pass  # forward as-is — no Phantom-injected auth.
-        else:  # pragma: no cover — exhaustive over the Literal above.
-            assert_never(resolved.auth_mode)
+        # (c) Inject auth via the route's provider (U8). ONE selection over
+        # three providers replaces two if/elif blocks that sat 96 lines apart,
+        # and the ``match`` inside the selector keeps the guarantee the two
+        # blocks had: a fourth auth mode with no case is a mypy error at
+        # ``assert_never``, not a silent no-auth fall-through (the pre-ADR-012
+        # bare ``if`` would have behaved like ``none``).
+        provider = self._auth_provider_for(resolved.auth_mode)
+        outcome = await provider.prepare(
+            full_url=full_url,
+            uid=row.uid,
+            method=step.method,
+            headers=substituted_headers,
+            body=body_bytes,
+            chain_id=row.chain_id,
+        )
+        if isinstance(outcome, AuthParked):
+            # The row parks in ``auth_expired`` carrying the SANITISED host the
+            # provider resolved (D2/F6), never a raw URL.
+            return FailedAuth(
+                status=outcome.status,
+                observed_at=self._clock(),
+                blocked_host=outcome.blocked_host,
+            )
+        # REBIND: the sigv4 provider signs the presigned-stripped URL, and the
+        # URL that was signed is the URL that must be sent. Every other
+        # provider hands back what it was given.
+        full_url = outcome.url
 
         # (d) Inject idempotency header.
         if step.idempotency_header:
@@ -823,16 +744,11 @@ class ChainExecutor:
             # records a blocked host for a slot that does not exist, so the row
             # parks and no kicker owns it. That park is pre-existing behaviour
             # which D2 makes visible in the column rather than changes.
-            parsed_host = urlparse(full_url).hostname
-            blocked = parsed_host.lower() if parsed_host else _NO_HOST_TOKEN
-            if resolved.auth_mode == "phantom_bearer":
-                # Mark the slot bad so the sender knows what to do.
-                await self._cache.mark_bad(host_key_for(full_url), row.uid)
-            elif resolved.auth_mode == "aws_sigv4":
-                # Symmetric to the bearer mark-bad: flip the host-keyed cred
-                # slot to ``bad`` so the row stays parked until a fresh
-                # credential re-push freshens it (the kicker wakes on ``fresh``).
-                await self._mark_signer_creds_bad(HostCredKey(host_key_for(full_url)))
+            blocked = sanitised_host_for(full_url)
+            # Mark THIS route's slot bad so the sender knows what to do. The
+            # ``none`` provider holds no slot and no-ops, which is what the
+            # inline chain did by having no arm for it.
+            await provider.mark_bad(host_key=host_key_for(full_url), uid=row.uid)
             return FailedAuth(
                 status=response.status, observed_at=self._clock(), blocked_host=blocked
             )
@@ -842,30 +758,31 @@ class ChainExecutor:
             return Failed5xx(status=response.status)
         return FailedNetwork(error=f"Unexpected status {response.status}")
 
-    async def _signer_creds_for(self, dest_host: HostCredKey) -> CredCacheRow | None:
-        """Return the host-keyed credential row, or ``None`` when unusable.
+    def _auth_provider_for(self, auth_mode: AuthMode) -> AuthSlotProvider:
+        """Pick this route's auth provider, exhaustively over ``auth_mode``.
 
-        The SigV4 analogue of the bearer ``token_cache.get`` lookup at the inject
-        site. ``None`` covers both "no credential store wired"
-        (``signer_creds is None`` — no route needs ``aws_sigv4`` in this
-        deployment) and "no slot for this host yet"; the caller treats both
-        identically (missing credential → park).
+        A ``match`` rather than a mapping, deliberately: a
+        ``dict[AuthMode, AuthSlotProvider]`` gives mypy no exhaustiveness check
+        (it does not verify that a literal covers every member of a Literal key
+        type, and a subscript narrows nothing), so adding a fourth auth mode
+        would become a runtime ``KeyError`` instead of the type error this
+        dispatch has always been.
+
+        Args:
+            auth_mode: The resolved route's outbound-auth selector.
+
+        Returns:
+            The provider that prepares and marks-bad for that mode.
         """
-        if self._signer_creds is None:
-            return None
-        return await self._signer_creds.get(dest_host)
-
-    async def _mark_signer_creds_bad(self, dest_host: HostCredKey) -> None:
-        """Flip the host's credential slot to ``bad`` (no-op without a store).
-
-        ADR-003: a bad credential stays in the store so the admin API can
-        surface it; the kicker re-wakes the parked row only once a re-push
-        freshens the slot. A no-op when ``signer_creds is None`` (there is no
-        slot to mark) — the row still parks via the ``FailedAuth`` return.
-        """
-        if self._signer_creds is None:
-            return
-        await self._signer_creds.mark_bad(dest_host)
+        match auth_mode:
+            case "phantom_bearer":
+                return BearerAuthProvider(cache=self._cache)
+            case "aws_sigv4":
+                return SigV4AuthProvider(store=self._signer_creds)
+            case "none":
+                return NoAuthProvider()
+            case _:  # pragma: no cover - exhaustive over the Literal above.
+                assert_never(auth_mode)
 
     def _check_send_deadline(
         self,
