@@ -32,7 +32,6 @@ round-robin to a single-store loop; body reads route through
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import sqlite3
@@ -54,6 +53,7 @@ from phantom.chain.executor import (
     TemplateUnresolved,
 )
 from phantom.compression import build_codec_for_algorithm
+from phantom.hashing import sha256_hex
 from phantom.instances.context import InstanceContext
 from phantom.models.upload import UploadRow
 from phantom.observability.metrics import MetricsRegistry
@@ -184,14 +184,19 @@ class Sender:
         Then per body_ref:
 
         1. Read stored bytes from the body store.
-        2. Compute SHA-256; compare to row.body_hashes[name].storage_hash.
-           Mismatch raises :class:`StorageCorruptionError` (no retry;
-           corrupted state).
+        2. Compute SHA-256 off the event loop; compare to
+           row.body_hashes[name].storage_hash. Mismatch raises
+           :class:`StorageCorruptionError` (no retry; corrupted state).
         3. Decode via the codec named in row.storage_encoding.
-        4. Compute SHA-256 of decoded bytes; compare to
-           row.body_hashes[name].body_hash. Mismatch raises
+        4. Compute SHA-256 of decoded bytes, also off the event loop;
+           compare to row.body_hashes[name].body_hash. Mismatch raises
            :class:`CodecRoundTripDriftError` (no retry; corrupted state).
         5. Return decoded bytes.
+
+        Both hashes and the decode between them run through
+        ``asyncio.to_thread`` (CL4), so this method suspends three times per
+        body ref and no caller may assume it is atomic. That was already true
+        before CL4, because the decode was offloaded on its own.
 
         The body store (plan § 2.3.18) is the
         mode-selected :class:`BodyStore` binding on
@@ -251,11 +256,11 @@ class Sender:
                 # so the row terminates rather than silently propagating
                 # un-verified bytes upstream.
                 raise StorageCorruptionError(name, "<expected-hash-missing>", "<no-row-hash>")
-            actual_storage = hashlib.sha256(stored_bytes).hexdigest()
+            actual_storage = await asyncio.to_thread(sha256_hex, stored_bytes)
             if actual_storage != hashes.storage_hash:
                 raise StorageCorruptionError(name, hashes.storage_hash, actual_storage)
             decoded_bytes = await asyncio.to_thread(codec.decode, stored_bytes)
-            actual_body = hashlib.sha256(decoded_bytes).hexdigest()
+            actual_body = await asyncio.to_thread(sha256_hex, decoded_bytes)
             if actual_body != hashes.body_hash:
                 raise CodecRoundTripDriftError(name, hashes.body_hash, actual_body)
             decoded[name] = decoded_bytes

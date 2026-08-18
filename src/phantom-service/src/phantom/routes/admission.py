@@ -40,7 +40,6 @@ In ``all_ram`` mode the knob has no effect (no disk target); in
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,6 +47,7 @@ from types import TracebackType
 from uuid import UUID
 
 from phantom.chain.parser import envelope_from_persistence_json
+from phantom.hashing import sha256_hex
 from phantom.instances.context import InstanceContext
 from phantom.instances.snapshot import InstanceSettingsSnapshot
 from phantom.models.chain import ChainEnvelope
@@ -244,11 +244,6 @@ def _route_name(url: str, instance_ctx: InstanceContext) -> str:
     return resolved.route_name if resolved is not None else "unknown"
 
 
-def _sha256_hex(b: bytes) -> str:
-    """SHA-256 hex of ``b`` — top-level so asyncio.to_thread can target it."""
-    return hashlib.sha256(b).hexdigest()
-
-
 def _body_hashes_diverge(
     existing: dict[str, BodyHashes],
     incoming: dict[str, BodyHashes],
@@ -408,15 +403,15 @@ async def _encode_and_hash_bodies(
     for name, data in body_refs.items():
         if storage_encoding == "original":
             # Identity codec — encoded == raw; one hash covers both.
-            body_hash_hex = await asyncio.to_thread(_sha256_hex, data)
+            body_hash_hex = await asyncio.to_thread(sha256_hex, data)
             encoded = data
             storage_hash_hex = body_hash_hex
         else:
             body_hash_hex, encoded = await asyncio.gather(
-                asyncio.to_thread(_sha256_hex, data),
+                asyncio.to_thread(sha256_hex, data),
                 asyncio.to_thread(codec.encode, data),
             )
-            storage_hash_hex = await asyncio.to_thread(_sha256_hex, encoded)
+            storage_hash_hex = await asyncio.to_thread(sha256_hex, encoded)
         stored_body_refs[name] = encoded
         body_hashes_map[name] = BodyHashes(
             body_hash=BodyHash(body_hash_hex),
