@@ -86,7 +86,13 @@ class SaturationGate:
 
     Disk-pressure accounting is updated by an external probe via
     :meth:`set_disk_usage_bytes`; the probe runs out of band so the gate's
-    synchronous admit path never does I/O.
+    synchronous admit path never does I/O. That probe re-reads
+    ``max_disk_bytes`` off this gate on EVERY tick (F13), so the disk cap
+    is genuinely live: a cap pushed here by ``update_caps`` applies at the
+    next admit, and the observation it is compared against refreshes
+    within one probe interval. While the cap is 0 the probe skips its
+    walk, which is safe because :meth:`admit` short-circuits on
+    ``max_disk_bytes > 0`` before reading the observation.
     """
 
     def __init__(

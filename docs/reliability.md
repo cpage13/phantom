@@ -326,7 +326,12 @@ forever-retained rows accumulate on a small SD card.
 - **Saturation cap.** Before RAM or disk pressure, the `SaturationGate`
   refuses admission past its row and byte caps with a `503 saturation_cap`
   (or `503 disk_pressure`) and a `Retry-After`. The producer gets clean
-  backpressure rather than unbounded buffering.
+  backpressure rather than unbounded buffering. The row and byte caps are
+  compared against counters the gate keeps itself, so they are exact. The
+  disk bound is different: it is compared against an observation the
+  disk-pressure probe refreshes on a fixed 30 second cadence, so a
+  reloaded `saturation.max_disk_bytes` is in force within one probe
+  interval, including a cap raised from `0` on a running process.
 - **Row-count backstop.** A `retention.max_rows` cap lets the reaper
   evict the oldest *terminal* rows once the table exceeds the limit
   (default `100_000`; set `-1` to opt into unbounded, time-only
@@ -577,6 +582,7 @@ contention tests are the highest-value durability coverage.
 | Saturation slot released exactly once on conflict paths | [`src/phantom-service/tests/unit/test_r31_no_double_release_on_conflict.py`](../src/phantom-service/tests/unit/test_r31_no_double_release_on_conflict.py) | A conflict-reject never double-releases a slot and steals from live rows. |
 | Unbounded table growth → `max_rows` backstop | [`src/phantom-service/tests/unit/test_v3_retention_table_growth_and_cleanup.py`](../src/phantom-service/tests/unit/test_v3_retention_table_growth_and_cleanup.py) | The reaper evicts oldest terminal rows over the cap; in-flight/`auth_expired` never evicted. |
 | Mode-flip guard over persisted rows | [`src/phantom-service/tests/unit/test_a3_mode_flip_with_persisted_rows.py`](../src/phantom-service/tests/unit/test_a3_mode_flip_with_persisted_rows.py) | Booting `all_ram` over a populated disk-backed root backs up and runs (ADR-025): the live DB and body tree move to a recoverable `mode_switch` backup, `mode_switch_backup_total` bumps, and the service boots fresh with no silent data loss. |
+| Disk cap reloaded up from zero is enforced | [`src/phantom-service/tests/unit/test_disk_pressure_probe_reload.py`](../src/phantom-service/tests/unit/test_disk_pressure_probe_reload.py) | The probe re-reads `max_disk_bytes` per tick instead of deciding at loop entry, so a cap raised from `0` on a running process produces a real observation within one interval and refuses the next over-cap admission. The reverse leg pauses the walk without killing the loop, and each transition logs exactly once. |
 
 ## 2.7 Retry cadence and thundering herd
 

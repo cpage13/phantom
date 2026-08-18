@@ -8,9 +8,20 @@ the sender's persist_now raised, and RAM filled until OOM-kill.
 This probe runs out of band so the gate's synchronous ``admit`` path
 stays I/O-free. Each tick:
 
-1. Reads ``FileBodyStore.total_bytes`` (an ``os.walk``-based sum).
-2. Calls :meth:`SaturationGate.set_disk_usage_bytes` with the result.
-3. Sleeps :attr:`poll_interval_seconds` until the next tick.
+1. Re-reads ``saturation.max_disk_bytes`` and logs any enable/disable
+   transition. The cap is hot-reloadable (ADR-013), so it is read per
+   tick and NEVER decided once at loop entry (F13).
+2. While the cap is positive, reads ``FileBodyStore.total_bytes`` (an
+   ``os.walk``-based sum).
+3. Calls :meth:`SaturationGate.set_disk_usage_bytes` with the result.
+4. Sleeps :attr:`poll_interval_seconds` until the next tick.
+
+While the cap is ``0`` the walk is skipped, because the observation has
+exactly one consumer and that consumer short-circuits on
+``max_disk_bytes > 0`` before it looks at the observation at all. The
+last observation is left in place rather than zeroed: zeroing would
+replace a stale truth with a fresh lie, and the next tick after a
+re-enable overwrites it anyway.
 
 When the cached observation crosses the gate's ``max_disk_bytes`` cap,
 the gate's next admit returns
@@ -30,12 +41,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 30 s default: the disk_usage_bytes observation feeds operator-visible
-# /v1/admin/status (Item §6.1) and the admit decision; staler than 30 s
-# risks tripping max_disk_bytes only after the disk is already full,
-# tighter than 5 s wastes CPU on `os.walk` for no observable benefit.
-# Fixed constant — operators tune the cap (max_disk_bytes) and live with
-# this probe cadence.
+# 30 s default: the disk_usage_bytes observation feeds the gate's admit
+# decision and nothing else. (An earlier version of this comment also
+# claimed it feeds operator-visible /v1/admin/status; that was already
+# false, since both admin surfaces compute disk usage from a live
+# total_bytes() walk. Corrected with F13, whose skip-the-walk-under-a-
+# zero-cap decision rests on the admit path being the sole consumer.)
+# Staler than 30 s risks tripping max_disk_bytes only after the disk is
+# already full, tighter than 5 s wastes CPU on `os.walk` for no
+# observable benefit. Fixed constant: operators tune the cap
+# (max_disk_bytes) and live with this probe cadence. The cadence also
+# bounds how long a reloaded cap waits for its first observation, since
+# the transition is detected and sampled in the SAME tick.
 DEFAULT_PROBE_INTERVAL_SECONDS = 30.0
 
 
@@ -59,21 +76,44 @@ class DiskPressureProbe:
         self._poll_interval = poll_interval_seconds
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        """Main loop — sample disk usage and update the gate until stopped."""
-        # If max_disk_bytes is unset, the probe is a no-op — exit early.
-        if self._instance.saturation.max_disk_bytes <= 0:
-            logger.info(
-                "DiskPressureProbe disabled (max_disk_bytes=0 for instance %s)",
-                self._instance.cfg.id,
-            )
-            return
+        """Main loop: sample disk usage and update the gate until stopped.
+
+        The cap is re-read on EVERY tick, never decided at entry.
+        ``saturation.max_disk_bytes`` is hot-reloadable (ADR-013) and
+        ``apply_reload`` pushes it into the gate; a probe that returned at
+        boot because the cap was 0 made a later reload unenforceable forever,
+        since the gate's disk-usage observation has no other writer (F13).
+        """
+        cap = self._instance.saturation.max_disk_bytes
+        sampling = cap > 0
+        logger.info(
+            "DiskPressureProbe started for instance %s (sampling=%s, max_disk_bytes=%d)",
+            self._instance.cfg.id,
+            sampling,
+            cap,
+        )
         while not stop_event.is_set():
-            try:
-                await self._probe_once()
-            except Exception:
-                # Broad except — a transient probe failure must not kill
-                # the loop; the gate keeps the previous observation.
-                logger.exception("DiskPressureProbe tick failed")
+            # One int read per tick, deliberately outside the gate's lock:
+            # the same argument set_disk_usage_bytes documents applies, a
+            # single int read is atomic under the GIL, and the worst case
+            # is one tick decided against a cap that changed microseconds
+            # ago. The next tick corrects it.
+            cap = self._instance.saturation.max_disk_bytes
+            if (cap > 0) != sampling:
+                sampling = cap > 0
+                logger.info(
+                    "DiskPressureProbe %s for instance %s (max_disk_bytes=%d)",
+                    "resumed sampling" if sampling else "paused sampling",
+                    self._instance.cfg.id,
+                    cap,
+                )
+            if sampling:
+                try:
+                    await self._probe_once()
+                except Exception:
+                    # Broad except: a transient probe failure must not kill
+                    # the loop; the gate keeps the previous observation.
+                    logger.exception("DiskPressureProbe tick failed")
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=self._poll_interval)
             except TimeoutError:

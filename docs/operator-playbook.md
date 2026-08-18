@@ -738,7 +738,14 @@ sender re-reads from disk on its next attempt.
 3. If the disk is also filling up, consider raising
    `saturation.max_in_flight_bytes` and `max_disk_bytes` to
    match the new traffic shape OR lowering them to back-pressure
-   the producer.
+   the producer. Both are hot-reloadable. `max_in_flight_bytes` takes
+   effect on the very next admission; `max_disk_bytes` takes effect
+   within one probe interval (30 s), because the gate compares the new
+   cap against a disk-usage observation the disk-pressure probe
+   refreshes on that cadence. Raising it **from `0`** now works without
+   a restart too: the probe re-reads the cap every tick and resumes
+   sampling on the tick that sees the change, logging one
+   `DiskPressureProbe resumed sampling` line so you can confirm it took.
 
 ### Body-too-large rejections (413)
 

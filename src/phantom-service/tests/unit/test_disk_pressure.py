@@ -25,6 +25,12 @@ from phantom.workers.saturation import SaturationGate
 
 from .conftest import make_snapshot, snapshot_thunk, track_instance
 
+# How long the zero-cap liveness check waits before concluding the loop
+# is still alive. The probe's poll interval in that test is 60 s, so any
+# small positive window proves "did not return at entry" without pacing
+# the suite.
+_ZERO_CAP_LIVENESS_SECONDS = 0.05
+
 
 async def _build(tmp_path: Path, *, max_disk_bytes: int = 100_000) -> InstanceContext:
     store = SqliteUploadStore(str(tmp_path / "uploads.db"))
@@ -82,14 +88,35 @@ async def test_probe_updates_gate_disk_usage(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_probe_returns_immediately_when_max_disk_bytes_zero(tmp_path: Path) -> None:
-    """``max_disk_bytes=0`` disables the probe entirely (loop exits)."""
+async def test_probe_under_a_zero_cap_keeps_its_loop_and_skips_the_walk(
+    tmp_path: Path,
+) -> None:
+    """``max_disk_bytes=0`` disables SAMPLING, never the loop itself (F13).
+
+    This test used to assert the opposite, that ``run`` exits immediately
+    under a zero cap. That early return was F13: the probe is spawned
+    once per instance in the lifespan and a reload pushes new caps into
+    the gate without touching it, so a probe that returned at boot made
+    every later cap unenforceable forever. The loop now lives for the
+    process lifetime and re-reads the cap per tick; only the ``os.walk``
+    is skipped, because the observation's one consumer short-circuits on
+    ``max_disk_bytes > 0`` before reading it.
+
+    Success: ``run`` does NOT return on its own (it has to be stopped),
+    and the gate's observation is still its initial zero because no walk
+    ran. The reload leg is covered by
+    ``test_disk_pressure_probe_reload.py``.
+    """
     import asyncio
 
     instance = await _build(tmp_path, max_disk_bytes=0)
     probe = DiskPressureProbe(instance=instance, poll_interval_seconds=60.0)
     stop_event = asyncio.Event()
-    # run() should exit immediately when max_disk_bytes <= 0.
-    await asyncio.wait_for(probe.run(stop_event), timeout=1.0)
-    # Gate's disk_usage_bytes stays at its initial zero.
-    assert instance.saturation.disk_usage_bytes == 0
+    task = asyncio.create_task(probe.run(stop_event))
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=_ZERO_CAP_LIVENESS_SECONDS)
+        assert instance.saturation.disk_usage_bytes == 0
+    finally:
+        stop_event.set()
+        await task
