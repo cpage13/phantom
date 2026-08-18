@@ -92,6 +92,12 @@ from phantom.storage import (
     SqliteUploadStore,
 )
 from phantom.storage.credential_store import SqliteCredentialStore
+
+# The private name crosses a module boundary deliberately (Q10): the helper is
+# private to the durability mechanism, not to the module, and the repo already
+# does this with _DEFAULT_BUSY_TIMEOUT_MS across three storage modules. The
+# import cannot cycle: file_body_store imports NOTHING from phantom.
+from phantom.storage.file_body_store import _makedirs_durable
 from phantom.storage.integrity import (
     isolate_db_file,
     quarantine,
@@ -271,6 +277,10 @@ def _ensure_data_root_writable(data_root: Path) -> None:
     failure that nonetheless left a writable directory) is the original error re-raised,
     so a real fault is never silently degraded.
 
+    The directory is created DURABLY: the ancestor chain this call creates has
+    each new entry's parent fsynced, so the data root survives a power cut on
+    the very first boot of a new instance (Q10).
+
     Args:
         data_root: The per-instance data directory to create.
 
@@ -281,7 +291,21 @@ def _ensure_data_root_writable(data_root: Path) -> None:
             :class:`DegradedInstance`, builds no context).
     """
     try:
-        data_root.mkdir(parents=True, exist_ok=True)
+        # DURABLY (Q10). F10 made every directory level BELOW this one durable
+        # and deliberately stopped here, because the body store's contract
+        # begins at its own root. The data root's own entry in its parent was
+        # left unfsynced by everyone, so a power cut between this mkdir and
+        # the first fsync beneath it could leave a brand-new instance booting
+        # into a directory that is not there. The window is first-boot only:
+        # every later boot finds the directory already present, and the helper
+        # then fsyncs nothing.
+        #
+        # The boundary is COMPUTED rather than assumed, because parents=True
+        # may create several levels: <storage.data_dir> itself can be absent
+        # on a first boot, and the deepest EXISTING ancestor is exactly what
+        # the helper documents as its boundary argument.
+        boundary = next(p for p in data_root.parents if p.exists())
+        _makedirs_durable(data_root, boundary)
     except OSError as mkdir_error:
         # A non-directory at the path, or an unwritable parent: PROBE to classify.
         # The probe is the signal, not the exception type, but if the probe somehow

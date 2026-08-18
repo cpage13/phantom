@@ -67,6 +67,8 @@ from phantom.storage.integrity import list_quarantines
 from phantom.storage.sqlite_store import SqliteUploadStore
 from phantom.storage.token_cache import SqliteTokenCache
 
+from phantom import app as app_module
+
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
@@ -853,7 +855,7 @@ async def test_data_root_prep_mkdir_failure_over_writable_dir_does_not_degrade(
     fault behind a "storage unavailable" boot.
 
     Drives it by pre-creating a writable ``data_root`` (so the probe succeeds) and
-    patching ``Path.mkdir`` to raise an ``OSError`` for THAT path only. The error
+    patching the durable-makedirs helper to raise an ``OSError`` for THAT path only. The error
     must propagate out of the lifespan (a crash, the honest outcome for an
     unclassified fault), and the instance must NOT be recorded degraded.
 
@@ -867,18 +869,21 @@ async def test_data_root_prep_mkdir_failure_over_writable_dir_does_not_degrade(
     instance_root.mkdir(parents=True)
 
     sentinel_message = "transient mkdir glitch over a writable substrate"
-    real_mkdir = Path.mkdir
+    real_makedirs_durable = app_module._makedirs_durable
 
-    def _mkdir_raising_for_instance_root(
-        self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
-    ) -> None:
-        # Only the per-instance data_root prep raises; every other boot mkdir
-        # (bodies/, shard dirs, ...) delegates to the real implementation.
-        if self == instance_root:
+    def _makedirs_raising_for_instance_root(leaf: Path, boundary: Path) -> None:
+        # Only the per-instance data_root prep raises; every other durable
+        # makedirs (bodies/, shard dirs, ...) delegates to the real one.
+        #
+        # Q10 moved the seam: the helper creates the data root durably now,
+        # so the injection targets the name app.py calls rather than
+        # ``Path.mkdir``, which ``os.makedirs`` does not route through. The
+        # objective is unchanged.
+        if leaf == instance_root:
             raise OSError(sentinel_message)
-        real_mkdir(self, mode, parents=parents, exist_ok=exist_ok)
+        real_makedirs_durable(leaf, boundary)
 
-    monkeypatch.setattr(Path, "mkdir", _mkdir_raising_for_instance_root)
+    monkeypatch.setattr(app_module, "_makedirs_durable", _makedirs_raising_for_instance_root)
 
     app = create_app(_settings(data_root=tmp_path))
     # The unclassified fault must propagate (crash), not be swallowed into a degrade.
