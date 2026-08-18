@@ -65,7 +65,7 @@ from phantom.runtime.lock_retry import (
     retry_on_transient_lock,
 )
 from phantom.storage.interface import TERMINAL_STATES
-from phantom.workers.saturation import SaturationGate, row_holds_slot
+from phantom.workers.saturation import SaturationGate, is_deliverable, row_holds_slot
 
 if TYPE_CHECKING:
     from phantom.storage.interface import BodyStore, UploadStore
@@ -226,10 +226,9 @@ async def run_recovery(
             # terminal (still deliverable — its body MUST be present), so it
             # falls through to the body-existence check below, as intended.
             continue
-        if row.body_discarded_at is not None:
-            # H4 carve-out (auth_expired bodies were intentionally
-            # discarded by the reaper; missing body files there are
-            # not a corruption signal).
+        if not is_deliverable(row):
+            # H4 carve-out: a missing body file here is not a corruption
+            # signal, because the reaper meant to drop these bytes.
             continue
         if not row.body_hashes:
             continue

@@ -43,6 +43,7 @@ from phantom.observability.metrics import MetricsRegistry
 from phantom.storage.file_body_store import FileBodyStore
 from phantom.storage.ram_body_store import RamBodyStore
 from phantom.storage.sqlite_store import SqliteUploadStore
+from phantom.workers.saturation import is_deliverable
 
 logger = logging.getLogger(__name__)
 
@@ -224,10 +225,12 @@ class PersistController:
         4. ``ram.delete`` — release RAM bytes.
         """
         row = await self._store.get(chain_id)
-        if row is None or row.body_discarded_at is not None:
-            # H4 carve-out (R7-2): the body was discarded by retention
-            # policy (or the row is gone). Nothing to migrate; migrating
-            # would resurrect bytes the operator's window dropped.
+        if row is None or not is_deliverable(row):
+            # H4 carve-out (R7-2): migrating a discarded body would
+            # resurrect bytes the operator's window dropped. The ``row is
+            # None`` disjunct is a DIFFERENT question (this caller does its
+            # own fresh ``get``, so the row can have vanished) and stays
+            # visibly separate from the predicate.
             logger.info(
                 "PersistController skipping chain_id=%s: row %s",
                 chain_id,

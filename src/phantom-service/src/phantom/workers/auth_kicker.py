@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from phantom.instances.context import InstanceContext
 from phantom.workers._expire import expire_row
 from phantom.workers._kicker_auth_mode import row_resolved_route
-from phantom.workers.saturation import AdmissionGranted
+from phantom.workers.saturation import AdmissionGranted, is_deliverable
 
 logger = logging.getLogger(__name__)
 
@@ -99,16 +99,9 @@ class AuthKicker:
         for row in rows:
             if row.state != "auth_expired":
                 continue
-            if row.body_discarded_at is not None:
-                # H4 carve-out (R6-3): the reaper discarded this row's
-                # body by retention policy; nothing is left to deliver.
-                # Re-queueing would land the row in ``corrupted`` on the
-                # sender's next claim (BodyMissingError), turning a
-                # policy-aged record into a false storage-fault
-                # diagnostic, and would burn a saturation slot. Mirror
-                # ``replay``'s up-front refusal: leave the row parked in
-                # ``auth_expired`` until the metadata-retention pass
-                # reaps it.
+            if not is_deliverable(row):
+                # H4 carve-out (R6-3); see ``is_deliverable`` for what the
+                # stamp means. Leave the row parked in ``auth_expired``.
                 continue
             # auth_mode GUARD (plan §2.5): with the CredentialKicker live, both
             # kickers walk the SAME auth_expired rows on the SAME saturation

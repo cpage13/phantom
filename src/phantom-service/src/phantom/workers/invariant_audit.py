@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING
 
 from phantom.observability.metrics import MetricsRegistry
 from phantom.storage.interface import TERMINAL_STATES
+from phantom.workers.saturation import is_deliverable
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -197,9 +198,9 @@ class InvariantAuditor:
             # deliverable; its body MUST be present) so it is still audited.
             if row.state in TERMINAL_STATES:
                 continue
-            # H4 carve-out: discarded bodies legitimately have no
-            # body-store presence (auth_expired retention path).
-            if row.body_discarded_at is not None:
+            # H4 carve-out: a legitimately absent body, so there is no
+            # invariant to check (auth_expired retention path).
+            if not is_deliverable(row):
                 continue
             # Invariant #1 + #3 checks per body_hash entry.
             present_names: set[str] = set()

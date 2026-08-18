@@ -1,4 +1,12 @@
-"""SaturationGate — counter cache consulted synchronously by ingress."""
+"""SaturationGate: a counter cache consulted synchronously by ingress.
+
+Also the home of the two shared row predicates, which are the same kind of
+thing: one statement each about what a row's persisted fields MEAN, consulted
+by every worker that walks rows. :func:`row_holds_slot` answers "does this row
+currently charge the gate", and :func:`is_deliverable` answers "does this row
+still have bytes to send" (the H4 carve-out). Both live here so no caller
+re-derives them by hand.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +17,7 @@ from datetime import datetime
 from typing import Final
 
 from phantom.config.settings import SaturationCfg
+from phantom.models.upload import UploadRow
 from phantom.observability.metrics import MetricsRegistry
 
 logger = logging.getLogger(__name__)
@@ -50,6 +59,33 @@ def row_holds_slot(state: str, body_discarded_at: datetime | None) -> bool:
     if state not in SLOT_HOLDING_STATES:
         return False
     return not (state == "stored" and body_discarded_at is not None)
+
+
+def is_deliverable(row: UploadRow) -> bool:
+    """Return True when the row still has bytes to send.
+
+    The H4 carve-out (R6-3) stated once. A stamped ``body_discarded_at``
+    means the reaper discarded this row's body by retention policy, so
+    nothing is left to deliver: re-queueing the row would land it in
+    ``corrupted`` on the sender's next claim (BodyMissingError), turning
+    a policy-aged record into a false storage-fault diagnostic, and
+    would burn a saturation slot on a row that can never succeed. Both
+    kicker wake paths mirror ``replay``'s up-front refusal and leave
+    such a row parked until the metadata-retention pass reaps it.
+
+    The five row-walk callers ask the same question for different
+    reasons (a wake, a recovery judgement, an audit, a migration), so
+    each keeps its own one-line reason at the call site; what is shared,
+    and lives here, is what the stamp MEANS.
+
+    Args:
+        row: The row being considered for delivery-shaped work.
+
+    Returns:
+        ``True`` when the body is still present as far as the row's own
+        metadata is concerned; ``False`` once the discard stamp is set.
+    """
+    return row.body_discarded_at is None
 
 
 @dataclass(frozen=True)
