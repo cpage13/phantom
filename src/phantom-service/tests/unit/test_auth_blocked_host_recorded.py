@@ -1,4 +1,4 @@
-"""F6 via D2 — the park records the credential that actually failed.
+"""F6 via D2: the park records the credential that actually failed.
 
 The executor keys auth on the CURRENT step's host; the kickers keyed their wake
 probe on ``row.endpoint``, the FIRST step's host, captured once at admission.

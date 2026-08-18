@@ -1,4 +1,4 @@
-"""N3 — a raw-intake object key containing braces is delivered, not failed.
+"""N3: a raw-intake object key containing braces is delivered, not failed.
 
 Object keys are arbitrary bytes, and the catch-all deliberately puts the
 bucket and key ONLY into the synthesized step's URL, because ``ChainStep.name``

@@ -1,4 +1,4 @@
-"""F12 — replay is deliberately not idempotent, and the endpoint says so.
+"""F12: replay is deliberately not idempotent, and the endpoint says so.
 
 Replay means "deliver this again", so a second call is a second instruction
 rather than a repeat of the first. The CAS re-queues from seven states

@@ -1,4 +1,4 @@
-"""F11 via D3 — a raw SigV4 intake creates no bearer token slot.
+"""F11 via D3: a raw SigV4 intake creates no bearer token slot.
 
 Raw intake passes the client's ``Authorization`` header into the shared
 admission prelude, which wrote it into the BEARER token cache with no

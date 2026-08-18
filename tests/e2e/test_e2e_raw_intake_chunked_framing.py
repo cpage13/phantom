@@ -1,4 +1,4 @@
-"""F9 gate — a chunked raw upload is delivered instead of wedged.
+"""F9 gate: a chunked raw upload is delivered instead of wedged.
 
 uvicorn de-frames a chunked request body before the handler sees it, but it
 still exposes the raw ``Transfer-Encoding`` header. The catch-all's strip set

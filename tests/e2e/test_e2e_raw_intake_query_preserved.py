@@ -1,4 +1,4 @@
-"""F4 gate — a query-addressed raw upload keeps its query to the upstream.
+"""F4 gate: a query-addressed raw upload keeps its query to the upstream.
 
 Before F4 both destination carriers dropped the inbound query string, so a
 stock ``PUT /bucket/key?partNumber=3&uploadId=ABC`` reached the upstream as a
