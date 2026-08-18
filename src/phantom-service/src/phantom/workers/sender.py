@@ -42,6 +42,7 @@ from phantom.chain.executor import (
     CaptureExpiredStored,
     CaptureIncomplete,
     CaptureNotRenderable,
+    ChainStepIndexError,
     Failed4xx,
     Failed5xx,
     FailedAuth,
@@ -267,9 +268,16 @@ class Sender:
         return decoded
 
     async def _drive_one(self, store: UploadStore, row: UploadRow) -> None:
-        """Drive one claimed row through one step."""
+        """Drive one claimed row through one step.
+
+        The ``try`` spans the body load AND the executor call, because Q2's
+        ``ChainStepIndexError`` is raised inside the latter. Each arm catches
+        exactly one type, so no other failure inside either call changes
+        behaviour; everything else still propagates to ``_worker_loop``.
+        """
         try:
             body_refs = await self._load_body_refs(row)
+            result = await self._instance.executor.execute_one_step(row, body_refs)
         except StorageCorruptionError as exc:
             await self._on_corrupted(store, row, error_code="storage_corruption", detail=str(exc))
             return
@@ -292,7 +300,22 @@ class Sender:
                 detail=f"body_missing_in_sender:{exc.missing}",
             )
             return
-        result = await self._instance.executor.execute_one_step(row, body_refs)
+        except ChainStepIndexError as exc:
+            # Q2. The row's persisted index disagrees with its persisted
+            # envelope, which is row-level data inconsistency and goes to
+            # ADR-014's corrupted path like the two hash failures above. The
+            # try widened to span execute_one_step for this arm alone, and the
+            # catch is bounded by the exception TYPE: a bare ``except
+            # ValueError`` here would be wrong, because ``resolve_route``
+            # raises one too and F1 gives that its own classification
+            # (``RouteUnresolved``, a result variant that PARKS the row).
+            await self._on_corrupted(
+                store,
+                row,
+                error_code="storage_corruption",
+                detail=f"step_index_out_of_range:{exc}",
+            )
+            return
 
         if isinstance(result, Succeeded):
             await self._on_succeeded(store, row, result)

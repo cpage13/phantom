@@ -448,6 +448,29 @@ ExecuteStepResult = (
 )
 
 
+class ChainStepIndexError(Exception):
+    """``current_step_index`` points past the end of the persisted chain.
+
+    An EXCEPTION rather than an ``ExecuteStepResult`` member, deliberately
+    (Q2). The state is unreachable through every writer of that column:
+    admission writes 0, the sender's advance arm writes an index the executor
+    already bounded with ``chain_done = step_index + 1 >= len(steps)``, the
+    rewind arm writes a real ``enumerate`` index over the step list, and every
+    other caller passes ``None``, which the store COALESCEs to the existing
+    value. Adding a union member would cost a union entry, a sender arm, a
+    facade export and a transition for a state that cannot occur.
+
+    What it must NOT do is escape. ``_drive_one``'s caller re-raises anything
+    that is not a transient lock error, so an unclassified raise here escapes
+    the worker TaskGroup and kills the process; recovery then resets the row to
+    ``queued`` and the next claim crashes again. That is F1's crash-loop shape,
+    which is why an unreachable line still gets a guard. The sender catches
+    this type alone and routes the row to ``corrupted``: the row's persisted
+    index disagrees with its persisted envelope, which is row-level data
+    inconsistency, and ADR-014's corrupted path is where those go.
+    """
+
+
 class ChainExecutor:
     """The primitive turning a :class:`ChainEnvelope` into upstream HTTP calls."""
 
@@ -508,11 +531,18 @@ class ChainExecutor:
 
         Returns:
             One member of the :data:`ExecuteStepResult` union.
+
+        Raises:
+            ChainStepIndexError: When the row's persisted
+                ``current_step_index`` points past the end of its persisted
+                envelope. Unreachable through any writer of that column; the
+                sender catches it and routes the row to ``corrupted`` so an
+                impossible state cannot crash-loop the process (Q2).
         """
         envelope = envelope_from_persistence_json(row.chain_envelope_json)
         step_index = row.current_step_index
         if step_index >= len(envelope.steps):
-            raise ValueError(
+            raise ChainStepIndexError(
                 f"current_step_index {step_index} past end of chain (steps={len(envelope.steps)})",
             )
         step = envelope.steps[step_index]
