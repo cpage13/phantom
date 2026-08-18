@@ -92,6 +92,15 @@ CREATE INDEX IF NOT EXISTS idx_uploads_instance
 CREATE INDEX IF NOT EXISTS idx_uploads_updated_at
     ON uploads(updated_at);
 
+-- Serves the reaper's three retention predicates, all of the shape
+-- `state = ? AND updated_at < ?`: the body-discard pass
+-- (list_terminal_older_than), the metadata-deletion pass
+-- (delete_terminal_older_than) and the count-cap eviction. Without it
+-- idx_uploads_state_next_attempt seeks the state equality and then filters
+-- updated_at row by row, because updated_at is not that index's second column.
+CREATE INDEX IF NOT EXISTS idx_uploads_state_updated_at
+    ON uploads(state, updated_at);
+
 CREATE INDEX IF NOT EXISTS idx_uploads_body_location
     ON uploads(body_location);
 

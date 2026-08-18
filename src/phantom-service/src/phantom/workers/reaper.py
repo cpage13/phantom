@@ -197,8 +197,8 @@ class Reaper:
             # release, and crash posture.
             if body_seconds >= 0:
                 cutoff = now - timedelta(seconds=body_seconds)
-                rows_to_discard = await store.list_terminal_older_than(state, cutoff)
-                for row in rows_to_discard:
+                chain_ids_to_discard = await store.list_terminal_older_than(state, cutoff)
+                for chain_id in chain_ids_to_discard:
                     # R9-5 confirm-then-act: stamp FIRST, atomically
                     # guarded on the swept state + an unstamped row. A
                     # replay or kicker wake that revived the row between
@@ -212,7 +212,7 @@ class Reaper:
                     # metadata pass and the orphan janitor converge
                     # (bounded, self-healing).
                     outcome = await store.discard_body_and_zero_accounting(
-                        row.chain_id, expected_state=state
+                        chain_id, expected_state=state
                     )
                     if not outcome.flipped:
                         continue
@@ -226,7 +226,7 @@ class Reaper:
                     await instance.saturation.settle(
                         SlotDelta.from_discard(outcome, size_bytes=outcome.body_size_bytes)
                     )
-                    await body_store.delete(row.chain_id)
+                    await body_store.delete(chain_id)
                     await self._reaper_actions_total.inc(label_value=_REAPER_ACTION_BODY_DISCARDED)
             # Metadata-row deletion pass.
             if metadata_seconds >= 0:

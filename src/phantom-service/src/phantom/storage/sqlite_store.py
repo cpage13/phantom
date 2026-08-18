@@ -2140,12 +2140,20 @@ class SqliteUploadStore:
         self,
         state: UploadState,
         cutoff: datetime,
-    ) -> list[UploadRow]:
-        """Reaper helper — list rows whose body should be discarded."""
+    ) -> list[UUID]:
+        """Reaper helper — list the chain_ids whose body should be discarded.
+
+        A chain_id-only projection (U12), the same shape
+        :meth:`list_all_chain_ids` already returns: the consuming loop reads
+        one field off each result and the discard re-reads the row it needs
+        inside its own transaction, so materialising strict rows here bought
+        nothing. ``idx_uploads_state_updated_at`` turns the predicate from a
+        state-only seek into a range seek.
+        """
         conn = self._read_connection()
         async with conn.execute(
             """
-            SELECT * FROM uploads
+            SELECT chain_id FROM uploads
              WHERE state = ?
                AND body_discarded_at IS NULL
                AND updated_at < ?
@@ -2153,7 +2161,7 @@ class SqliteUploadStore:
             (state, cutoff.isoformat()),
         ) as cur:
             fetched = await cur.fetchall()
-        return [_row_to_upload(r) for r in fetched]
+        return [UUID(r["chain_id"]) for r in fetched]
 
     async def evict_terminal_over_limit(self, max_rows: int) -> list[DeletedRowAccounting]:
         """Reaper helper (V3) — count-cap backstop on the ``uploads`` table.

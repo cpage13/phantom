@@ -804,14 +804,20 @@ class UploadStore(Protocol):
         self,
         state: UploadState,
         cutoff: datetime,
-    ) -> list[UploadRow]:
-        """Return terminal rows in ``state`` whose ``updated_at`` < ``cutoff``.
+    ) -> list[UUID]:
+        """Return the chain_ids in ``state`` whose ``updated_at`` < ``cutoff``.
 
         Reaper helper (plan § 2.3.16) — called for the body-discard
-        pass: every row returned has its body deleted and is then
+        pass: every chain_id returned has its body deleted and is then
         marked ``body_discarded_at`` via :meth:`discard_body`. Filters
         on ``body_discarded_at IS NULL`` so already-discarded rows do
         not re-enter the pass.
+
+        Chain_ids rather than rows (U12): the pass reads no other field, and
+        :meth:`discard_body_and_zero_accounting` captures its own
+        in-transaction pre-image, so a strict row per candidate was decoded
+        and thrown away. Its sibling
+        :meth:`delete_terminal_older_than` already projects this way.
         """
         ...
 

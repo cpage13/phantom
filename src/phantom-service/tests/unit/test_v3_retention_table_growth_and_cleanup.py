@@ -312,9 +312,9 @@ async def test_reap_cleans_all_associated_state(tmp_path: Path) -> None:
 
         # Reap exactly as Reaper._sweep_instance does.
         cutoff = datetime.now(tz=UTC)
-        for row in await st.store.list_terminal_older_than("failed", cutoff):
-            await st.body_store.delete(row.chain_id)
-            await st.store.discard_body_and_zero_accounting(row.chain_id, expected_state="failed")
+        for chain_id in await st.store.list_terminal_older_than("failed", cutoff):
+            await st.body_store.delete(chain_id)
+            await st.store.discard_body_and_zero_accounting(chain_id, expected_state="failed")
         await st.store.delete_terminal_older_than("failed", cutoff)
         await st.store.cleanup_idempotency_index()
 
