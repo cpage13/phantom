@@ -11,6 +11,15 @@ from phantom.instances.context import InstanceContext
 
 logger = logging.getLogger(__name__)
 
+# How often the scheduler wakes to compare the clock against ``vacuum_cron``.
+# The cron expression's finest granularity is one minute, so any period
+# comfortably below 60 s samples every matching minute exactly once; 30 s is
+# the same value ``disk_pressure`` uses for its probe and keeps shutdown
+# latency at most one period. NOT a knob: nothing about a deployment changes
+# the right sampling rate for a one-minute grid, and ``vacuum_cron`` answers a
+# different question (WHEN a VACUUM fires, not how often the loop checks).
+_POLL_INTERVAL_SECONDS = 30
+
 
 def _parse_cron(spec: str) -> tuple[int | None, int | None, int | None, int | None, int | None]:
     """Parse a minimal cron string ``m h dom mon dow`` (each ``*`` or int).
@@ -66,11 +75,14 @@ class VacuumScheduler:
         self._last_run_minute: tuple[int, int, int, int, int] | None = None
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        """Tick every ~30s; fire VACUUM when the cron matches and saturation=0."""
+        """Tick every ``_POLL_INTERVAL_SECONDS``; fire VACUUM when the cron matches.
+
+        The VACUUM fires only on a matching cron minute with saturation=0.
+        """
         while not stop_event.is_set():
             await self._tick(self._clock())
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=30)
+                await asyncio.wait_for(stop_event.wait(), timeout=_POLL_INTERVAL_SECONDS)
             except TimeoutError:
                 continue
 
