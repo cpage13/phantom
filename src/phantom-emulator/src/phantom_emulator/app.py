@@ -96,6 +96,7 @@ def create_app(cfg: AppConfig, state: EmulatorState | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        """Log the startup banner once, then serve for the process's lifetime."""
         logger.info(_STARTUP_BANNER)
         yield
 

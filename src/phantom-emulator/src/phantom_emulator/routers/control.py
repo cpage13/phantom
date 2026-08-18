@@ -170,6 +170,7 @@ async def shutdown(
     """
 
     def _terminate() -> None:
+        """Send SIGTERM to this process, after the response has been returned."""
         logger.info("shutdown: SIGTERM to self")
         os.kill(os.getpid(), signal.SIGTERM)
 

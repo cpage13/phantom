@@ -360,6 +360,7 @@ def _parse_grouping_headers(
     """
 
     def _uuid_header(name: str) -> UUID | None:
+        """Parse one optional UUID header, raising ``header_invalid`` on a bad value."""
         raw = headers.get(name)
         if raw is None:
             return None

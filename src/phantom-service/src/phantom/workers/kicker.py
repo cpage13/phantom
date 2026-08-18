@@ -117,6 +117,7 @@ class TokenCacheOracle:
         """Register on the cache's wake hook, discarding the written slot's identity."""
 
         async def _handler(endpoint: str, uid: str) -> None:
+            """Wake the kicker on any cache write, ignoring which slot moved."""
             del endpoint, uid  # The scan matches against current cache state.
             await on_write()
 
@@ -151,6 +152,7 @@ class CredentialStoreOracle:
             return
 
         async def _handler(dest_host: HostCredKey) -> None:
+            """Wake the kicker on any credential write, ignoring which host moved."""
             del dest_host  # The scan matches against current store state.
             await on_write()
 

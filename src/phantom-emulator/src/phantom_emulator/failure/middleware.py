@@ -198,6 +198,7 @@ async def _apply_response_modifiers(
         logger.info("failure_inject: slow_trickle at %d B/s", rate)
 
         async def _trickle() -> AsyncIterator[bytes]:
+            """Yield the drained body in timed chunks at the policy's byte rate."""
             yield_chunk_bytes = max(1, rate // 10)
             chunk_delay = yield_chunk_bytes / rate
             offset = 0
@@ -267,6 +268,7 @@ def make_failure_middleware(
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
+        """Apply the path's configured failure policy around the downstream call."""
         path = request.url.path
         scope = _scope_for_path(path)
 

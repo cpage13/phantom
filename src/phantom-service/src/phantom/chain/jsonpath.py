@@ -133,6 +133,7 @@ def substitute(template: str, values: dict[str, dict[str, Any]]) -> tuple[str, b
     resolved = True
 
     def _replace(m: re.Match[str]) -> str:
+        """Return the captured value for one placeholder, or the placeholder itself."""
         nonlocal resolved
         step, name = m.group(1), m.group(2)
         step_values = values.get(step)

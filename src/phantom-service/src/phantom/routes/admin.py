@@ -919,6 +919,7 @@ def _chunk_bytes(data: bytes) -> AsyncIterator[bytes]:
     """Yield ``data`` once for streaming-friendly emission."""
 
     async def gen() -> AsyncIterator[bytes]:
+        """Yield the whole payload as a single chunk."""
         yield data
 
     return gen()

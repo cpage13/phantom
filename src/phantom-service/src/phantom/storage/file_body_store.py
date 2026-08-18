@@ -376,6 +376,7 @@ class FileBodyStore:
         upload_dir = self._path_for(chain_id)
 
         def _read_all() -> dict[str, bytes]:
+            """Read every body file in the upload directory, off the event loop."""
             result: dict[str, bytes] = {}
             try:
                 entries = list(upload_dir.iterdir())
@@ -454,6 +455,7 @@ class FileBodyStore:
         """Return every chain_id that has at least one body_ref on disk."""
 
         def _scan() -> list[UUID]:
+            """Walk the shard directories and collect every chain_id with bodies."""
             chain_ids: list[UUID] = []
             for shard in self._root.iterdir():
                 if not shard.is_dir() or shard.name.startswith("."):

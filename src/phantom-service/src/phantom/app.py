@@ -907,6 +907,7 @@ async def _build_instance_context(
     # isolate_db_file (m-4) - the coupled quarantine(...) would move the
     # upload body tree, which is wrong for it.
     def _open_upload_store() -> Awaitable[SqliteUploadStore]:
+        """Build and start a FRESH upload store, so a retry never reuses a half-open one."""
         fresh = SqliteUploadStore(
             str(db_path),
             sqlite_cfg=sqlite_cfg,
@@ -915,10 +916,12 @@ async def _build_instance_context(
         return _started(fresh)
 
     def _open_token_cache() -> Awaitable[SqliteTokenCache]:
+        """Build and start a FRESH token cache, so a retry never reuses a half-open one."""
         fresh = SqliteTokenCache(str(token_cache_db_path), sqlite_cfg=sqlite_cfg)
         return _started(fresh)
 
     def _open_credential_store() -> Awaitable[SqliteCredentialStore]:
+        """Build and start a FRESH credential store, so a retry never reuses a half-open one."""
         fresh = SqliteCredentialStore(str(credential_store_db_path), sqlite_cfg=sqlite_cfg)
         return _started(fresh)
 
@@ -1087,9 +1090,11 @@ async def _build_instance_context(
     instance_id = cfg.id
 
     def current_settings_thunk() -> InstanceSettingsSnapshot:
+        """Return this instance's LIVE settings snapshot, re-read per call."""
         return settings_holder.snapshot_for(instance_id)
 
     def codec_factory() -> BodyCodec:
+        """Build the body codec named by the LIVE compression settings."""
         # Selects from the LIVE settings snapshot per call so a hot
         # reload of compression.algorithm / compression.level applies
         # to the next admission (ADR-013; round 5 fix R5-2). The
@@ -1273,6 +1278,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """Run the boot guards, build every instance context, serve, then shut down."""
         # This lifespan is attached to the single ``app`` (assigned below,
         # before this coroutine ever runs); the closure references that
         # named ``app`` to wire its dependency overrides, so ``_app`` itself

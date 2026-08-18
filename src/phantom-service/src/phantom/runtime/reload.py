@@ -177,6 +177,7 @@ def make_sighup_handler(
     in_flight: dict[int, asyncio.Task[None]] = {}
 
     def _handler() -> None:
+        """Schedule one SIGHUP reload task and track it until it finishes."""
         loop = asyncio.get_running_loop()
         task = loop.create_task(_sighup_reload(holder, settings_path, instances))
         in_flight[id(task)] = task

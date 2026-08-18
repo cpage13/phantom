@@ -132,6 +132,7 @@ class _AuthorizationRedactor(logging.Filter):
         return True
 
     def _redact(self, value: object) -> object:
+        """Return ``value`` with every Authorization entry and bearer string masked."""
         if isinstance(value, dict):
             return {
                 k: (self._MASK if k.lower() == "authorization" else self._redact(v))
@@ -144,6 +145,7 @@ class _AuthorizationRedactor(logging.Filter):
         return value
 
     def _redact_str(self, value: str) -> str:
+        """Return ``value`` with any ``Bearer <token>`` sequence replaced by the mask."""
         # Best-effort: replace "Bearer <token>" sequences. This catches both
         # explicit string-formatted records and stringified dicts.
         lower = value.lower()
