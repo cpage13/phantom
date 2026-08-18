@@ -1,4 +1,4 @@
-"""ExponentialBackoffStrategy — base * factor**attempts capped + jittered."""
+"""ExponentialBackoffStrategy - base * factor**attempts capped + jittered."""
 
 from __future__ import annotations
 

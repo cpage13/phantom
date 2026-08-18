@@ -1,7 +1,7 @@
 """Admin endpoint request/response shapes.
 
 Every admin endpoint emits one of these Pydantic models. Bearer tokens
-never appear in any of these models (ADR-004) — :class:`TokenSlot`
+never appear in any of these models (ADR-004) - :class:`TokenSlot`
 deliberately has no ``bearer`` field.
 
 See plan §5.4 for the canonical surface.
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # HTTP methods Phantom accepts inside an envelope step. Pinned here so
 # the admin projection (``ChainAdminDetail.project_from_envelope``) and
 # the strict-Literal on ``ChainAdminStepDetail.method`` stay in lockstep
-# — if a future ChainStep ever grows a new method, both update here.
+# - if a future ChainStep ever grows a new method, both update here.
 _ALLOWED_METHODS: frozenset[str] = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 
 
@@ -77,7 +77,7 @@ class ChainAdminStepDetail(BaseModel):
 
 
 class ChainAdminDetail(BaseModel):
-    """Admin-only chain detail — extends ChainResponse with inspection fields.
+    """Admin-only chain detail - extends ChainResponse with inspection fields.
 
     Returned only by ``GET /v1/admin/chains/{chain_id}``. Loopback per
     ADR-004. The wire-facing :class:`ChainResponse` stays unchanged;
@@ -100,7 +100,7 @@ class ChainAdminDetail(BaseModel):
     ``body_location`` discriminator. ``ram`` corresponds to bodies the
     RAM body store holds; ``file`` to bodies the file body store holds
     (PersistController flipped the column after fsync). The
-    ``committed`` durability marker is gone — atomic admission +
+    ``committed`` durability marker is gone - atomic admission +
     fsync-before-flip ordering make every persisted body durable by
     construction.
 
@@ -225,12 +225,12 @@ class ChainAdminDetail(BaseModel):
         JSON (round-tripped through Pydantic at ingress). This helper
         extracts:
 
-        - ``metadata`` — the first JSON-body step's
+        - ``metadata`` - the first JSON-body step's
           ``body.value.metadata.key_value_store`` (string-to-string) when
           present; empty dict otherwise. An upstream create-file step
           puts the KVS here; pure body-ref chains have no KVS so the
           dict is empty.
-        - ``steps`` — a :class:`ChainAdminStepDetail` per envelope step
+        - ``steps`` - a :class:`ChainAdminStepDetail` per envelope step
           preserving name/method/url/headers and exposing
           ``has_body = step.body is not None``.
 
@@ -264,7 +264,7 @@ class ChainAdminDetail(BaseModel):
         """Pull the metadata KVS out of the first JSON-bodied step.
 
         Some upstreams put the KVS on the create-file step under
-        ``body.value.metadata.keyValueStore`` — that create-file body is
+        ``body.value.metadata.keyValueStore`` - that create-file body is
         serialized with the upstream client's camelCase alias generator
         (the upstream client calls ``model_dump(by_alias=True,
         mode="json")``). For envelopes that came in already-snake-cased
@@ -304,7 +304,7 @@ class ChainAdminDetail(BaseModel):
 
         Each step's headers dict is copied (string keys, string values)
         and ``has_body`` reflects whether the step declared any body
-        discriminator. Unknown / malformed steps are skipped silently —
+        discriminator. Unknown / malformed steps are skipped silently -
         the admin projection is best-effort; the underlying row is still
         intact and recoverable.
         """
@@ -744,7 +744,7 @@ class ResolvedDefaultsSummary(BaseModel):
         description=(
             "Resolved RAM-tier body-store ceiling (post-rename from "
             "the pre-Phase-1 ``in_memory_max_bytes`` field; same "
-            "semantic — bytes cap on the RamBodyStore)."
+            "semantic - bytes cap on the RamBodyStore)."
         ),
     )
     large_body_threshold_bytes: int = Field(
@@ -842,7 +842,7 @@ class AdminStatusResponse(BaseModel):
 
 
 class ListUploadsResponse(BaseModel):
-    """``GET /v1/admin/chains`` shape — operator-detail rows + cursor."""
+    """``GET /v1/admin/chains`` shape - operator-detail rows + cursor."""
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
@@ -987,7 +987,7 @@ class TokenListResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Plan § 4.2.5 — Observability admin response models.
+# Plan § 4.2.5 - Observability admin response models.
 # ---------------------------------------------------------------------------
 
 
@@ -1072,7 +1072,7 @@ class RamPressureStatusResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Phase 4 § 5.2.5 — Quarantine inventory admin endpoint.
+# Phase 4 § 5.2.5 - Quarantine inventory admin endpoint.
 # ---------------------------------------------------------------------------
 
 

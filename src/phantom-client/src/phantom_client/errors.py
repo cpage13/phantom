@@ -2,17 +2,17 @@
 
 The SDK distinguishes three kinds of failure:
 
-- :class:`PhantomTransportError` and its subclasses — connect refused,
+- :class:`PhantomTransportError` and its subclasses - connect refused,
   read timeout, network drop. **Retry-eligible**: the SDK retries these
   per :class:`phantom_client.config.RetryPolicy`. Phantom never saw the
   request, so the SDK is safe to repeat.
-- :class:`PhantomHttpError` and its subclasses — Phantom returned a
+- :class:`PhantomHttpError` and its subclasses - Phantom returned a
   non-2xx with a structured ``ErrorEnvelope`` body. **Not** retry-
   eligible: Phantom is the retry engine, so doubling up muddies
   idempotency. The SDK surfaces the typed exception and the caller
   decides.
 - SDK-side validation errors (envelope didn't parse, pre-flight check
-  failed) — :class:`PhantomEnvelopeError`, :class:`PollDeadlineExceeded`,
+  failed) - :class:`PhantomEnvelopeError`, :class:`PollDeadlineExceeded`,
   :class:`EmptyFilterError`.
 
 Every ADR-010 ``error.code`` string maps to a typed exception class via
@@ -68,7 +68,7 @@ class PhantomNetworkError(PhantomTransportError):
 
 
 # ---------------------------------------------------------------------------
-# HTTP-class — Phantom returned a non-2xx with an ErrorEnvelope.
+# HTTP-class - Phantom returned a non-2xx with an ErrorEnvelope.
 # ---------------------------------------------------------------------------
 
 
@@ -112,43 +112,43 @@ class PhantomHttpError(PhantomClientError):
 
 
 class PhantomBadRequestError(PhantomHttpError):
-    """400 — malformed request envelope-level shape, invalid target."""
+    """400 - malformed request envelope-level shape, invalid target."""
 
 
 class PhantomUnauthorizedError(PhantomHttpError):
-    """401 — auth_token_missing or otherwise unauthorized."""
+    """401 - auth_token_missing or otherwise unauthorized."""
 
 
 class PhantomNotFoundError(PhantomHttpError):
-    """404 — referenced resource (upload, instance, token slot) missing."""
+    """404 - referenced resource (upload, instance, token slot) missing."""
 
 
 class PhantomConflictError(PhantomHttpError):
-    """409 — state conflict (e.g., replay a row that isn't replayable)."""
+    """409 - state conflict (e.g., replay a row that isn't replayable)."""
 
 
 class PhantomPayloadTooLargeError(PhantomHttpError):
-    """413 — declared or streamed body exceeded the server's max_buffered_bytes cap (H2)."""
+    """413 - declared or streamed body exceeded the server's max_buffered_bytes cap (H2)."""
 
 
 class PhantomUnprocessableError(PhantomHttpError):
-    """422 — semantic envelope problem (generic)."""
+    """422 - semantic envelope problem (generic)."""
 
 
 class PhantomValidationError(PhantomUnprocessableError):
-    """422 — envelope_invalid / body_ref_missing / body_ref_orphan / template_unresolved."""
+    """422 - envelope_invalid / body_ref_missing / body_ref_orphan / template_unresolved."""
 
 
 class PhantomRateLimitedError(PhantomHttpError):
-    """429 — caller rate-limited."""
+    """429 - caller rate-limited."""
 
 
 class PhantomServerError(PhantomHttpError):
-    """5xx — server-side failure not classified as a saturation cap."""
+    """5xx - server-side failure not classified as a saturation cap."""
 
 
 class PhantomUnavailableError(PhantomServerError):
-    """503 — saturation_cap or other temporarily-unavailable."""
+    """503 - saturation_cap or other temporarily-unavailable."""
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +166,7 @@ class PhantomEnvelopeError(PhantomClientError):
     """
 
 
-class PollDeadlineExceeded(PhantomClientError):  # noqa: N818 — name fixed by plan public surface
+class PollDeadlineExceeded(PhantomClientError):  # noqa: N818 - name fixed by plan public surface
     """:func:`phantom_client.poller.poll_until` exceeded its deadline."""
 
 
@@ -181,7 +181,7 @@ class EmptyFilterError(PhantomClientError):
 EXCEPTION_FOR_CODE: dict[str, type[PhantomHttpError]] = {
     "envelope_invalid": PhantomValidationError,
     # Duplicate multipart ``envelope`` part (finding R3-9, the E-1 sibling)
-    # — a malformed-input 422 in the same envelope/validation family.
+    # - a malformed-input 422 in the same envelope/validation family.
     "envelope_duplicate": PhantomValidationError,
     # A grouping/ordering request header (X-Phantom-Group-Id /
     # X-Phantom-Multifile-Id / X-Phantom-Order) was present on
@@ -190,7 +190,7 @@ EXCEPTION_FOR_CODE: dict[str, type[PhantomHttpError]] = {
     "header_invalid": PhantomBadRequestError,
     "body_ref_missing": PhantomValidationError,
     "body_ref_orphan": PhantomValidationError,
-    # Duplicate ``body_refs[<name>]`` multipart part (finding E-1) — a
+    # Duplicate ``body_refs[<name>]`` multipart part (finding E-1) - a
     # malformed-input 422 in the same family as the other body_ref codes.
     "body_ref_duplicate": PhantomValidationError,
     # 413 closure: the H2 audit fix makes the service reject oversized
@@ -205,13 +205,13 @@ EXCEPTION_FOR_CODE: dict[str, type[PhantomHttpError]] = {
     # 400: the instance cannot serve the lookup as posed; the operator
     # supplies the per-instance capture_name/json_path binding.
     "lookup_not_configured": PhantomBadRequestError,
-    # Idempotency key reused with a different body (finding G-1). 422 —
+    # Idempotency key reused with a different body (finding G-1). 422 -
     # the request is well-formed but conflicts with the prior claim under
     # the same key. A generic unprocessable (not a validation/envelope
     # problem); the caller must not retry without changing its key.
     "idempotency_key_conflict": PhantomUnprocessableError,
     # Envelope chain_id (row PK) already in use by a live row (finding
-    # D-1). 409 Conflict — distinct from the saturation/disk back-pressure
+    # D-1). 409 Conflict - distinct from the saturation/disk back-pressure
     # 503s; the producer must mint a fresh chain_id.
     "chain_id_in_use": PhantomConflictError,
     # The one-call admin restore moved nothing into the live tree (finding

@@ -1,11 +1,11 @@
-"""Sender — the load-bearing worker loop (plan §4.26).
+"""Sender - the load-bearing worker loop (plan §4.26).
 
 Per worker:
 
 1. Poll the persistent SQLite store via ``claim_due``.
 2. For each claimed row: load body_refs via the mode-selected
    :class:`BodyStore` (HybridBodyStore in hybrid mode; RamBodyStore in
-   all_ram; FileBodyStore in all_disk — the body store itself routes
+   all_ram; FileBodyStore in all_disk - the body store itself routes
    the read), decode storage encoding, call
    ``executor.execute_one_step``, classify result.
 3. Persist the attempt result via ``record_attempt_result``.
@@ -104,10 +104,10 @@ class Sender:
         self._worker_count = worker_count
         self._poll_seconds = poll_interval_ms / 1000.0
         # Metrics surface (plan § 4.2.2):
-        # * record_attempt_result_no_op_total — bumped when a state
+        # * record_attempt_result_no_op_total - bumped when a state
         #   transition UPDATE finds rowcount=0 (the M-W4-F7 race-aware
         #   path landed in Phase 2).
-        # * body_missing_total — bumped when the body store has no
+        # * body_missing_total - bumped when the body store has no
         #   bytes for a row that declared body_hashes (H8 corrupted
         #   route landed in Phase 2).
         # * route_unresolved_total: bumped when a step's host matches no
@@ -208,7 +208,7 @@ class Sender:
         """
         # A row with no declared body_hashes (e.g., a metadata-only POST
         # with no body_refs at admission) skips the body store entirely
-        # — return an empty dict immediately. The KeyError-to-corrupted
+        # - return an empty dict immediately. The KeyError-to-corrupted
         # path only applies when the row claims body files exist but
         # the body store has none.
         if not row.body_hashes:
@@ -216,13 +216,13 @@ class Sender:
         try:
             raw_refs = await self._instance.body_store.get_all(row.chain_id)
         except KeyError as exc:
-            # H8 audit closure — sender no longer silently routes a
+            # H8 audit closure - sender no longer silently routes a
             # missing body as an empty payload. Per ADR-014's runtime
             # missing-body contract, an absent body store entry for a
             # row with declared body_hashes is storage corruption, not
             # a happy-path "empty body" case. Routing the row to
             # ``corrupted`` matches the storage_hash mismatch path
-            # (StorageCorruptionError) — same _on_corrupted handler,
+            # (StorageCorruptionError) - same _on_corrupted handler,
             # same terminal transition, same last_error formatting.
             #
             # Pre-Phase-2 the empty-dict return looked identical to a
@@ -253,7 +253,7 @@ class Sender:
         for name, stored_bytes in raw_refs.items():
             hashes = row.body_hashes.get(name)
             if hashes is None:
-                # Row without hashes — cannot verify. Treat as corruption
+                # Row without hashes - cannot verify. Treat as corruption
                 # so the row terminates rather than silently propagating
                 # un-verified bytes upstream.
                 raise StorageCorruptionError(name, "<expected-hash-missing>", "<no-row-hash>")
@@ -369,14 +369,14 @@ class Sender:
             return
         if isinstance(result, (Failed5xx, FailedNetwork, CaptureIncomplete)):
             # CaptureIncomplete (finding R7-5-B): a 2xx whose body was missing a
-            # required downstream capture is RETRYABLE — the same step re-runs
+            # required downstream capture is RETRYABLE - the same step re-runs
             # (does NOT advance), so a complete body on a later attempt produces
             # the capture. Shares the retry/exhaust→stored path with 5xx/network.
             await self._on_retryable_failure(store, row, result)
             return
         # Exhaustiveness tail (ADR-032): this dispatch is a fall-through
         # ``isinstance`` chain with NO static ``assert_never`` (the executor's
-        # ``ExecuteStepResult`` union is not statically checked at THIS site —
+        # ``ExecuteStepResult`` union is not statically checked at THIS site -
         # only its ``auth_mode`` dispatch is). A result member added to the union
         # without an arm above would otherwise fall through and return ``None``
         # silently, leaving the row wedged in ``attempting`` still holding a
@@ -468,19 +468,19 @@ class Sender:
                 row,
                 write,
                 no_op_message=(
-                    "record_attempt_result no-op: chain_id=%s — "
+                    "record_attempt_result no-op: chain_id=%s - "
                     "admin cancel/replay took the row from attempting"
                 ),
             ):
                 return
-            # H4 audit closure — body-retention contract reconciliation.
+            # H4 audit closure - body-retention contract reconciliation.
             #
             # Sender deletes the body immediately ONLY when
-            # ``succeeded_body_seconds == 0`` (the default — bodies are
+            # ``succeeded_body_seconds == 0`` (the default - bodies are
             # ephemeral past success). When the operator configures a
             # non-zero ``succeeded_body_seconds`` retention window,
             # admin GET /chains/{id}/body must still surface the body
-            # for that window — so the reaper owns deletion at the
+            # for that window - so the reaper owns deletion at the
             # configured time, not the sender.
             #
             # Pre-Phase-2 behavior: sender always deleted on success.
@@ -558,7 +558,7 @@ class Sender:
                 row,
                 write,
                 no_op_message=(
-                    "record_attempt_result no-op: chain_id=%s — "
+                    "record_attempt_result no-op: chain_id=%s - "
                     "admin cancel/replay took the row from attempting (mid-chain step)"
                 ),
             )
@@ -573,7 +573,7 @@ class Sender:
     ) -> None:
         """Transition row to ``corrupted`` (terminal; no retry).
 
-        Body verification failed — either the stored bytes don't match
+        Body verification failed - either the stored bytes don't match
         the recorded ``storage_hash`` (hardware / filesystem mutation)
         or the codec round-trip drifted from the recorded ``body_hash``
         (codec library bug). The row never advances; the gate settles
@@ -595,7 +595,7 @@ class Sender:
             row,
             write,
             no_op_message=(
-                "_on_corrupted no-op: chain_id=%s — admin cancel/replay "
+                "_on_corrupted no-op: chain_id=%s - admin cancel/replay "
                 "took the row from attempting"
             ),
         )
@@ -603,7 +603,7 @@ class Sender:
     async def _on_rewind(
         self, store: UploadStore, row: UploadRow, result: CaptureExpiredRewind
     ) -> None:
-        """ADR-011 reexecute=True — rewind ``current_step_index`` and re-queue."""
+        """ADR-011 reexecute=True - rewind ``current_step_index`` and re-queue."""
         write = await store.record_attempt_result(
             row.chain_id,
             new_state="queued",
@@ -620,7 +620,7 @@ class Sender:
             row,
             write,
             no_op_message=(
-                "_on_rewind no-op: chain_id=%s — admin cancel/replay took the row from attempting"
+                "_on_rewind no-op: chain_id=%s - admin cancel/replay took the row from attempting"
             ),
         )
 
@@ -739,7 +739,7 @@ class Sender:
             row,
             write,
             no_op_message=(
-                "_on_terminal_failure no-op: chain_id=%s — admin cancel/replay "
+                "_on_terminal_failure no-op: chain_id=%s - admin cancel/replay "
                 "took the row from attempting"
             ),
         )
@@ -778,7 +778,7 @@ class Sender:
             row,
             write,
             no_op_message=(
-                "_on_auth_failure no-op: chain_id=%s — admin cancel/replay "
+                "_on_auth_failure no-op: chain_id=%s - admin cancel/replay "
                 "took the row from attempting"
             ),
         ):
@@ -841,7 +841,7 @@ class Sender:
             # finding R7-5-B: a 2xx whose body was missing a required capture.
             # The status WAS a success, but the body was incomplete; surface a
             # typed, retryable last_error naming the missing capture(s) so the
-            # operator sees the chain isn't wedged silently — it's retrying a
+            # operator sees the chain isn't wedged silently - it's retrying a
             # step whose response body arrived incomplete.
             last_error = (
                 f"capture_incomplete:{result.upstream_status}:{list(result.missing_captures)}"
@@ -885,7 +885,7 @@ class Sender:
             row,
             write,
             no_op_message=(
-                "_on_retryable_failure(queued) no-op: chain_id=%s — "
+                "_on_retryable_failure(queued) no-op: chain_id=%s - "
                 "admin cancel/replay took the row from attempting"
             ),
         ):
@@ -893,7 +893,7 @@ class Sender:
         # Retry-linger trigger (plan § 2.3.11 / § 2.3.18).
         # When the row has been in RAM longer than ``linger_seconds``
         # AND the controller is wired (hybrid mode only), enqueue the
-        # chain for RAM→disk migration. Fire-and-forget — the
+        # chain for RAM→disk migration. Fire-and-forget - the
         # controller serializes via its own queue and the next attempt
         # will read from disk via :class:`HybridBodyStore`'s fall-through.
         controller = self._instance.persist_controller

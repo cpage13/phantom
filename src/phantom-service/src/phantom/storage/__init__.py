@@ -1,4 +1,4 @@
-"""Storage package — Protocols and concrete stores."""
+"""Storage package - Protocols and concrete stores."""
 
 from __future__ import annotations
 

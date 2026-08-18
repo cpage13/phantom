@@ -1,4 +1,4 @@
-"""``python -m phantom`` entry point — uvicorn launcher (and ``--validate``).
+"""``python -m phantom`` entry point - uvicorn launcher (and ``--validate``).
 
 A Phantom process serves ONE ASGI application on ONE socket: intake
 (``POST /v1/send``), the admin surface (``/v1/admin/*``), and the public
@@ -12,7 +12,7 @@ reachability sets ``bind_tcp`` explicitly (e.g. ``0.0.0.0:8080``) and gets
 the unauthenticated-exposure warning from :func:`phantom.app.create_app`.
 
 When ``server.tls.enabled`` is set, that SAME single socket is served over
-TLS (HTTPS) instead of plaintext — ``ssl_*`` kwargs are splatted into the
+TLS (HTTPS) instead of plaintext - ``ssl_*`` kwargs are splatted into the
 existing ``uvicorn.run`` (the cert pair comes from
 :func:`phantom.runtime.tls_cert.resolve_tls_paths`); still ONE listener, not
 a second server. TLS does not change the bind, only the wire.
@@ -46,7 +46,7 @@ class _SslKwargs(TypedDict, total=False):
     """The optional ``ssl_*`` keyword arguments for ``uvicorn.run``.
 
     A ``total=False`` TypedDict (not a bare ``dict[str, str]``) so mypy matches
-    each key to ``uvicorn.run``'s correspondingly-named parameter — and so an
+    each key to ``uvicorn.run``'s correspondingly-named parameter - and so an
     EMPTY mapping (TLS off) splats to nothing, keeping the call byte-for-byte
     today's plaintext behavior. Populated only when ``server.tls.enabled``.
     """
@@ -72,7 +72,7 @@ def main() -> int:
         help=(
             "Load the config, run all Pydantic validators, print the "
             "resolved settings (or the first validation error), and exit "
-            "0/1. Does NOT bind a server — safe to run at deploy time."
+            "0/1. Does NOT bind a server - safe to run at deploy time."
         ),
     )
     args = parser.parse_args()
@@ -94,7 +94,7 @@ def main() -> int:
         # WANTS to see the resolved settings (post-env-overlay) so they
         # can confirm "yes this is what production will see." Per project
         # rules (`logging.getLogger` instead of `print` for operational
-        # output) — but `--validate` is a one-shot CLI tool, not operational
+        # output) - but `--validate` is a one-shot CLI tool, not operational
         # output. `sys.stdout.write` keeps the contract: stdout = the answer.
         sys.stdout.write(settings.model_dump_json(indent=_SETTINGS_DUMP_INDENT) + "\n")
         return 0
@@ -150,7 +150,7 @@ def main() -> int:
         # ssl_keyfile_password applies ONLY to an OPERATOR-supplied encrypted
         # key. The TlsCfg XOR validator guarantees both-or-neither, so
         # `tls.cert_path is not None` IS exactly the operator-supplied case; the
-        # `is None` case is auto-gen, whose key is written UNENCRYPTED — passing
+        # `is None` case is auto-gen, whose key is written UNENCRYPTED - passing
         # a password there would make uvicorn try to decrypt an unencrypted key
         # and fail at bind. So gate the password on operator-supplied only.
         if tls.cert_path is not None and tls.key_password is not None:

@@ -48,7 +48,7 @@ class ReceivedEntry(BaseModel):
             "``Authorization``, absence of ``X-Phantom-*``, preservation "
             "of ``User-Agent`` and custom producer headers. Multi-value "
             'headers join on ``", "`` per Starlette\'s header-dict '
-            "semantics. Authorization values are recorded verbatim — "
+            "semantics. Authorization values are recorded verbatim - "
             "tests opt-in to assert against them."
         ),
     )
@@ -56,7 +56,7 @@ class ReceivedEntry(BaseModel):
     body_hash: str = Field(
         ...,
         description=(
-            "SHA-256 hex of the received body bytes — used by "
+            "SHA-256 hex of the received body bytes - used by "
             "transparent-proxy E2E tests to assert byte-identity against "
             "the agent's pre-submit hash."
         ),

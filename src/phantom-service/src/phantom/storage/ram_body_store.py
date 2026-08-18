@@ -4,7 +4,7 @@ Per-upload bodies live as ``dict[UUID, dict[name, bytes]]`` keyed by
 ``chain_id``. A lock guards the dict against rare admin-list-vs-mutate
 races.
 
-Plan § 2.3.8 dropped the ``tier`` property — the
+Plan § 2.3.8 dropped the ``tier`` property - the
 Protocol no longer carries it. Added :meth:`list_orphans` returning
 ``[]`` (RAM bodies have no orphans by construction; the dict is
 purged on chain drop).
@@ -97,7 +97,7 @@ class RamBodyStore:
             self._total_bytes -= sum(len(b) for b in dropped.values())
 
     async def total_bytes(self) -> int:
-        """Saturation accounting — sum of stored body bytes.
+        """Saturation accounting - sum of stored body bytes.
 
         Returns a RUNNING COUNTER rather than re-summing every ref of every
         entry (U11). The sum was O(all refs) under ``_lock``, which every
@@ -125,7 +125,7 @@ class RamBodyStore:
         """Return RAM-tier orphans relative to ``known_chain_ids``.
 
         Always returns ``[]``. RAM bodies have no orphans by
-        construction — the dict is mutated synchronously with row
+        construction - the dict is mutated synchronously with row
         deletes through the same code paths (admission clears the
         chain_id namespace then writes ``put``; reaper / cancel /
         replay call ``delete``), so a chain_id present in RAM is

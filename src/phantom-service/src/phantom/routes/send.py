@@ -1,4 +1,4 @@
-"""``POST /v1/send`` handler — chain ingress (plan §4.33).
+"""``POST /v1/send`` handler - chain ingress (plan §4.33).
 
 The handler is HTTP-shaped only: parse headers, parse body, dispatch
 to the owning instance, delegate to :func:`admit_chain`, build the
@@ -56,12 +56,12 @@ SUGGESTED_POLL_AFTER_SECONDS: int = 5
 
 
 def get_dispatcher() -> InstanceDispatcher:
-    """Dependency placeholder — wired by the composition root."""
+    """Dependency placeholder - wired by the composition root."""
     raise NotImplementedError("InstanceDispatcher dependency must be overridden by app factory")
 
 
 def get_max_buffered_bytes() -> int:
-    """Dependency placeholder — returns ``Settings.storage.max_buffered_bytes``.
+    """Dependency placeholder - returns ``Settings.storage.max_buffered_bytes``.
 
     The composition root binds this to the resolved YAML value (default
     2 GiB; see :class:`phantom.config.settings.StorageCfg`). The route
@@ -105,7 +105,7 @@ def get_phantom_default_target() -> str | None:
     (``routes/catch_all.py``) as the second destination carrier, after the
     explicit ``?phantom=<url>`` query parameter. Defaults to ``None`` (no
     default configured) so a partial wiring or a test harness that does not
-    override it simply has no default target — a raw request with no
+    override it simply has no default target - a raw request with no
     ``?phantom=`` carrier then rejects 421 ``invalid_target``.
     """
     return None
@@ -122,7 +122,7 @@ async def post_send(
     instance_cfgs: Annotated[Sequence[InstanceCfg], Depends(get_instance_cfgs)],
     degraded_instances: Annotated[Sequence[DegradedInstance], Depends(get_degraded_instances)],
 ) -> Response:
-    """Ingress endpoint — accept a chain submission and return 202.
+    """Ingress endpoint - accept a chain submission and return 202.
 
     The handler stays HTTP-shaped: parse headers (the grouping/ordering
     trio through :func:`_parse_grouping_headers`), then
@@ -169,8 +169,8 @@ async def post_send(
     # resolve_and_admit prelude) because only the JSON/multipart ingress
     # path carries X-Phantom-Group-Id / -Multifile-Id / -Order; the
     # raw-intake adapter (which shares the same prelude) never sends them.
-    # A malformed value is attributed to ``"unrouted"`` — the request has
-    # not yet been admitted to any instance at this point — matching the
+    # A malformed value is attributed to ``"unrouted"`` - the request has
+    # not yet been admitted to any instance at this point - matching the
     # sentinel resolve_and_admit uses for its own unroutable errors.
     try:
         group_id, multifile_id, send_order = _parse_grouping_headers(
@@ -245,7 +245,7 @@ async def resolve_and_admit(
     adapter does this from its destination carriers; ``post_send`` inherits
     it from the producer-supplied envelope). Extracting this prelude keeps
     one source of truth for the 421 mapping and the :class:`AdmissionInputs`
-    shape so the two ingress paths cannot drift — the same precedent
+    shape so the two ingress paths cannot drift - the same precedent
     :func:`admit_chain` set when it was lifted out of ``post_send``.
 
     Args:
@@ -449,7 +449,7 @@ def _check_content_length(
     Returns a 413 :class:`Response` when the header is present and parses
     to a value greater than ``max_buffered_bytes``. Returns ``None`` (no
     early rejection) when the header is absent, malformed, or fits under
-    the cap — the absent / malformed cases fall through to the streaming
+    the cap - the absent / malformed cases fall through to the streaming
     cap inside :func:`_parse_body`, which holds the contract.
 
     H2 audit closure: declared payload above cap → 413 before any body
@@ -460,7 +460,7 @@ def _check_content_length(
     try:
         declared = int(raw_header)
     except ValueError:
-        # Malformed header — let the parser decide. Returning a 4xx
+        # Malformed header - let the parser decide. Returning a 4xx
         # here would also be defensible, but the parser already covers
         # the malformed-body class of errors with proper error codes.
         return None
@@ -524,7 +524,7 @@ async def _parse_body(
         if content_type.startswith("multipart/"):
             # Starlette's MultiPartParser respects ``max_part_size``
             # internally and raises HTTPException(400) when a part runs
-            # over — that's the streaming cap for the multipart path.
+            # over - that's the streaming cap for the multipart path.
             form_iter = _multipart_iter(request, max_part_size=max_buffered_bytes)
             return await parse_multipart_request(
                 form_iter,
@@ -699,7 +699,7 @@ def _error_response(
 
 
 async def _multipart_iter(request: Request, *, max_part_size: int) -> AsyncIterator[_PartShim]:
-    """Adapter — yield parts from FastAPI/starlette's form parser.
+    """Adapter - yield parts from FastAPI/starlette's form parser.
 
     The Pydantic parser expects an async iterator of objects with
     ``.name`` / ``.read(max_bytes)``. We adapt FastAPI's
@@ -708,7 +708,7 @@ async def _multipart_iter(request: Request, *, max_part_size: int) -> AsyncItera
     Args:
         request: Incoming FastAPI request.
         max_part_size: Per-multipart-part byte cap passed straight to
-            starlette's ``MultiPartParser`` (whose own default is 1 MiB —
+            starlette's ``MultiPartParser`` (whose own default is 1 MiB -
             far below Phantom's per-upload cap). Driven by
             ``Settings.storage.max_buffered_bytes`` so the parser ceiling
             and the post-parse buffered-bytes cap move together.

@@ -1,4 +1,4 @@
-"""ColdBackupScheduler — periodic SQLite online-backup snapshots.
+"""ColdBackupScheduler - periodic SQLite online-backup snapshots.
 
 Plan § 5.2.6 / strategy §3 "optional cold backup snapshots."
 
@@ -9,7 +9,7 @@ TaskGroup; the scheduler runs SQLite's online-backup API at
 snapshot files. Backups land in ``<data_dir>/backups/`` and are named
 ``uploads.backup.<iso>.db``.
 
-The online-backup API is non-blocking on the live database — readers
+The online-backup API is non-blocking on the live database - readers
 and writers continue to operate during the snapshot. The scheduler
 never writes to the live DB; its writes target the snapshot directory
 only (single-writer-per-purpose, plan § 0.5).
@@ -41,7 +41,7 @@ class ColdBackupScheduler:
 
     Plan § 5.2.6. Spawned only when
     ``Settings.storage.db_integrity.backup_enabled`` is True. The
-    scheduler self-checks the flag on entry — toggling it off via hot
+    scheduler self-checks the flag on entry - toggling it off via hot
     reload while running has no effect; mode-flip requires a restart
     (consistent with the body-store mode contract, plan § 2.3.10).
 
@@ -72,17 +72,17 @@ class ColdBackupScheduler:
     async def run(self, stop_event: asyncio.Event) -> None:
         """Run the snapshot loop until stopped.
 
-        Composition-root spawn point — :func:`phantom.app.create_app`'s
+        Composition-root spawn point - :func:`phantom.app.create_app`'s
         lifespan :class:`asyncio.TaskGroup`. Exits immediately when
         ``backup_enabled`` is False; otherwise snapshots every
         ``backup_period_seconds``. Per-snapshot exceptions are logged
-        and the loop continues — a failed snapshot does not kill the
+        and the loop continues - a failed snapshot does not kill the
         process (strategy §3 commit: "service comes up serving empty
         state on any persistence failure").
 
         Args:
             stop_event: Set by the lifespan on shutdown; the loop exits
-                cleanly as soon as it fires — the same ``stop_event``-drain
+                cleanly as soon as it fires - the same ``stop_event``-drain
                 idiom every other lifespan worker uses (sender / janitor /
                 …) so the supervising :class:`asyncio.TaskGroup` is not
                 blocked waiting on a never-returning task at shutdown.
@@ -92,7 +92,7 @@ class ColdBackupScheduler:
             return
         self._backup_root.mkdir(parents=True, exist_ok=True)
         # stop_event-driven loop (mirrors BodyOrphanJanitor.run) so the
-        # lifespan TaskGroup drains cleanly at shutdown — the snapshot
+        # lifespan TaskGroup drains cleanly at shutdown - the snapshot
         # cadence is the timeout on the stop wait, so a set event both
         # exits the loop promptly AND cuts the inter-snapshot sleep short.
         while not stop_event.is_set():
@@ -111,7 +111,7 @@ class ColdBackupScheduler:
         path without driving the run loop. Production callers go
         through :meth:`run`.
         """
-        # UTC stamp via the shared helper — the ``Z`` suffix declares
+        # UTC stamp via the shared helper - the ``Z`` suffix declares
         # UTC, so naive local time here would lie (finding A-2) and a
         # backwards clock step could break the lex-sort rotation
         # invariant in :meth:`_rotate`.
@@ -129,7 +129,7 @@ class ColdBackupScheduler:
     async def _rotate(self) -> None:
         """Keep ``backup_rotate_n`` most-recent snapshots; delete older.
 
-        Sorted alphabetically — the ISO timestamp suffix is
+        Sorted alphabetically - the ISO timestamp suffix is
         lex-sortable so the lex order matches chronological order.
         """
         keep = self._settings.storage.db_integrity.backup_rotate_n

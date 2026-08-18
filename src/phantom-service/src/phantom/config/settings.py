@@ -8,7 +8,7 @@ overlay:
    (``env_nested_delimiter="__"``).
 3. Explicit kwargs passed to :class:`Settings`.
 
-List-typed fields (``instances``) are NOT env-overlay-able — they
+List-typed fields (``instances``) are NOT env-overlay-able - they
 live in YAML only.
 
 Smart defaults from the host probe
@@ -26,7 +26,7 @@ Fields that take their value from the probe all carry a Pydantic
 default of ``None`` so the validator can tell "operator left this
 unset" apart from "operator pinned to 0". Reading any such field on
 an unresolved ``Settings`` (one whose validator hasn't run) is a
-programmer error — the validator guarantees every probe-fillable
+programmer error - the validator guarantees every probe-fillable
 field is non-``None`` post-load.
 """
 
@@ -95,11 +95,11 @@ def host_is_loopback(host: str) -> bool:
 
 
 class TlsCfg(BaseModel):
-    """``server.tls`` block — flip the single listener from HTTP to HTTPS.
+    """``server.tls`` block - flip the single listener from HTTP to HTTPS.
 
     When ``enabled``, the EXISTING uvicorn listener (``__main__.py:89-93``) is
     served with TLS: ``ssl_certfile``/``ssl_keyfile`` are passed straight to
-    ``uvicorn.run`` (``uvicorn/main.py:534-536``). Self-signed is fine — Phantom
+    ``uvicorn.run`` (``uvicorn/main.py:534-536``). Self-signed is fine - Phantom
     does NOT verify its own cert; clients use ``verify=off`` or pin it
     (loopback/sidecar trust model). NOT a second listener; the one socket
     simply speaks HTTPS instead of HTTP.
@@ -137,9 +137,9 @@ class TlsCfg(BaseModel):
     def _reject_half_configured_paths(self) -> TlsCfg:
         """Reject the asymmetric (XOR) cert/key state; the resolver needs both-or-neither.
 
-        Two ``enabled`` configs are valid: BOTH paths set (operator-supplied —
+        Two ``enabled`` configs are valid: BOTH paths set (operator-supplied -
         :func:`phantom.runtime.tls_cert.resolve_tls_paths` validates and uses them
-        verbatim) OR BOTH paths None (auto-gen — the resolver mints a self-signed
+        verbatim) OR BOTH paths None (auto-gen - the resolver mints a self-signed
         pair). Exactly ONE set is a half-configured mistake the resolver has no
         defined branch for, so reject it here at config-load (fails in
         ``--validate``, friendlier than a later ``resolve_tls_paths`` / uvicorn
@@ -149,7 +149,7 @@ class TlsCfg(BaseModel):
         if self.enabled and (self.cert_path is None) != (self.key_path is None):
             raise ValueError(
                 "server.tls: set BOTH cert_path and key_path (operator-supplied), "
-                "or NEITHER (auto-gen) — not exactly one"
+                "or NEITHER (auto-gen) - not exactly one"
             )
         return self
 
@@ -182,7 +182,7 @@ class ServerCfg(BaseModel):
     )
     tls: TlsCfg = Field(
         default_factory=TlsCfg,  # type: ignore[arg-type]
-        description="See :class:`TlsCfg` — flip the single listener to HTTPS (off by default).",
+        description="See :class:`TlsCfg` - flip the single listener to HTTPS (off by default).",
     )
 
 
@@ -244,7 +244,7 @@ class BodyStoreCfg(BaseModel):
         ge=0,
         description=(
             "RamBodyStore size ceiling in bytes. None means probe-fill "
-            "at startup — the ``_resolve_defaults`` model validator "
+            "at startup - the ``_resolve_defaults`` model validator "
             "sets this to a hardware-aware fraction of available RAM "
             "(preserving the pre-rename ``in_memory_max_bytes`` "
             "probe-fill semantic). Explicit int overrides (e.g., "
@@ -275,7 +275,7 @@ class BodyStoreCfg(BaseModel):
         300,
         ge=1,
         description=(
-            "InvariantAuditor sweep cadence (seconds). Plan § 4.2.3 — "
+            "InvariantAuditor sweep cadence (seconds). Plan § 4.2.3 - "
             "walks live rows and counters invariant violations against "
             "the seven §0.5 invariants. Low frequency by design; CI "
             "uses the resulting counter to fail the next build on any "
@@ -302,7 +302,7 @@ class CompressionCfg(BaseModel):
     mode: Literal["always"] = Field(
         "always",
         description=(
-            "Encoding policy. Only ``always`` is supported — Phantom "
+            "Encoding policy. Only ``always`` is supported - Phantom "
             "always applies the configured codec."
         ),
     )
@@ -323,7 +323,7 @@ class CompressionCfg(BaseModel):
 class SqliteCfg(BaseModel):
     """SQLite-specific knobs.
 
-    Phase 1: dropped the configurable ``autovacuum`` knob — ``auto_vacuum``
+    Phase 1: dropped the configurable ``autovacuum`` knob - ``auto_vacuum``
     is hardcoded to NONE in code per the SD-card-wear hard rule
     (plan § 0.3). The previously free-form ``synchronous`` and
     ``journal_mode`` fields are narrowed to ``Literal`` types so an
@@ -340,7 +340,7 @@ class SqliteCfg(BaseModel):
     journal_mode: Literal["WAL"] = Field(
         "WAL",
         description=(
-            "SQLite journal mode. Hardcoded to WAL — load-bearing for "
+            "SQLite journal mode. Hardcoded to WAL - load-bearing for "
             "the strategy pragma set (plan § 2.3.5) and the recovery "
             "sweep's assumptions."
         ),
@@ -367,7 +367,7 @@ class SqliteCfg(BaseModel):
         1000,
         ge=0,
         description=(
-            "SQLite ``busy_timeout`` in milliseconds — how long SQLite busy-WAITS "
+            "SQLite ``busy_timeout`` in milliseconds - how long SQLite busy-WAITS "
             "in its connection worker thread for a contended write lock before "
             "raising SQLITE_BUSY (finding R9-V6-1). Phantom serializes EVERY "
             "writer through one ``asyncio`` lock on a single connection, so "
@@ -400,7 +400,7 @@ class DbIntegrityCfg(BaseModel):
     * **Fail-open vs fail-closed**. Strategy §3 commits to
       ``fail_open=True`` ("service comes up serving empty state after
       quarantine"). Operators willing to abort startup on detected
-      corruption can pin ``fail_open=False`` — the composition root then
+      corruption can pin ``fail_open=False`` - the composition root then
       logs ERROR and raises after quarantining (the artifacts still get
       preserved for retrieval).
     """
@@ -410,7 +410,7 @@ class DbIntegrityCfg(BaseModel):
     fail_open: bool = Field(
         default=True,
         description=(
-            "Default True per strategy §3 — the service starts with a "
+            "Default True per strategy §3 - the service starts with a "
             "fresh empty SQLite after quarantine. Pin False to abort "
             "startup on detected corruption (the quarantine still "
             "fires; the process exits after)."
@@ -420,7 +420,7 @@ class DbIntegrityCfg(BaseModel):
         default=False,
         description=(
             "Enable periodic SQLite online-backup snapshots. Off by "
-            "default — opt-in for belt-and-suspenders deployments."
+            "default - opt-in for belt-and-suspenders deployments."
         ),
     )
     backup_period_seconds: int = Field(
@@ -490,7 +490,7 @@ class StorageCfg(BaseModel):
     )
     db_integrity: DbIntegrityCfg = Field(
         default_factory=DbIntegrityCfg,
-        description="See :class:`DbIntegrityCfg` — Phase 4 corruption-resilience knobs.",
+        description="See :class:`DbIntegrityCfg` - Phase 4 corruption-resilience knobs.",
     )
 
 
@@ -520,7 +520,7 @@ class SaturationCfg(BaseModel):
         description=(
             "Byte cap across all in-flight uploads. Filled from the host "
             "probe when left unset (None). A value of 0 refuses every "
-            "admission — including 0-byte bodies — matching the "
+            "admission - including 0-byte bodies - matching the "
             "zero-semantics of max_in_flight (0 == refuse-all). It is NOT "
             "an 'unlimited' sentinel; leave the field unset (None) to take "
             "the probe-derived default."
@@ -570,7 +570,7 @@ class RetentionCfg(BaseModel):
     which fails safe but hides the typo).
 
     Every per-state body / metadata window defaults to a hard-coded
-    sensible value — these knobs are tunable but the probe doesn't
+    sensible value - these knobs are tunable but the probe doesn't
     influence them.
     """
 
@@ -629,7 +629,7 @@ class RetentionCfg(BaseModel):
         description="Body retention while parked in ``auth_expired`` (default 6 months).",
     )
     expired_metadata_seconds: int = Field(
-        2_592_000,  # 30 days — mirrors failed_metadata_seconds (a terminal give-up to audit).
+        2_592_000,  # 30 days - mirrors failed_metadata_seconds (a terminal give-up to audit).
         ge=-1,
         description=(
             "Metadata retention after a row gives up at the send-deadline "
@@ -662,7 +662,7 @@ class RetentionCfg(BaseModel):
             "time-based passes: if the table exceeds ``max_rows`` it evicts "
             "oldest-DONE-first (by ``updated_at``) until at or below the cap. "
             "Only fully-terminal rows (succeeded/failed/cancelled/stored/"
-            "corrupted) are eligible — in-flight (queued/attempting) and "
+            "corrupted) are eligible - in-flight (queued/attempting) and "
             "still-deliverable ``auth_expired`` rows are NEVER evicted, so the "
             "backstop cannot drop an undelivered upload (invariant #1 holds). "
             "Default ``100_000``: a safe row backstop sized for the smallest "
@@ -715,7 +715,7 @@ class RetryStrategyCfg(BaseModel):
 
 
 class RetryCfg(BaseModel):
-    """``retry`` block — worker pool size and the default strategy."""
+    """``retry`` block - worker pool size and the default strategy."""
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
@@ -837,7 +837,7 @@ class RouteCfg(BaseModel):
 class SigV4CredentialCfg(BaseModel):
     """One config-declared destination credential for the ``aws_sigv4`` signer.
 
-    This is the **config acquisition route** — the boot-time analogue of the
+    This is the **config acquisition route** - the boot-time analogue of the
     runtime admin push (``PUT /v1/admin/credentials/{dest_host}``). It is the
     ONE place env-var *names* are accepted (GLOBAL §1.2(a) B1), mirroring
     :class:`~phantom.config.ad_mint.AdMintConfig`'s ``primary_client_secret_env``
@@ -855,10 +855,10 @@ class SigV4CredentialCfg(BaseModel):
     Two arms, discriminated by ``kind`` (mirroring the admin push body's
     discriminated union):
 
-    * ``sigv4_static`` — a static key-pair declared by env-var name.
+    * ``sigv4_static`` - a static key-pair declared by env-var name.
       ``access_key_id_env`` and ``secret_access_key_env`` are REQUIRED;
       ``region`` is REQUIRED; ``session_token_env`` is optional (STS).
-    * ``profile_ref`` — a botocore profile / default-chain reference. No env
+    * ``profile_ref`` - a botocore profile / default-chain reference. No env
       vars and no secret are held at rest; the signer resolves credentials at
       sign time. ``profile=None`` marks the default chain.
     """
@@ -905,7 +905,7 @@ class SigV4CredentialCfg(BaseModel):
     region: str | None = Field(
         None,
         min_length=1,
-        description="AWS region (static arm — required there; ignored for profile_ref).",
+        description="AWS region (static arm - required there; ignored for profile_ref).",
     )
     # profile-ref arm (kind == "profile_ref").
     profile: str | None = Field(
@@ -915,7 +915,7 @@ class SigV4CredentialCfg(BaseModel):
     )
     # Scope state for BOTH arms (NOT arm-specific, NOT an env-var-resolved
     # secret): the AWS service the signer signs for, carried onto the
-    # materialized credential. Required — strict mode rejects the bare wire
+    # materialized credential. Required - strict mode rejects the bare wire
     # string without the before-validator.
     service: SigningService = Field(
         ..., description="AWS service this credential signs for (both arms)."
@@ -938,7 +938,7 @@ class SigV4CredentialCfg(BaseModel):
         ``service`` already fails at field validation, so it needs no entry in
         the per-arm sets here). Catching the shape error here (loud Pydantic
         ``ValidationError``) keeps the boot materializer's static-arm
-        assumptions total — by the time the loop runs, a ``sigv4_static`` entry
+        assumptions total - by the time the loop runs, a ``sigv4_static`` entry
         is guaranteed to carry every name it will resolve. The boot loop still
         owns the orthogonal failure (a NAMED env var that is absent or empty at
         runtime).
@@ -1071,7 +1071,7 @@ class InstanceCfg(BaseModel):
     )
     capture_reexecution: bool = Field(
         False,
-        description="ADR-011 knob — re-execute on capture-TTL expiry.",
+        description="ADR-011 knob - re-execute on capture-TTL expiry.",
     )
     routes: list[RouteCfg] = Field(
         default_factory=list,
@@ -1198,7 +1198,7 @@ class Settings(BaseSettings):
             "Config-declared destination credentials for the ``aws_sigv4`` "
             "signer (the boot-time analogue of the runtime admin push). Each "
             "entry names the env var holding its secret access key (never the "
-            "secret literal — GLOBAL §1.2(a) B1 / ADR-004). At boot the named "
+            "secret literal - GLOBAL §1.2(a) B1 / ADR-004). At boot the named "
             "env vars are resolved to literals and materialized into EVERY "
             "instance's host-keyed credential store under ``source='config'`` "
             "(``app.py`` lifespan). The credentials key on the globally-"
@@ -1267,7 +1267,7 @@ class Settings(BaseSettings):
         # Storage block.
         if self.storage.body_store.ram_ceiling_bytes is None:
             # RAM-tier ceiling mirrors in-flight bytes (the cap binds the
-            # same physical resource — bytes in the RAM body store).
+            # same physical resource - bytes in the RAM body store).
             # This preserves the pre-rename in_memory_max_bytes
             # probe-fill semantic per plan § 2.3.1.
             self.storage.body_store.ram_ceiling_bytes = defaults.max_in_flight_bytes
@@ -1287,7 +1287,7 @@ class Settings(BaseSettings):
         """Re-read the YAML at ``path`` and produce a new validated Settings.
 
         Calls the same validator chain as the initial load. The probe
-        runs again by default — machine facts may have changed since
+        runs again by default - machine facts may have changed since
         startup (e.g., free disk shrank). Hot reload (SIGHUP and
         ``POST /v1/admin/reload``) uses this default since R7-1: with
         ``skip_probe=True`` a probe-reliant YAML (the documented
@@ -1303,7 +1303,7 @@ class Settings(BaseSettings):
         Args:
             path: Filesystem path to the YAML config.
             skip_probe: When ``True``, bypass the host probe. The new
-                Settings is constructed independently — the caller is
+                Settings is constructed independently - the caller is
                 responsible for swapping live snapshots atomically via
                 :meth:`SettingsHolder.replace`.
 
@@ -1368,7 +1368,7 @@ def load_settings(path: Path | str) -> Settings:
     """Load Phantom settings from a YAML file with env-var overlay.
 
     Args:
-        path: Path to the YAML file. Missing or empty files are tolerated —
+        path: Path to the YAML file. Missing or empty files are tolerated -
             they produce a no-instance settings object with a startup
             warning.
 

@@ -2,8 +2,8 @@
 
 The SDK accepts configuration in two shapes:
 
-- ``PhantomClient("http://...")`` — base-URL only. The convenience path.
-- ``PhantomClient(ClientConfig(...))`` — full configuration for
+- ``PhantomClient("http://...")`` - base-URL only. The convenience path.
+- ``PhantomClient(ClientConfig(...))`` - full configuration for
   advanced cases (custom timeouts, retry policy, default uid,
   bearer-on-loopback admin token, default headers).
 
@@ -19,7 +19,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
-# Timeouts — passed verbatim to httpx.Timeout(...).
+# Timeouts - passed verbatim to httpx.Timeout(...).
 # ---------------------------------------------------------------------------
 
 
@@ -41,7 +41,7 @@ class Timeouts(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Retry policy — transport-class retries only.
+# Retry policy - transport-class retries only.
 # ---------------------------------------------------------------------------
 
 
@@ -74,7 +74,7 @@ class RetryPolicy(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Per-call submission options — map onto X-Phantom-* request headers.
+# Per-call submission options - map onto X-Phantom-* request headers.
 # ---------------------------------------------------------------------------
 
 
@@ -82,7 +82,7 @@ class SubmitOptions(BaseModel):
     """Per-call submission knobs.
 
     Map one-to-one onto the optional ``X-Phantom-*`` request headers.
-    None on a field means "don't send that header" — Phantom applies
+    None on a field means "don't send that header" - Phantom applies
     its configured default.
     """
 

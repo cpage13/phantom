@@ -1,7 +1,7 @@
 """In-process state stores for the phantom-emulator.
 
 The emulator keeps every observable in RAM. Nothing here survives a
-process restart — that is intentional: the emulator is test
+process restart - that is intentional: the emulator is test
 infrastructure and a clean slate on each launch is the desired
 property. See plan §1 "No persistence across restarts."
 
@@ -33,7 +33,7 @@ from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.config import AppConfig
 from phantom_emulator.control_models import ReceivedEntry
 
-if TYPE_CHECKING:  # pragma: no cover — typing-only imports
+if TYPE_CHECKING:  # pragma: no cover - typing-only imports
     from phantom_emulator.auth.jwks import RsaKeyPair
     from phantom_emulator.auth.jwt_minter import JwtMinter
     from phantom_emulator.failure.injection import FailureInjectionState
@@ -166,7 +166,7 @@ class AcceptedBody:
 S3ObjectKey = tuple[str, str]
 
 # Type alias for the full forwarded path (no leading slash) that keys the
-# auth-free /raw sink store. The path itself is the address — there is no
+# auth-free /raw sink store. The path itself is the address - there is no
 # bucket/key split and no token (contrast UploadToken / S3ObjectKey).
 RawPath = str
 
@@ -178,7 +178,7 @@ class S3Object:
     Attributes:
         bucket: First path segment of ``<verb> /{bucket}/{key}``.
         key: Remaining path (the object key; may contain slashes).
-        method: The inbound HTTP verb that stored it — one of the
+        method: The inbound HTTP verb that stored it - one of the
             forwarded upload verbs (``PUT``/``POST``/``PATCH``). Captured
             so the e2e can assert the verb round-trips through the catch-all
             to the sink.
@@ -186,7 +186,7 @@ class S3Object:
         content_type: The request ``Content-Type``, or ``None``.
         all_headers: Every inbound header (lowercased keys, original
             values), captured so round-trip / transparent-proxy
-            assertions can audit the envelope — mirrors
+            assertions can audit the envelope - mirrors
             :attr:`AcceptedBody.all_headers`.
         stored_at: Server-side acceptance timestamp.
     """
@@ -205,7 +205,7 @@ class RawBody:
     """A body stored by the auth-free, token-free /raw sink (TASK 0.5).
 
     The forward-as-is Phase-1 analogue of :class:`AcceptedBody`: no token,
-    no auth — the full forwarded path itself is the key. Accepts any forwarded
+    no auth - the full forwarded path itself is the key. Accepts any forwarded
     upload verb (PUT/POST/PATCH), recording it in :attr:`method`.
     ``all_headers`` is captured (lowercased keys, original values) so the e2e
     can assert that ``X-Phantom-*`` headers were stripped and a benign upstream
@@ -213,9 +213,9 @@ class RawBody:
 
     Attributes:
         path: The full forwarded path (no leading slash) used as the store
-            key — slash-bearing keys captured whole by the ``:path``
+            key - slash-bearing keys captured whole by the ``:path``
             convertor.
-        method: The inbound HTTP verb that stored it — one of the forwarded
+        method: The inbound HTTP verb that stored it - one of the forwarded
             upload verbs (``PUT``/``POST``/``PATCH``). Captured so the e2e
             can assert the verb round-trips through the catch-all to the sink.
         query: The inbound query string with no leading ``?``, or ``""`` when
@@ -226,7 +226,7 @@ class RawBody:
         body: Raw bytes the unsigned, tokenless upload stored (byte-identical).
         content_type: The request ``Content-Type``, or ``None``.
         all_headers: Every inbound header (lowercased keys, original
-            values) — mirrors :attr:`AcceptedBody.all_headers`.
+            values) - mirrors :attr:`AcceptedBody.all_headers`.
         stored_at: Server-side acceptance timestamp.
     """
 
@@ -351,7 +351,7 @@ class EmulatorState:
             ``API_KEY`` mode is active.
         static_jwt: Pre-minted JWT served by ``static_token`` mode.
         accepted_idempotency_keys: Log of idempotency-keys seen on
-            create calls — used by the control surface so tests can
+            create calls - used by the control surface so tests can
             assert that a request was deduped vs. served fresh.
     """
 
@@ -383,7 +383,7 @@ class EmulatorState:
     # ``mint_slot_secrets`` maps a SAFE slot tag ("primary"/"secondary") to
     # the synthetic secret the test injected; the token endpoint compares the
     # presented secret via hmac.compare_digest and records ONLY the tag.
-    # ``mint_attempts`` is the ordered attempt ledger (seq/slot/status/at —
+    # ``mint_attempts`` is the ordered attempt ledger (seq/slot/status/at -
     # never a secret, token, header, or form body). ``auth_token_gate``, when
     # installed (closed) BEFORE the child boots, makes the AUTH_TOKEN
     # middleware path signal ``reached`` and hold before policy evaluation /
@@ -395,7 +395,7 @@ class EmulatorState:
     api_key_secret: str | None = None
     static_jwt: str | None = None
 
-    # Bound during startup — see app.create_app / lifespan.
+    # Bound during startup - see app.create_app / lifespan.
     rng: random.Random = field(default_factory=random.Random)
     failure_state: FailureInjectionState | None = None
     jwt_minter: JwtMinter | None = None

@@ -75,7 +75,7 @@ async def token_endpoint(
         client_id: OAuth2 client identifier.
         client_secret: OAuth2 client secret.
         state: Shared emulator state.
-        scope: Requested scope (accepted but ignored — the emulator
+        scope: Requested scope (accepted but ignored - the emulator
             issues a token for the configured audience regardless).
 
     Returns:
@@ -154,7 +154,7 @@ async def tenant_token_alias(
     state: StateDep,
     scope: Annotated[str | None, Form()] = None,
 ) -> JSONResponse:
-    """The AAD tenant token path — azure-identity's direct POST target.
+    """The AAD tenant token path - azure-identity's direct POST target.
 
     ``azure-identity`` (locked 1.25.3) POSTs ``/{tenant}/oauth2/v2.0/token``
     on the configured authority with NO discovery round-trip, so the generic

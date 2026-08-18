@@ -35,10 +35,10 @@ class InstanceStoragePaths:
     :data:`bodies`) in one place instead of duplicated across call sites.
 
     Attributes:
-        data_root: ``<storage.data_dir>/<cfg.data_dir>`` — the instance's
+        data_root: ``<storage.data_dir>/<cfg.data_dir>`` - the instance's
             directory; quarantine artifacts are FLAT siblings here.
-        db_path: ``data_root / "uploads.db"`` — the live SQLite DB.
-        bodies_root: ``data_root / "bodies"`` — the live body-store root.
+        db_path: ``data_root / "uploads.db"`` - the live SQLite DB.
+        bodies_root: ``data_root / "bodies"`` - the live body-store root.
     """
 
     data_root: Path
@@ -98,7 +98,7 @@ class InstanceContext:
     a small set of workers (the RAM-pressure watcher's RAM-only
     metric, the disk-pressure probe's file-only metric) need the
     specific half rather than the composed :attr:`body_store`. All
-    other consumers — admission, admin, sender, body-orphan janitor —
+    other consumers - admission, admin, sender, body-orphan janitor -
     go through :attr:`body_store` exclusively.
     """
 
@@ -119,7 +119,7 @@ class InstanceContext:
 
     Owns ``uploads``, ``idempotency_index``, and ``token_cache`` tables.
     Admission writes via :meth:`UploadStore.insert_with_idempotency_claim`
-    (atomic upload + idempotency-claim INSERT — H7 closure); workers
+    (atomic upload + idempotency-claim INSERT - H7 closure); workers
     update state machine columns; PersistController flips
     ``body_location='file'``; reaper deletes terminal rows. See plan
     § 0.5 single-writer manifest.
@@ -135,7 +135,7 @@ class InstanceContext:
     file_body_store: FileBodyStore
     """File half of the body store. Mode-gated callers only.
 
-    Held here for the same reason as :attr:`ram_body_store` — the
+    Held here for the same reason as :attr:`ram_body_store` - the
     PersistController and DiskPressureProbe need the half-specific
     surface. All other consumers go through :attr:`body_store`.
     """
@@ -197,6 +197,6 @@ class InstanceContext:
     instance, passes it to ``ChainExecutor(signer_creds=…)`` AND places the SAME
     object here, so the admin credential-push handler can write into it under the
     destination-host key (the model is the token PUSH path). ``None`` (the
-    default) when the deployment uses no ``aws_sigv4`` route — keeping existing
+    default) when the deployment uses no ``aws_sigv4`` route - keeping existing
     construction sites unchanged.
     """

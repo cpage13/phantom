@@ -1,4 +1,4 @@
-"""Refresh — autonomous AD mint (ADR-001)."""
+"""Refresh - autonomous AD mint (ADR-001)."""
 
 from __future__ import annotations
 

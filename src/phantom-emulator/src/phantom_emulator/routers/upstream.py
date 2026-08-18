@@ -2,16 +2,16 @@
 
 Two production endpoints + two stubs:
 
-- ``POST /v1/files/create`` (also served at ``POST /v2/files``) —
+- ``POST /v1/files/create`` (also served at ``POST /v2/files``) -
   accepts JSON, mints a fresh upload-handle id + presigned
   upload URL, dedups on ``Idempotency-Key``, preserves
   ``metadata.keyValueStore``.
-- ``PUT /v1/files/upload/{token}`` — accepts a body, stores it on
+- ``PUT /v1/files/upload/{token}`` - accepts a body, stores it on
   :class:`EmulatorState.accepted_bodies` along with any
   ``x-amz-meta-*`` request headers.
-- ``GET /v1/files/{file_id}`` — stub returning the same
+- ``GET /v1/files/{file_id}`` - stub returning the same
   upload-handle payload the create call minted.
-- ``POST /v1/files/search`` — stub returning ``[]``.
+- ``POST /v1/files/search`` - stub returning ``[]``.
 
 The ``/v2/files`` alias on the create-file endpoint exists because a
 real upstream adapter may build its two-step chain envelope with the
@@ -159,7 +159,7 @@ async def create_file(
     real upstream adapter to reach the upstream. Both paths run this
     same handler.
 
-    Reads the JSON body (tolerantly — invalid JSON returns 400),
+    Reads the JSON body (tolerantly - invalid JSON returns 400),
     deduplicates on ``Idempotency-Key`` when present, mints a fresh
     upload-handle payload + presigned upload URL, and stamps
     ``metadata.keyValueStore`` back onto the response so

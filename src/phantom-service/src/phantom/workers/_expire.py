@@ -2,9 +2,9 @@
 
 Every other sender-owned state transition writes its ``new_state="…"``
 literal inside :mod:`phantom.workers.sender` (ADR-015). ``expired`` is the
-one exception: it is fired from TWO subsystems — the executor-driven sender
+one exception: it is fired from TWO subsystems - the executor-driven sender
 give-up path (``_on_send_deadline_expired``) AND the kicker parked-row sweeps
-— and both must apply identical body-discard + saturation-release + CAS
+- and both must apply identical body-discard + saturation-release + CAS
 semantics. Centralising the write in this one cycle-free leaf module keeps the
 ADR-015 one-writer-per-effect discipline (exactly one ``new_state="expired"``
 call site) while spanning the two callers.
@@ -109,7 +109,7 @@ async def expire_row(
             ``file`` ``body_location`` without branching.
         row: The claimed/parked row being expired.
         expected_state: The CAS pre-state the ``record_attempt_result`` UPDATE
-            guards on — ``"attempting"`` for the executor give-up path, or
+            guards on - ``"attempting"`` for the executor give-up path, or
             ``"auth_expired"`` for the parked-row kicker sweep. A row that moved
             under us (admin cancel/replay or a concurrent wake) yields
             rowcount 0 and is left untouched, not clobbered.
@@ -133,7 +133,7 @@ async def expire_row(
     if not write.landed:
         # A concurrent admin cancel/replay or a kicker wake moved the row
         # between claim and this write; do NOT clobber the new state.
-        logger.info("expire_row no-op: chain_id=%s — row moved under us", row.chain_id)
+        logger.info("expire_row no-op: chain_id=%s - row moved under us", row.chain_id)
         return
     # DISCARD FIRST, because the row is NOW in ``expired`` (we just flipped
     # it) and the discard CAS guards on that. The body is discarded in BOTH

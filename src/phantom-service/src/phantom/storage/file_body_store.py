@@ -3,7 +3,7 @@
 Layout: ``<root>/<sharded-prefix>/<chain_id>/<name>``. Each named
 body_ref is written via ``aiofiles`` to a tmp file, fsync'd off-loop
 via ``asyncio.to_thread(os.fsync)``, then renamed into place. A
-parent-directory fsync (also off-loop) follows the rename on Linux —
+parent-directory fsync (also off-loop) follows the rename on Linux -
 NTFS journals metadata so this is a no-op on Windows.
 
 The full durability contract, which callers rely on for the
@@ -31,7 +31,7 @@ durable, depending on no other caller's fsync.
 All blocking file system calls (``os.fsync``, parent-dir fsync) run
 via ``asyncio.to_thread``; ``aiofiles`` covers open/write/close.
 
-Plan § 2.3.8 dropped the ``tier`` property — the
+Plan § 2.3.8 dropped the ``tier`` property - the
 Protocol no longer carries it. :meth:`list_orphans` is unchanged.
 
 Phase 4 § 5.2.3 (WS-4 Finding 9): :meth:`start` purges ``.tmp/``
@@ -155,7 +155,7 @@ def _rm_rf(path: Path) -> int:
 def _purge_tmp_orphans(tmp_dir: Path) -> None:
     """Delete every entry under ``tmp_dir`` (the .tmp staging directory).
 
-    The directory itself stays — new admissions stage atomic writes
+    The directory itself stays - new admissions stage atomic writes
     into it. Per-entry removal is tolerant of mid-purge vanishing
     (another startup raced through, or an operator hand-deleted) and
     logs (does not raise) on permission errors.
@@ -204,14 +204,14 @@ class FileBodyStore:
     async def start(self) -> None:
         """Create the root and tmp directories if missing; purge .tmp/ orphans.
 
-        Phase 4 § 5.2.3 — WS-4 Finding 9. The atomic-write helper
+        Phase 4 § 5.2.3 - WS-4 Finding 9. The atomic-write helper
         ``_put_one`` stages partial body files in ``<root>/.tmp/`` before
         renaming to the canonical layout. A crash mid-write or a power
         loss leaves a partially-written staged file behind; left alone,
         they accumulate on disk-full or repeated crashes. This one-shot
         startup purge clears the staging directory before any new
         admission can stage a write into it. The canonical body tree is
-        NOT touched — that's the body-orphan janitor's steady-state
+        NOT touched - that's the body-orphan janitor's steady-state
         responsibility (plan § 2.3.14).
         """
         await asyncio.to_thread(_makedirs_durable, self._root, self._root.parent)
@@ -244,7 +244,7 @@ class FileBodyStore:
 
         Public counterpart to :meth:`_path_for`. Used by recovery and
         E2E test helpers that need to inspect or manipulate files
-        directly. The path is structural — its existence is not
+        directly. The path is structural - its existence is not
         guaranteed.
         """
         return self._path_for(chain_id, name)
@@ -357,7 +357,7 @@ class FileBodyStore:
 
         The sender's ``_load_body_refs`` catches ``KeyError`` and re-raises
         :class:`BodyMissingError`, which ``_drive_one`` routes to the
-        ``corrupted`` terminal state (the H8 / ADR-014 path) — so a
+        ``corrupted`` terminal state (the H8 / ADR-014 path) - so a
         vanished body directory quarantines the row rather than crashing
         the worker's drive loop.
 
@@ -367,7 +367,7 @@ class FileBodyStore:
         between the directory listing and each ``open``) closes the
         time-of-check/time-of-use window in which a concurrent
         :meth:`delete` could remove the directory or a file *after* an
-        existence check passed but *before* the read — exactly the race
+        existence check passed but *before* the read - exactly the race
         that previously surfaced as a raw ``FileNotFoundError`` escaping
         to the sender (e2e ``test_multipart_corrupted``). Any filesystem-
         absence error raised mid-traversal is mapped to ``KeyError`` for
@@ -392,7 +392,7 @@ class FileBodyStore:
                     # A constituent body file vanished mid-traversal (a
                     # concurrent whole-chain delete). The body is an
                     # atomic unit (ADR-014), so a partial directory is a
-                    # missing body — surface the same KeyError the
+                    # missing body - surface the same KeyError the
                     # all-gone case raises.
                     raise KeyError(f"No body refs for chain_id={chain_id}") from exc
             return result

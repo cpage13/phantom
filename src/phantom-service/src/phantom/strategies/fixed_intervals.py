@@ -1,4 +1,4 @@
-"""FixedIntervalsStrategy — schedule with a caller-supplied interval list."""
+"""FixedIntervalsStrategy - schedule with a caller-supplied interval list."""
 
 from __future__ import annotations
 

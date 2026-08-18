@@ -6,11 +6,11 @@ failure if the holder outlasts the budget." Two boot-path call sites consume it
 so they cannot drift on the backoff discipline (the explicit goal of § 4D.1's
 "do NOT duplicate the backoff logic"):
 
-* :func:`phantom.workers.recovery.run_recovery` — recovery's idempotent WRITES
+* :func:`phantom.workers.recovery.run_recovery` - recovery's idempotent WRITES
   (``reset_attempting_to_queued`` / ``mark_corrupted``) on the ``uploads.db``
   write lock (finding R9-V6-2); raises :class:`phantom.workers.recovery.RecoveryLockError`
   past budget.
-* :func:`phantom.app._build_instance_context` — the boot-time DATABASE OPEN
+* :func:`phantom.app._build_instance_context` - the boot-time DATABASE OPEN
   (``store.start()`` / ``token_cache.start()``, § 4D.1); raises
   :class:`BootOpenLockError` past budget so the open is then treated as an
   unrecoverable access failure and the DB is isolated.
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 # Total wall-clock the boot path will wait on a transient lock before giving up
 # (finding R9-V6-2). Generous (a slow boot is acceptable per the durability
-# contract — a wedged service is not) yet bounded so a TRULY stuck holder
+# contract - a wedged service is not) yet bounded so a TRULY stuck holder
 # surfaces a clean, loud failure rather than hanging the boot forever. Shared by
 # recovery's write retry and § 4D.1's boot-open retry so both wait the same.
 LOCK_RETRY_BUDGET_SECONDS: float = 120.0
@@ -51,12 +51,12 @@ class BootOpenLockError(RuntimeError):
     """A boot-time database OPEN could not acquire the lock within the budget.
 
     Raised by the § 4D.1 boot-open retry when an external holder kept the DB
-    locked for the entire :data:`LOCK_RETRY_BUDGET_SECONDS` budget — past the
+    locked for the entire :data:`LOCK_RETRY_BUDGET_SECONDS` budget - past the
     point a transient contender would have released. The boot-open guard catches
     it (it is NOT a transient-lock error and so falls out of the retry) and
     treats the open as an UNRECOVERABLE access failure: the database is isolated
     and the instance boots fresh, exactly as for a permission / I/O open fault.
-    A transient holder that releases within the budget never reaches this — the
+    A transient holder that releases within the budget never reaches this - the
     open simply succeeds on a later attempt.
     """
 
@@ -73,13 +73,13 @@ async def retry_on_transient_lock[T](
     """Run ``op``, riding out a TRANSIENT SQLite lock with bounded backoff.
 
     Calls ``op`` and returns its result. If ``op`` raises a transient SQLite
-    lock error (:func:`is_transient_lock_error` — a cross-process ``SQLITE_BUSY``
+    lock error (:func:`is_transient_lock_error` - a cross-process ``SQLITE_BUSY``
     or a ``SQLITE_LOCKED`` that outlasted the connection's ``busy_timeout``),
     retries with bounded exponential backoff until the lock clears or
     ``budget_seconds`` is exhausted. On exhaustion it raises whatever
     ``on_budget_exhausted(last_lock_error)`` returns (the caller's own
     operator-facing error, chained from the last lock exception). A NON-lock
-    exception (a genuine fault) propagates immediately — only the transient-lock
+    exception (a genuine fault) propagates immediately - only the transient-lock
     class is retried.
 
     ``op`` MUST be safe to re-run: each retry calls it again. Recovery's writes
@@ -125,11 +125,11 @@ async def retry_on_transient_lock[T](
             if remaining <= 0:
                 raise on_budget_exhausted(exc) from exc
             backoff = min(backoff_base_seconds * (2**attempt), backoff_max_seconds)
-            # Never sleep past the deadline — keep the total wait bounded.
+            # Never sleep past the deadline - keep the total wait bounded.
             backoff = min(backoff, remaining)
             logger.warning(
                 "%s is blocked on a transient SQLite lock (an external process "
-                "holds it past busy_timeout); riding it out — retrying in %.1fs "
+                "holds it past busy_timeout); riding it out - retrying in %.1fs "
                 "(%.0fs of the %.0fs budget remaining)",
                 description,
                 backoff,

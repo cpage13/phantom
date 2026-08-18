@@ -148,13 +148,13 @@ _SIGHUP_INSTALL_ERRORS: Final[tuple[type[BaseException], ...]] = (
     NotImplementedError,
     ValueError,
 )
-"""``add_signal_handler`` failures (Windows / non-main-thread) — log and skip."""
+"""``add_signal_handler`` failures (Windows / non-main-thread) - log and skip."""
 
 
 def _default_executor_worker_count(settings: Settings) -> int:
     """Compute the asyncio default-executor worker count from settings.
 
-    Pure function — the side-effecting :func:`_resize_default_executor`
+    Pure function - the side-effecting :func:`_resize_default_executor`
     wraps this for testability. Sizes against
     ``saturation.max_in_flight`` x number of instances x
     :data:`_THREADS_PER_INFLIGHT_REQUEST`, then clamps to
@@ -164,7 +164,7 @@ def _default_executor_worker_count(settings: Settings) -> int:
     guarantee ``settings.saturation.max_in_flight`` and
     ``settings.instances`` are non-falsy populated values by the time
     this is called from the lifespan, so no exception handling is
-    needed at this layer — any access failure here would be a settings
+    needed at this layer - any access failure here would be a settings
     invariants bug, not a normal operating condition.
     """
     inflight_cap = settings.saturation.max_in_flight or _DEFAULT_EXECUTOR_MIN_WORKERS
@@ -328,11 +328,11 @@ class _Startable(Protocol):
 
     async def start(self) -> None:
         """Open the connection (and, for the upload store, apply schema)."""
-        ...  # pragma: no cover — Protocol stub.
+        ...  # pragma: no cover - Protocol stub.
 
     async def stop(self) -> None:
         """Close the connection (a no-op if it was never opened)."""
-        ...  # pragma: no cover — Protocol stub.
+        ...  # pragma: no cover - Protocol stub.
 
 
 async def _started[StartableT: _Startable](store: StartableT) -> StartableT:
@@ -372,7 +372,7 @@ class _StorageSubstrateUnwritableError(RuntimeError):
     """The instance's data_dir is unwritable, so it cannot buffer durably (M-1).
 
     Raised by :func:`_open_db_with_retry_then_isolate` when the isolate-or-
-    recreate of an unrecoverable open ITSELF fails with an ``OSError`` — the
+    recreate of an unrecoverable open ITSELF fails with an ``OSError`` - the
     rename aside or the fresh-DB open hits a read-only / full ``data_dir``. This
     is the one physics boundary "always boot durably" cannot honor: no writable
     disk means no durable buffering. :func:`_build_instance_context` catches it
@@ -401,7 +401,7 @@ class ConfigCredentialError(RuntimeError):
     ``secret_access_key_env`` / ``session_token_env``) is absent or empty. This
     is fail-fast by design (GLOBAL §1.2(a) B1 / plan Phase 2 TASK 2.4b): a
     config-declared credential whose backing secret env var is missing is an
-    operator misconfiguration that must be fixed, not silently skipped — a
+    operator misconfiguration that must be fixed, not silently skipped - a
     silent skip would strand every ``aws_sigv4`` forward on that host with no
     credential and no signal. Unlike :class:`_StorageSubstrateUnwritableError`
     (a physics boundary that DEGRADES the one instance), this is a config error
@@ -468,7 +468,7 @@ def _config_credential_to_internal(
     if cfg.kind == "profile_ref":
         return ProfileRefCred(service=cfg.service, profile=cfg.profile, region=cfg.region)
 
-    # sigv4_static — the validator guarantees these are set.
+    # sigv4_static - the validator guarantees these are set.
     assert cfg.access_key_id_env is not None
     assert cfg.secret_access_key_env is not None
     assert cfg.region is not None
@@ -579,7 +579,7 @@ async def _open_db_with_retry_then_isolate[StoreT](
     1. **Retry a transient lock.** ``open_fresh`` is run through the shared
        :func:`phantom.runtime.lock_retry.retry_on_transient_lock`, so a transient
        ``SQLITE_BUSY`` / ``SQLITE_LOCKED`` holder is ridden out with bounded
-       backoff. Each attempt calls ``open_fresh`` again — which builds a FRESH
+       backoff. Each attempt calls ``open_fresh`` again - which builds a FRESH
        store/cache and ``start()``s it, the natural unit of work for an open (a
        half-opened connection from a failed attempt is abandoned, not reused).
     2. **Isolate an unrecoverable failure.** Any other ``aiosqlite.Error`` /
@@ -593,14 +593,14 @@ async def _open_db_with_retry_then_isolate[StoreT](
        fresh open fails, PROBE ``data_root`` (:func:`_data_root_is_unwritable`):
        when the directory itself is unwritable (read-only / full ``data_dir``),
        raise :class:`_StorageSubstrateUnwritableError` so the caller degrades the
-       instance. The probe — not the failed call's Python exception type — is the
+       instance. The probe - not the failed call's Python exception type - is the
        signal: a read-only directory surfaces as ``sqlite3.OperationalError`` (an
        ``aiosqlite.Error``, NOT an ``OSError``) from the recreate ``start()``, so
        keying off ``OSError`` alone would let that exact real-world fault
        crash-loop the boot. When the directory IS writable, the open failed for a
        different reason (a DB unusable past the isolate, a lock past budget on the
        reopen); that original error is re-raised UNCHANGED so a genuine fault is
-       never silently degraded — the substrate probe is the only thing that turns
+       never silently degraded - the substrate probe is the only thing that turns
        a failure into a degrade.
 
     Args:
@@ -609,7 +609,7 @@ async def _open_db_with_retry_then_isolate[StoreT](
         isolate: Moves the DB (and WAL/SHM) aside. ``quarantine(...)`` for the
             upload store (coupled body tree), :func:`isolate_db_file` for the
             body-less token cache (m-4). Its return (the dest path(s)) is
-            discarded — the movers log their own destinations — so the type is
+            discarded - the movers log their own destinations - so the type is
             ``Callable[[], object]``.
         db_path: The DB path, for the WARNING + degraded-fault detail.
         data_root: The per-instance data directory holding ``db_path``, probed for
@@ -642,7 +642,7 @@ async def _open_db_with_retry_then_isolate[StoreT](
         # create the file) is classified by PROBING data_root: an unwritable
         # substrate degrades (do NOT crash); a writable one re-raises the real
         # fault. We catch the same (aiosqlite.Error, OSError) classes the open
-        # raises because the recreate runs the very same start() — a read-only
+        # raises because the recreate runs the very same start() - a read-only
         # dir surfaces there as sqlite3.OperationalError (an aiosqlite.Error,
         # not an OSError), which keying off OSError alone would let escape.
         try:
@@ -764,7 +764,7 @@ async def _build_instance_context(
     # reconciliation finishes any backup/restore move interrupted by a prior
     # crash (so the live tree is fully clean), then the mode guard inspects
     # that clean tree. All MUST run before the SqliteUploadStore opens and
-    # before the body store is constructed — opening a corrupt DB or booting
+    # before the body store is constructed - opening a corrupt DB or booting
     # all_ram over a populated tree is exactly what they prevent.
     #
     # Seam 3: each stage carries its OWN typed fault mapping below, so the
@@ -992,7 +992,7 @@ async def _build_instance_context(
             f"isolated, or recreated: {exc!r}",
         )
 
-    # The aws_sigv4 credential store — same boot-open guard as the token cache
+    # The aws_sigv4 credential store - same boot-open guard as the token cache
     # (own DB file, isolated via isolate_db_file rather than the body-coupled
     # quarantine). On failure, close the already-open stores before degrading so
     # no descriptor leaks.
@@ -1022,11 +1022,11 @@ async def _build_instance_context(
 
     # Config acquisition route (plan Phase 2 TASK 2.4b): with the credential
     # store open, materialize the top-level ``sigv4_credentials`` declarations
-    # into THIS instance's store — resolve each entry's named env var(s) to
+    # into THIS instance's store - resolve each entry's named env var(s) to
     # literals (the B1 boot-time resolution) and ``set`` under the normalized
     # destination host with ``source="config"``. Empty (the default) is a
     # no-op. A missing/empty named env var raises ConfigCredentialError, which
-    # PROPAGATES (a config error the operator must fix — not a per-instance
+    # PROPAGATES (a config error the operator must fix - not a per-instance
     # degrade), crashing boot loudly. Runs per instance, so every instance's
     # store receives the top-level map (the admin-push fan-out analogue). On
     # failure, close the three already-open stores before propagating so no
@@ -1184,7 +1184,7 @@ def _build_resolved_defaults_summary(settings: Settings) -> ResolvedDefaultsSumm
 async def _stop_instance(ctx: InstanceContext) -> None:
     """Tear down every Protocol-typed dependency for one instance.
 
-    The AdMinter is no longer torn down here — Phase 2 § 3.2.5 (H6
+    The AdMinter is no longer torn down here - Phase 2 § 3.2.5 (H6
     closure) moved it under the lifespan's :class:`asyncio.TaskGroup`,
     which cancels the run-loop on lifespan exit. Calling minter.stop()
     here would be a double-stop (TaskGroup cancellation already
@@ -1262,7 +1262,7 @@ def create_app(
     Args:
         settings: The loaded + validated top-level settings.
         settings_path: Filesystem path of the YAML config the
-            ``settings`` was loaded from. Required for hot reload — both
+            ``settings`` was loaded from. Required for hot reload - both
             SIGHUP and ``POST /v1/admin/reload`` re-read this file. When
             ``None`` (e.g., tests that synthesize a Settings instance),
             hot reload is disabled (the SIGHUP handler is not installed
@@ -1280,7 +1280,7 @@ def create_app(
     configure_logging(settings.observability)
     _warn_if_bound_non_loopback(settings)
 
-    # Plan § 4.2 — one process-wide metrics registry. Threaded to every
+    # Plan § 4.2 - one process-wide metrics registry. Threaded to every
     # store / worker that emits metrics; exposed via the admin
     # observability endpoints (plan § 4.2.5).
     metrics_registry = MetricsRegistry()
@@ -1308,7 +1308,7 @@ def create_app(
         # named ``app`` to wire its dependency overrides, so ``_app`` itself
         # is intentionally unused.
         #
-        # Process-wide startup guards — run ONCE, before any instance
+        # Process-wide startup guards - run ONCE, before any instance
         # context is built (the integrity gate + all_ram guard run
         # per-instance inside _build_instance_context).
         #   * apply_umask: bare-metal owner-only file perms (WS-4 F6).
@@ -1345,7 +1345,7 @@ def create_app(
             SCHEMA_DISCARD_COUNTER_DESCRIPTION,
         )
         # Install the initial per-instance snapshots before any instance
-        # context is built — the InstanceContext.current_settings thunk
+        # context is built - the InstanceContext.current_settings thunk
         # captures the holder by reference and resolves lazily, so the
         # holder must be populated before the first worker tick.
         await settings_holder.replace(initial_snapshots)
@@ -1353,7 +1353,7 @@ def create_app(
         #
         # Every ingress request offloads CPU-bound work to the thread
         # pool: sha256(raw), codec.encode(raw), sha256(encoded), plus
-        # fsync(dir) and fsync(file)/replace on the persist path — up
+        # fsync(dir) and fsync(file)/replace on the persist path - up
         # to ~6 thread-pool calls per in-flight admission. CPython's
         # default executor (``min(32, cpu+4)``) saturates around 12
         # threads on typical producer hardware; under 16-way concurrent
@@ -1390,7 +1390,7 @@ def create_app(
                 case _:
                     assert_never(outcome)
             # AdMinter is no longer self-spawning. Its run-loop is
-            # spawned on the lifespan TaskGroup below (H6 closure —
+            # spawned on the lifespan TaskGroup below (H6 closure -
             # the unsupervised ``minter.start()`` create_task call
             # site is gone).
 
@@ -1435,10 +1435,10 @@ def create_app(
         app.dependency_overrides[admin_routes.get_resolved_defaults_summary] = lambda: (
             resolved_defaults_summary
         )
-        # Plan § 4.2.5 — observability admin endpoints depend on the
+        # Plan § 4.2.5 - observability admin endpoints depend on the
         # process-wide MetricsRegistry.
         app.dependency_overrides[admin_routes.get_metrics_registry] = lambda: metrics_registry
-        # Plan § 5.2.5 — quarantine-inventory endpoint depends on the
+        # Plan § 5.2.5 - quarantine-inventory endpoint depends on the
         # resolved storage data_dir for the filesystem walk.
         app.dependency_overrides[admin_routes.get_data_root] = lambda: Path(
             settings.storage.data_dir
@@ -1469,7 +1469,7 @@ def create_app(
                 # add_signal_handler is unsupported on Windows event loops
                 # and may fail when running outside the main thread (e.g.,
                 # in some test harnesses). Hot reload via POST is still
-                # available — log and continue.
+                # available - log and continue.
                 logger.warning("SIGHUP handler not installed; admin reload endpoint only")
 
         try:
@@ -1499,11 +1499,11 @@ def create_app(
                         cred_kicker.run(stop_event), name=f"credential-kicker-{ctx.cfg.id}"
                     )
                     tg.create_task(vacuum.run(stop_event), name=f"vacuum-{ctx.cfg.id}")
-                    # Plan § 5.2.6 — optional per-instance cold backup.
+                    # Plan § 5.2.6 - optional per-instance cold backup.
                     # Each instance has its own data_root/uploads.db, so
                     # one scheduler per instance when the operator opts in
                     # via db_integrity.backup_enabled. Writes only to
-                    # <data_root>/backups/ — the live DB stays single-writer
+                    # <data_root>/backups/ - the live DB stays single-writer
                     # (plan § 0.5). Driven by stop_event like every other
                     # lifespan worker so the TaskGroup drains cleanly on
                     # shutdown (an unstoppable loop would block teardown).
@@ -1520,14 +1520,14 @@ def create_app(
                             cold_backup.run(stop_event),
                             name=f"cold-backup-{ctx.cfg.id}",
                         )
-                    # H6 audit closure — AdMinter run-loop is now
+                    # H6 audit closure - AdMinter run-loop is now
                     # supervised by the lifespan TaskGroup. An unhandled
                     # exception (AuthUnavailableError with empty backoff,
                     # azure-identity import failure, etc.) propagates as
                     # an ExceptionGroup out of this ``async with`` and
                     # crashes the process visibly; the orchestrator
                     # restarts it. Pre-Phase-2 the minter spawned its
-                    # own asyncio.create_task — that task was
+                    # own asyncio.create_task - that task was
                     # unsupervised and a silent exception left the
                     # runtime believing the minter was healthy.
                     if ctx.minter is not None:
@@ -1541,7 +1541,7 @@ def create_app(
                     # RamPressureWatcher relies on it. DiskPressureProbe
                     # samples the file body store, so it is meaningful in
                     # ``hybrid`` and ``all_disk``. BodyOrphanJanitor sweeps
-                    # disk orphans only — same two modes. ``all_ram`` spawns
+                    # disk orphans only - same two modes. ``all_ram`` spawns
                     # none of these.
                     if ctx.persist_controller is not None:
                         # The watcher reads ceiling and cadence from the
@@ -1584,8 +1584,8 @@ def create_app(
                     Reaper(instances=instances, metrics_registry=metrics_registry).run(stop_event),
                     name="reaper",
                 )
-                # Plan § 4.2.3 — InvariantAuditor runs in every mode.
-                # One audit coroutine per instance — each instance has its
+                # Plan § 4.2.3 - InvariantAuditor runs in every mode.
+                # One audit coroutine per instance - each instance has its
                 # own store/body_store pair so the audit is scoped per
                 # instance.
                 for ctx in instances:
@@ -1646,7 +1646,7 @@ def create_app(
     # guard read it through their dependencies. Empty in the normal
     # all-instances-healthy case.
     app.state.degraded_boot = degraded_boot
-    # Plan § 4.2 — admin observability endpoints (plan § 4.2.5) resolve the
+    # Plan § 4.2 - admin observability endpoints (plan § 4.2.5) resolve the
     # process-wide MetricsRegistry from app.state.
     app.state.metrics_registry = metrics_registry
 

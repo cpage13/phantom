@@ -1,4 +1,4 @@
-"""Observability — logging redaction + in-process metrics primitives."""
+"""Observability - logging redaction + in-process metrics primitives."""
 
 from __future__ import annotations
 

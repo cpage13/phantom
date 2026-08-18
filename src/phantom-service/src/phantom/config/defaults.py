@@ -13,7 +13,7 @@ from phantom.config.probe import MachineFacts
 
 # Ceilings keep the auto-resolved values reasonable on very large
 # hardware (a server with 1 TiB of RAM shouldn't auto-resolve to a
-# 256 GiB max_in_flight_bytes — operators on big iron tune explicitly).
+# 256 GiB max_in_flight_bytes - operators on big iron tune explicitly).
 _MAX_MEMORY_CEILING_BYTES = 8 * 1024 * 1024 * 1024  # 8 GiB
 _WORKER_COUNT_CEILING = 8
 
@@ -43,7 +43,7 @@ _MAX_IN_FLIGHT_FLOOR = 64
 _MAX_IN_FLIGHT_CEILING = 1000
 
 # RAM fraction reserved for Phantom. A quarter of total RAM is a
-# defensive default — leaves three quarters for the OS, other
+# defensive default - leaves three quarters for the OS, other
 # co-tenant processes, codec working memory, and asyncio task frames.
 _RAM_FRACTION_NUMERATOR = 1
 _RAM_FRACTION_DENOMINATOR = 4
@@ -85,7 +85,7 @@ class ResolvedDefaults:
     large_body_threshold_bytes: int
     max_large_in_flight: int
 
-    # Storage — size-aware persist trigger threshold.
+    # Storage - size-aware persist trigger threshold.
     body_size_threshold_bytes: int
 
     # Workers

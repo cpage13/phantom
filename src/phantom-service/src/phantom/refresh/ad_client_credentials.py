@@ -1,4 +1,4 @@
-"""AdMinter — autonomous AD client-credentials token mint (ADR-001).
+"""AdMinter - autonomous AD client-credentials token mint (ADR-001).
 
 Uses ``azure.identity.aio.ClientSecretCredential`` to mint a token
 under Phantom's own AD app registration. A background loop mints
@@ -58,9 +58,9 @@ class AdMinter:
 
         H6 audit closure (Phase 2 § 3.2.5): the minter is no longer
         spawned via ``asyncio.create_task`` inside its own ``start()``
-        method (which left the task unsupervised — a silent exception
+        method (which left the task unsupervised - a silent exception
         in the refresh loop would have looked identical to a healthy
-        minter). The composition root — ``app.py``'s ``lifespan`` —
+        minter). The composition root - ``app.py``'s ``lifespan`` -
         now invokes ``minter.run()`` on its supervising
         ``asyncio.TaskGroup``; an unhandled exception propagates out as
         an ``ExceptionGroup`` and crashes the process visibly.
@@ -154,7 +154,7 @@ class AdMinter:
 
     async def _mint(self, client_secret: str, scope: str) -> datetime:
         """Mint one token using azure-identity and write it to the cache."""
-        # Lazy import — azure-identity is heavy and instances without an
+        # Lazy import - azure-identity is heavy and instances without an
         # AdMinter never need to import it.
         from azure.identity.aio import ClientSecretCredential
 
@@ -178,7 +178,7 @@ class AdMinter:
         return expiry
 
     def trigger_immediate_mint_for_test(self) -> None:
-        """Test hook — set the immediate-mint event."""
+        """Test hook - set the immediate-mint event."""
         self._immediate_mint.set()
 
     @property

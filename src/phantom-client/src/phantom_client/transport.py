@@ -1,4 +1,4 @@
-"""Internal HTTP transport — the SDK's single source of truth for the wire.
+"""Internal HTTP transport - the SDK's single source of truth for the wire.
 
 :class:`Transport` wraps a single :class:`httpx.AsyncClient` and exposes
 typed methods for every HTTP interaction the SDK supports. It is
@@ -32,7 +32,7 @@ Key behaviors:
 - Non-2xx responses are parsed as the ADR-010 ``ErrorEnvelope`` and
   raised as a typed :class:`~phantom_client.errors.PhantomHttpError`
   subclass.
-- ``Authorization`` is never logged — the logging filter redacts it.
+- ``Authorization`` is never logged - the logging filter redacts it.
 - A ``unix:`` ``phantom_url`` (the documented UDS form of the service
   connections table) is routed through a real
   ``httpx.AsyncHTTPTransport(uds=...)`` automatically; a missing socket
@@ -74,7 +74,7 @@ _LOG = logging.getLogger(__name__)
 # rejects the older spelling.
 type QueryParamValue = str | int
 
-# Path constants — single source of truth for the v1 URL space.
+# Path constants - single source of truth for the v1 URL space.
 _PATH_SEND = "/v1/send"
 
 # Backoff jitter range; ±50% per RetryPolicy.backoff_jitter docstring.
@@ -82,7 +82,7 @@ _JITTER_HALF_RANGE = 0.5
 
 # The documented Unix-domain-socket form of ``phantom_url``: ``unix:`` + the
 # socket path (the service connections-table contract, mirroring
-# ``server.bind_uds`` on the service side). Never handed to httpx as a URL —
+# ``server.bind_uds`` on the service side). Never handed to httpx as a URL -
 # bare ``unix:`` is not a fetchable httpx scheme.
 _UDS_URL_SCHEME = "unix:"
 # Synthetic authority for request construction over UDS. httpx still needs an
@@ -102,13 +102,13 @@ def _uds_socket_path(phantom_url: str) -> str | None:
         return None
     path = phantom_url[len(_UDS_URL_SCHEME) :]
     if path.startswith("//"):
-        # unix:///abs/path — strip the empty authority marker.
+        # unix:///abs/path - strip the empty authority marker.
         path = path[2:]
     return path
 
 
 # ---------------------------------------------------------------------------
-# Logging filter — strip Authorization from anything that reaches the logger.
+# Logging filter - strip Authorization from anything that reaches the logger.
 # ---------------------------------------------------------------------------
 
 
@@ -236,7 +236,7 @@ class Transport:
             self._client = None
 
     # -----------------------------------------------------------------
-    # submit_chain — the load-bearing primitive.
+    # submit_chain - the load-bearing primitive.
     # -----------------------------------------------------------------
 
     async def submit_chain(
@@ -536,7 +536,7 @@ class Transport:
         UTF-8-decodes the bytes; that inflates binary payloads (a random
         100 KiB body grows to ~150 KiB and its hash mutates), violating
         the transparent-proxy invariant. The filename value is cosmetic
-        from receivers' perspective — multipart parsing only branches on
+        from receivers' perspective - multipart parsing only branches on
         whether the value is non-empty, not on what it spells.
         """
         parts: list[tuple[str, tuple[str, bytes, str]]] = [

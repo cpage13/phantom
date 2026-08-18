@@ -14,7 +14,7 @@ from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field
 
-ErrorCode: TypeAlias = Literal[  # noqa: UP040 — see chain.py rationale
+ErrorCode: TypeAlias = Literal[  # noqa: UP040 - see chain.py rationale
     "envelope_invalid",
     "envelope_duplicate",
     "header_invalid",
@@ -64,10 +64,10 @@ rather than only a defensive default. ``codec_round_trip_drift`` remains a
 
 STATUS_FOR_CODE: dict[ErrorCode, int] = {
     "envelope_invalid": 422,
-    # A multipart submission carried two ``envelope`` parts — ambiguous
+    # A multipart submission carried two ``envelope`` parts - ambiguous
     # which chain the producer intended (the envelope holds the chain_id /
     # destination / step chain). Rejected for parity with body_ref_duplicate
-    # and the duplicate-step-name check (finding R3-9 — the E-1 sibling);
+    # and the duplicate-step-name check (finding R3-9 - the E-1 sibling);
     # silently last-wins dropped one envelope with no signal.
     "envelope_duplicate": 422,
     # An OPTIONAL grouping/ordering request header on POST /v1/send was
@@ -83,7 +83,7 @@ STATUS_FOR_CODE: dict[ErrorCode, int] = {
     "body_ref_missing": 422,
     "body_ref_orphan": 422,
     # A multipart submission carried two parts with the same
-    # ``body_refs[<name>]`` — ambiguous which body the producer intended.
+    # ``body_refs[<name>]`` - ambiguous which body the producer intended.
     # Rejected for parity with body_ref_missing / body_ref_orphan
     # (finding E-1); silently last-wins dropped one body with no signal.
     "body_ref_duplicate": 422,
@@ -108,13 +108,13 @@ STATUS_FOR_CODE: dict[ErrorCode, int] = {
     # the claim it collides with. An idempotency key MUST be a function
     # of the body; reusing it with different bytes is a client contract
     # violation that would otherwise silently drop the second body
-    # behind a success-shaped 200 replay (finding G-1). 422 — the
+    # behind a success-shaped 200 replay (finding G-1). 422 - the
     # request is well-formed but semantically unprocessable.
     "idempotency_key_conflict": 422,
     # The envelope's chain_id (the row primary key) is already in use by
     # a live row. A re-POST of the same chain_id under a fresh
     # idempotency key would otherwise escape as a naked HTTP 500
-    # (finding D-1). 409 Conflict — the request conflicts with current
+    # (finding D-1). 409 Conflict - the request conflicts with current
     # server state; the producer must mint a fresh chain_id (UUID4 collisions
     # are astronomically rare, so this almost always means a client bug).
     "chain_id_in_use": 409,
@@ -180,18 +180,18 @@ STATUS_FOR_CODE: dict[ErrorCode, int] = {
     # unprocessable as posed.
     "request_invalid": 422,
     "saturation_cap": 503,
-    # disk_pressure shares the saturation-class 503 — both "server cannot
-    # accept right now, retry later" — distinguished from saturation_cap
+    # disk_pressure shares the saturation-class 503 - both "server cannot
+    # accept right now, retry later" - distinguished from saturation_cap
     # by the cause: disk_pressure means storage is the constraint, not
     # in-flight row/byte counts. Both emit Retry-After.
     "disk_pressure": 503,
-    # A storage-layer write FAULT (an ``OSError`` — fsync EIO or ENOSPC)
+    # A storage-layer write FAULT (an ``OSError`` - fsync EIO or ENOSPC)
     # struck while admission was durably buffering the upload body
     # (``body_store.put``). Distinct from ``disk_pressure``: that is the
     # PROACTIVE ``max_disk_bytes`` gate (a polled ceiling), whereas this is
     # a REACTIVE per-write failure that the proactive gate cannot foresee (a
     # burst that fills the real disk between probe ticks, or a flaky SD card
-    # returning EIO). 503 + Retry-After — the fault is transient (the reaper/
+    # returning EIO). 503 + Retry-After - the fault is transient (the reaper/
     # operator frees space; a transient EIO may not recur), so the producer should
     # retry rather than fall back direct-to-upstream (findings R7-1-A/B,
     # R7-2-A). Durability holds regardless: the failed put commits no row, so

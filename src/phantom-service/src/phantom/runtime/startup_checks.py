@@ -1,29 +1,29 @@
-"""Startup hardening seam — the single typed home for the boot-time guards.
+"""Startup hardening seam - the single typed home for the boot-time guards.
 
 This module is the one place the production composition root
 (:func:`phantom.app.create_app`'s ``lifespan``) reaches for the
 five startup behaviors that defend a Pi-class deployment:
 
-* :func:`apply_umask` — process-wide bare-metal file-perm hardening
+* :func:`apply_umask` - process-wide bare-metal file-perm hardening
   (WS-4 F6): every file the service creates after this call is
   owner-only (``0o600`` / ``0o700``).
-* :func:`check_retention_floor` — process-wide config invariant
+* :func:`check_retention_floor` - process-wide config invariant
   (plan § 4.2.4): bodies must not be retained longer than their
   metadata row, else a reaped row orphans its body file. It is the one
   guard here with a SECOND caller: ``apply_reload`` re-runs it between
   the YAML load and the swap (F14), where a violation rejects the
   reload rather than crashing the process.
-* :func:`check_instance_isolation` — process-wide config invariant
+* :func:`check_instance_isolation` - process-wide config invariant
   (plan § 9.10.1): every configured instance must be *completely
   isolated* (unique id, its own storage partition, unambiguous
   routing). Fail-closed on a duplicate ``id``, a colliding/nested
   ``data_dir``, or a duplicate ``host_prefix``.
-* :func:`check_body_store_mode` — per-instance back-up-and-run guard
+* :func:`check_body_store_mode` - per-instance back-up-and-run guard
   (findings A-3 + F-2, plan § 1.2 / ADR-025): when ``all_ram`` is
   selected over a populated on-disk body tree it relocates the live DB +
   body tree to a recoverable ``mode_switch`` quarantine pair and boots
   fresh, rather than refusing to boot or silently corrupting the data.
-* :func:`run_integrity_gate` — per-instance DB-corruption gate
+* :func:`run_integrity_gate` - per-instance DB-corruption gate
   (plan § 5.2.2): runs ``PRAGMA integrity_check`` before the store
   opens, quarantines a corrupt DB + body tree, bumps
   ``db_quarantine_total``, and either proceeds fresh (``fail_open``)
@@ -31,14 +31,14 @@ five startup behaviors that defend a Pi-class deployment:
 
 It also owns the single mode-wiring decision table
 (:func:`build_body_store`) so the ``hybrid`` / ``all_ram`` / ``all_disk``
-composition lives in exactly one place — no second copy to drift.
+composition lives in exactly one place - no second copy to drift.
 
 Reused, never duplicated: :class:`phantom.storage.integrity.IntegrityChecker`,
 :class:`phantom.workers.cold_backup.ColdBackupScheduler`, and the
 :class:`ConfigInvariantError` exception defined here.
 
 Provenance: relocated from ``runtime/composition.py`` during the
-2026-05-29 refinement (Option B, ADR pending) — these guards previously
+2026-05-29 refinement (Option B, ADR pending) - these guards previously
 ran only in the dead-path ``compose_and_run``, which R-2 then deleted.
 ``app.py``'s lifespan is now the one production composition root.
 """
@@ -116,7 +116,7 @@ SCHEMA_DISCARD_COUNTER_DESCRIPTION: str = (
     "population-of-zero exception)."
 )
 
-# The :class:`phantom.config.settings.BodyStoreCfg.mode` Literal — kept
+# The :class:`phantom.config.settings.BodyStoreCfg.mode` Literal - kept
 # inline so callers can narrow on a match without importing the model.
 BodyStoreMode = Literal["hybrid", "all_ram", "all_disk"]
 
@@ -126,7 +126,7 @@ def _derive_expected_uploads_columns() -> frozenset[str]:
 
     Builds a throwaway in-memory SQLite, applies ``storage/schema.sql``'s DDL,
     and reads ``frozenset(name for PRAGMA table_info(uploads))``. This makes
-    ``schema.sql`` the SOLE source of the expected column set — there is no
+    ``schema.sql`` the SOLE source of the expected column set - there is no
     hand-maintained name list to drift out of sync (the deletion test: a
     duplicated frozenset would need a mirror test to guard it; deriving removes
     the duplicate entirely). Synchronous :mod:`sqlite3` (not ``aiosqlite``) is
@@ -319,7 +319,7 @@ class ConfigInvariantError(ValueError):
 
     * **Retention floor** (:func:`check_retention_floor`):
       ``retention.body_seconds`` must not exceed
-      ``retention.metadata_seconds`` for any state — bodies cannot
+      ``retention.metadata_seconds`` for any state - bodies cannot
       outlive their metadata row.
     * **Instance isolation** (:func:`check_instance_isolation`):
       every instance must have a unique ``id``, a non-colliding /
@@ -355,7 +355,7 @@ def apply_umask() -> None:
     """Set the process umask so startup-created files are owner-only.
 
     Bare-metal trust boundary (WS-4 F6). Called once, process-wide,
-    before any instance directory or store is created — every file the
+    before any instance directory or store is created - every file the
     service writes (the SQLite DB, its WAL/SHM, buffered body files,
     the token cache) is then created ``0o600`` / ``0o700`` rather than
     inheriting a potentially group/world-readable process default.
@@ -411,7 +411,7 @@ def check_retention_floor(settings: Settings) -> None:
             retention.auth_expired_metadata_seconds,
         ),
         ("corrupted", retention.corrupted_body_seconds, retention.corrupted_metadata_seconds),
-        # NB: this list is (state, body, metadata) — OPPOSITE of the reaper's
+        # NB: this list is (state, body, metadata) - OPPOSITE of the reaper's
         # (state, metadata, body). ADR-032's ``expired`` pair, in THIS order:
         ("expired", retention.expired_body_seconds, retention.expired_metadata_seconds),
     ]
@@ -425,7 +425,7 @@ def check_retention_floor(settings: Settings) -> None:
         if metadata_seconds < 0:
             continue
         if body_seconds < 0:
-            # Body kept forever but metadata expires — bodies outlive
+            # Body kept forever but metadata expires - bodies outlive
             # rows. Reject.
             msg = (
                 f"retention.{state}_body_seconds={body_seconds} (forever) "
@@ -450,13 +450,13 @@ def check_instance_isolation(instances: Sequence[InstanceCfg]) -> None:
     dispatcher's ``_by_id`` map (an instance becomes unreachable) and a
     shared ``data_dir`` puts two stores on one ``uploads.db`` (a
     single-writer violation that corrupts the DB). This runs once,
-    process-wide, at the top of the lifespan — before any instance
+    process-wide, at the top of the lifespan - before any instance
     context is built.
 
     Three collisions are rejected:
 
-    * **Duplicate ``id``** — exact string match.
-    * **Colliding ``data_dir``** — compared after :meth:`Path.resolve`
+    * **Duplicate ``id``** - exact string match.
+    * **Colliding ``data_dir``** - compared after :meth:`Path.resolve`
       normalization (so ``foo`` == ``./foo`` == ``foo/``). Rejected on
       an exact match AND on true path-*component* nesting (one resolved
       path is an ancestor of another via :attr:`Path.parents`), so
@@ -464,10 +464,10 @@ def check_instance_isolation(instances: Sequence[InstanceCfg]) -> None:
       inside ``a/b`` is caught. Raw-string prefix comparison is
       deliberately NOT used (it both missed ``./foo`` dups and falsely
       rejected sibling prefixes).
-    * **Duplicate ``host_prefix``** — lower-cased before comparing
+    * **Duplicate ``host_prefix``** - lower-cased before comparing
       (matching the dispatcher's ``.lower()``), exact-match only. Glob
       *overlap* (e.g. ``*.example.com`` vs ``api.example.com``) stays
-      permitted by declaration order — first-match-wins is intentional,
+      permitted by declaration order - first-match-wins is intentional,
       not a collision.
 
     Args:
@@ -505,7 +505,7 @@ def check_instance_isolation(instances: Sequence[InstanceCfg]) -> None:
                     f"data_dir."
                 )
                 raise ConfigInvariantError(msg)
-            # True component nesting in either direction — an instance's
+            # True component nesting in either direction - an instance's
             # data_dir must not live inside another's storage partition.
             if other_dir in resolved.parents:
                 msg = (
@@ -553,7 +553,7 @@ def _disk_body_chain_dir_count(bodies_root: Path) -> int:
     so it counts every chain dir found. Dot-prefixed shards (the
     ``.tmp`` staging dir) and non-directory entries are skipped; a chain
     dir is any subdirectory of a shard. The chain dir's name is NOT
-    required to be a valid UUID here — any leftover upload tree counts as
+    required to be a valid UUID here - any leftover upload tree counts as
     "populated" for the fail-closed decision.
 
     Args:
@@ -585,11 +585,11 @@ def check_body_store_mode(
     ``all_disk`` deployment left body files under ``bodies_root``,
     booting ``all_ram`` directly would:
 
-    * condemn every ``body_location='file'`` row to ``corrupted`` —
+    * condemn every ``body_location='file'`` row to ``corrupted`` -
       recovery's ``has_body_ref`` walk asks the RamBodyStore (zero disk
       knowledge), so physically-intact bytes are declared missing
       (A-3 silent data loss); AND
-    * leak those bytes forever — no :class:`BodyOrphanJanitor` spawns in
+    * leak those bytes forever - no :class:`BodyOrphanJanitor` spawns in
       ``all_ram`` (F-2 disk leak).
 
     Plan § 1.2 / ADR-025: rather than refusing to boot (the prior
@@ -613,8 +613,8 @@ def check_body_store_mode(
     Args:
         mode: The configured ``storage.body_store.mode``.
         bodies_root: The per-instance ``<data_root>/bodies`` path
-            (the production layout — NOT ``body_store/``).
-        db_path: The per-instance ``<data_root>/uploads.db`` path — backed
+            (the production layout - NOT ``body_store/``).
+        db_path: The per-instance ``<data_root>/uploads.db`` path - backed
             up alongside ``bodies_root`` so the healthy DB and its body tree
             are preserved as one recoverable pair.
 
@@ -685,7 +685,7 @@ async def run_integrity_gate(
     if integrity_result.ok:
         return
     logger.error(
-        "DB integrity check failed (%s) — quarantining live artifacts",
+        "DB integrity check failed (%s) - quarantining live artifacts",
         integrity_result.message,
     )
     integrity_checker.quarantine_now()
@@ -707,7 +707,7 @@ async def run_integrity_gate(
 class SchemaAction(enum.Enum):
     """What the boot-time schema gate decides to do with the on-disk DB.
 
-    Plan § 4S.2. An enum (not a raw string) per the coding standard — a
+    Plan § 4S.2. An enum (not a raw string) per the coding standard - a
     categorical value with a known, closed set.
 
     Members:
@@ -754,7 +754,7 @@ class SchemaMigration:
 
     Plan § 4S.3. This is the seam for forward schema migrations. Until a
     migration is registered in :data:`SCHEMA_MIGRATIONS`, a non-current
-    database is DELETED (population of zero) rather than migrated — see
+    database is DELETED (population of zero) rather than migrated - see
     :func:`decide_schema_action`. Defined now so the seam is concrete and a
     future migration is a localized addition, not a redesign.
 
@@ -798,13 +798,13 @@ def decide_schema_action(
 ) -> SchemaAction:
     """Decide whether to boot the on-disk DB as-is or discard it (pure).
 
-    Plan § 4S.3. No I/O — the gate (:func:`run_schema_gate`) does the probing
+    Plan § 4S.3. No I/O - the gate (:func:`run_schema_gate`) does the probing
     and the deleting; this function only decides, so it is trivially
     unit-testable and the future-migration change stays local.
 
     Logic, in order:
 
-    1. FRESH DB (``observed_columns`` empty — no ``uploads`` table): there is
+    1. FRESH DB (``observed_columns`` empty - no ``uploads`` table): there is
        nothing on disk to discard; ``start()`` creates + stamps it. The gate
        passes an empty set for both a missing file (handled earlier) and a
        present-file-without-table. -> ``BOOT_AS_IS``.
@@ -817,7 +817,7 @@ def decide_schema_action(
 
     BOTH the version stamp and the column subset must hold for the step-2
     ``BOOT_AS_IS``: an unstamped-but-column-compatible DB (``user_version = 0``
-    with the current columns) is PRE-VERSION and discards (population of zero —
+    with the current columns) is PRE-VERSION and discards (population of zero -
     it cannot be a live field buffer); a stamped-but-column-deficient DB
     discards (the never-crash net).
 
@@ -830,23 +830,23 @@ def decide_schema_action(
         ``BOOT_AS_IS`` when the DB is fresh or stamped-current-and-complete;
         ``DISCARD_AND_BOOT_FRESH`` otherwise.
     """
-    # 1. Fresh DB — no uploads table to discard.
+    # 1. Fresh DB - no uploads table to discard.
     if not observed_columns:
         return SchemaAction.BOOT_AS_IS
     # 2. Stamped current AND every required column present (extras tolerated).
     #    ``observed_columns >= EXPECTED_UPLOADS_COLUMNS`` is the subset
-    #    predicate "observed is a superset of expected" — every column the
+    #    predicate "observed is a superset of expected" - every column the
     #    code reads is present (the gate's never-crash column check).
     if observed_version == SCHEMA_VERSION and observed_columns >= EXPECTED_UPLOADS_COLUMNS:
         return SchemaAction.BOOT_AS_IS
-    # 3. Pre-version OR column-deficient — cannot safely keep it.
+    # 3. Pre-version OR column-deficient - cannot safely keep it.
     #
     # FUTURE-MIGRATION HOOK: when SCHEMA_MIGRATIONS is non-empty and a path
     # observed_version -> SCHEMA_VERSION exists, run it and return BOOT_AS_IS
     # (a failed migration falls back to DISCARD_AND_BOOT_FRESH); today the
     # registry is empty so every non-current schema deletes and boots fresh.
     # Keeping the seam inside this pure decision function (no I/O) keeps it
-    # unit-testable and makes the future change local — the migration runner
+    # unit-testable and makes the future change local - the migration runner
     # would slot in right here, consulting SCHEMA_MIGRATIONS.
     if (
         SCHEMA_MIGRATIONS
@@ -873,7 +873,7 @@ async def run_schema_gate(*, db_path: Path, bodies_root: Path) -> SchemaGateResu
     then the instance boots fresh.
 
     Must run AFTER the mode guard (:func:`check_body_store_mode`) and BEFORE
-    the :class:`SqliteUploadStore` opens — a mismatched DB is deleted before
+    the :class:`SqliteUploadStore` opens - a mismatched DB is deleted before
     ``executescript`` can crash on it (an old DB missing an indexed column dies
     inside ``start()``). The version STAMP, by contrast, runs inside
     ``start()`` on the connection it opens (§ 4S.1).
@@ -881,7 +881,7 @@ async def run_schema_gate(*, db_path: Path, bodies_root: Path) -> SchemaGateResu
     This gate takes NO ``metrics_registry``: it is a pure decision-plus-delete
     that RETURNS its result; the WARNING + ``schema_discard_total`` bump live
     at the ``app.py`` call site (mirroring :func:`check_body_store_mode`'s
-    split). It uses NONE of § 1's mover/marker/reconciliation — nothing is
+    split). It uses NONE of § 1's mover/marker/reconciliation - nothing is
     preserved, so no crash-atomicity marker is needed; an interrupted unlink
     re-evaluates to ``DISCARD_AND_BOOT_FRESH`` on the next boot and finishes
     (a half-deleted set is just another non-current DB).
@@ -903,7 +903,7 @@ async def run_schema_gate(*, db_path: Path, bodies_root: Path) -> SchemaGateResu
         A :class:`SchemaGateResult` carrying the action, the observations, and
         ``discarded_path`` (the deleted path on a discard, else ``None``).
     """
-    # A non-existent file is a fresh instance — no connection is opened; the
+    # A non-existent file is a fresh instance - no connection is opened; the
     # store will create + stamp the DB.
     if not db_path.exists():
         return SchemaGateResult(
@@ -947,7 +947,7 @@ async def run_schema_gate(*, db_path: Path, bodies_root: Path) -> SchemaGateResu
     # scoped exception): this is a PRE-VERSION (user_version != SCHEMA_VERSION)
     # or WRONG-SCHEMA (a required column missing) database. Phantom has ZERO
     # field deployments, so such a database CANNOT occur in the field and holds
-    # NO field data to preserve — no field DB can carry real undelivered
+    # NO field data to preserve - no field DB can carry real undelivered
     # uploads yet. Deleting it discards nothing. This is the deliberate, scoped
     # exception to the cycle's "never discard without a recoverable backup"
     # headline: corruption (the integrity gate) and a mode switch (§ 1) KEEP
@@ -991,7 +991,7 @@ async def build_body_store(
     """Compose the mode-selected body store + optional PersistController.
 
     The single decision table for the three deployment modes
-    (plan § 2.3.10) — app.py's lifespan (the composition root) calls this
+    (plan § 2.3.10) - app.py's lifespan (the composition root) calls this
     so the wiring lives in exactly one place:
 
     =========== ===================== =====================
@@ -1020,12 +1020,12 @@ async def build_body_store(
             PersistController.
 
     Returns:
-        ``(body_store, persist_controller)`` — ``persist_controller`` is
+        ``(body_store, persist_controller)`` - ``persist_controller`` is
         set only in ``hybrid`` mode, ``None`` otherwise.
 
     Raises:
         ValueError: When ``mode`` is not one of the three Literal values
-            (defensive — Pydantic forbids other values at construction).
+            (defensive - Pydantic forbids other values at construction).
     """
     if mode == "hybrid":
         body_store: BodyStore = HybridBodyStore(ram=ram_body_store, disk=file_body_store)

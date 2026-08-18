@@ -41,25 +41,25 @@ DECLARED paths, never by re-deriving names.
 
 Public surface (plan § 5.2.1, § 1.1, cycle-7 § 4):
 
-* :func:`check_integrity` — async ``PRAGMA integrity_check`` probe.
+* :func:`check_integrity` - async ``PRAGMA integrity_check`` probe.
 * :func:`quarantine_paths` - pure helper returning the destinations for a
   known backup identity.
-* :func:`quarantine` — side-effecting rename of DB + body store root
+* :func:`quarantine` - side-effecting rename of DB + body store root
   (live -> quarantine), reason-parameterized; returns the written
   :class:`BackupManifest`.
 * :func:`isolate_db_file` - body-less DB isolate (the token cache),
   manifested like every other backup.
-* :func:`restore_mode_switch_backup` — side-effecting rename of a
+* :func:`restore_mode_switch_backup` - side-effecting rename of a
   ``mode_switch`` backup pair back into the live tree (quarantine -> live),
   addressed by its manifest.
-* :func:`reconcile_interrupted_backup_move` — finish-forward boot
+* :func:`reconcile_interrupted_backup_move` - finish-forward boot
   reconciliation for an interrupted backup OR restore move, keyed on
   ``backup_id``.
 * :func:`list_quarantines` - manifest-driven inventory (one entry per
   backup plus anomaly entries).
 * :func:`load_backup_manifest` / :func:`backup_manifest_path` - manifest
   addressing for the admin restore route.
-* :class:`IntegrityChecker` — thin orchestrator that bundles the
+* :class:`IntegrityChecker` - thin orchestrator that bundles the
   helpers into a single ``check(...)`` entry point usable from the
   composition root. The class form gives callers a single dependency
   to inject; the underlying free functions remain importable for unit
@@ -95,7 +95,7 @@ logger = logging.getLogger(__name__)
 # ``type X = Literal[...]`` alias returns an empty tuple from
 # ``typing.get_args``, so the runtime-visible ``TypeAlias`` form is kept for
 # any introspection.
-QuarantineReason: TypeAlias = Literal["corrupted", "mode_switch"]  # noqa: UP040 — see note above
+QuarantineReason: TypeAlias = Literal["corrupted", "mode_switch"]  # noqa: UP040 - see note above
 
 # Sentinel naming pieces. For ``reason="corrupted"`` the DB form is
 # ``<stem>.corrupted.<stamp>.db`` and the body-store form is
@@ -148,7 +148,7 @@ class IntegrityCheckResult:
             ``PRAGMA integrity_check`` returned ``ok``. ``True`` also
             on a missing file (fresh deployment).
         message: Human-readable diagnostic; ``"ok"`` on success,
-            ``"fresh — no file"`` on missing input, or a descriptive
+            ``"fresh - no file"`` on missing input, or a descriptive
             error string from SQLite / OS errors otherwise.
     """
 
@@ -446,7 +446,7 @@ async def check_integrity(db_path: Path) -> IntegrityCheckResult:
         ``ok=False`` with a diagnostic ``message`` otherwise.
     """
     if not db_path.exists():
-        return IntegrityCheckResult(ok=True, message="fresh — no file")
+        return IntegrityCheckResult(ok=True, message="fresh - no file")
     try:
         async with (
             aiosqlite.connect(str(db_path)) as conn,
@@ -532,7 +532,7 @@ def _artifact_destinations(
     Args:
         db_path: Live DB path.
         body_store_root: Live body-store root directory.
-        reason: ``corrupted`` or ``mode_switch`` — selects the infix(es).
+        reason: ``corrupted`` or ``mode_switch`` - selects the infix(es).
         name_token: The shared dest stamp (``_backup_name_token`` output).
 
     Returns:
@@ -644,10 +644,10 @@ def quarantine(
     live tree. Without the marker, a crash after the body move but before
     the DB move would let a marker-less mode guard see an empty
     ``bodies_root``, judge "safe", and boot ``all_ram`` over a healthy DB
-    whose ``body_location='file'`` rows now point only into the backup —
+    whose ``body_location='file'`` rows now point only into the backup -
     the exact A-3 data loss the guard exists to prevent.
 
-    The strategy commits to "renames only, never deletes" — the operator
+    The strategy commits to "renames only, never deletes" - the operator
     decides when to remove quarantine artifacts. WAL/SHM siblings of the
     SQLite are also moved when present so the quarantined DB is
     self-contained.
@@ -712,7 +712,7 @@ def quarantine(
             body_store_root,
             quarantined_body,
         )
-    # DB LAST — for corruption its continued presence is the re-quarantine
+    # DB LAST - for corruption its continued presence is the re-quarantine
     # gate; for mode_switch the marker is the re-trigger.
     if _move_db_with_siblings(db_path, quarantined_db):
         logger.error(
@@ -731,11 +731,11 @@ def isolate_db_file(db_path: Path, *, timestamp: datetime | None = None) -> Back
     """Isolate a body-LESS SQLite file to a ``.corrupted.<stamp>.db`` sibling.
 
     A DB-only counterpart to :func:`quarantine` for a database that has NO
-    coupled body-store tree — the per-instance token cache
+    coupled body-store tree - the per-instance token cache
     (``token_cache.db``). :func:`quarantine` moves the body-store root FIRST and
     couples a DB path with a body ROOT, so handing it the instance's
     ``bodies_root`` to isolate the token cache would relocate the UPLOAD body
-    tree — wrong (review m-4 / finding F-18: a body-less isolate fits the
+    tree - wrong (review m-4 / finding F-18: a body-less isolate fits the
     coupled corruption mover least well). This helper moves only ``db_path`` plus
     its ``-wal`` / ``-shm`` siblings to a timestamped sibling, leaving any body
     tree untouched.
@@ -748,7 +748,7 @@ def isolate_db_file(db_path: Path, *, timestamp: datetime | None = None) -> Back
     ``(reason=corrupted, kind=db)`` and surfaces on ``GET /v1/admin/quarantine``.
     No in-progress marker is written: an un-openable DB on disk is its own
     re-trigger (identical to the corruption path's body-less analogue), and a
-    DB-only move has no second artifact to leave half-done — the
+    DB-only move has no second artifact to leave half-done - the
     :func:`_move_db_with_siblings` primitive already sweeps each WAL/SHM sibling
     independently so a crash mid-move is finished by the same idempotent move on
     the next boot.
@@ -1046,7 +1046,7 @@ def _dir_byte_sum(directory: Path) -> int:
             try:
                 size += p.stat().st_size
             except OSError:
-                # File vanished mid-walk — operator removed it.
+                # File vanished mid-walk - operator removed it.
                 continue
     return size
 
@@ -1130,7 +1130,7 @@ def list_quarantines(data_root: Path) -> list[QuarantineInventoryEntry]:
             per-instance ``data_root``).
 
     Returns:
-        A list of :class:`QuarantineInventoryEntry` — empty when
+        A list of :class:`QuarantineInventoryEntry` - empty when
         ``data_root`` is missing or contains no backups or anomalies.
     """
     if not data_root.exists():
@@ -1207,7 +1207,7 @@ def list_quarantines(data_root: Path) -> list[QuarantineInventoryEntry]:
 
 
 # ---------------------------------------------------------------------
-# Class facade (plan § 5.2.2 — composition-root injection point).
+# Class facade (plan § 5.2.2 - composition-root injection point).
 # ---------------------------------------------------------------------
 
 

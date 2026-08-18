@@ -1,4 +1,4 @@
-"""InvariantAuditor — periodic row walk; counters invariant violations.
+"""InvariantAuditor - periodic row walk; counters invariant violations.
 
 Plan § 4.2.3. Runs at low frequency (default 300 s). Walks the live
 ``uploads`` table; checks each row against the seven §0.5 invariants
@@ -15,23 +15,23 @@ The seven §0.5 invariants split into two classes by enforcement
 mechanism:
 
 * **Row-walk-checkable (this module enforces):**
-  - #1 — ``body_location='file'`` ⟹ files exist (modulo the
+  - #1 - ``body_location='file'`` ⟹ files exist (modulo the
     ``body_discarded_at IS NOT NULL`` H4 carve-out).
-  - #3 — ``body_hashes`` ↔ body-store ref set.
+  - #3 - ``body_hashes`` ↔ body-store ref set.
 * **Counter/gauge observed (workers emit; this module reads only):**
-  - #2 — Saturation-bytes basis equals body_size_bytes (the per-write
+  - #2 - Saturation-bytes basis equals body_size_bytes (the per-write
     discipline in the saturation gate prevents drift; this auditor
     does not cross-check at runtime).
-  - #4 — Body-file orphans are GC'd (the
+  - #4 - Body-file orphans are GC'd (the
     :class:`BodyOrphanJanitor` enforces; its counter is the surface).
-  - #5 — record_attempt_result_no_op_total bump (the sender's
+  - #5 - record_attempt_result_no_op_total bump (the sender's
     :meth:`record_attempt_result` rowcount=0 check; counter is the
     surface).
-  - #6 — Persist controller is the sole writer of body_location='file'
+  - #6 - Persist controller is the sole writer of body_location='file'
     (pre-commit grep + the §0.5 single-writer manifest enforce this
     structurally; row-walk verifies the SHAPE of #1 + #3 which would
     fail under any violation).
-  - #7 — No ``attempting`` row survives a restart (the
+  - #7 - No ``attempting`` row survives a restart (the
     :func:`run_recovery` function enforces at startup).
 
 The InvariantAuditor's run-time effect is therefore narrow: it walks
@@ -119,21 +119,21 @@ class InvariantAuditor:
         )
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        """Main loop — sweep, sleep, until stopped.
+        """Main loop - sweep, sleep, until stopped.
 
         The loop is broad-``except``: a sweep failure logs at ERROR
         + continues the next iteration. The audit is a low-frequency
         diagnostic; one failed iteration just delays detection.
 
         Args:
-            stop_event: Set by the composition root —
-                :func:`phantom.app.create_app`'s lifespan — on shutdown.
+            stop_event: Set by the composition root -
+                :func:`phantom.app.create_app`'s lifespan - on shutdown.
                 The loop exits cleanly when it fires, the same
                 ``stop_event``-drain idiom every other lifespan worker
                 uses so the supervising :class:`asyncio.TaskGroup` drains
                 without waiting on a never-returning task.
         """
-        # First sweep fires immediately — a fresh process should not
+        # First sweep fires immediately - a fresh process should not
         # wait one period before the first audit.
         while not stop_event.is_set():
             try:
@@ -212,7 +212,7 @@ class InvariantAuditor:
                 if live_cleared:
                     break
                 if row.body_location == "file":
-                    # Invariant #1 — body_location='file' claims files
+                    # Invariant #1 - body_location='file' claims files
                     # exist on disk.
                     logger.error(
                         "invariant violation: missing_body_file chain_id=%s name=%s",
@@ -221,7 +221,7 @@ class InvariantAuditor:
                     )
                     await self._violation_counter.inc(label_value=_VIOLATION_MISSING_BODY_FILE)
                 else:
-                    # body_location='ram' — RAM body absent on a row
+                    # body_location='ram' - RAM body absent on a row
                     # claiming RAM presence. Could be a transient
                     # post-power-cut state before recovery runs
                     # (strategy §3 "implicit consistency rule"), but
@@ -236,7 +236,7 @@ class InvariantAuditor:
                 # Legal mid-sweep transition; nothing on this row is a
                 # violation, including the emptiness mismatch below.
                 continue
-            # Invariant #3 — body_hash set cardinality match. If the
+            # Invariant #3 - body_hash set cardinality match. If the
             # body store knows extras not in the row's declared
             # body_hashes, the orphan janitor catches them (invariant
             # #4). We only assert the row-declared set is a *subset*
@@ -245,7 +245,7 @@ class InvariantAuditor:
             # covered. Add an explicit check for emptiness mismatch.
             declared = set(row.body_hashes.keys())
             if declared and not present_names and row.body_location in ("ram", "file"):
-                # All declared body_hashes absent from store — a
+                # All declared body_hashes absent from store - a
                 # stronger #3 violation worth tracking distinctly.
                 logger.error(
                     "invariant violation: body_hash_set_mismatch chain_id=%s declared=%d present=0",

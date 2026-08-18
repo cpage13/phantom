@@ -1,7 +1,7 @@
 """SQLite-backed destination-credential store (ADR-003 / ADR-004).
 
 A FAITHFUL copy of :class:`phantom.storage.token_cache.SqliteTokenCache` (the
-2026-06-23 owner directive — copy the token implementation, differ only where
+2026-06-23 owner directive - copy the token implementation, differ only where
 forced). The store is keyed by the resolved destination **host alone**; the
 structured credential value persists to disk so it survives Phantom restart.
 Bad credentials stay in the store with ``status='bad'`` rather than being
@@ -15,17 +15,17 @@ token-cache writer locks, and a credential is shared across many uploads anyway.
 
 Admin reads use :class:`phantom.models.credential.CredentialSlot`, which carries
 no secret material (ADR-004); the store itself never exposes a secret read-back
-endpoint — the credential value is read internally only (the signer retrieves it
+endpoint - the credential value is read internally only (the signer retrieves it
 at sign time inside the executor).
 
 The forced differences from the token cache (and nothing else):
 
-* the key is the destination host alone — the PK drops the token cache's
+* the key is the destination host alone - the PK drops the token cache's
   ``uid`` axis;
 * the value is the structured :data:`~phantom.models.credential.DestinationCredential`
   serialized to a ``cred_json`` column, not a bare ``bearer`` string;
 * the wake handler takes one argument ``(dest_host)``, not two
-  ``(endpoint, uid)`` — see :data:`CredentialWakeHandler`.
+  ``(endpoint, uid)`` - see :data:`CredentialWakeHandler`.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def _credential_from_json(kind: str, cred_json: str) -> DestinationCredential:
     member serializes to ``"s3"`` via ``asdict``); this ``**payload`` splat path
     has NO pydantic, so the body's before-validator cannot run here. ``service``
     is re-coerced to :class:`SigningService` explicitly before construction. An
-    unknown service string (a corrupt DB row) raises ``ValueError`` — fail loud,
+    unknown service string (a corrupt DB row) raises ``ValueError`` - fail loud,
     correct.
     """
     payload = json.loads(cred_json)
@@ -212,7 +212,7 @@ class SqliteCredentialStore:
     ) -> CredCacheRow:
         """Write ``credential`` for ``dest_host`` and fire wake handlers.
 
-        UPSERT forcing ``status='fresh'`` (so a re-push un-bads the slot — the
+        UPSERT forcing ``status='fresh'`` (so a re-push un-bads the slot - the
         recovery loop relies on this), re-read to return the full row, then fire
         the registered wake handlers. The ``secret_access_key`` of a
         :class:`SigV4StaticCreds` persists at rest (the ADR-003 posture the
@@ -241,7 +241,7 @@ class SqliteCredentialStore:
 
         # Re-read to return the full row.
         fetched = await self.get(dest_host)
-        if fetched is None:  # pragma: no cover — write just completed
+        if fetched is None:  # pragma: no cover - write just completed
             raise RuntimeError("Credential store row missing after set")
 
         # Fire wake handlers. Exceptions in handlers are logged, not propagated.

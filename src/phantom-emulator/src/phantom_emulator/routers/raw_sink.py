@@ -1,7 +1,7 @@
-"""Auth-free, token-free path-style sink — the Phase-1 forward-as-is oracle.
+"""Auth-free, token-free path-style sink - the Phase-1 forward-as-is oracle.
 
 A deliberately naked ``/raw/{path:path}`` that 2xxs ANY forwarded upload verb
-(PUT/POST/PATCH) — plus a ``GET`` read-back — with NO authentication and NO
+(PUT/POST/PATCH) - plus a ``GET`` read-back - with NO authentication and NO
 token lookup: the forward-as-is analogue of the SigV4 validator in
 :mod:`phantom_emulator.routers.s3`. Where ``s3.py`` validates a re-signed
 upload (the Phase-4 oracle), this sink 2xxs a bare, unsigned, tokenless
@@ -10,7 +10,7 @@ no preceding mint step has a real upstream to hit. The upload-verb set mirrors
 the catch-all's forwarded set (``UPLOAD_METHODS``); the stored body records the
 inbound verb in :attr:`RawBody.method`.
 
-The full forwarded path (no leading slash) is the store key — there is no
+The full forwarded path (no leading slash) is the store key - there is no
 bucket/key split and no token. Bodies land in
 :attr:`EmulatorState.raw_bodies`, distinct from the token-keyed
 ``accepted_bodies`` and the ``(bucket, key)``-keyed ``s3_objects`` so the
@@ -48,7 +48,7 @@ async def put_raw(path: str, request: Request, state: StateDep) -> Response:
     """Store an unsigned, tokenless upload body keyed by the full forwarded path.
 
     2xxs ANY forwarded upload verb (PUT/POST/PATCH). NO ``_enforce_auth``, NO
-    ``pending_uploads``/token lookup, NO SigV4 recompute — the
+    ``pending_uploads``/token lookup, NO SigV4 recompute - the
     deliberately-naked Phase-1 sink. The ``{path:path}`` convertor captures the
     whole forwarded path (slash-bearing keys included) as the
     :attr:`EmulatorState.raw_bodies` key; the inbound verb is recorded in

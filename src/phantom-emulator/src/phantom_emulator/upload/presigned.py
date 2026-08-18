@@ -23,7 +23,7 @@ from phantom_emulator.state import PendingUpload
 logger = logging.getLogger(__name__)
 
 # Length of the opaque upload token embedded in the URL. 32 bytes of
-# url-safe randomness gives ~256 bits — more than enough for tests.
+# url-safe randomness gives ~256 bits - more than enough for tests.
 UPLOAD_TOKEN_BYTES: int = 32
 
 # Length of the synthetic signature parameter. Sized to look like an
@@ -116,7 +116,7 @@ class PresignedTokenStore:
     def is_expired(self, upload_token: str, now: datetime) -> bool:
         """Whether the URL for ``upload_token`` is past its TTL.
 
-        Returns ``True`` for unknown tokens — an unknown token is
+        Returns ``True`` for unknown tokens - an unknown token is
         functionally equivalent to "expired and unrecoverable" from the
         caller's perspective.
         """

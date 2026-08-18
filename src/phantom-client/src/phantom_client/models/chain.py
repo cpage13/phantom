@@ -27,7 +27,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 # ---------------------------------------------------------------------------
-# Chain state — set of literals matching ADR-010 §"Response".
+# Chain state - set of literals matching ADR-010 §"Response".
 # ---------------------------------------------------------------------------
 
 # NOTE: ``TypeAlias`` form (not PEP-695 ``type X = ...``) is the workspace
@@ -36,7 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 # tolerates either form via ``__value__`` unwrap, but using the same
 # form on both sides keeps Pydantic's emitted JSON schema inline (no
 # ``$defs/ChainState`` indirection) which simplifies downstream tooling.
-ChainState: TypeAlias = Literal[  # noqa: UP040 — see note above
+ChainState: TypeAlias = Literal[  # noqa: UP040 - see note above
     "queued",
     "attempting",
     "succeeded",
@@ -53,13 +53,13 @@ ChainState: TypeAlias = Literal[  # noqa: UP040 — see note above
 on send (storage hash mismatch or codec round-trip drift); the row is
 never retried. ``expired`` is a terminal state (ADR-032) reached when the
 per-route send-deadline elapses: the upload is dead, the body is released,
-and the row is never re-admitted — distinct from ``auth_expired``, which
+and the row is never re-admitted - distinct from ``auth_expired``, which
 is re-queued once a fresh token arrives.
 """
 
 
 # ---------------------------------------------------------------------------
-# Body variants — discriminated union over the ``kind`` literal.
+# Body variants - discriminated union over the ``kind`` literal.
 # ---------------------------------------------------------------------------
 
 
@@ -174,7 +174,7 @@ ChainBody = Annotated[
 
 
 # ---------------------------------------------------------------------------
-# Capture spec — one extraction from a step's response.
+# Capture spec - one extraction from a step's response.
 # ---------------------------------------------------------------------------
 
 
@@ -228,7 +228,7 @@ class ChainCapture(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Step — one HTTP request in the chain.
+# Step - one HTTP request in the chain.
 # ---------------------------------------------------------------------------
 
 
@@ -296,7 +296,7 @@ class ChainStep(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Envelope — the top-level submission unit.
+# Envelope - the top-level submission unit.
 # ---------------------------------------------------------------------------
 
 
@@ -379,7 +379,7 @@ class ChainEnvelope(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Response shapes — what Phantom returns on submit and on
+# Response shapes - what Phantom returns on submit and on
 # ``GET /v1/admin/chains/{chain_id}``.
 # ---------------------------------------------------------------------------
 

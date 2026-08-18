@@ -1,9 +1,9 @@
-"""Reaper — retention sweep + idempotency-index trim.
+"""Reaper - retention sweep + idempotency-index trim.
 
 Plan § 2.3.16. Collapsed to a single persistent
 store; the dual-store ``(memory_store, disk_store)`` round-robin is
 gone. The time-based ``after_seconds`` force-persist branch is also
-gone — the :class:`PersistController` owns retry-linger detection now
+gone - the :class:`PersistController` owns retry-linger detection now
 (plan § 2.3.11), not the reaper.
 
 The reaper writes:
@@ -96,7 +96,7 @@ class Reaper:
         )
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        """Main loop — sleep, then sweep, until stopped."""
+        """Main loop - sleep, then sweep, until stopped."""
         while not stop_event.is_set():
             try:
                 await self._sweep_once()

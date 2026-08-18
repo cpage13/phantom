@@ -1,4 +1,4 @@
-"""phantom-client — generic async Python SDK for the Phantom upload proxy.
+"""phantom-client - generic async Python SDK for the Phantom upload proxy.
 
 The single import you need: ``from phantom_client import PhantomClient``.
 Every other public name (model classes, config classes, exception

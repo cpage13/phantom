@@ -1,4 +1,4 @@
-"""Passthrough codec — no-op encode/decode."""
+"""Passthrough codec - no-op encode/decode."""
 
 from __future__ import annotations
 

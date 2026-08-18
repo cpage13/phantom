@@ -84,7 +84,7 @@ class Server:
             self._serve_task.cancel()
 
     # ------------------------------------------------------------------
-    # Typed control surface — mirrors /control/* endpoint paths 1:1.
+    # Typed control surface - mirrors /control/* endpoint paths 1:1.
     # ------------------------------------------------------------------
 
     def inject_failure(self, policy: FailurePolicy) -> None:
@@ -284,7 +284,7 @@ async def start_server(cfg: AppConfig) -> Server:
     # NOTE: older uvicorn required `install_signal_handlers = lambda: None`
     # here so a non-main-thread server didn't try to register SIGINT.
     # Modern uvicorn (>=0.30) auto-disables signal capture off the main
-    # thread inside `capture_signals` — the override is no longer needed.
+    # thread inside `capture_signals` - the override is no longer needed.
 
     serve_task = asyncio.create_task(uv_server.serve())
 

@@ -1,4 +1,4 @@
-"""Transport package — UpstreamClient Protocol + httpx implementation."""
+"""Transport package - UpstreamClient Protocol + httpx implementation."""
 
 from __future__ import annotations
 

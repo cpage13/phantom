@@ -1,7 +1,7 @@
 """Phantom runtime package.
 
-The composition root — the SOLE site of long-lived task spawning in
-production code (plan § 0.5 / § 4 / strategy §4) — is
+The composition root - the SOLE site of long-lived task spawning in
+production code (plan § 0.5 / § 4 / strategy §4) - is
 :func:`phantom.app.create_app`'s FastAPI ``lifespan``. Every supervised
 worker is scheduled under a single :class:`asyncio.TaskGroup` there; the
 pre-commit ``forbid-asyncio-create-task-outside-composition`` hook

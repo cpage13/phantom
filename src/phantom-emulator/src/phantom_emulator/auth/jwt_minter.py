@@ -1,7 +1,7 @@
 """JWT minting helper used by ``/oauth/token`` and static-token mode.
 
-The minter supports two signing algorithms — HS256 (shared secret)
-and RS256 (RSA private key) — selected by configuration. Both
+The minter supports two signing algorithms - HS256 (shared secret)
+and RS256 (RSA private key) - selected by configuration. Both
 algorithms produce a compact-serialized JWT carrying the standard
 OAuth2 claim set plus any extra claims a test scenario requests.
 
@@ -103,7 +103,7 @@ class JwtMinter:
                 algorithm="RS256",
                 headers={"kid": self.rsa_keys.kid},
             )
-        else:  # pragma: no cover — Literal narrowed elsewhere
+        else:  # pragma: no cover - Literal narrowed elsewhere
             raise ValueError(f"unknown signing mode: {mode}")
 
         logger.debug(

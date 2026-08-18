@@ -5,7 +5,7 @@ buffered chain. It is the schema-mirror for the ``uploads`` table in
 the single persistent SQLite (post-Phase-1).
 
 Phase 1: the old ``committed`` + ``tier`` columns collapsed into one
-``body_location`` field (``Literal['ram', 'file']``) — the source of
+``body_location`` field (``Literal['ram', 'file']``) - the source of
 truth for which BodyStore is holding the body files. The persist
 controller is the sole writer of the ``ram`` → ``file`` transition
 (plan § 0.5 invariant #6). The pre-Phase-1 ``Tier`` alias is gone
@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from phantom.models.chain import ChainState
 
-# NOTE: ``TypeAlias`` form is intentional — see phantom.models.chain for
+# NOTE: ``TypeAlias`` form is intentional - see phantom.models.chain for
 # the rationale (drift-detection test depends on ``typing.get_args``).
 UploadState: TypeAlias = ChainState  # noqa: UP040
 """Same enum on the wire and on disk. Snake-case canonical."""
@@ -40,7 +40,7 @@ invariant #6.
 StorageEncoding: TypeAlias = Literal["original", "zstd", "gzip"]  # noqa: UP040
 """Phantom-side storage compression marker; invisible to upstream.
 
-Distinct from the wire ``Content-Encoding`` the client sent — Phantom
+Distinct from the wire ``Content-Encoding`` the client sent - Phantom
 preserves the wire encoding end-to-end (req §5d).
 """
 
@@ -160,7 +160,7 @@ class UploadRow(BaseModel):
         description=(
             "Whether body files for this chain live in RamBodyStore "
             "('ram') or FileBodyStore ('file'). Single durability "
-            "commit point — flipped only by the PersistController. "
+            "commit point - flipped only by the PersistController. "
             "See strategy §3 invariant #1 / plan § 0.5 invariant #6."
         ),
     )
@@ -248,7 +248,7 @@ class UploadRow(BaseModel):
     )
     storage_encoding: StorageEncoding = Field(
         "original",
-        description=("Phantom's added storage compression — invisible to upstream (req §5d)."),
+        description=("Phantom's added storage compression - invisible to upstream (req §5d)."),
     )
     body_size_bytes: int = Field(
         0,

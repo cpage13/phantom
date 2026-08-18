@@ -28,7 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 # ``phantom_client.models.chain`` reads the state literal via
 # ``typing.get_args``; on a 3.12+ ``type X = Literal[...]`` alias, ``get_args``
 # returns the empty tuple, so we keep the runtime-visible ``TypeAlias`` form.
-ChainState: TypeAlias = Literal[  # noqa: UP040 — see note above
+ChainState: TypeAlias = Literal[  # noqa: UP040 - see note above
     "queued",
     "attempting",
     "succeeded",
@@ -40,12 +40,12 @@ ChainState: TypeAlias = Literal[  # noqa: UP040 — see note above
     "expired",
 ]
 """The nine canonical chain/upload states. Snake-case canonical for
-``auth_expired``. There is no separate ``received`` state — ingress
+``auth_expired``. There is no separate ``received`` state - ingress
 inserts directly into ``queued``. ``corrupted`` is terminal and reached
 only when body verification fails on send (storage hash mismatch or
 codec round-trip drift); never retried. ``expired`` is terminal (ADR-032):
 the per-route send-deadline elapsed, so the upload is dead, the body is
-released, and the row is NEVER re-admitted — the OPPOSITE of
+released, and the row is NEVER re-admitted - the OPPOSITE of
 ``auth_expired`` (which is re-queueable once a fresh token arrives).
 """
 

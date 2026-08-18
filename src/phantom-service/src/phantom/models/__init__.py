@@ -2,11 +2,11 @@
 
 Modules:
 
-* :mod:`phantom.models.chain` — ADR-010 request-chain envelope schema.
-* :mod:`phantom.models.upload` — internal :class:`UploadRow` and helpers.
-* :mod:`phantom.models.admin` — admin endpoint request/response shapes.
-* :mod:`phantom.models.errors` — typed error vocabulary.
-* :mod:`phantom.models.token` — internal token-cache row.
+* :mod:`phantom.models.chain` - ADR-010 request-chain envelope schema.
+* :mod:`phantom.models.upload` - internal :class:`UploadRow` and helpers.
+* :mod:`phantom.models.admin` - admin endpoint request/response shapes.
+* :mod:`phantom.models.errors` - typed error vocabulary.
+* :mod:`phantom.models.token` - internal token-cache row.
 """
 
 from __future__ import annotations

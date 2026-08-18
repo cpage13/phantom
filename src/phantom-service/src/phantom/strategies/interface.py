@@ -1,4 +1,4 @@
-"""UploadStrategy Protocol — pure-function retry scheduling (req §5e)."""
+"""UploadStrategy Protocol - pure-function retry scheduling (req §5e)."""
 
 from __future__ import annotations
 

@@ -1,11 +1,11 @@
-"""phantom_emulator — generic upstream emulator with two-step-upload endpoints.
+"""phantom_emulator - generic upstream emulator with two-step-upload endpoints.
 
 Re-exports the public surface:
 
-- :class:`AppConfig` — full configuration model.
-- :func:`start_server`, :class:`Server` — programmatic in-process startup.
-- :class:`FailurePolicy` — failure-injection policy.
-- :class:`AuthMode` — auth-mode enumeration.
+- :class:`AppConfig` - full configuration model.
+- :func:`start_server`, :class:`Server` - programmatic in-process startup.
+- :class:`FailurePolicy` - failure-injection policy.
+- :class:`AuthMode` - auth-mode enumeration.
 
 See ``docs/architecture-intent.md`` for the broader design.
 """

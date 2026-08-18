@@ -292,7 +292,7 @@ async def parse_json_request(
         max_buffered_bytes: Hard cap on the envelope body size.
 
     Returns:
-        ``(envelope, {})`` — empty body_refs dict.
+        ``(envelope, {})`` - empty body_refs dict.
 
     Raises:
         ParserError: On any validation failure.
@@ -337,9 +337,9 @@ async def parse_multipart_request(
         name = part.name
         if name == "envelope":
             # Reject a duplicate ``envelope`` part BEFORE reading its bytes
-            # (finding R3-9 — the E-1 sibling the body_refs guard missed).
+            # (finding R3-9 - the E-1 sibling the body_refs guard missed).
             # Silently last-wins on a second envelope dropped the first with
-            # no signal — and the envelope carries the chain_id (row PK), the
+            # no signal - and the envelope carries the chain_id (row PK), the
             # destination, and the step chain, so the producer could not even tell
             # which chain_id Phantom admitted. The parser already rejects
             # duplicate STEP names and duplicate ``body_refs[<name>]`` parts;
@@ -363,7 +363,7 @@ async def parse_multipart_request(
             ref_name = name[len("body_refs[") : -1]
             # Reject a duplicate part name BEFORE reading its bytes
             # (finding E-1). Silently last-wins dropped the first part
-            # with no signal to the producer — inconsistent with the parser's
+            # with no signal to the producer - inconsistent with the parser's
             # structural rejection of body_ref_missing / body_ref_orphan.
             # The producer must send exactly one part per ref name; an
             # ambiguous duplicate is unprocessable.

@@ -1,4 +1,4 @@
-"""In-process metrics — simple counters and gauges.
+"""In-process metrics - simple counters and gauges.
 
 Phantom's observability surface is structured logging + JSON-over-HTTP
 admin endpoints. This module provides :class:`Counter` and :class:`Gauge`
@@ -7,7 +7,7 @@ serialize them to JSON.
 
 NO dependency on ``prometheus_client`` or ``opentelemetry`` (plan § 4.3).
 For Phantom's producer-deployment context (Pi-class hardware, single-process
-service, loopback admin), a heavy metrics framework is overkill — the
+service, loopback admin), a heavy metrics framework is overkill - the
 in-process registry + JSON serialization is sufficient.
 
 The :class:`MetricsRegistry` is constructed once in
@@ -73,7 +73,7 @@ class Counter:
         Returns:
             A fresh ``dict`` mirroring the counter's state at the call
             time. Dict reads are atomic under the GIL, so this is safe
-            to call without holding ``_lock`` — the only risk is
+            to call without holding ``_lock`` - the only risk is
             observing a value bumped between two reads, which is
             acceptable for a snapshot surface.
         """
@@ -129,7 +129,7 @@ class MetricsRegistry:
     The runtime constructs one :class:`MetricsRegistry` and threads it
     through every worker that emits metrics (plan § 4.2.2). Workers
     call :meth:`register_counter` / :meth:`register_gauge` at
-    construction time (idempotent — re-registration returns the
+    construction time (idempotent - re-registration returns the
     existing instance) and hold the returned reference for the lifetime
     of the runtime.
 
@@ -145,7 +145,7 @@ class MetricsRegistry:
         """Register a :class:`Counter` under ``name``; return the instance.
 
         Idempotent: re-registering the same ``name`` returns the
-        existing instance (the description must match — re-registering
+        existing instance (the description must match - re-registering
         with a different description is a programming error and raises
         ``ValueError``).
 
@@ -175,7 +175,7 @@ class MetricsRegistry:
     def register_gauge(self, name: str, description: str) -> Gauge:
         """Register a :class:`Gauge` under ``name``; return the instance.
 
-        Idempotent — see :meth:`register_counter`.
+        Idempotent - see :meth:`register_counter`.
         """
         existing = self.gauges.get(name)
         if existing is not None:

@@ -2,10 +2,10 @@
 
 The HTTP-shaped route handler stays in :mod:`phantom.routes.send`
 (parse headers → parse body → dispatch → admit → respond). All
-admission logic — saturation gate, auth-header → token cache write,
+admission logic - saturation gate, auth-header → token cache write,
 codec selection, body-hash computation, body-store ``put``, and the
 single atomic SQLite transaction that inserts both the upload row
-and the idempotency claim — lives here and is testable without
+and the idempotency claim - lives here and is testable without
 booting FastAPI.
 
 Admission path (plan § 2.3.17).
@@ -157,7 +157,7 @@ class ChainAdmissionError(Exception):
 
 # RFC 7230 §3.2.6 token chars. Header names are case-insensitive but
 # must consist entirely of these. Leading/trailing whitespace is never
-# permitted (RFC 7230 §3.2 — field-name has no LWS allowance).
+# permitted (RFC 7230 §3.2 - field-name has no LWS allowance).
 _HTTP_TOKEN_CHARS: frozenset[str] = frozenset(
     "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 )
@@ -258,7 +258,7 @@ def _body_hashes_diverge(
 
     Divergence is any of: a different set of ref names, or a differing
     ``body_hash`` for a shared name. ``storage_hash`` is deliberately
-    NOT compared — it depends on the deployment's codec, and two
+    NOT compared - it depends on the deployment's codec, and two
     submissions of identical raw bytes are "the same upload" regardless
     of how they happen to be encoded at rest.
 
@@ -289,7 +289,7 @@ def _envelope_destinations(envelope: ChainEnvelope) -> tuple[tuple[str, str], ..
     Used by the idempotency divergence check (finding R3-3): an idempotency
     key identifies an OPERATION, and the operation includes its
     destination. Binding only the body bytes (finding G-1) is necessary but
-    not sufficient — same key + same body + DIFFERENT destination would
+    not sufficient - same key + same body + DIFFERENT destination would
     otherwise silently replay to the wrong place behind a 200.
 
     Deliberately scoped to ``(method, URL)`` per step, NOT the whole
@@ -326,7 +326,7 @@ def _envelopes_diverge(existing: ChainEnvelope, incoming: ChainEnvelope) -> bool
     :func:`_body_hashes_diverge` on an idempotency-key collision: the
     operation an idempotency key names is "deliver THESE bytes to THIS
     destination", so divergence in EITHER the body or the destination is a
-    conflict (finding R3-3 — the destination half).
+    conflict (finding R3-3 - the destination half).
 
     Args:
         existing: The envelope of the row the idempotency claim points at.
@@ -402,7 +402,7 @@ async def _encode_and_hash_bodies(
     body_hashes_map: dict[str, BodyHashes] = {}
     for name, data in body_refs.items():
         if storage_encoding == "original":
-            # Identity codec — encoded == raw; one hash covers both.
+            # Identity codec - encoded == raw; one hash covers both.
             body_hash_hex = await asyncio.to_thread(sha256_hex, data)
             encoded = data
             storage_hash_hex = body_hash_hex
@@ -442,14 +442,14 @@ async def _resolve_existing_idempotent_row(
     still live), then falls back to the index directly.
 
     Returns ``None`` when the claim resolves to a ``chain_id`` whose
-    ``uploads`` row no longer exists — an ORPHANED index entry. This window
+    ``uploads`` row no longer exists - an ORPHANED index entry. This window
     is real (finding R3-2): the reaper deletes the row
     (``delete_terminal_older_than``) before it cleans the index
     (``cleanup_idempotency_index``) in a later transaction, and admin /
     bulk deletes never touch the index at all. The caller treats ``None``
     as recoverable (the colliding submission becomes the new owner of the
     key). This previously asserted ``existing_row is not None`` and crashed
-    admission with a bare ``AssertionError`` → naked HTTP 500 — exactly the
+    admission with a bare ``AssertionError`` → naked HTTP 500 - exactly the
     ADR-017-violating anti-pattern finding D-1 set out to eliminate.
 
     Note: with the orphan-aware atomic claim in
@@ -728,7 +728,7 @@ async def _build_row(
     # the row is born ``body_location='file'``. In hybrid and all_ram
     # mode the body lives in RAM at the moment of insertion; in hybrid
     # mode the PersistController is the sole writer of the ram→file
-    # transition (plan § 0.5 invariant #6 — admission MUST NOT flip
+    # transition (plan § 0.5 invariant #6 - admission MUST NOT flip
     # this column).
     initial_body_location: BodyLocation = "file" if mode == "all_disk" else "ram"
 
@@ -768,7 +768,7 @@ async def _build_row(
         capture_reexecution_active=snapshot.capture_reexecution,
         # The saturation basis (InvariantAuditor invariant #2): this is
         # the quantity the gate admitted (stage 3) and the sender will
-        # release on a terminal transition — the STORED size. Zero when
+        # release on a terminal transition - the STORED size. Zero when
         # the submission carried no body_refs.
         body_size_bytes=encoded.admit_bytes,
         storage_encoding=encoded.storage_encoding,
@@ -819,11 +819,11 @@ async def _persist_row_and_claim(
     """
     chain_id = row.chain_id
 
-    # chain_id-collision PRE-CHECK — BEFORE the body-store put
+    # chain_id-collision PRE-CHECK - BEFORE the body-store put
     # (finding R7-4b, HIGH data loss).
     #
     # The body store is keyed by ``chain_id``. A duplicate submit of an
-    # ALREADY-LIVE chain_id (the canonical at-least-once client retry —
+    # ALREADY-LIVE chain_id (the canonical at-least-once client retry -
     # the first 202 was lost, or a freeze made it look stalled, catalog
     # D-12) must NEVER touch the original upload's body. If we let the
     # ``body_store.put`` below run for a chain_id that is already live,
@@ -835,11 +835,11 @@ async def _persist_row_and_claim(
     # D-1 409 cleanup, which assumed the put was for a NEW row's body.
     #
     # So we detect the collision UP FRONT with a cheap PK lookup and
-    # reject WITHOUT ever writing the body — there is nothing of the
+    # reject WITHOUT ever writing the body - there is nothing of the
     # duplicate's to roll back, and the original's body is never touched.
     # The raise unwinds into the slot's ``__aexit__``, which releases the
     # saturation slot EXACTLY once (the H1 leak protection; finding
-    # R3-1's single-release invariant is preserved — no double release,
+    # R3-1's single-release invariant is preserved - no double release,
     # because no body was put and the collision arm is not reached).
     #
     # The atomic ``insert_with_idempotency_claim`` below remains the
@@ -933,7 +933,7 @@ async def _persist_row_and_claim(
     # store.insert_with_idempotency_claim, which returns a typed
     # InsertClaimOutcome distinguishing a clean insert, an
     # idempotency-claim collision (replay-or-conflict), and a
-    # chain_id PK collision (finding D-1 — was a naked 500).
+    # chain_id PK collision (finding D-1 - was a naked 500).
     #
     # § 2 (Item 2): EVERY admission now writes a dedup claim. The key is
     # the ``ingress_dedup_key`` derived once in the preparation stage
@@ -946,7 +946,7 @@ async def _persist_row_and_claim(
     #
     # finding R9-V6-1: a cross-process SQLITE_BUSY that outlasts the
     # store's ``busy_timeout`` (a sibling connection holding the WAL
-    # write lock — a stray ``sqlite3 uploads.db`` admin session, a backup
+    # write lock - a stray ``sqlite3 uploads.db`` admin session, a backup
     # tool mid-snapshot, a second instance mis-sharing the data_dir) raises
     # ``sqlite3.OperationalError: database is locked`` from the upload
     # INSERT. That is neither the ``IntegrityError`` (chain_id collision)
@@ -963,7 +963,7 @@ async def _persist_row_and_claim(
     # already cleared the open transaction, and no row committed, so
     # durability holds (R9-V6-3 confirms the data layer never corrupts under
     # the lock); the saturation slot is freed by the slot's ``__aexit__``.
-    # A NON-lock ``OperationalError`` (a genuine schema/type fault —
+    # A NON-lock ``OperationalError`` (a genuine schema/type fault -
     # ``is_transient_lock_error`` returns False) is re-raised so it
     # surfaces as ``internal_error`` rather than being masked behind a
     # misleading retryable 503.
@@ -996,12 +996,12 @@ async def _resolve_collision(
 ) -> AdmissionOutcome:
     """Resolve a non-INSERTED persist outcome: clean up, then replay or reject.
 
-    Collision — roll back the body-store put + the saturation grant. No
+    Collision - roll back the body-store put + the saturation grant. No
     new in-flight row committed, so the slot must be freed (H1 contract).
     This is an EXPECTED rejection, not a failure: the slot is released
     exactly once via :meth:`_AdmittedSlot.release_on_rejection`, and the
     slot's ``__aexit__`` does NOT release a second time when a rejection
-    below raises (finding R3-1 — the over-release direction of the H1
+    below raises (finding R3-1 - the over-release direction of the H1
     slot-accounting class).
 
     Args:
@@ -1026,16 +1026,16 @@ async def _resolve_collision(
     # Body-store rollback is keyed on the COLLISION KIND (finding
     # R7-4b). The body store is keyed by ``chain_id``:
     #
-    # * IDEMPOTENCY_COLLISION — a DIFFERENT chain_id reused the same
+    # * IDEMPOTENCY_COLLISION - a DIFFERENT chain_id reused the same
     #   idempotency KEY, so this submission's body sits at its own,
     #   non-colliding ``chain_id`` key. Delete it (otherwise every
-    #   duplicate POST orphans bytes — finding G-1's cleanup).
+    #   duplicate POST orphans bytes - finding G-1's cleanup).
     #
-    # * CHAIN_ID_COLLISION — this would only fire in the residual
+    # * CHAIN_ID_COLLISION - this would only fire in the residual
     #   tight race where a concurrent submit of the SAME chain_id won
     #   the PK after both passed the persist stage's pre-check. The body
     #   at that shared key belongs to the WINNING (live) row; deleting it
-    #   would destroy a live upload's body — exactly the R7-4b data
+    #   would destroy a live upload's body - exactly the R7-4b data
     #   loss. So we DO NOT delete on a chain_id collision. (Under the
     #   normal single-retry path the pre-check already rejected
     #   before any put, so no put of ours exists here anyway.)
@@ -1056,7 +1056,7 @@ async def _resolve_collision(
             details={"chain_id": str(chain_id)},
         )
 
-    # IDEMPOTENCY_COLLISION — resolve the existing row, then decide
+    # IDEMPOTENCY_COLLISION - resolve the existing row, then decide
     # replay-vs-conflict (G-1 body, R3-3 destination). ``idempotency_key``
     # is the ``ingress_dedup_key`` (§ 2): always set, typed ``str`` (no
     # None-guard needed since the header-absent mint guarantees a value).
@@ -1065,12 +1065,12 @@ async def _resolve_collision(
     )
     if existing_row is None:
         # Finding R3-2: the claim resolved to a row that no longer
-        # exists — an ORPHANED index entry. The atomic insert
+        # exists - an ORPHANED index entry. The atomic insert
         # (insert_with_idempotency_claim) replaces an orphaned claim
         # in-transaction, so a genuine IDEMPOTENCY_COLLISION almost
         # never reaches here with an orphan; this branch is defense
         # in depth for the non-atomic claim_idempotency path. Surface
-        # a typed, retryable conflict — NEVER a bare AssertionError
+        # a typed, retryable conflict - NEVER a bare AssertionError
         # → naked 500 (the D-1 anti-pattern this helper had
         # reintroduced). The producer retries; the orphaned claim is gone
         # by then (the atomic insert cleaned it), so the retry is
@@ -1079,7 +1079,7 @@ async def _resolve_collision(
             code="idempotency_key_conflict",
             message=(
                 "X-Phantom-Idempotency-Key claim pointed at a "
-                "reaped row; the stale claim was cleared — retry to "
+                "reaped row; the stale claim was cleared - retry to "
                 "be admitted under this key"
             ),
             instance_id=instance_ctx.cfg.id,
@@ -1125,7 +1125,7 @@ async def _resolve_collision(
             instance_id=instance_ctx.cfg.id,
             details={"idempotency_key": idempotency_key},
         )
-    # Same key + same body + same destination — a genuine replay.
+    # Same key + same body + same destination - a genuine replay.
     # Return the existing row with status 200 (ADR-017
     # idempotency_replay posture).
     return AdmissionOutcome(row=existing_row, status_code=200)
@@ -1209,7 +1209,7 @@ async def admit_chain(
     # Stage 1: header-name well-formedness (RFC 7230).
     #
     # Reject envelopes with malformed step-header names at admission
-    # time. RFC 7230 §3.2 defines header names as ``token`` — visible
+    # time. RFC 7230 §3.2 defines header names as ``token`` - visible
     # ASCII excluding separator characters; leading/trailing whitespace
     # is forbidden. A producer that sends ``"  X-Phantom-Probe  "`` slips
     # past the X-Phantom-* prefix strip (which checks
@@ -1226,7 +1226,7 @@ async def admit_chain(
     # byte size, not the raw declared size. The sender releases
     # ``UploadRow.body_size_bytes`` (the stored size) on every terminal
     # transition (sender.py), and the auth-kicker re-admits at
-    # ``body_size_bytes`` too — so admission MUST admit the same quantity
+    # ``body_size_bytes`` too - so admission MUST admit the same quantity
     # or the byte counter (and the large-body class counter) drift on every
     # compressed upload until the cap wedges. InvariantAuditor invariant #2
     # ("saturation-bytes basis equals body_size_bytes") names this contract.

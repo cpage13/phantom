@@ -1,4 +1,4 @@
-"""Phantom — buffering upload-proxy service.
+"""Phantom - buffering upload-proxy service.
 
 See ``docs/architecture-intent.md`` and the ADRs in ``docs/adr/`` for the design.
 """

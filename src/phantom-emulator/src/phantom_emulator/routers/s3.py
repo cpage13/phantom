@@ -7,20 +7,20 @@ key-pair (200 + store the body on match, 403 ``SignatureDoesNotMatch`` on
 mismatch), plus a symmetric SigV4-validated ``GET /{bucket}/{key}`` that
 returns the stored bytes. The upload-verb set mirrors Phantom's catch-all
 forwarded set (``UPLOAD_METHODS``) so a forwarded POST/PATCH validates and
-stores via the SAME method-agnostic recompute as a PUT — only GET stays the
+stores via the SAME method-agnostic recompute as a PUT - only GET stays the
 read-back. No real AWS, no full S3 (no multipart / list / ACL / tagging /
 versioning / copy / bare-bucket CreateBucket).
 
 The validator ENFORCES ``x-amz-content-sha256`` (upload verbs and GET): a
 request without that signed header is rejected ``400 "Missing required
-header for this request: x-amz-content-sha256"`` — exactly as real S3 does
-— and the value is treated as the canonical payload hash. Phantom's
+header for this request: x-amz-content-sha256"`` - exactly as real S3 does
+- and the value is treated as the canonical payload hash. Phantom's
 ``aws_sigv4`` signer now signs S3 with ``S3SigV4Auth``, which emits + signs
 that header, so both sides agree on the SIGNED header set.
 
 The validator NEVER calls botocore's :meth:`SigV4Auth.add_auth`. That is a
 *client* signing path: it stamps wall-clock-now over the inbound
-``X-Amz-Date`` and (for the S3 subclass) recomputes the payload hash —
+``X-Amz-Date`` and (for the S3 subclass) recomputes the payload hash -
 either of which 403s a perfectly valid inbound signature. Instead it
 **recomputes from the request's own declared ``SignedHeaders``** via the
 lower-level ``canonical_request`` -> ``string_to_sign`` -> ``signature``
@@ -34,7 +34,7 @@ are used for the recompute ON PURPOSE: the base path reads the inbound
 would ``del`` + recompute it and CLOBBER the pinned inbound value. So even
 though Phantom now SIGNS with ``S3SigV4Auth`` (so the header is present and
 in ``SignedHeaders``), the validator deliberately recomputes via base
-lower-level methods to honor the pinned inbound value — resolving the prior
+lower-level methods to honor the pinned inbound value - resolving the prior
 "if Phantom ever switches… the validator must too" note (the validator
 need NOT switch its recompute; it must only enforce the header and key on it).
 
@@ -85,13 +85,13 @@ _AUTH_RE = re.compile(
     r"Signature=(?P<sig>[0-9a-f]+)$"
 )
 
-# Shared 403 for any signature-validation failure — the emulator's
+# Shared 403 for any signature-validation failure - the emulator's
 # existing rejection vocabulary (routers/upstream.py uses the same
 # code+detail for upload-PUT rejections).
 _SIG_MISMATCH = HTTPException(status_code=403, detail="SignatureDoesNotMatch")
 
 # The 400 real S3 returns when ``x-amz-content-sha256`` is absent. The signed
-# header is part of the canonical request, so it cannot be injected post-sign —
+# header is part of the canonical request, so it cannot be injected post-sign -
 # only a signer that EMITS + SIGNS it (``S3SigV4Auth``) satisfies real S3. This
 # is kept DISTINCT from the 403 ``SignatureDoesNotMatch`` so a caller can assert
 # the SAME status + detail real S3 emits for a missing-header request.
@@ -254,7 +254,7 @@ async def get_object(bucket: str, key: str, request: Request, state: StateDep) -
 
     SigV4-validated for symmetry with :func:`put_object` (the emulator's
     real GET is authenticated). Returns the stored bytes on a valid
-    signature; ``403 SignatureDoesNotMatch`` on a bad signature — checked
+    signature; ``403 SignatureDoesNotMatch`` on a bad signature - checked
     BEFORE the store lookup so a bad-signature GET never leaks existence;
     ``404 NoSuchKey`` if the object is absent; ``404`` for a reserved
     bucket.

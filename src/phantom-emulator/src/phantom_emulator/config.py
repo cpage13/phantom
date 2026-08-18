@@ -3,7 +3,7 @@
 Pydantic models define the full configuration surface. Defaults are
 chosen so that an empty YAML (or no YAML at all) produces a working
 emulator. Environment variables prefixed ``PHANTOM_EMULATOR_`` may
-overlay any value using ``__`` as the nested delimiter — for example
+overlay any value using ``__`` as the nested delimiter - for example
 ``PHANTOM_EMULATOR_AUTH__SIGNING__MODE=RS256``.
 
 See plan §4.1, §7.
@@ -183,7 +183,7 @@ class S3Cfg(BaseModel):
     ``access_key_id`` (the credential-id equality check),
     ``secret_access_key`` (the recompute key), and ``body_max_bytes``
     (the 413 cap). ``region`` / ``service`` document the expected
-    credential scope but are NOT consumed by the recompute — the
+    credential scope but are NOT consumed by the recompute - the
     request's own credential scope drives the comparison.
 
     Defaults are the public AWS-doc example pair so a test that signs
@@ -245,7 +245,7 @@ class AppConfig(BaseSettings):
 
     Composed from a YAML file, environment overlay, and built-in
     defaults. Environment variables use the prefix
-    ``PHANTOM_EMULATOR_`` and the nested delimiter ``__`` — for
+    ``PHANTOM_EMULATOR_`` and the nested delimiter ``__`` - for
     example ``PHANTOM_EMULATOR_AUTH__SIGNING__MODE=RS256``.
     """
 
@@ -321,7 +321,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"config root must be a YAML mapping, got {type(raw).__name__}")
 
-    # Environment variables still overlay after merging YAML — Pydantic
+    # Environment variables still overlay after merging YAML - Pydantic
     # Settings' precedence is env > init kwargs > defaults. To preserve
     # that, we construct the AppConfig with YAML-derived overrides; env
     # then wins per Pydantic's normal Settings flow.

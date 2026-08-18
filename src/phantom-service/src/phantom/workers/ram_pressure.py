@@ -1,4 +1,4 @@
-"""RamPressureWatcher — enforce the ``body_store.ram_ceiling_bytes`` cap.
+"""RamPressureWatcher - enforce the ``body_store.ram_ceiling_bytes`` cap.
 
 The cap exists in YAML (:attr:`BodyStoreCfg.ram_ceiling_bytes`,
 renamed from the pre-Phase-1 ``in_memory_max_bytes``) so operators
@@ -27,7 +27,7 @@ Plan § 2.3.12. The watcher's run loop:
   chain_ids via the store's :meth:`SqliteUploadStore.list_oldest_ram_bodies`
   helper (plan § 2.3.4) and calls
   :meth:`PersistController.enqueue` on each. The controller dedupes
-  duplicate in-flight chain_ids and the next tick re-samples — no
+  duplicate in-flight chain_ids and the next tick re-samples - no
   inline awaits on the migration future.
 * Skips a candidate ONLY when it is mid-attempt AND its attempt began
   within a time-bounded "fresh" window (~2x the poll interval). A row
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Batch size cap for one pressure event — bounds the amount of work
+# Batch size cap for one pressure event - bounds the amount of work
 # done before the watcher re-samples and decides whether to keep
 # enqueueing. Picked an order-of-magnitude that comfortably exceeds
 # typical RAM-resident chain counts (the watcher just exits the
@@ -77,7 +77,7 @@ _MAX_ENQUEUE_BATCH_SIZE: int = 64
 # for the time-bounded attempting-skip (finding F-1). A row that
 # transitioned to ``attempting`` within this many poll intervals is
 # skipped (the sender is plausibly actively reading its body); a row
-# that has been ``attempting`` longer is enqueued anyway — the upstream
+# that has been ``attempting`` longer is enqueued anyway - the upstream
 # is genuinely stalled, RAM must be bounded, and migrating is safe (the
 # HybridBodyStore writes+fsyncs to disk BEFORE deleting RAM, so the
 # sender's RAM-first read falls back to disk; the controller dedupes
@@ -102,14 +102,14 @@ def _is_fresh_attempt(
 
     The attempt-start time is the row's ``updated_at`` (set on the
     queued→attempting flip by ``SqliteUploadStore.claim_due``). A "fresh"
-    attempt is one that started within ``window_seconds`` of ``now`` — it
+    attempt is one that started within ``window_seconds`` of ``now`` - it
     is skipped by the RAM-pressure sweep so the watcher does not migrate
     a body the sender may be actively reading. An attempt older than the
     window is "stalled" (returns ``False``) and gets enqueued so the RAM
     ceiling is enforced (finding F-1).
 
     Both datetimes are normalized to UTC; a naive ``updated_at`` is
-    assumed to already be UTC wall-clock (defensive — the store reads
+    assumed to already be UTC wall-clock (defensive - the store reads
     tz-aware values, but this keeps the comparison total).
 
     Args:
@@ -148,7 +148,7 @@ class RamPressureWatcher:
         Args:
             instance: The instance whose RAM body store, upload store,
                 and live settings snapshot to consult.
-            persist_controller: Migration target. Mandatory — the
+            persist_controller: Migration target. Mandatory - the
                 watcher is only spawned in ``hybrid`` mode (plan
                 § 2.3.10). The controller's :meth:`enqueue` is
                 idempotent, so duplicate enqueues for an in-flight
@@ -176,7 +176,7 @@ class RamPressureWatcher:
         )
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        """Main loop — sleep, sample, enqueue on pressure, until stopped."""
+        """Main loop - sleep, sample, enqueue on pressure, until stopped."""
         while not stop_event.is_set():
             try:
                 await self._check_once()
@@ -216,7 +216,7 @@ class RamPressureWatcher:
             current,
             max_bytes,
         )
-        # Pressure event observed — bump signal counter.
+        # Pressure event observed - bump signal counter.
         await self._ram_signal_total.inc()
         # list_oldest_ram_bodies queries the persistent store for
         # body_location='ram' chain_ids ordered by received_at. The
@@ -231,7 +231,7 @@ class RamPressureWatcher:
         # body read; a row that has been ``attempting`` LONGER is treated
         # as a stalled attempt (slow/unreachable upstream) and enqueued
         # anyway so the ceiling is actually enforced. ``updated_at`` is
-        # the attempt-start time — ``claim_due`` sets it on the
+        # the attempt-start time - ``claim_due`` sets it on the
         # queued→attempting flip. Read the live poll interval so a hot
         # reload of ``ram_pressure_poll_seconds`` reshapes the window.
         poll_interval = self._instance.current_settings().body_store.ram_pressure_poll_seconds
@@ -241,7 +241,7 @@ class RamPressureWatcher:
         )
         now = datetime.now(tz=UTC)
         for chain_id in candidates:
-            # Skip only rows mid-attempt whose attempt began RECENTLY —
+            # Skip only rows mid-attempt whose attempt began RECENTLY -
             # the sender may be actively reading the body, and racing the
             # controller's migration against a live read invites a
             # duplicate fsync + RAM-delete window. A stalled attempt
@@ -274,7 +274,7 @@ class RamPressureWatcher:
                     chain_id,
                 )
                 continue
-            # Optimistic re-sample — the controller may have already
+            # Optimistic re-sample - the controller may have already
             # cleared some RAM. The sample is O(1) since U11 (a running
             # counter, not a walk of every ref), which is what makes
             # re-sampling once per candidate reasonable rather than a cost.

@@ -27,7 +27,7 @@ class FailureScope(StrEnum):
     """Per-request failure scope.
 
     The middleware maps each URL path to one scope. ``GLOBAL`` is the
-    fallback — if no scope-specific policy exists, the GLOBAL policy
+    fallback - if no scope-specific policy exists, the GLOBAL policy
     (if any) applies.
     """
 

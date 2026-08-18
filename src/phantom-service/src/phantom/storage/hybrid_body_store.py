@@ -1,10 +1,10 @@
-"""HybridBodyStore — RAM-first writes, RAM-presence-authoritative reads.
+"""HybridBodyStore - RAM-first writes, RAM-presence-authoritative reads.
 
 Production-default :class:`BodyStore` binding (Settings
 ``storage.body_store.mode='hybrid'``). Composes :class:`RamBodyStore`
 and :class:`FileBodyStore`. The migration from RAM to disk is owned
 exclusively by the :class:`PersistController` (plan § 0.5 single-writer
-manifest invariant #6) — HybridBodyStore reads runtime authority off
+manifest invariant #6) - HybridBodyStore reads runtime authority off
 :class:`RamBodyStore` presence; it never inspects ``body_location`` on
 the SQLite row.
 
@@ -34,7 +34,7 @@ class HybridBodyStore:
     ``body_location`` column.
 
     Reads consult RAM first; on RAM miss, fall through to disk. The
-    runtime authority is body presence on the underlying stores — this
+    runtime authority is body presence on the underlying stores - this
     class does NOT consult the SQLite ``body_location`` column at read
     time. Per plan § 2.3.9: a row's ``body_location`` is the
     *persistence-side* truth, but body bytes can transiently be on
@@ -80,7 +80,7 @@ class HybridBodyStore:
         disk. Admission's size-threshold path (plan § 2.3.10
         ``body_size_threshold_bytes``) routes large bodies to direct
         disk-write by enqueueing against the persist controller
-        immediately after this :meth:`put` returns — never by branching
+        immediately after this :meth:`put` returns - never by branching
         inside HybridBodyStore.
 
         Namespace semantics (R11-a): this put REPLACES the RAM half's
@@ -111,10 +111,10 @@ class HybridBodyStore:
         A :class:`KeyError` raised by :meth:`RamBodyStore.get` is the
         race window: the persist controller cleared the RAM entry
         between :meth:`has_body_ref` and :meth:`get`. The file is
-        durable by then (commit-last-column ordering — plan § 0.5), so
+        durable by then (commit-last-column ordering - plan § 0.5), so
         falling through to disk gives the bytes. The
         :func:`contextlib.suppress` makes the documented fall-through
-        explicit (not a "silent KeyError swallow" — H8 closure pattern).
+        explicit (not a "silent KeyError swallow" - H8 closure pattern).
         """
         if await self._ram.has_body_ref(chain_id, name):
             with contextlib.suppress(KeyError):
@@ -128,7 +128,7 @@ class HybridBodyStore:
         is the durable fallback once the persist controller's
         commit-last-column flip lands. RAM-side :class:`KeyError` (no
         entry for ``chain_id``) is the explicit fall-through-to-disk
-        path — see :func:`contextlib.suppress` rationale on :meth:`get`.
+        path - see :func:`contextlib.suppress` rationale on :meth:`get`.
 
         COMPLETENESS CAVEAT (N2): a NON-EMPTY RAM entry short-circuits the
         disk read outright, with no merge and no comparison against the row's
@@ -154,7 +154,7 @@ class HybridBodyStore:
     async def delete(self, chain_id: UUID) -> None:
         """Drop the body from BOTH stores. Idempotent.
 
-        Per plan § 2.3.9: RAM-first delete keeps the invariant — a
+        Per plan § 2.3.9: RAM-first delete keeps the invariant - a
         racing reader sees the RAM body gone first and falls through
         to disk before disk is also gone. ``RamBodyStore.delete`` and
         ``FileBodyStore.delete`` are both idempotent so a missing
@@ -164,7 +164,7 @@ class HybridBodyStore:
         await self._disk.delete(chain_id)
 
     async def total_bytes(self) -> int:
-        """Return RAM-tier bytes only — the saturation / RAM-pressure metric.
+        """Return RAM-tier bytes only - the saturation / RAM-pressure metric.
 
         Disk-tier bytes are bounded by the filesystem and tracked
         separately by :class:`DiskPressureProbe` (per

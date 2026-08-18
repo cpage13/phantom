@@ -354,7 +354,7 @@ class AdmissionRefusedSaturation:
 
 @dataclass(frozen=True)
 class AdmissionRefusedDiskPressure:
-    """Disk-bytes ceiling reached — observed via the periodic disk probe (§2.3)."""
+    """Disk-bytes ceiling reached - observed via the periodic disk probe (§2.3)."""
 
 
 AdmissionResult = AdmissionGranted | AdmissionRefusedSaturation | AdmissionRefusedDiskPressure
@@ -405,7 +405,7 @@ class SaturationGate:
                 is then a no-op).
             large_body_threshold_bytes: Bodies at or above this size are
                 counted in the separate large-body class. Zero disables
-                the class — no row counts as large.
+                the class - no row counts as large.
             max_large_in_flight: Max concurrent in-flight bodies in the
                 large class. Ignored when ``large_body_threshold_bytes=0``.
             metrics_registry: Optional :class:`MetricsRegistry` for
@@ -429,7 +429,7 @@ class SaturationGate:
         # large bodies in flight.
         self._large_charge_sizes: dict[int, int] = {}
         # Last-observed disk usage from the periodic probe. Zero means
-        # "no observation yet" — the gate behaves as if disk is empty
+        # "no observation yet" - the gate behaves as if disk is empty
         # until the first probe lands.
         self._disk_usage_bytes = 0
         # Metrics surface (plan § 4.2.2). saturation_balance is the
@@ -500,7 +500,7 @@ class SaturationGate:
         Synchronous on purpose: the probe runs in its own coroutine and
         reads ``FileBodyStore.total_bytes`` (which is async); calling this
         setter is the last step. The setter is not lock-protected because
-        write/read of a single Python int is atomic under the GIL — the
+        write/read of a single Python int is atomic under the GIL - the
         cost of contention is reading a slightly-stale value for one
         admit call, which is acceptable.
         """
@@ -521,7 +521,7 @@ class SaturationGate:
             # Disk pressure is checked first: it's the cheaper signal
             # (read of a cached int) and the producer's operator wants to see
             # disk_pressure when it's the actual cause. The check uses
-            # `>=` so a row landing exactly at the cap is still refused —
+            # `>=` so a row landing exactly at the cap is still refused -
             # a 0-byte ingress at-cap would otherwise be admitted and
             # then promptly trip ENOSPC when its row arrives on disk.
             if (
@@ -531,7 +531,7 @@ class SaturationGate:
                 return AdmissionRefusedDiskPressure()
             if self._in_flight + 1 > self._max_in_flight:
                 return AdmissionRefusedSaturation()
-            # Bytes cap. A 0 cap means "refuse all" — matching the row
+            # Bytes cap. A 0 cap means "refuse all" - matching the row
             # cap, where ``max_in_flight=0`` refuses every admission via
             # ``0 + 1 > 0``. Finding A-1: a naive ``+ declared > cap``
             # admitted 0-byte bodies under a 0 cap (``0 + 0 > 0`` is
@@ -569,7 +569,7 @@ class SaturationGate:
                 self._large_charge_sizes[declared_bytes] = (
                     self._large_charge_sizes.get(declared_bytes, 0) + 1
                 )
-        # Emit gauge after releasing the lock — Gauge.set acquires its
+        # Emit gauge after releasing the lock - Gauge.set acquires its
         # own asyncio.Lock and we forbid await inside async with lock
         # (plan § 0.3).
         await self._saturation_balance.set(self._in_flight_bytes)
@@ -720,7 +720,7 @@ class SaturationGate:
         cap change cannot interleave with a half-completed admit.
 
         In-flight counters (``_in_flight``, ``_in_flight_bytes``,
-        ``_large_in_flight``) are NOT reset — they reflect actual current
+        ``_large_in_flight``) are NOT reset - they reflect actual current
         state. Newly-arriving admits are evaluated against the new caps
         immediately. A changed ``large_body_threshold_bytes`` applies to
         NEW classifications only: in-flight large charges release

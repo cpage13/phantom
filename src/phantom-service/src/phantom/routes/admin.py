@@ -1,4 +1,4 @@
-"""Admin endpoint router (loopback, no auth — ADR-004).
+"""Admin endpoint router (loopback, no auth - ADR-004).
 
 Plan § 2.3.19.
 -------------------------------------------
@@ -9,7 +9,7 @@ sites). Every site is collapsed to the single
 :attr:`InstanceContext.store` + :attr:`InstanceContext.body_store`
 references (the dual-store carry is gone from InstanceContext per
 F-Slice1D-B). Body-location surfacing in responses uses the new
-``body_location`` discriminator on :class:`UploadRow` —
+``body_location`` discriminator on :class:`UploadRow` -
 :class:`ChainAdminDetail` carries ``body_location: Literal['ram',
 'file']`` instead of ``tier`` + ``committed``.
 
@@ -157,17 +157,17 @@ def _admin_error(
 
 
 def get_dispatcher() -> InstanceDispatcher:
-    """Dependency placeholder — wired by the composition root."""
+    """Dependency placeholder - wired by the composition root."""
     raise NotImplementedError("InstanceDispatcher dependency must be overridden by app factory")
 
 
 def get_version() -> str:
-    """Phantom version string — overridden by the composition root."""
+    """Phantom version string - overridden by the composition root."""
     return "0.1.0"
 
 
 def get_resolved_defaults_summary() -> ResolvedDefaultsSummary | None:
-    """Resolved-defaults summary — overridden by the composition root.
+    """Resolved-defaults summary - overridden by the composition root.
 
     Returns ``None`` in tests or partial wirings where the summary
     isn't built. Production always wires a concrete summary via
@@ -177,7 +177,7 @@ def get_resolved_defaults_summary() -> ResolvedDefaultsSummary | None:
 
 
 def get_metrics_registry() -> MetricsRegistry:
-    """Process-wide :class:`MetricsRegistry` — wired by the composition root.
+    """Process-wide :class:`MetricsRegistry` - wired by the composition root.
 
     Plan § 4.2.5. The composition root (``app.py.create_app``) overrides
     this dependency with ``lambda: app.state.metrics_registry``; admin
@@ -190,7 +190,7 @@ def get_metrics_registry() -> MetricsRegistry:
 
 
 def get_data_root() -> Path:
-    """Top-level ``Settings.storage.data_dir`` — wired by app factory.
+    """Top-level ``Settings.storage.data_dir`` - wired by app factory.
 
     Plan § 5.2.5 / § 1.4 / § 1.5. This is the TOP-LEVEL data dir; the
     quarantine inventory and restore routes combine it with each instance's
@@ -256,7 +256,7 @@ async def _aggregate_stats(targets: list[InstanceContext]) -> StatsResponse:
     # ``stored`` is terminal, so the non-terminal loop below never sees it
     # and ``by_state.stored`` would stay structurally zero. We add a
     # second, read-only GROUP BY aggregate (counts_by_state) and consume
-    # ONLY its ``stored`` entry here — the non-terminal entries, in_flight,
+    # ONLY its ``stored`` entry here - the non-terminal entries, in_flight,
     # and body_location keep coming from the loop, so the loop is not
     # redundant. The two reads (auth_expired from the loop, stored from
     # the aggregate) are eventually-consistent by design; admin stats
@@ -358,7 +358,7 @@ async def get_admin_status(
             )
         )
         total_backlog += len(rows)
-        # Sum body-file bytes per instance — see §6.1. Reads the store's
+        # Sum body-file bytes per instance - see §6.1. Reads the store's
         # running total (CL6), seeded by one walk at boot and maintained by
         # the two writers, so the request does no filesystem work.
         total_disk_bytes += await ctx.file_body_store.total_bytes()
@@ -418,7 +418,7 @@ async def get_instance_status(
         in_flight=stats.in_flight,
         by_state=stats.by_state,
         auth=stats.auth,
-        # See §6.1 — per-instance body-file bytes via the existing store helper.
+        # See §6.1 - per-instance body-file bytes via the existing store helper.
         disk_usage_bytes=await ctx.file_body_store.total_bytes(),
         degraded_durability=False,
     )
@@ -531,7 +531,7 @@ async def list_uploads(
 ) -> ListUploadsResponse:
     """List chains with filters + cursor pagination.
 
-    Single-store pagination (plan § 2.3.19) —
+    Single-store pagination (plan § 2.3.19) -
     the pre-Phase-1 dual-store fan-out is gone with the schema
     collapse. The cursor opaquely carries the underlying store's
     continuation token.
@@ -577,7 +577,7 @@ async def list_uploads(
     # Multi-instance pagination would need an outer cursor; today every
     # production deployment runs a single instance per Phantom process
     # (see CONTEXT.md "Topology and storage"), so the one-instance
-    # path is the load-bearing one — the multi-instance fan-out
+    # path is the load-bearing one - the multi-instance fan-out
     # concatenates the per-instance pages.
     all_rows: list[UploadRow] = []
     next_cursor: str | None = None
@@ -1022,11 +1022,11 @@ async def _build_tar_stream(
     """Yield a single tar archive with manifest.json + every body.
 
     Built entirely in-memory, then yielded as one chunk. Tar archives need
-    every member's size up front, so streaming-as-we-go is not free —
+    every member's size up front, so streaming-as-we-go is not free -
     materializing first keeps the implementation simple and matches the
     v1 export.tar / extract use case (producer-scale data, not GB+).
 
-    With an empty filter the export returns every row in the store —
+    With an empty filter the export returns every row in the store -
     including terminal states (``succeeded`` / ``failed`` / ``stored`` /
     ``cancelled`` / ``corrupted``). ADR-005's producer-recovery use case is
     "pull every buffered body the operator might want," which is exactly
@@ -1482,7 +1482,7 @@ async def push_credential_one(
 
     The SigV4 analogue of :func:`push_token_one` (the admin token push), per the
     2026-06-23 copy directive. Differs only by the route prefix
-    (``/credentials`` vs ``/tokens``), the key (the destination host alone — a
+    (``/credentials`` vs ``/tokens``), the key (the destination host alone - a
     SigV4 step has no caller-supplied ``uid``), and the structured
     :data:`CredentialPushBody` (vs the bare token string).
 
@@ -1506,14 +1506,14 @@ async def push_credential_one(
     :class:`~phantom.models.credential.SigningService` at the strict boundary),
     so an operator PUT whose body omits ``service`` or names an unknown service
     is rejected ``422`` at the door (before any store write) by the body
-    validator — the same fail-loud the config route applies at boot.
+    validator - the same fail-loud the config route applies at boot.
 
     A bearer-only deployment carries no credential store
     (``signer_creds is None``); such instances are skipped (the push is a no-op
-    for them — the store is optional by construction, ADR design), never a
+    for them - the store is optional by construction, ADR design), never a
     crash.
 
-    Returns ``204 No Content`` with NO body — the ``secret_access_key`` is
+    Returns ``204 No Content`` with NO body - the ``secret_access_key`` is
     therefore never echoed (ADR-004). The admin surface exposes credential
     STATUS only, never secret material.
 
@@ -1718,8 +1718,8 @@ async def get_quarantine_inventory(
 
     Scope (Finding F-1):
 
-    * ``?instance=<id>`` — scan just that instance's per-instance data_root.
-    * omitted — scan every configured instance and concatenate the results
+    * ``?instance=<id>`` - scan just that instance's per-instance data_root.
+    * omitted - scan every configured instance and concatenate the results
       (the natural "everything quarantined across the deployment" view).
 
     Raises:

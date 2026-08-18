@@ -1,4 +1,4 @@
-"""AWS SigV4 request signer — the ``aws_sigv4`` executor arm's primitive.
+"""AWS SigV4 request signer - the ``aws_sigv4`` executor arm's primitive.
 
 One call to :func:`sign_sigv4` re-signs a single outbound request with the
 botocore signer class DISPATCHED from the credential's
@@ -6,20 +6,20 @@ botocore signer class DISPATCHED from the credential's
 and mutates the passed ``headers`` dict in place (adding ``Authorization`` /
 ``X-Amz-Date`` / ``X-Amz-Security-Token`` when a session token is present). For
 the S3 service the dispatched signer is ``S3SigV4Auth``, which EMITS + SIGNS
-``x-amz-content-sha256`` — the signed header real S3 requires (the base
+``x-amz-content-sha256`` - the signed header real S3 requires (the base
 ``SigV4Auth`` hashes the payload for the signature but never emits the header, so
 real S3 400s ``Missing required header for this request: x-amz-content-sha256``).
 A credential whose service has no map entry raises :class:`SigV4SigningError`,
 which the executor parks (``auth_expired``), never a bare ``KeyError``. The
 signer runs per send attempt inside the executor (``chain/executor.py``), so a
-retry hours after the upload was buffered re-signs with a FRESH timestamp — the
+retry hours after the upload was buffered re-signs with a FRESH timestamp - the
 routing design's core requirement (a stale SigV4 signature would be rejected by
 S3's clock-skew window).
 
 The signer reads RESOLVED credential values only. A
 :class:`~phantom.models.credential.SigV4StaticCreds` carries the literal
 ``access_key_id`` / ``secret_access_key`` / ``region`` (and optional
-``session_token``) botocore needs at sign time — no env-var-name resolution
+``session_token``) botocore needs at sign time - no env-var-name resolution
 happens here. A :class:`~phantom.models.credential.ProfileRefCred` delegates to
 botocore's credential chain (profile / default chain, with SSO/STS auto-refresh);
 because that chain does blocking file/network I/O, it is resolved inside
@@ -122,7 +122,7 @@ async def sign_sigv4(
         headers: The outbound header map; signed headers are merged in place.
         body: The exact outbound body bytes (fed to botocore as ``data=`` so it
             computes the payload hash over the bytes actually forwarded).
-        credential: The resolved destination credential — either inline static
+        credential: The resolved destination credential - either inline static
             SigV4 keys or a profile/default-chain reference. Its ``service``
             selects the signer class.
 
@@ -136,7 +136,7 @@ async def sign_sigv4(
     # botocore signer class. A map-miss raises ``SigV4SigningError`` (parkable by
     # the executor's ``except``), NEVER a bare ``KeyError`` (which would escape
     # the executor and crash the loop). ``credential.service`` is passed to
-    # botocore's ``service_name`` slot DIRECTLY — a ``StrEnum`` member IS a
+    # botocore's ``service_name`` slot DIRECTLY - a ``StrEnum`` member IS a
     # ``str``, so it is consumed verbatim and a store-reloaded raw-string
     # credential signs identically (no ``.value``).
     signer_class = _SERVICE_SIGNERS.get(credential.service)

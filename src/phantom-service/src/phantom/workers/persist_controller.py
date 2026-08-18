@@ -1,4 +1,4 @@
-"""PersistController — SOLE mover of bodies from RAM to disk.
+"""PersistController - SOLE mover of bodies from RAM to disk.
 
 Per plan § 0.5 single-writer manifest invariant #6 and plan § 2.3.11.
 
@@ -9,22 +9,22 @@ path AND never set ``body_location='file'`` on the SQLite row.
 
 Triggers (callers that ``enqueue`` against this controller):
 
-* **Retry-linger** — sender's failure handler enqueues when a row's
+* **Retry-linger** - sender's failure handler enqueues when a row's
   retry count + linger window indicate the body should move off RAM
   so the next attempt reads from a durable store.
-* **RAM-pressure** — :class:`RamPressureWatcher` enqueues oldest-
+* **RAM-pressure** - :class:`RamPressureWatcher` enqueues oldest-
   resident chain_ids when the ``RamBodyStore`` byte total exceeds
   ``body_store.ram_ceiling_bytes``.
-* **Size-threshold** — admission enqueues immediately when a body
+* **Size-threshold** - admission enqueues immediately when a body
   exceeds ``persist_trigger.body_size_threshold_bytes``.
 
 Commit-last-column ordering (plan § 0.5 + § 2.3.11):
 
   1. Read body bytes from RAM (``RamBodyStore.get_all``).
-  2. Write bytes to disk (``FileBodyStore.put`` — fsyncs each body
+  2. Write bytes to disk (``FileBodyStore.put`` - fsyncs each body
      file + the parent directory before returning).
   3. Flip ``body_location='ram'`` → ``'file'`` on the SQLite row
-     (``SqliteUploadStore.mark_persisted`` — THE commit point).
+     (``SqliteUploadStore.mark_persisted`` - THE commit point).
   4. Drop the RAM body bytes.
 
 A crash between (2) and (3) leaves a durable file on disk PLUS a row
@@ -97,7 +97,7 @@ class PersistController:
             ram_body_store: Source for body bytes prior to migration.
             file_body_store: Destination for body bytes after migration.
                 Its ``put`` method fsyncs each body file + the parent
-                directory before returning — the fsync-before-flip
+                directory before returning - the fsync-before-flip
                 ordering invariant (plan § 0.5) is enforced by that
                 contract, not by an explicit fsync call here.
             metrics_registry: Optional :class:`MetricsRegistry` for
@@ -156,11 +156,11 @@ class PersistController:
             return handle
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        """Main loop — drain the queue, migrate each chain_id, signal handle.
+        """Main loop - drain the queue, migrate each chain_id, signal handle.
 
-        Supervised by the composition root — :func:`phantom.app.create_app`'s
+        Supervised by the composition root - :func:`phantom.app.create_app`'s
         lifespan :class:`asyncio.TaskGroup` (plan § 2.3.10). The loop never
-        re-raises an exception — unrelated chain_ids must continue migrating
+        re-raises an exception - unrelated chain_ids must continue migrating
         even when one fails. Failures on a single chain are logged with full
         context AND the failing chain's handle gets the exception set, so any
         awaiting caller sees it.
@@ -171,7 +171,7 @@ class PersistController:
 
         The loop polls the queue with a short timeout and exits the moment
         ``stop_event`` fires, draining cleanly at shutdown so the lifespan
-        TaskGroup is not left waiting on a never-returning task — the same
+        TaskGroup is not left waiting on a never-returning task - the same
         ``stop_event``-drain idiom every other lifespan worker uses (sender /
         kicker / vacuum / reaper / auditor / …).
 
@@ -202,7 +202,7 @@ class PersistController:
             )
             self._resolve_handle(chain_id, exception=exc)
             await self._persist_total.inc(label_value=_PERSIST_OUTCOME_FAILURE)
-            # Do NOT re-raise — TaskGroup would cancel the entire
+            # Do NOT re-raise - TaskGroup would cancel the entire
             # runtime. Errors on one chain don't kill the service.
         finally:
             # Whether success or failure, the queue depth dropped.
@@ -213,16 +213,16 @@ class PersistController:
 
         Order matters (plan § 0.5 commit-last-column):
 
-        0. live-row pre-check — skip rows already body-discarded or
+        0. live-row pre-check - skip rows already body-discarded or
            gone (R7-2; narrows the race window before any work).
-        1. ``ram.get_all`` — pull body bytes.
-        2. ``file.put`` — write + fsync (fsync inside FileBodyStore).
-        3. ``store.mark_persisted`` — flip ``body_location`` (the
+        1. ``ram.get_all`` - pull body bytes.
+        2. ``file.put`` - write + fsync (fsync inside FileBodyStore).
+        3. ``store.mark_persisted`` - flip ``body_location`` (the
            commit point). Rowcount 0 means the reaper's body-discard
            (or a row deletion) landed between steps 1 and 3: the
            just-written disk bytes are policy-discarded, so they are
            deleted again here and never flipped live (R7-2).
-        4. ``ram.delete`` — release RAM bytes.
+        4. ``ram.delete`` - release RAM bytes.
         """
         row = await self._store.get(chain_id)
         if row is None or not is_deliverable(row):
@@ -240,7 +240,7 @@ class PersistController:
         body_refs = await self._ram.get_all(chain_id)
         # FileBodyStore.put fsyncs every body file + the parent dir
         # before returning. The fsync-before-flip ordering invariant
-        # (plan § 0.5) is enforced by that contract — see
+        # (plan § 0.5) is enforced by that contract - see
         # FileBodyStore._put_one + parent-dir fsync after the loop.
         await self._file.put(chain_id, body_refs)
         # The commit point: SOLE writer of body_location='file'. The
@@ -281,7 +281,7 @@ class PersistController:
         """Pop ``chain_id`` from ``_in_flight`` and signal its future.
 
         Called from :meth:`run`'s success and failure paths. The
-        ``_handles_lock`` is NOT held — popping from the dict is fast
+        ``_handles_lock`` is NOT held - popping from the dict is fast
         and not racing with a concurrent ``enqueue`` (queue ordering
         guarantees enqueue happens-before run-dequeue for the same
         chain_id within one event loop).

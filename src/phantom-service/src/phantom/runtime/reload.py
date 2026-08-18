@@ -1,4 +1,4 @@
-"""Hot-reload engine — the cohesive YAML-reload + SIGHUP cluster.
+"""Hot-reload engine - the cohesive YAML-reload + SIGHUP cluster.
 
 One caller surface, two triggers: the SIGHUP handler installed by
 :func:`phantom.app.create_app`'s ``lifespan`` and the
@@ -19,7 +19,7 @@ pool. Validation (including probe-fill resolution) completes inside
 leaves the running config untouched per ADR-013.
 
 The SIGHUP path (:func:`sighup_reload`, scheduled by
-:func:`make_sighup_handler`) swallows parse/validation failures — a bad
+:func:`make_sighup_handler`) swallows parse/validation failures - a bad
 YAML must not crash the process; the admin route instead returns a 422
 envelope. :class:`suppress_signal_handler_errors` guards the lifespan's
 SIGHUP teardown.
@@ -105,15 +105,15 @@ async def _reload_minter(
     Args:
         ctx: The instance context whose minter slot may have drifted.
         new_cfg: The freshly-reloaded :class:`InstanceCfg`.
-        token_cache: Token cache (unused — kept for signature stability;
+        token_cache: Token cache (unused - kept for signature stability;
             the lifespan TaskGroup owns minter wiring).
     """
-    del token_cache  # No longer used — see docstring.
+    del token_cache  # No longer used - see docstring.
     if ctx.cfg.ad_mint == new_cfg.ad_mint:
         return
     logger.warning(
         "ad_mint config changed for instance %s; restart required for new minter "
-        "(reload-time swap is not supported — Phase 2 H6 moved supervision under "
+        "(reload-time swap is not supported - Phase 2 H6 moved supervision under "
         "the lifespan TaskGroup)",
         ctx.cfg.id,
     )
@@ -216,7 +216,7 @@ class suppress_signal_handler_errors:  # noqa: N801  context-manager naming
 
     The handler may have failed to install (Windows / non-main-thread)
     or the loop may already be closed at teardown. Both paths are
-    fine — we don't want lifespan shutdown to mask a real worker error
+    fine - we don't want lifespan shutdown to mask a real worker error
     with a signal-handler cleanup exception.
     """
 
@@ -356,7 +356,7 @@ async def apply_reload(
     for ctx in instances:
         new_cfg = new_by_id.get(ctx.cfg.id)
         if new_cfg is None:
-            # Operator removed this instance from the YAML — keep
+            # Operator removed this instance from the YAML - keep
             # the live instance running with its previous settings (a
             # topology change requires a process restart).
             logger.warning("Reload omitted instance %s; keeping previous config", ctx.cfg.id)

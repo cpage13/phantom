@@ -187,7 +187,7 @@ class SqliteTokenCache:
 
         # Re-read to return the full row.
         fetched = await self.get(endpoint, uid)
-        if fetched is None:  # pragma: no cover — write just completed
+        if fetched is None:  # pragma: no cover - write just completed
             raise RuntimeError("Token cache row missing after set")
 
         # Fire wake handlers. Exceptions in handlers are logged, not propagated.
@@ -229,7 +229,7 @@ class SqliteTokenCache:
         *,
         endpoint: str | None = None,
     ) -> list[TokenSlot]:
-        """Return slot metadata — bearer is NEVER included (ADR-004)."""
+        """Return slot metadata - bearer is NEVER included (ADR-004)."""
         conn = self._require_conn()
         if endpoint is not None:
             async with conn.execute(

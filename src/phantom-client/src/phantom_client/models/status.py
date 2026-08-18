@@ -1,21 +1,21 @@
 """Upload-row, state-alias, and admin-status response models.
 
 These mirror the shapes Phantom emits on the admin API:
-- ``UploadRow`` — the row as returned by ``GET /v1/admin/chains/{chain_id}``
+- ``UploadRow`` - the row as returned by ``GET /v1/admin/chains/{chain_id}``
   and ``GET /v1/admin/chains``. ``extra="ignore"`` so unknown fields
   on the wire round-trip silently rather than failing the SDK; integration
   tests pin the documented field set.
-- ``UploadState`` — alias for ``ChainState`` from
+- ``UploadState`` - alias for ``ChainState`` from
   :mod:`phantom_client.models.chain`. Re-exported here because the
   admin-side vocabulary uses "upload" while the wire vocabulary uses
   "chain"; both name the same set of states.
-- ``TERMINAL_STATES`` — the SDK's default ``poll_until`` stopping
+- ``TERMINAL_STATES`` - the SDK's default ``poll_until`` stopping
   condition. Includes ``auth_expired`` because no further attempt
   happens without external intervention (see §4.2 of the plan and
   ADR-011).
-- ``SortKey`` — enum of valid ``sort`` query-param values.
+- ``SortKey`` - enum of valid ``sort`` query-param values.
 - ``StatsResponse``, ``TokenSlot``, ``HealthResponse``,
-  ``ReadyResponse`` — admin response payload shapes.
+  ``ReadyResponse`` - admin response payload shapes.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from phantom_client.models.chain import ChainState
 # State alias + terminal set.
 # ---------------------------------------------------------------------------
 
-UploadState: TypeAlias = ChainState  # noqa: UP040 — match TypeAlias convention used by ChainState
+UploadState: TypeAlias = ChainState  # noqa: UP040 - match TypeAlias convention used by ChainState
 """Admin-API name for an upload's state. Same literal set as ChainState."""
 
 
@@ -52,13 +52,13 @@ never retries a body-verification failure), so a poll that excluded it
 could only run to its deadline; this also matches
 ``poll_group_until_finished``, whose rollup counts ``corrupted``
 members as finished.
-Includes ``expired`` (ADR-032): truly terminal — the per-route
+Includes ``expired`` (ADR-032): truly terminal - the per-route
 send-deadline elapsed, so the upload is dead, the body is released, and
 it is never retried. Distinct from ``auth_expired``'s "stalled pending
 external action": an ``expired`` row will never progress, by anyone.
 
-Callers who need to poll *through* ``auth_expired`` — for example to
-assert eventual delivery after kicking the row with a fresh token —
+Callers who need to poll *through* ``auth_expired`` - for example to
+assert eventual delivery after kicking the row with a fresh token -
 must override with a smaller set, typically
 ``frozenset({"succeeded", "failed"})``.
 """
@@ -78,7 +78,7 @@ class SortKey(StrEnum):
 
 
 # ---------------------------------------------------------------------------
-# Captured-values store — nested per step on each UploadRow.
+# Captured-values store - nested per step on each UploadRow.
 # Duplicates phantom.models.upload.{CapturedStepValues,CapturedValues}
 # byte-for-byte; the contract test enforces alignment.
 # ---------------------------------------------------------------------------
@@ -118,7 +118,7 @@ class CapturedValues(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Upload row — SDK view (extra="ignore" tolerates unknown fields).
+# Upload row - SDK view (extra="ignore" tolerates unknown fields).
 # ---------------------------------------------------------------------------
 
 
@@ -227,7 +227,7 @@ class UploadRow(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Token slot — ADR-004 invariant: no bearer field ever.
+# Token slot - ADR-004 invariant: no bearer field ever.
 # ---------------------------------------------------------------------------
 
 
@@ -254,7 +254,7 @@ class TokenSlot(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stats response — what /v1/admin/stats returns.
+# Stats response - what /v1/admin/stats returns.
 #
 # The nested-component shapes (TierBreakdown, StateBreakdown,
 # SaturationStatus, AuthStatus) duplicate phantom.models.admin so the SDK
@@ -262,8 +262,8 @@ class TokenSlot(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-BodyLocation: TypeAlias = Literal["ram", "file"]  # noqa: UP040 — match TypeAlias convention
-"""Which body store holds the row's body bytes — same literal set as
+BodyLocation: TypeAlias = Literal["ram", "file"]  # noqa: UP040 - match TypeAlias convention
+"""Which body store holds the row's body bytes - same literal set as
 ``phantom.models.upload.BodyLocation``. Replaces the pre-Phase-1 ``Tier``
 alias (``memory`` / ``persisted``) per plan § 2.3.19 / § 2.3.20."""
 
@@ -379,7 +379,7 @@ class StatsResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Health and readiness shapes — small but uniform.
+# Health and readiness shapes - small but uniform.
 # ---------------------------------------------------------------------------
 
 

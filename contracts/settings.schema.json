@@ -124,7 +124,7 @@
         },
         "invariant_audit_period_seconds": {
           "default": 300,
-          "description": "InvariantAuditor sweep cadence (seconds). Plan \u00a7 4.2.3 \u2014 walks live rows and counters invariant violations against the seven \u00a70.5 invariants. Low frequency by design; CI uses the resulting counter to fail the next build on any non-zero label.",
+          "description": "InvariantAuditor sweep cadence (seconds). Plan \u00a7 4.2.3 - walks live rows and counters invariant violations against the seven \u00a70.5 invariants. Low frequency by design; CI uses the resulting counter to fail the next build on any non-zero label.",
           "minimum": 1,
           "title": "Invariant Audit Period Seconds",
           "type": "integer"
@@ -158,7 +158,7 @@
             }
           ],
           "default": null,
-          "description": "RamBodyStore size ceiling in bytes. None means probe-fill at startup \u2014 the ``_resolve_defaults`` model validator sets this to a hardware-aware fraction of available RAM (preserving the pre-rename ``in_memory_max_bytes`` probe-fill semantic). Explicit int overrides (e.g., 536_870_912 / 512 MiB). Ignored in all_disk mode (no RAM to bound).",
+          "description": "RamBodyStore size ceiling in bytes. None means probe-fill at startup - the ``_resolve_defaults`` model validator sets this to a hardware-aware fraction of available RAM (preserving the pre-rename ``in_memory_max_bytes`` probe-fill semantic). Explicit int overrides (e.g., 536_870_912 / 512 MiB). Ignored in all_disk mode (no RAM to bound).",
           "title": "Ram Ceiling Bytes"
         },
         "ram_pressure_poll_seconds": {
@@ -197,7 +197,7 @@
         "mode": {
           "const": "always",
           "default": "always",
-          "description": "Encoding policy. Only ``always`` is supported \u2014 Phantom always applies the configured codec.",
+          "description": "Encoding policy. Only ``always`` is supported - Phantom always applies the configured codec.",
           "title": "Mode",
           "type": "string"
         }
@@ -207,11 +207,11 @@
     },
     "DbIntegrityCfg": {
       "additionalProperties": false,
-      "description": "Phase 4 DB-corruption resilience knobs (plan \u00a7 5.2.5).\n\nTwo surfaces:\n\n* **Cold-backup (plan \u00a7 5.2.6)**. Off by default; opt-in for\n  belt-and-suspenders deployments. When enabled, the\n  :class:`phantom.workers.cold_backup.ColdBackupScheduler` is spawned\n  under the composition root's TaskGroup and snapshots the live DB\n  to ``<data_dir>/backups/`` on a configurable cadence.\n* **Fail-open vs fail-closed**. Strategy \u00a73 commits to\n  ``fail_open=True`` (\"service comes up serving empty state after\n  quarantine\"). Operators willing to abort startup on detected\n  corruption can pin ``fail_open=False`` \u2014 the composition root then\n  logs ERROR and raises after quarantining (the artifacts still get\n  preserved for retrieval).",
+      "description": "Phase 4 DB-corruption resilience knobs (plan \u00a7 5.2.5).\n\nTwo surfaces:\n\n* **Cold-backup (plan \u00a7 5.2.6)**. Off by default; opt-in for\n  belt-and-suspenders deployments. When enabled, the\n  :class:`phantom.workers.cold_backup.ColdBackupScheduler` is spawned\n  under the composition root's TaskGroup and snapshots the live DB\n  to ``<data_dir>/backups/`` on a configurable cadence.\n* **Fail-open vs fail-closed**. Strategy \u00a73 commits to\n  ``fail_open=True`` (\"service comes up serving empty state after\n  quarantine\"). Operators willing to abort startup on detected\n  corruption can pin ``fail_open=False`` - the composition root then\n  logs ERROR and raises after quarantining (the artifacts still get\n  preserved for retrieval).",
       "properties": {
         "backup_enabled": {
           "default": false,
-          "description": "Enable periodic SQLite online-backup snapshots. Off by default \u2014 opt-in for belt-and-suspenders deployments.",
+          "description": "Enable periodic SQLite online-backup snapshots. Off by default - opt-in for belt-and-suspenders deployments.",
           "title": "Backup Enabled",
           "type": "boolean"
         },
@@ -231,7 +231,7 @@
         },
         "fail_open": {
           "default": true,
-          "description": "Default True per strategy \u00a73 \u2014 the service starts with a fresh empty SQLite after quarantine. Pin False to abort startup on detected corruption (the quarantine still fires; the process exits after).",
+          "description": "Default True per strategy \u00a73 - the service starts with a fresh empty SQLite after quarantine. Pin False to abort startup on detected corruption (the quarantine still fires; the process exits after).",
           "title": "Fail Open",
           "type": "boolean"
         }
@@ -269,7 +269,7 @@
         },
         "capture_reexecution": {
           "default": false,
-          "description": "ADR-011 knob \u2014 re-execute on capture-TTL expiry.",
+          "description": "ADR-011 knob - re-execute on capture-TTL expiry.",
           "title": "Capture Reexecution",
           "type": "boolean"
         },
@@ -374,7 +374,7 @@
     },
     "RetentionCfg": {
       "additionalProperties": false,
-      "description": "Per-terminal-state retention windows (req \u00a75b post-ADR-009).\n\nAll seconds; ``-1`` means \"never expire automatically\" and is the\nONLY sentinel: every window field is validated ``ge=-1`` (C11,\nround-10 hardening), so an operator typo like ``-5`` is a loud\nvalidation error instead of silently meaning \"forever\" (the\nreaper's ``>= 0`` sweep guard treats any negative as never-expire,\nwhich fails safe but hides the typo).\n\nEvery per-state body / metadata window defaults to a hard-coded\nsensible value \u2014 these knobs are tunable but the probe doesn't\ninfluence them.",
+      "description": "Per-terminal-state retention windows (req \u00a75b post-ADR-009).\n\nAll seconds; ``-1`` means \"never expire automatically\" and is the\nONLY sentinel: every window field is validated ``ge=-1`` (C11,\nround-10 hardening), so an operator typo like ``-5`` is a loud\nvalidation error instead of silently meaning \"forever\" (the\nreaper's ``>= 0`` sweep guard treats any negative as never-expire,\nwhich fails safe but hides the typo).\n\nEvery per-state body / metadata window defaults to a hard-coded\nsensible value - these knobs are tunable but the probe doesn't\ninfluence them.",
       "properties": {
         "auth_expired_body_seconds": {
           "default": 15552000,
@@ -448,7 +448,7 @@
         },
         "max_rows": {
           "default": 100000,
-          "description": "Optional row-count backstop on the ``uploads`` table (V3). The per-state windows above are purely TIME-based; ``max_in_flight`` bounds only in-flight rows, so under sustained ingest terminal rows can grow the table without bound between reaps (notably the forever-retained ``stored``/``auth_expired`` metadata). When ``max_rows >= 0`` the reaper enforces it as a hard cap AFTER its time-based passes: if the table exceeds ``max_rows`` it evicts oldest-DONE-first (by ``updated_at``) until at or below the cap. Only fully-terminal rows (succeeded/failed/cancelled/stored/corrupted) are eligible \u2014 in-flight (queued/attempting) and still-deliverable ``auth_expired`` rows are NEVER evicted, so the backstop cannot drop an undelivered upload (invariant #1 holds). Default ``100_000``: a safe row backstop sized for the smallest target producer, so an instance that never sets a value still cannot grow the table without bound. Set ``-1`` to opt into unbounded (time-only retention); tune the cap per the SD-card size on the producer.",
+          "description": "Optional row-count backstop on the ``uploads`` table (V3). The per-state windows above are purely TIME-based; ``max_in_flight`` bounds only in-flight rows, so under sustained ingest terminal rows can grow the table without bound between reaps (notably the forever-retained ``stored``/``auth_expired`` metadata). When ``max_rows >= 0`` the reaper enforces it as a hard cap AFTER its time-based passes: if the table exceeds ``max_rows`` it evicts oldest-DONE-first (by ``updated_at``) until at or below the cap. Only fully-terminal rows (succeeded/failed/cancelled/stored/corrupted) are eligible - in-flight (queued/attempting) and still-deliverable ``auth_expired`` rows are NEVER evicted, so the backstop cannot drop an undelivered upload (invariant #1 holds). Default ``100_000``: a safe row backstop sized for the smallest target producer, so an instance that never sets a value still cannot grow the table without bound. Set ``-1`` to opt into unbounded (time-only retention); tune the cap per the SD-card size on the producer.",
           "minimum": -1,
           "title": "Max Rows",
           "type": "integer"
@@ -494,7 +494,7 @@
     },
     "RetryCfg": {
       "additionalProperties": false,
-      "description": "``retry`` block \u2014 worker pool size and the default strategy.",
+      "description": "``retry`` block - worker pool size and the default strategy.",
       "properties": {
         "default_strategy": {
           "$ref": "#/$defs/RetryStrategyCfg",
@@ -715,7 +715,7 @@
             }
           ],
           "default": null,
-          "description": "Byte cap across all in-flight uploads. Filled from the host probe when left unset (None). A value of 0 refuses every admission \u2014 including 0-byte bodies \u2014 matching the zero-semantics of max_in_flight (0 == refuse-all). It is NOT an 'unlimited' sentinel; leave the field unset (None) to take the probe-derived default.",
+          "description": "Byte cap across all in-flight uploads. Filled from the host probe when left unset (None). A value of 0 refuses every admission - including 0-byte bodies - matching the zero-semantics of max_in_flight (0 == refuse-all). It is NOT an 'unlimited' sentinel; leave the field unset (None) to take the probe-derived default.",
           "title": "Max In Flight Bytes"
         },
         "max_large_in_flight": {
@@ -761,7 +761,7 @@
         },
         "tls": {
           "$ref": "#/$defs/TlsCfg",
-          "description": "See :class:`TlsCfg` \u2014 flip the single listener to HTTPS (off by default)."
+          "description": "See :class:`TlsCfg` - flip the single listener to HTTPS (off by default)."
         }
       },
       "title": "ServerCfg",
@@ -769,7 +769,7 @@
     },
     "SigV4CredentialCfg": {
       "additionalProperties": false,
-      "description": "One config-declared destination credential for the ``aws_sigv4`` signer.\n\nThis is the **config acquisition route** \u2014 the boot-time analogue of the\nruntime admin push (``PUT /v1/admin/credentials/{dest_host}``). It is the\nONE place env-var *names* are accepted (GLOBAL \u00a71.2(a) B1), mirroring\n:class:`~phantom.config.ad_mint.AdMintConfig`'s ``primary_client_secret_env``\n/ ``secondary_client_secret_env`` (which likewise hold the *name* of an env\nvar, never the secret literal). The secret access key NEVER appears in\nconfig: only the NAME of the environment variable that holds it. At boot\n(``app.py`` lifespan, ``_build_instance_context``) the named env vars are\nresolved to their literal values and a\n:class:`~phantom.models.credential.SigV4StaticCreds` (or\n:class:`~phantom.models.credential.ProfileRefCred`) of RESOLVED values is\nwritten into the host-keyed credential store under ``source=\"config\"``. By\nthe time the store holds anything, the env-var names are gone (the B1\ninvariant: resolved values in the store, names only on this config route).\n\nTwo arms, discriminated by ``kind`` (mirroring the admin push body's\ndiscriminated union):\n\n* ``sigv4_static`` \u2014 a static key-pair declared by env-var name.\n  ``access_key_id_env`` and ``secret_access_key_env`` are REQUIRED;\n  ``region`` is REQUIRED; ``session_token_env`` is optional (STS).\n* ``profile_ref`` \u2014 a botocore profile / default-chain reference. No env\n  vars and no secret are held at rest; the signer resolves credentials at\n  sign time. ``profile=None`` marks the default chain.",
+      "description": "One config-declared destination credential for the ``aws_sigv4`` signer.\n\nThis is the **config acquisition route** - the boot-time analogue of the\nruntime admin push (``PUT /v1/admin/credentials/{dest_host}``). It is the\nONE place env-var *names* are accepted (GLOBAL \u00a71.2(a) B1), mirroring\n:class:`~phantom.config.ad_mint.AdMintConfig`'s ``primary_client_secret_env``\n/ ``secondary_client_secret_env`` (which likewise hold the *name* of an env\nvar, never the secret literal). The secret access key NEVER appears in\nconfig: only the NAME of the environment variable that holds it. At boot\n(``app.py`` lifespan, ``_build_instance_context``) the named env vars are\nresolved to their literal values and a\n:class:`~phantom.models.credential.SigV4StaticCreds` (or\n:class:`~phantom.models.credential.ProfileRefCred`) of RESOLVED values is\nwritten into the host-keyed credential store under ``source=\"config\"``. By\nthe time the store holds anything, the env-var names are gone (the B1\ninvariant: resolved values in the store, names only on this config route).\n\nTwo arms, discriminated by ``kind`` (mirroring the admin push body's\ndiscriminated union):\n\n* ``sigv4_static`` - a static key-pair declared by env-var name.\n  ``access_key_id_env`` and ``secret_access_key_env`` are REQUIRED;\n  ``region`` is REQUIRED; ``session_token_env`` is optional (STS).\n* ``profile_ref`` - a botocore profile / default-chain reference. No env\n  vars and no secret are held at rest; the signer resolves credentials at\n  sign time. ``profile=None`` marks the default chain.",
       "properties": {
         "access_key_id_env": {
           "anyOf": [
@@ -825,7 +825,7 @@
             }
           ],
           "default": null,
-          "description": "AWS region (static arm \u2014 required there; ignored for profile_ref).",
+          "description": "AWS region (static arm - required there; ignored for profile_ref).",
           "title": "Region"
         },
         "secret_access_key_env": {
@@ -879,11 +879,11 @@
     },
     "SqliteCfg": {
       "additionalProperties": false,
-      "description": "SQLite-specific knobs.\n\nPhase 1: dropped the configurable ``autovacuum`` knob \u2014 ``auto_vacuum``\nis hardcoded to NONE in code per the SD-card-wear hard rule\n(plan \u00a7 0.3). The previously free-form ``synchronous`` and\n``journal_mode`` fields are narrowed to ``Literal`` types so an\noperator typo or unsupported mode is a Pydantic error at startup\nrather than a silent misconfig at runtime.",
+      "description": "SQLite-specific knobs.\n\nPhase 1: dropped the configurable ``autovacuum`` knob - ``auto_vacuum``\nis hardcoded to NONE in code per the SD-card-wear hard rule\n(plan \u00a7 0.3). The previously free-form ``synchronous`` and\n``journal_mode`` fields are narrowed to ``Literal`` types so an\noperator typo or unsupported mode is a Pydantic error at startup\nrather than a silent misconfig at runtime.",
       "properties": {
         "busy_timeout_ms": {
           "default": 1000,
-          "description": "SQLite ``busy_timeout`` in milliseconds \u2014 how long SQLite busy-WAITS in its connection worker thread for a contended write lock before raising SQLITE_BUSY (finding R9-V6-1). Phantom serializes EVERY writer through one ``asyncio`` lock on a single connection, so internal write-vs-write contention is impossible by construction; this timeout ONLY governs EXTERNAL cross-process contention (a stray ``sqlite3`` admin session, a backup tool, a mis-shared data_dir). Under such a hold a LARGE value is harmful: each contended writer monopolizes the single writer slot for the full window, so an admission burst queues serially behind multiple busy-waits and the producer's HTTP read times out before admission can return its clean ``503 storage_unavailable``. The 1000 ms default rides out sub-second external blips while failing FAST under a sustained external hold so the contended write returns a clean retryable signal quickly. Boot-time recovery rides out longer locks via its own bounded retry-with-backoff, independent of this value.",
+          "description": "SQLite ``busy_timeout`` in milliseconds - how long SQLite busy-WAITS in its connection worker thread for a contended write lock before raising SQLITE_BUSY (finding R9-V6-1). Phantom serializes EVERY writer through one ``asyncio`` lock on a single connection, so internal write-vs-write contention is impossible by construction; this timeout ONLY governs EXTERNAL cross-process contention (a stray ``sqlite3`` admin session, a backup tool, a mis-shared data_dir). Under such a hold a LARGE value is harmful: each contended writer monopolizes the single writer slot for the full window, so an admission burst queues serially behind multiple busy-waits and the producer's HTTP read times out before admission can return its clean ``503 storage_unavailable``. The 1000 ms default rides out sub-second external blips while failing FAST under a sustained external hold so the contended write returns a clean retryable signal quickly. Boot-time recovery rides out longer locks via its own bounded retry-with-backoff, independent of this value.",
           "minimum": 0,
           "title": "Busy Timeout Ms",
           "type": "integer"
@@ -891,7 +891,7 @@
         "journal_mode": {
           "const": "WAL",
           "default": "WAL",
-          "description": "SQLite journal mode. Hardcoded to WAL \u2014 load-bearing for the strategy pragma set (plan \u00a7 2.3.5) and the recovery sweep's assumptions.",
+          "description": "SQLite journal mode. Hardcoded to WAL - load-bearing for the strategy pragma set (plan \u00a7 2.3.5) and the recovery sweep's assumptions.",
           "title": "Journal Mode",
           "type": "string"
         },
@@ -943,7 +943,7 @@
         },
         "db_integrity": {
           "$ref": "#/$defs/DbIntegrityCfg",
-          "description": "See :class:`DbIntegrityCfg` \u2014 Phase 4 corruption-resilience knobs."
+          "description": "See :class:`DbIntegrityCfg` - Phase 4 corruption-resilience knobs."
         },
         "max_buffered_bytes": {
           "default": 2147483648,
@@ -973,7 +973,7 @@
     },
     "TlsCfg": {
       "additionalProperties": false,
-      "description": "``server.tls`` block \u2014 flip the single listener from HTTP to HTTPS.\n\nWhen ``enabled``, the EXISTING uvicorn listener (``__main__.py:89-93``) is\nserved with TLS: ``ssl_certfile``/``ssl_keyfile`` are passed straight to\n``uvicorn.run`` (``uvicorn/main.py:534-536``). Self-signed is fine \u2014 Phantom\ndoes NOT verify its own cert; clients use ``verify=off`` or pin it\n(loopback/sidecar trust model). NOT a second listener; the one socket\nsimply speaks HTTPS instead of HTTP.",
+      "description": "``server.tls`` block - flip the single listener from HTTP to HTTPS.\n\nWhen ``enabled``, the EXISTING uvicorn listener (``__main__.py:89-93``) is\nserved with TLS: ``ssl_certfile``/``ssl_keyfile`` are passed straight to\n``uvicorn.run`` (``uvicorn/main.py:534-536``). Self-signed is fine - Phantom\ndoes NOT verify its own cert; clients use ``verify=off`` or pin it\n(loopback/sidecar trust model). NOT a second listener; the one socket\nsimply speaks HTTPS instead of HTTP.",
       "properties": {
         "cert_path": {
           "anyOf": [
@@ -1088,7 +1088,7 @@
       "description": "HTTP server bind, ingress, and admin configuration."
     },
     "sigv4_credentials": {
-      "description": "Config-declared destination credentials for the ``aws_sigv4`` signer (the boot-time analogue of the runtime admin push). Each entry names the env var holding its secret access key (never the secret literal \u2014 GLOBAL \u00a71.2(a) B1 / ADR-004). At boot the named env vars are resolved to literals and materialized into EVERY instance's host-keyed credential store under ``source='config'`` (``app.py`` lifespan). The credentials key on the globally-meaningful destination host, so this map is top-level rather than per-instance. A missing named env var is a fail-fast boot error. Each entry also declares a REQUIRED ``service`` (the AWS service the signer signs for, e.g. ``s3``); a missing or unknown service is a loud ``ValidationError`` at settings-load. Empty (the default) is a no-op: a bearer-only deployment declares nothing here. Restart-required (not hot-reloaded).",
+      "description": "Config-declared destination credentials for the ``aws_sigv4`` signer (the boot-time analogue of the runtime admin push). Each entry names the env var holding its secret access key (never the secret literal - GLOBAL \u00a71.2(a) B1 / ADR-004). At boot the named env vars are resolved to literals and materialized into EVERY instance's host-keyed credential store under ``source='config'`` (``app.py`` lifespan). The credentials key on the globally-meaningful destination host, so this map is top-level rather than per-instance. A missing named env var is a fail-fast boot error. Each entry also declares a REQUIRED ``service`` (the AWS service the signer signs for, e.g. ``s3``); a missing or unknown service is a loud ``ValidationError`` at settings-load. Empty (the default) is a no-op: a bearer-only deployment declares nothing here. Restart-required (not hot-reloaded).",
       "items": {
         "$ref": "#/$defs/SigV4CredentialCfg"
       },

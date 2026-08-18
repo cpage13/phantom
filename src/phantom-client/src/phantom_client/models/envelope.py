@@ -50,16 +50,16 @@ class ResponseHeaders(BaseModel):
 
     The shape mirrors what the headers carry:
 
-    - ``upload_id`` — equals ``envelope.chain_id`` for chain submissions.
-    - ``group_id`` — the row's query-grouping handle; equals
+    - ``upload_id`` - equals ``envelope.chain_id`` for chain submissions.
+    - ``group_id`` - the row's query-grouping handle; equals
       ``chain_id`` unless the submission supplied
       ``X-Phantom-Group-Id``. Always present (cycle-7: replaces the
       retired batch-named echo).
-    - ``status`` — the current upload state as a snake_case literal.
-    - ``attempts`` — count of attempts completed so far.
-    - ``next_attempt_at`` — ISO-8601 UTC timestamp; ``None`` for terminal
+    - ``status`` - the current upload state as a snake_case literal.
+    - ``attempts`` - count of attempts completed so far.
+    - ``next_attempt_at`` - ISO-8601 UTC timestamp; ``None`` for terminal
       states.
-    - ``suggested_poll_after_seconds`` — Phantom's hint for when to poll
+    - ``suggested_poll_after_seconds`` - Phantom's hint for when to poll
       next. Integer seconds.
     """
 

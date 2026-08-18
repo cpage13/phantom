@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 _FALLBACK_HS256_SECRET: str = "phantom-emulator-default-secret!"
 
 # Startup banner emphasising this is NOT production infrastructure.
-_STARTUP_BANNER: str = "phantom-emulator: TEST INFRASTRUCTURE ONLY — no auth on control plane"
+_STARTUP_BANNER: str = "phantom-emulator: TEST INFRASTRUCTURE ONLY - no auth on control plane"
 
 
 def _initialize_state(cfg: AppConfig) -> EmulatorState:

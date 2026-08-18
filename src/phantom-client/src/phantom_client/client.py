@@ -1,4 +1,4 @@
-"""``PhantomClient`` — the SDK's public async facade.
+"""``PhantomClient`` - the SDK's public async facade.
 
 The two-shape constructor accepts either a base URL string (the simple
 path used by a thin upstream adapter) or a fully-configured :class:`ClientConfig`.
@@ -7,7 +7,7 @@ single :class:`httpx.AsyncClient`.
 
 Public surface (re-exported from :mod:`phantom_client`):
 
-- ``submit_chain`` — the canonical chain-submission method (ADR-010).
+- ``submit_chain`` - the canonical chain-submission method (ADR-010).
   No other names exist: ``send_chain``, ``send_request_chain``, and
   ``send_files`` are deliberate non-names.
 - Admin: list/filter/replay/cancel/delete uploads, bulk delete,
@@ -92,7 +92,7 @@ _CAPTURED_VALUE_LOOKUP_LIMIT = 1000
 # kwarg is set. The kwarg is ignored when a full ClientConfig is passed.
 _DEFAULT_READ_TIMEOUT_SECONDS = 30.0
 
-# Admin path constants — single source of truth for the v1 admin surface.
+# Admin path constants - single source of truth for the v1 admin surface.
 _PATH_UPLOAD = "/v1/admin/chains/{chain_id}"
 _PATH_UPLOADS = "/v1/admin/chains"
 _PATH_UPLOAD_BODY = "/v1/admin/chains/{chain_id}/body"
@@ -110,7 +110,7 @@ _PATH_LOOKUP_BY_LOCAL_UUID = "/v1/admin/uploads/by-local-uuid/{local_uuid}"
 _PATH_TOKENS = "/v1/admin/tokens"
 _PATH_TOKEN_FOR = "/v1/admin/tokens/{endpoint}/{uid}"
 
-# Destination SigV4 credential push — host-keyed, the analogue of the
+# Destination SigV4 credential push - host-keyed, the analogue of the
 # per-(endpoint, uid) token slot above (the executor looks it up by host).
 _PATH_CREDENTIAL_FOR = "/v1/admin/credentials/{dest_host}"
 
@@ -158,8 +158,8 @@ class PhantomClient:
 
     Two-shape constructor:
 
-    - ``PhantomClient("http://phantom:8080")`` — base URL only.
-    - ``PhantomClient(ClientConfig(...))`` — full configuration.
+    - ``PhantomClient("http://phantom:8080")`` - base URL only.
+    - ``PhantomClient(ClientConfig(...))`` - full configuration.
 
     Use as an async context manager to guarantee connection cleanup::
 
@@ -531,7 +531,7 @@ class PhantomClient:
             _PATH_UPLOAD_BUNDLE.format(chain_id=chain_id), model=UploadBundle
         )
 
-    async def extract(self, filter: ExtractFilter) -> AsyncIterator[bytes]:  # noqa: A002 — match plan signature
+    async def extract(self, filter: ExtractFilter) -> AsyncIterator[bytes]:  # noqa: A002 - match plan signature
         """Stream a tar archive of every row matching the filter.
 
         The not-started check is EAGER, and deliberately so: this is a plain
@@ -592,7 +592,7 @@ class PhantomClient:
         """Delete one upload row (and its body)."""
         await self._transport.delete_no_body(_PATH_UPLOAD.format(chain_id=chain_id))
 
-    async def bulk_delete(self, filter: DeleteFilter) -> int:  # noqa: A002 — match plan signature
+    async def bulk_delete(self, filter: DeleteFilter) -> int:  # noqa: A002 - match plan signature
         """Delete rows matching ``filter``.
 
         Pre-flights: an empty filter raises :class:`EmptyFilterError`
@@ -618,7 +618,7 @@ class PhantomClient:
     ) -> list[TokenSlot]:
         """List token slots, optionally scoped to one endpoint/instance.
 
-        Per ADR-004, bearer values are NEVER returned — each slot
+        Per ADR-004, bearer values are NEVER returned - each slot
         carries ``(endpoint, uid, last_updated, status)`` only.
         """
         params: dict[str, QueryParamValue] = {}
@@ -667,7 +667,7 @@ class PhantomClient:
             credential: A :class:`SigV4StaticCredBody` (static key-pair) or
                 :class:`ProfileRefCredBody` (profile / default chain). Construct it
                 with a :class:`SigningService` member (e.g. ``service=SigningService.S3``),
-                NOT a raw string — the client model is strict and has no coercer.
+                NOT a raw string - the client model is strict and has no coercer.
 
         Example:
             >>> await client.push_credential(
@@ -803,13 +803,13 @@ class PhantomClient:
 
 
 # ---------------------------------------------------------------------------
-# Internal list-wrapper models — Phantom's token-list and instance-list
+# Internal list-wrapper models - Phantom's token-list and instance-list
 # replies are envelope-style but the SDK doesn't expose the envelope types
 # (only the contained items). ListUploadsResponse is a public model and
 # lives in phantom_client.models.admin so the contract test can reach it.
 # ---------------------------------------------------------------------------
 
-from pydantic import BaseModel, ConfigDict, Field  # noqa: E402 — late-bound by design
+from pydantic import BaseModel, ConfigDict, Field  # noqa: E402 - late-bound by design
 
 
 class _TokenListResponse(BaseModel):

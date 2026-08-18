@@ -11,7 +11,7 @@ class BodyMissingError(Exception):
 
     Phase 2 § 3.2.6 (H8 audit closure). The sender previously caught
     ``KeyError`` from ``body_store.get_all`` and returned an empty
-    dict — making a row with declared bodies but absent body store
+    dict - making a row with declared bodies but absent body store
     entries look identical to a row with no body declared. The sender
     then forwarded an empty payload upstream, an effective data loss.
 

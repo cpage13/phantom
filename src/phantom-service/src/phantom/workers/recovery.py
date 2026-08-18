@@ -7,7 +7,7 @@ by ``body_location``). Startup recovery does three things:
 1. Reset every ``attempting`` row to ``queued`` (invariant #7).
    Sender pools were mid-attempt at process exit; their writes never
    landed, so the next process must re-attempt.
-2. Integrity guard — multipart-aware. For every non-discarded row,
+2. Integrity guard - multipart-aware. For every non-discarded row,
    verify every declared body_ref exists in the body store. A missing
    body_ref anywhere in the body list quarantines the row in the
    ``corrupted`` terminal state. This preserves the multipart-as-
@@ -20,9 +20,9 @@ by ``body_location``). Startup recovery does three things:
 Body-location discriminates the integrity check's expectations:
 
 * ``body_location='ram'`` rows whose RAM bytes vanished (RAM lost on
-  restart — by design for the RAM tier) quarantine as
+  restart - by design for the RAM tier) quarantine as
   ``ram_body_lost_on_restart`` UNLESS the body has been
-  discarded (``body_discarded_at IS NOT NULL`` — the H4 carve-out
+  discarded (``body_discarded_at IS NOT NULL`` - the H4 carve-out
   added in Phase 2).
 * ``body_location='file'`` rows whose file body_refs cannot be located
   on disk quarantine as ``file_body_missing_on_recovery`` (same H4
@@ -30,15 +30,15 @@ Body-location discriminates the integrity check's expectations:
 
 The orphan-file side of the picture is the body-orphan janitor's
 responsibility (plan § 2.3.14); recovery only marks rows as
-``corrupted`` — it never deletes body files itself.
+``corrupted`` - it never deletes body files itself.
 
 Recovery is invoked from ``app.py``'s lifespan (the composition root)
 BEFORE workers are scheduled, so the workers see
 the corrected row population.
 
 Cursor-drain discipline (V1/V2 crash-recovery fix). The integrity
-guard walks ``store.iter_rows()`` — an open ``SELECT`` cursor on the
-store's single connection — and must NOT write while that cursor is
+guard walks ``store.iter_rows()`` - an open ``SELECT`` cursor on the
+store's single connection - and must NOT write while that cursor is
 open. Over a SIGKILL-hot WAL past SQLite's ``wal_autocheckpoint``
 threshold, a mid-walk ``mark_corrupted`` write triggers an
 autocheckpoint that collides with the open read cursor →
@@ -77,13 +77,13 @@ class RecoveryLockError(RuntimeError):
     """Boot recovery could not acquire the DB write lock within the budget.
 
     Raised when an external holder kept the ``uploads.db`` write lock for the
-    entire :data:`phantom.runtime.lock_retry.LOCK_RETRY_BUDGET_SECONDS` budget —
+    entire :data:`phantom.runtime.lock_retry.LOCK_RETRY_BUDGET_SECONDS` budget -
     past the point a transient contender would have released. This is the loud,
     operator-facing surface for a PERSISTENT lock (a wedged sibling process, a
     stuck backup): it propagates as a clean startup failure the supervisor
     restarts into (and the next boot rides out the lock if it has since
     cleared), rather than a raw ``sqlite3.OperationalError`` traceback. A
-    transient holder never reaches this — it is ridden out by the bounded
+    transient holder never reaches this - it is ridden out by the bounded
     retry (finding R9-V6-2).
     """
 
@@ -106,7 +106,7 @@ async def _retry_recovery_write_on_lock[T](
 
     Recovery writes are idempotent (``reset_attempting_to_queued`` is an
     unconditional state reset; ``mark_corrupted`` a guarded terminal write), so
-    re-running a write whose predecessor was rejected by the lock is safe — no
+    re-running a write whose predecessor was rejected by the lock is safe - no
     double-effect, nothing lost. This is what keeps a transient boot-time lock
     (operator ``sqlite3`` session, backup tool, lingering prior process) from
     crashing startup and stranding the buffered backlog (finding R9-V6-2).
@@ -131,7 +131,7 @@ async def _retry_recovery_write_on_lock[T](
         return RecoveryLockError(
             f"recovery write {description!r} could not acquire the "
             f"uploads.db write lock within "
-            f"{LOCK_RETRY_BUDGET_SECONDS:.0f}s — an external holder "
+            f"{LOCK_RETRY_BUDGET_SECONDS:.0f}s - an external holder "
             f"(an open 'sqlite3 uploads.db' session, a backup/snapshot "
             f"tool, or a stale prior process) is holding the lock past "
             f"the boot budget. Clear the holder and restart; the "
@@ -153,7 +153,7 @@ async def run_recovery(
     """Run the boot-time recovery sweep against a single store.
 
     Two passes over the integrity guard so no write is ever issued
-    while the ``iter_rows`` read cursor is open (V1/V2 fix — see the
+    while the ``iter_rows`` read cursor is open (V1/V2 fix - see the
     module docstring): pass 1 walks every row and COLLECTS the
     quarantine targets; pass 2 issues the ``mark_corrupted`` writes
     after the cursor is drained.
@@ -173,7 +173,7 @@ async def run_recovery(
             previously-persisted ``body_location='ram'`` row is
             quarantined because RAM is empty post-restart).
     """
-    # Step 1 — attempting → queued. Invariant #7.
+    # Step 1 - attempting → queued. Invariant #7.
     #
     # finding R9-V6-2: this is recovery's FIRST write and the one that crashed
     # startup when an external process held the uploads.db write lock past
@@ -187,7 +187,7 @@ async def run_recovery(
     if reset:
         logger.info("Recovery reset %d attempting rows to queued", reset)
 
-    # Step 2 — integrity guard. Multipart-aware (strategy §1 / plan
+    # Step 2 - integrity guard. Multipart-aware (strategy §1 / plan
     # § 0.4 glossary): the body is an atomic unit; a single missing
     # ref anywhere in body_hashes invalidates the chain.
     #
@@ -211,10 +211,10 @@ async def run_recovery(
     async for row in store.iter_rows():
         if row.state in TERMINAL_STATES:
             # Terminal carve-out (finding R9-PM-3). A row that already
-            # reached a terminal state is FINISHED — its missing body is
+            # reached a terminal state is FINISHED - its missing body is
             # EXPECTED, not a corruption signal: a ``succeeded`` row's body
             # is deleted on delivery (``succeeded_body_seconds=0`` default,
-            # sender.py — and that delete does NOT stamp
+            # sender.py - and that delete does NOT stamp
             # ``body_discarded_at``, so the H4 carve-out below would miss
             # it), and ``failed``/``cancelled``/``stored``/``corrupted``
             # rows are likewise done. Recovery's job is to make DELIVERABLE
@@ -223,7 +223,7 @@ async def run_recovery(
             # records of all uploads delivered-then-reaped since the last
             # boot, destroying the durable ``succeeded`` record and firing
             # spurious InvariantAuditor alerts. ``auth_expired`` is NOT
-            # terminal (still deliverable — its body MUST be present), so it
+            # terminal (still deliverable - its body MUST be present), so it
             # falls through to the body-existence check below, as intended.
             continue
         if not is_deliverable(row):
@@ -251,7 +251,7 @@ async def run_recovery(
         to_quarantine.append((row.chain_id, reason))
 
     # The read cursor is now closed (the walk above has exited). Issue
-    # the quarantine WRITES — safe even over a hot WAL, since no read
+    # the quarantine WRITES - safe even over a hot WAL, since no read
     # cursor is open on the connection to conflict with an autocheckpoint.
     # Each is also wrapped in the transient-lock retry (finding R9-V6-2): an
     # external holder that appears between the reset above and these writes

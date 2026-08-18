@@ -9,13 +9,13 @@ composes against. Concrete implementations live in the sibling modules:
 
 Plan § 2.3.4 / § 2.3.8 changes:
 
-* :class:`UploadStore` — dropped ``tier`` property and the legacy
+* :class:`UploadStore` - dropped ``tier`` property and the legacy
   ``mark_committed`` / ``list_uncommitted`` methods. Added the new
   ``mark_persisted`` (sole writer of the body_location ram→file
   transition), ``mark_corrupted``, ``iter_rows``,
   ``list_oldest_ram_bodies``, ``list_chain_ids``, and
   ``insert_with_idempotency_claim`` (atomic admission transaction).
-* :class:`BodyStore` — dropped ``tier`` property. Added
+* :class:`BodyStore` - dropped ``tier`` property. Added
   ``list_orphans(known_chain_ids)``.
 """
 
@@ -229,19 +229,19 @@ class InsertClaimOutcome(enum.Enum):
     """Outcome of :meth:`UploadStore.insert_with_idempotency_claim`.
 
     The atomic admission transaction inserts the upload row AND the
-    idempotency claim. Three distinguishable terminal outcomes — the
+    idempotency claim. Three distinguishable terminal outcomes - the
     caller (admission) maps each to a different HTTP response:
 
-    * :attr:`INSERTED` — both rows committed; a new chain is admitted
+    * :attr:`INSERTED` - both rows committed; a new chain is admitted
       (HTTP 202).
-    * :attr:`IDEMPOTENCY_COLLISION` — the ``idempotency_index`` UNIQUE
+    * :attr:`IDEMPOTENCY_COLLISION` - the ``idempotency_index`` UNIQUE
       claim already exists for this ingress key. Admission resolves the
       existing row and either replays it (HTTP 200, same body) or rejects
-      with ``idempotency_key_conflict`` (HTTP 422, different body —
+      with ``idempotency_key_conflict`` (HTTP 422, different body -
       finding G-1).
-    * :attr:`CHAIN_ID_COLLISION` — the ``uploads.chain_id`` PRIMARY KEY
+    * :attr:`CHAIN_ID_COLLISION` - the ``uploads.chain_id`` PRIMARY KEY
       already exists (the envelope reused a live chain_id). Admission
-      rejects with ``chain_id_in_use`` (HTTP 409 — finding D-1) rather
+      rejects with ``chain_id_in_use`` (HTTP 409 - finding D-1) rather
       than letting the raw ``sqlite3.IntegrityError`` escape as a naked
       500.
     """
@@ -273,7 +273,7 @@ class StateTally:
 WakeHandler = Callable[[str, str], Awaitable[None]]
 """Callback registered with :class:`TokenCache.register_wake_handler`.
 
-Args: ``(endpoint, uid)`` — the slot that was just written. The ``uid``
+Args: ``(endpoint, uid)`` - the slot that was just written. The ``uid``
 here is the credential-cache axis (X-Phantom-Uid value); not to be
 confused with chain_id.
 """
@@ -355,7 +355,7 @@ class UploadStore(Protocol):
         """Persist the result of one attempt against this row.
 
         M-W4-F7 audit closure: ``expected_state`` is a defensive
-        precondition — the UPDATE only fires when the row is currently
+        precondition - the UPDATE only fires when the row is currently
         in that state. The default ``"attempting"`` matches the
         sender's normal flow (a row is in ``attempting`` between
         ``claim_due`` and the terminal UPDATE). If the row's state
@@ -657,7 +657,7 @@ class UploadStore(Protocol):
 
         Returns an :class:`InsertClaimOutcome` distinguishing a clean
         insert from an idempotency-claim collision and a
-        ``uploads.chain_id`` PRIMARY KEY collision (finding D-1 — the
+        ``uploads.chain_id`` PRIMARY KEY collision (finding D-1 - the
         latter previously escaped as a naked HTTP 500). Either both
         INSERTs commit or neither does (single SQLite transaction).
         Closes H7 structurally per plan § 2.3.17.
@@ -710,7 +710,7 @@ class UploadStore(Protocol):
 
         M-W4-F7 audit closure: the UPDATE is guarded by
         ``state IN ('succeeded','failed','corrupted','cancelled','queued',
-        'auth_expired','stored')`` — every state EXCEPT ``attempting``
+        'auth_expired','stored')`` - every state EXCEPT ``attempting``
         and the body-released terminal ``expired`` (ADR-032). A sender is
         actively driving an ``attempting`` row, so replay must refuse
         rather than clobber the sender's in-flight work; an ``expired``
@@ -807,7 +807,7 @@ class UploadStore(Protocol):
     ) -> list[UUID]:
         """Return the chain_ids in ``state`` whose ``updated_at`` < ``cutoff``.
 
-        Reaper helper (plan § 2.3.16) — called for the body-discard
+        Reaper helper (plan § 2.3.16) - called for the body-discard
         pass: every chain_id returned has its body deleted and is then
         marked ``body_discarded_at`` via :meth:`discard_body`. Filters
         on ``body_discarded_at IS NULL`` so already-discarded rows do
@@ -828,18 +828,18 @@ class UploadStore(Protocol):
     ) -> list[DeletedRowAccounting]:
         """Hard-delete terminal rows in ``state`` whose ``updated_at`` < ``cutoff``.
 
-        Reaper helper (plan § 2.3.16) — the metadata-retention pass.
+        Reaper helper (plan § 2.3.16) - the metadata-retention pass.
         Returns one :class:`DeletedRowAccounting` per deleted row,
         captured in the same write transaction, so the reaper can
         release the gate for ``stored`` rows whose body was never
         separately discarded (R8-4). Raises ``ValueError`` if ``state``
-        is non-terminal (single-purpose surface — the reaper should
+        is non-terminal (single-purpose surface - the reaper should
         never call this with a queued/attempting state).
         """
         ...
 
     async def evict_terminal_over_limit(self, max_rows: int) -> list[DeletedRowAccounting]:
-        """Count-cap backstop (V3) — evict oldest-DONE rows over ``max_rows``.
+        """Count-cap backstop (V3) - evict oldest-DONE rows over ``max_rows``.
 
         Reaper helper. When the ``uploads`` table holds more than
         ``max_rows`` rows, delete the oldest fully-terminal rows
@@ -847,8 +847,8 @@ class UploadStore(Protocol):
         below the cap, and return one :class:`DeletedRowAccounting` per
         deleted row (the caller deletes their bodies, trims the
         idempotency index, and releases the gate for rows that still
-        held a slot — R8-4). Only :data:`TERMINAL_STATES` rows are
-        evictable — in-flight and still-deliverable ``auth_expired``
+        held a slot - R8-4). Only :data:`TERMINAL_STATES` rows are
+        evictable - in-flight and still-deliverable ``auth_expired``
         rows are never dropped, so the backstop cannot lose an
         undelivered upload. ``max_rows < 0`` is unbounded (no-op →
         ``[]``), preserving time-only retention.
@@ -930,7 +930,7 @@ class BodyStore(Protocol):
         ...
 
     async def total_bytes(self) -> int:
-        """Saturation accounting — sum of stored body bytes.
+        """Saturation accounting - sum of stored body bytes.
 
         Describes the VALUE, not how an implementation arrives at it:
         :class:`~phantom.storage.ram_body_store.RamBodyStore` and
@@ -950,7 +950,7 @@ class BodyStore(Protocol):
         The body-orphan janitor (plan § 2.3.14) calls this
         with the union of every live ``uploads.chain_id`` and reaps the
         returned set. RAM bindings return ``[]`` (no orphans by
-        construction — RAM is purged on chain drop). File bindings
+        construction - RAM is purged on chain drop). File bindings
         compare on-disk chain dirs against the known set.
         """
         ...
@@ -995,7 +995,7 @@ class TokenCache(Protocol):
         *,
         endpoint: str | None = None,
     ) -> list[TokenSlot]:
-        """Return slot metadata only — never the bearer (ADR-004)."""
+        """Return slot metadata only - never the bearer (ADR-004)."""
         ...
 
     def register_wake_handler(self, handler: WakeHandler) -> None:
@@ -1047,12 +1047,12 @@ class CredentialStore(Protocol):
 TERMINAL_STATES: frozenset[
     Literal["succeeded", "failed", "stored", "cancelled", "corrupted", "expired"]
 ] = frozenset({"succeeded", "failed", "stored", "cancelled", "corrupted", "expired"})
-"""States after which a row never advances on its own — only the reaper
+"""States after which a row never advances on its own - only the reaper
 or admin actions move it. ``auth_expired`` is NOT terminal (auth_kicker
-re-queues it on token refresh). ``corrupted`` is terminal — body
+re-queues it on token refresh). ``corrupted`` is terminal - body
 verification failed at send time and no retry will resolve it. ``expired``
 is terminal (ADR-032): the per-route send-deadline elapsed, the body was
-released, and the row is never re-admitted — the deliberate OPPOSITE of
+released, and the row is never re-admitted - the deliberate OPPOSITE of
 ``auth_expired``, which stays out of this set so the kickers keep sweeping
 it (``list_non_terminal`` is ``WHERE state NOT IN (TERMINAL_STATES)``).
 """

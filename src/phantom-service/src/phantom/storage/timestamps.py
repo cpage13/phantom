@@ -9,13 +9,13 @@ token derived from the backup's uuid identity; the timestamp half is
 display and sort material only).
 
 Both use ISO 8601 *basic* format (no separators) with a literal ``Z``
-suffix. The ``Z`` declares UTC — so the timestamp MUST be computed from
+suffix. The ``Z`` declares UTC - so the timestamp MUST be computed from
 ``datetime.now(tz=UTC)``, never naive local time. Two sites historically
 diverged here (aggressor finding A-2): ``cold_backup.py`` and
 ``integrity.py`` each stamped ``datetime.now()`` (naive local) while
 labelling the result ``Z``. On a non-UTC host the filename then lied
 about the wall clock, and a backwards clock step (DST fall-back / NTP
-correction) could make a newer snapshot lex-sort *before* an older one —
+correction) could make a newer snapshot lex-sort *before* an older one -
 breaking the rotation invariant that assumes lex order matches
 chronological order.
 
@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-# ISO 8601 basic timestamp format — no separators, trailing literal
+# ISO 8601 basic timestamp format - no separators, trailing literal
 # ``Z`` (UTC). Safe across POSIX/NTFS filenames and lex-sortable so
 # lex order matches chronological order (REQUIRED by cold-backup
 # rotation, which keeps the lexically-highest N files). Seconds
@@ -42,7 +42,7 @@ FS_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 def utc_stamp(moment: datetime | None = None) -> str:
     """Return a UTC filesystem-artifact timestamp string.
 
-    The result is formatted with :data:`FS_TIMESTAMP_FORMAT` — ISO 8601
+    The result is formatted with :data:`FS_TIMESTAMP_FORMAT` - ISO 8601
     basic with a trailing ``Z``. Because the ``Z`` declares UTC, the
     timestamp is always computed in UTC regardless of the host timezone.
 

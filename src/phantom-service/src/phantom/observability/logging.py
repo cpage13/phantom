@@ -104,7 +104,7 @@ class SensitiveCaptureRedactor(logging.Filter):
     the formatter sees the record. Other args/extras pass through
     unchanged.
 
-    Records without both extras are passed through with no change —
+    Records without both extras are passed through with no change -
     non-capture log records are unaffected; only the executor's
     capture-time log lines get redacted.
     """

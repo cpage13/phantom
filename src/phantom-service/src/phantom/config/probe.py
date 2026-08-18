@@ -1,4 +1,4 @@
-"""System probe — read machine facts at startup for smart defaults.
+"""System probe - read machine facts at startup for smart defaults.
 
 The probe runs once during Settings.from_yaml. The MachineFacts it
 produces feed compute_defaults (config/defaults.py); the validator on

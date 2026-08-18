@@ -2,7 +2,7 @@
 
 :class:`TokenCacheRow` is the boundary type between the SQLite
 ``token_cache`` table and Phantom's in-memory code. It is **internal
-only** — the bearer field never crosses an HTTP response boundary
+only** - the bearer field never crosses an HTTP response boundary
 (ADR-004). Admin-facing serialization uses
 :class:`phantom.models.admin.TokenSlot` instead, which has no bearer.
 """
@@ -14,22 +14,22 @@ from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field
 
-# NOTE: ``TypeAlias`` form intentional — see phantom.models.chain rationale.
+# NOTE: ``TypeAlias`` form intentional - see phantom.models.chain rationale.
 TokenSource: TypeAlias = Literal["inbound_request", "admin_push", "plugin_mint"]  # noqa: UP040
 """How the cache slot's bearer was last written.
 
-* ``inbound_request`` — a ``POST /v1/send`` ingress carried it.
-* ``admin_push`` — operator pushed via ``PUT /v1/admin/tokens/...``.
-* ``plugin_mint`` — the ``ad_client_credentials`` plugin minted it.
+* ``inbound_request`` - a ``POST /v1/send`` ingress carried it.
+* ``admin_push`` - operator pushed via ``PUT /v1/admin/tokens/...``.
+* ``plugin_mint`` - the ``ad_client_credentials`` plugin minted it.
 """
 
 TokenStatus: TypeAlias = Literal["fresh", "bad", "unknown"]  # noqa: UP040
 """Freshness state of the cached bearer.
 
-* ``fresh`` — most recently observed bearer; presumed valid.
-* ``bad`` — last attempt with this bearer returned 401/403; kept in
+* ``fresh`` - most recently observed bearer; presumed valid.
+* ``bad`` - last attempt with this bearer returned 401/403; kept in
   the cache anyway per ADR-003 so the admin API can surface it.
-* ``unknown`` — slot exists but has not been used yet (rare).
+* ``unknown`` - slot exists but has not been used yet (rare).
 """
 
 

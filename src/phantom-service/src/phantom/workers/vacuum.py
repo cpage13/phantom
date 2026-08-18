@@ -1,4 +1,4 @@
-"""VacuumScheduler — cron-style SQLite VACUUM, only when in-flight=0."""
+"""VacuumScheduler - cron-style SQLite VACUUM, only when in-flight=0."""
 
 from __future__ import annotations
 

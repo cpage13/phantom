@@ -1,11 +1,11 @@
-"""Raw-intake catch-all route — stock S3-style upload → chain envelope (Phase 1).
+"""Raw-intake catch-all route - stock S3-style upload → chain envelope (Phase 1).
 
 The producer-facing primary landing. A stock object-storage client speaks
 plain ``PUT /{bucket}/{key}`` with a raw body and an ``Authorization``
 header it signed with throwaway credentials; it knows nothing of Phantom's
 ``POST /v1/send`` chain-envelope contract. This module bridges that gap:
 
-* TASK 1.1 — a root-mounted catch-all ``/{phantom_path:path}`` that accepts
+* TASK 1.1 - a root-mounted catch-all ``/{phantom_path:path}`` that accepts
   the upload verbs (``PUT`` / ``POST`` / ``PATCH``) and is registered LAST
   in the app so it never shadows the fixed ``/v1/*`` surface. A second
   arm answers the read/metadata verbs (``GET`` / ``HEAD`` / ``DELETE`` /
@@ -14,7 +14,7 @@ header it signed with throwaway credentials; it knows nothing of Phantom's
   path segment in Phantom's own namespace (``v1/`` today, plus the
   forward-reserved set).
 
-* TASK 1.3 — destination resolution. The raw request line carries no real
+* TASK 1.3 - destination resolution. The raw request line carries no real
   host (the client's ``Host`` is Phantom itself), so the synthesized step
   URL must be rewritten to a REAL upstream BEFORE dispatch, or Phantom
   would forward the request back to itself in an infinite loop. Two
@@ -26,7 +26,7 @@ header it signed with throwaway credentials; it knows nothing of Phantom's
   rewrite. When neither names a destination (and on an empty path) the
   request is rejected 421 ``invalid_target`` BEFORE any durable write.
 
-* TASK 1.2 — the raw→envelope adapter. A 1-step :class:`ChainEnvelope` is
+* TASK 1.2 - the raw→envelope adapter. A 1-step :class:`ChainEnvelope` is
   synthesized around the resolved URL, the request method, the raw body,
   and the forwarded headers. Phantom's reserved ``X-Phantom-*`` markers are
   stripped, and so is the full hop-by-hop set: RFC 7230 section 6.1's seven
@@ -86,7 +86,7 @@ logger = logging.getLogger(__name__)
 # Synthesized-envelope constants. ``ChainStep.name`` and ``ChainBodyRef.name``
 # are both regex-constrained to ``^[a-z][a-z0-9_]*$`` (models/chain.py), so the
 # bucket/key (which routinely contain dots, slashes, and uppercase) can NEVER
-# be a step/ref name — they live ONLY in the step ``url``. These fixed literals
+# be a step/ref name - they live ONLY in the step ``url``. These fixed literals
 # satisfy the regex on both the declared (envelope) and provided (body_refs)
 # sides; the adapter mints exactly ``{"payload"}`` (body present) or ``{}``
 # (body absent) on both sides by construction.
@@ -204,7 +204,7 @@ def _resolve_destination(
     1. ``?phantom=<full-url>`` query parameter: the carrier's value names the
        destination (the explicit carrier always wins, including on an empty
        path). Phase 1 accepts a FULL URL only; bare ids are not resolved here.
-    2. A configured ``Settings.phantom_default_target`` — the path is
+    2. A configured ``Settings.phantom_default_target`` - the path is
        appended (``{default}/{phantom_path}``) for the single-upstream
        convenience case.
 
@@ -217,10 +217,10 @@ def _resolve_destination(
     detection that consumed the carrier here.
 
     An empty / slash-only ``phantom_path`` with no ``?phantom=`` carrier is
-    "no address" — a stock object PUT always names a bucket/key, so an empty
+    "no address" - a stock object PUT always names a bucket/key, so an empty
     path is unroutable; it returns ``None`` even when a default target is
     configured. ``None`` means the caller must reject 421 ``invalid_target``
-    before any durable write (never forward — that is the loop hazard).
+    before any durable write (never forward - that is the loop hazard).
 
     Args:
         phantom_path: The matched catch-all path (no leading slash).
@@ -301,8 +301,8 @@ def _synthesize_envelope(
     ``idempotency_key`` defaulting to ``str(chain_id)``) is minted per
     request, so two identical raw PUTs produce two distinct rows rather than
     colliding on an idempotency replay. The single step carries the real
-    destination URL, the request method, the forwarded headers, and — only
-    when the request actually carried a body — a :class:`ChainBodyRef`
+    destination URL, the request method, the forwarded headers, and - only
+    when the request actually carried a body - a :class:`ChainBodyRef`
     naming the constant ``payload`` ref.
 
     The chain is marked LITERAL (``templated=False``, N3). A synthesized
@@ -395,7 +395,7 @@ async def raw_intake(
     if resolved_url is None:
         # No carrier named a real upstream (and an empty path is unroutable):
         # reject BEFORE reading the body or attempting any write. This is the
-        # same 421 dispatch raises for an unroutable host — never a forward
+        # same 421 dispatch raises for an unroutable host - never a forward
         # loop back to Phantom.
         return _error_response(
             "invalid_target",
@@ -440,7 +440,7 @@ async def raw_intake(
     body_refs: dict[str, bytes] = {_SYNTHETIC_BODY_REF_NAME: raw_body} if has_body else {}
 
     # Structural guard mirroring chain/parser.py's declared-vs-provided
-    # cross-check (which admit_chain does NOT repeat — it consumes an
+    # cross-check (which admit_chain does NOT repeat - it consumes an
     # already-validated envelope). The adapter mints both sides itself, so
     # this can only ever fail on a coding error; assert it explicitly so a
     # future edit that desyncs the two surfaces fails loudly here rather than
@@ -496,7 +496,7 @@ async def raw_intake_unsupported(phantom_path: str) -> Response:
     path now matches. Registering this complementary-method arm (in the SAME
     router, AFTER :func:`raw_intake`) restores the prior behavior: an unknown
     path under a non-upload verb is 404, exactly as before the catch-all
-    existed. ``DELETE`` is out of scope by design and stays 404 here — it is
+    existed. ``DELETE`` is out of scope by design and stays 404 here - it is
     NOT an object-delete surface.
 
     Args:

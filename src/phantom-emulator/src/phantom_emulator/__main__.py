@@ -2,7 +2,7 @@
 
 This is the launcher used by the Docker container. For in-process
 tests, :func:`phantom_emulator.server.start_server` is the right
-entry point — it gives back a typed handle and avoids the global
+entry point - it gives back a typed handle and avoids the global
 event loop.
 """
 

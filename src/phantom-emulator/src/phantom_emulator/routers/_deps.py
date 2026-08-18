@@ -13,7 +13,7 @@ from fastapi import Request
 from phantom_emulator.state import EmulatorState
 
 # The upload verbs both write-sinks register. INVARIANT: this set MUST equal
-# the Phantom catch-all's forwarded upload-verb set — the
+# the Phantom catch-all's forwarded upload-verb set - the
 # ``["PUT", "POST", "PATCH"]`` literal at
 # ``src/phantom-service/src/phantom/routes/catch_all.py`` (the ``raw_intake``
 # ``@router.api_route(..., methods=[...])``). A forwarded verb the sinks do not

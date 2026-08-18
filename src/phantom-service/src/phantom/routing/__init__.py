@@ -1,4 +1,4 @@
-"""Route policy resolution — fnmatch over an instance's declared routes.
+"""Route policy resolution - fnmatch over an instance's declared routes.
 
 A route resolution maps the first-step URL of a chain to the per-instance
 ``RouteCfg`` that owns it. The resolution rule is "first match by host
@@ -21,8 +21,8 @@ from phantom.config.settings import InstanceCfg
 from phantom.models.chain import ChainEnvelope
 
 # The outbound-auth mode a route declares. Named here (rather than left as a
-# bare inline Literal) so consumers that branch on it — the executor's auth
-# arm, the two kickers' auth_mode guard — compare against an
+# bare inline Literal) so consumers that branch on it - the executor's auth
+# arm, the two kickers' auth_mode guard - compare against an
 # exhaustiveness-checkable type instead of raw strings (CONTEXT "no raw string
 # comparisons when the value set is known"). Mirrors ``RouteCfg.auth_mode``
 # (config/settings.py).

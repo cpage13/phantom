@@ -2,15 +2,15 @@
 
 The emulator can present several auth shapes to inbound requests:
 
-- ``oauth_client_credentials`` — full OAuth2 client-credentials grant
+- ``oauth_client_credentials`` - full OAuth2 client-credentials grant
   with JWT bearer authentication on protected endpoints.
-- ``static_token`` — a single pre-minted JWT is accepted; clients may
+- ``static_token`` - a single pre-minted JWT is accepted; clients may
   obtain it from ``POST /oauth/token`` (which always returns the
   static JWT in this mode) or from configuration.
-- ``plain_bearer`` — accepts any value in ``Authorization: Bearer``
+- ``plain_bearer`` - accepts any value in ``Authorization: Bearer``
   that is on a configured allow-list. No JWT semantics.
-- ``api_key`` — a shared secret in the ``X-API-Key`` header.
-- ``none`` — no authentication at all.
+- ``api_key`` - a shared secret in the ``X-API-Key`` header.
+- ``none`` - no authentication at all.
 
 The policy table threads the per-mode data; ``authenticate`` runs the
 check for a single request against a single policy.
@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:  # pragma: no cover — typing-only import
+if TYPE_CHECKING:  # pragma: no cover - typing-only import
     from phantom_emulator.auth.jwt_minter import JwtMinter
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ def authenticate(
     """Check whether a request meets the policy.
 
     Args:
-        headers: Mapping of request headers (case-sensitive — callers
+        headers: Mapping of request headers (case-sensitive - callers
             should pre-normalize for FastAPI which lowercases keys).
         policy: The resolved policy to evaluate.
         jwt_minter: Used for JWT decode/verify in
@@ -108,7 +108,7 @@ def authenticate(
             return False
         return True
 
-    return False  # pragma: no cover — exhaustive enum
+    return False  # pragma: no cover - exhaustive enum
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:

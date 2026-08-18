@@ -18,11 +18,11 @@ Plan § 2.3.4 + § 2.3.5 + § 2.3.7:
 * Added :meth:`mark_persisted`, :meth:`mark_corrupted`,
   :meth:`iter_rows`, :meth:`list_oldest_ram_bodies`,
   :meth:`list_chain_ids`, and :meth:`insert_with_idempotency_claim`
-  (atomic admission transaction — closes H7 structurally; uses
+  (atomic admission transaction - closes H7 structurally; uses
   explicit BEGIN/commit/rollback per Round 3 B2).
 * Pragma block parameterized from Settings: ``synchronous`` (default
   ``NORMAL`` for SD-card wear), ``journal_size_limit`` (default 16
-  MiB). ``auto_vacuum=NONE`` stays HARDCODED per § 0.3 — never
+  MiB). ``auto_vacuum=NONE`` stays HARDCODED per § 0.3 - never
   configurable.
 * Startup pragma assertions verify each pragma stuck after open.
 
@@ -160,7 +160,7 @@ def _metadata_kvs_json_path(key: str) -> str:
 # (§ 4S.1) and read at boot by
 # :func:`phantom.runtime.startup_checks.run_schema_gate` (§ 4S.2): a DB whose
 # stamp does not equal this value is treated as pre-version / wrong-schema and
-# deleted, then the instance boots fresh (population of zero — no field DB can
+# deleted, then the instance boots fresh (population of zero - no field DB can
 # hold real undelivered uploads yet; see ADR-025's scoped exception and
 # § 4S.0). Version 2 was the cycle-7 uploads revision (group_id, multifile_id,
 # send_order, sent_at replacing batch_id / order_in_batch); version 3 adds
@@ -191,14 +191,14 @@ def is_chain_id_collision(exc: sqlite3.IntegrityError) -> bool:
 # lock past our ``busy_timeout``) and same-connection cursor-vs-checkpoint
 # collisions as ``sqlite3.OperationalError`` with one of these phrasings. Match
 # on the fragment (not an exact string) so the classifier is robust across
-# SQLite versions while staying specific to the TRANSIENT contention class — a
+# SQLite versions while staying specific to the TRANSIENT contention class - a
 # schema/syntax/type ``OperationalError`` carries none of these fragments and is
 # correctly left un-classified (it is a genuine, non-retryable fault).
 _TRANSIENT_LOCK_FRAGMENTS: frozenset[str] = frozenset(
     {
-        "database is locked",  # SQLITE_BUSY — the cross-process write-lock timeout.
+        "database is locked",  # SQLITE_BUSY - the cross-process write-lock timeout.
         "database is busy",  # alternate SQLITE_BUSY phrasing across versions.
-        "database table is locked",  # SQLITE_LOCKED — table-level contention.
+        "database table is locked",  # SQLITE_LOCKED - table-level contention.
     }
 )
 
@@ -207,7 +207,7 @@ def is_transient_lock_error(exc: BaseException) -> bool:
     """Return True if ``exc`` is a TRANSIENT SQLite lock/contention error.
 
     The single, shared definition of "this ``sqlite3.OperationalError`` is a
-    ride-it-out lock contention, not a permanent fault" — used by admission
+    ride-it-out lock contention, not a permanent fault" - used by admission
     (→ a clean ``storage_unavailable`` 503) and by recovery boot (→ a bounded
     retry-with-backoff) so both paths classify the SAME way (findings R9-V6-1 /
     R9-V6-2; the R7-1-D uncaught-``OperationalError`` class).
@@ -216,13 +216,13 @@ def is_transient_lock_error(exc: BaseException) -> bool:
     ``sqlite3.OperationalError: database is locked``; a same-connection
     cursor-vs-checkpoint collision raises ``SQLITE_LOCKED`` ("database is
     locked" / "database table is locked"). Both are transient: the holder
-    releases, the checkpoint completes, and the next attempt succeeds — Phantom
+    releases, the checkpoint completes, and the next attempt succeeds - Phantom
     must NOT surface them as a naked 5xx or crash startup over them.
 
     Deliberately NARROW: only an :class:`sqlite3.OperationalError` whose message
     carries a known SQLITE_BUSY/SQLITE_LOCKED fragment qualifies. A genuine
     ``OperationalError`` (malformed schema, ``no such table``, a type error) is
-    NOT transient and must NOT be misclassified as retryable — it would mask a
+    NOT transient and must NOT be misclassified as retryable - it would mask a
     real bug behind an infinite retry / a misleading 503. Non-OperationalError
     exceptions (``IntegrityError``, ``OSError``) are out of scope and return
     False so their existing dedicated handling is untouched.
@@ -429,7 +429,7 @@ class SqliteUploadStore:
     """SQLite-backed :class:`UploadStore` implementation.
 
     The ``tier`` constructor parameter is
-    gone — every store instance is just "the SQLite at this path." The
+    gone - every store instance is just "the SQLite at this path." The
     composition root (plan § 2.3.10) constructs exactly
     one store per process; the historical ``:memory:`` + ``disk`` split
     is dead.
@@ -477,7 +477,7 @@ class SqliteUploadStore:
         # Metrics surface (plan § 4.2.2). Store-level metrics are
         # registered eagerly so the admin endpoint surfaces a
         # zero-valued bucket before any row is written. The store does
-        # NOT bump these per write — per plan § 4.2.2, the admin
+        # NOT bump these per write - per plan § 4.2.2, the admin
         # endpoint computes the body-location-distribution gauge on
         # demand to avoid drift from invariant-coupled per-write
         # updates.
@@ -551,11 +551,11 @@ class SqliteUploadStore:
         journal_limit = self._journal_size_limit_bytes()
         await self._conn.execute(f"PRAGMA journal_size_limit={journal_limit};")
         await self._conn.execute("PRAGMA foreign_keys=ON;")
-        # Autovacuum locked OFF — SD-card-death risk on flash (plan § 0.3 hard rule;
+        # Autovacuum locked OFF - SD-card-death risk on flash (plan § 0.3 hard rule;
         # NEVER configurable via Settings). VacuumScheduler reclaims space at
         # most once a day, gated on the in-flight queue being empty.
         await self._conn.execute("PRAGMA auto_vacuum=NONE;")
-        # busy_timeout — see SqliteCfg.busy_timeout_ms / _DEFAULT_BUSY_TIMEOUT_MS
+        # busy_timeout - see SqliteCfg.busy_timeout_ms / _DEFAULT_BUSY_TIMEOUT_MS
         # for the value rationale (R9-V6-1).
         busy_timeout_ms = self._busy_timeout_ms()
         await self._conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms};")
@@ -600,14 +600,14 @@ class SqliteUploadStore:
 
         # Belt-and-suspenders for V1/V2 (defense in depth; the root-cause fix
         # is the cursor-drain discipline in run_recovery). A genuine SIGKILL
-        # (power loss / OOM-kill) leaves a HOT ``uploads.db-wal`` — the killed
+        # (power loss / OOM-kill) leaves a HOT ``uploads.db-wal`` - the killed
         # process never checkpointed it, so it can be many MB, well past
         # SQLite's ``wal_autocheckpoint`` threshold. The very next write would
         # otherwise trigger an in-line autocheckpoint; if any read cursor is
         # open on this single connection at that moment, the checkpoint and the
         # cursor collide → ``SQLITE_LOCKED`` ("database is locked"). Checkpoint
-        # + TRUNCATE the WAL HERE, at start() — before recovery's sweep and
-        # before any worker opens a cursor, with no cursor of our own open — so
+        # + TRUNCATE the WAL HERE, at start() - before recovery's sweep and
+        # before any worker opens a cursor, with no cursor of our own open - so
         # the WAL is COLD when recovery (and steady-state traffic) runs. This is
         # a no-op on a clean WAL and a normal maintenance op on a hot one.
         await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -706,14 +706,14 @@ class SqliteUploadStore:
     async def _write_txn(self, conn: aiosqlite.Connection) -> AsyncIterator[None]:
         """Hold the write lock and ROLL BACK the transaction on ANY failure.
 
-        Findings R7-1-D / R7-2-B (Medium-High — service-wide wedge). Every
+        Findings R7-1-D / R7-2-B (Medium-High - service-wide wedge). Every
         write path on the single shared aiosqlite connection issues
         ``execute(...)`` (an implicit ``BEGIN`` under aiosqlite's
         autocommit-off default) and ends with ``await conn.commit()``. If
-        EITHER the DML ``execute`` OR the ``commit`` raises — a
+        EITHER the DML ``execute`` OR the ``commit`` raises - a
         ``sqlite3.OperationalError`` for SQLITE_IOERR (fsync EIO on the WAL)
         or SQLITE_FULL (disk full), the exact B-13 / C-01/C-02 storage-fault
-        classes — the implicit transaction is left OPEN on the connection.
+        classes - the implicit transaction is left OPEN on the connection.
         Because admission + sender + reaper + persist-controller all funnel
         through this ONE connection (``self._conn``), the next writer's
         ``BEGIN`` then raises "cannot start a transaction within a
@@ -725,13 +725,13 @@ class SqliteUploadStore:
         ``self._write_lock`` (the existing per-connection serialization), and
         on ANY exception leaving the body it issues ``await conn.rollback()``
         before re-raising, clearing the open transaction so the connection
-        stays usable. A clean exit does NOT commit — each writer commits
+        stays usable. A clean exit does NOT commit - each writer commits
         explicitly as its last in-lock statement (so post-commit reads inside
         the lock are preserved); the CM only guarantees rollback-on-error.
 
         POSTURE (the maintainer's fsyncgate question). We do NOT
         PANIC-and-restart on SQLITE_IOERR. R7-1/R7-2 PROVED Phantom's
-        durability holds under these faults — a failed commit leaves NO
+        durability holds under these faults - a failed commit leaves NO
         durable half-commit (a fresh reader sees nothing; ``integrity_check``
         = ``ok``). Unlike PostgreSQL's fsyncgate (where the kernel marked the
         page clean and the half-write was unrecoverable), Phantom can fully
@@ -802,11 +802,11 @@ class SqliteUploadStore:
 
         Returns an :class:`InsertClaimOutcome`:
 
-        * :attr:`~InsertClaimOutcome.INSERTED` — both rows committed.
-        * :attr:`~InsertClaimOutcome.IDEMPOTENCY_COLLISION` — the
+        * :attr:`~InsertClaimOutcome.INSERTED` - both rows committed.
+        * :attr:`~InsertClaimOutcome.IDEMPOTENCY_COLLISION` - the
           ``idempotency_index`` claim already exists for this ingress key
           (admission resolves the existing row → replay or conflict).
-        * :attr:`~InsertClaimOutcome.CHAIN_ID_COLLISION` — the
+        * :attr:`~InsertClaimOutcome.CHAIN_ID_COLLISION` - the
           ``uploads.chain_id`` PRIMARY KEY already exists (finding D-1).
 
         Either both INSERTs commit or neither does (single SQLite
@@ -815,7 +815,7 @@ class SqliteUploadStore:
         let the IntegrityError escape admission as a naked HTTP 500.
 
         Uses explicit ``BEGIN`` / ``commit`` / ``rollback`` (Round 3
-        B2 — ``async with self._conn:`` is not safe for aiosqlite
+        B2 - ``async with self._conn:`` is not safe for aiosqlite
         because aiosqlite's context manager protocol does not map to
         SQLite-level transactions).
         """
@@ -824,7 +824,7 @@ class SqliteUploadStore:
             try:
                 await conn.execute("BEGIN")
                 # Finding R3-2 root-cause closure: an ``idempotency_index``
-                # entry can outlive its ``uploads`` row — the reaper deletes
+                # entry can outlive its ``uploads`` row - the reaper deletes
                 # the row (``delete_terminal_older_than``) in one transaction
                 # and cleans the index (``cleanup_idempotency_index``) in a
                 # later one; admin / bulk deletes never touch the index at
@@ -894,14 +894,14 @@ class SqliteUploadStore:
                 if "idempotency_index" in msg:
                     return InsertClaimOutcome.IDEMPOTENCY_COLLISION
                 # Foreign-key / check / other unexpected integrity failure
-                # — re-raise so the caller's catch-all surfaces it
+                # - re-raise so the caller's catch-all surfaces it
                 # (genuinely unexpected → internal_error is correct here).
                 raise
             except BaseException:
                 # Findings R7-1-D / R7-2-B: the explicit ``BEGIN`` above means
-                # a NON-IntegrityError failure — a ``sqlite3.OperationalError``
+                # a NON-IntegrityError failure - a ``sqlite3.OperationalError``
                 # for SQLITE_IOERR (fsync EIO on the WAL) or SQLITE_FULL (disk
-                # full) raised by either the DML ``execute`` OR ``commit`` —
+                # full) raised by either the DML ``execute`` OR ``commit`` -
                 # must ALSO roll back. The pre-R8 code caught ONLY
                 # ``IntegrityError``, so such an OperationalError propagated
                 # with the transaction left OPEN, wedging every subsequent
@@ -910,7 +910,7 @@ class SqliteUploadStore:
                 # open transaction, then re-raise (admission's catch-all maps
                 # it / releases the slot). If the rollback itself fails, log
                 # and re-raise the ORIGINAL error. See ``_write_txn`` for the
-                # full posture rationale (rollback-and-continue, not PANIC —
+                # full posture rationale (rollback-and-continue, not PANIC -
                 # R7 proved durability holds with no half-commit).
                 try:
                     await conn.rollback()
@@ -1008,7 +1008,7 @@ class SqliteUploadStore:
         """Persist one attempt's result.
 
         M-W4-F7 audit closure (Phase 2 § 3.2.8): the UPDATE is guarded
-        by ``WHERE state = :expected_state`` — default ``'attempting'``.
+        by ``WHERE state = :expected_state`` - default ``'attempting'``.
         If a concurrent admin ``cancel`` or ``replay`` moved the row
         out of ``attempting`` between the sender's ``claim_due`` and
         the terminal UPDATE here, the UPDATE finds no rows. The caller
@@ -1208,7 +1208,7 @@ class SqliteUploadStore:
         Co-located with :meth:`list_uploads` because the format is
         load-bearing for that method's WHERE/ORDER pair. Admin
         pagination (``routes/admin.py``) consumes this cursor
-        opaquely — it carries the cursor through to the next request
+        opaquely - it carries the cursor through to the next request
         without inspecting its contents.
         """
         payload = asdict(
@@ -1523,7 +1523,7 @@ class SqliteUploadStore:
         return await self.list_all_chain_ids()
 
     async def reset_attempting_to_queued(self) -> int:
-        """Recovery sweep — reset stuck ``attempting`` rows."""
+        """Recovery sweep - reset stuck ``attempting`` rows."""
         conn = self._require_conn()
         now_iso = datetime.now(tz=UTC).isoformat()
         async with self._write_txn(conn):
@@ -1542,13 +1542,13 @@ class SqliteUploadStore:
         (plan § 2.3.11) after fsync of the body file(s)
         and their parent directory completes. Two ``WHERE`` guards:
 
-        * ``body_location = 'ram'`` is defensive — a duplicate call
+        * ``body_location = 'ram'`` is defensive - a duplicate call
           after an unrelated race is a no-op rather than a silent
           over-write.
         * ``body_discarded_at IS NULL`` is the H4 carve-out (R7-2): a
           migration that raced the reaper's body-discard must NOT flip
           the row to ``'file'`` and resurrect policy-discarded bytes
-          (every other H4 consumer — recovery, the InvariantAuditor,
+          (every other H4 consumer - recovery, the InvariantAuditor,
           replay, the kicker wake path - already guards the stamp).
 
         Returns:
@@ -1706,14 +1706,14 @@ class SqliteUploadStore:
         Admission-side dedup fallback for the case where the
         ``idempotency_index`` row was reaped (or a buggy cleanup
         pruned it mid-retention) but the upload row is still live.
-        Matches against the row's ``chain_id_at_ingress`` column —
+        Matches against the row's ``chain_id_at_ingress`` column -
         the producer-supplied ``X-Phantom-Idempotency-Key`` captured at
         admission. Distinct from ``idempotency_key`` (the envelope
         field that Phantom forwards to upstream).
 
         Returns the first matching chain_id or ``None`` if no row has
         that ingress key. With the Phase-1 single-store collapse the
-        old "cross-tier fallback" phrasing is gone — there is just one
+        old "cross-tier fallback" phrasing is gone - there is just one
         store to scan.
         """
         conn = self._read_connection()
@@ -1752,7 +1752,7 @@ class SqliteUploadStore:
             (chain_id_at_ingress,),
         ) as cur:
             row = await cur.fetchone()
-        if row is None:  # pragma: no cover — INSERT OR IGNORE just ran
+        if row is None:  # pragma: no cover - INSERT OR IGNORE just ran
             raise RuntimeError(
                 f"idempotency_index missing row for {chain_id_at_ingress}",
             )
@@ -1831,7 +1831,7 @@ class SqliteUploadStore:
 
         M-W4-F7 audit closure (Phase 2 § 3.2.8): the UPDATE is guarded
         by ``state IN ('succeeded','failed','corrupted','cancelled',
-        'queued','auth_expired','stored')`` — every state EXCEPT
+        'queued','auth_expired','stored')`` - every state EXCEPT
         ``attempting``. A sender is actively driving an ``attempting``
         row; replay must refuse rather than clobber the sender's
         in-flight work. Round 1 defender fix (R1-1): the refusal is now
@@ -1993,11 +1993,11 @@ class SqliteUploadStore:
         since: datetime | None = None,
         instance: str | None = None,
     ) -> list[DeletedRowAccounting]:
-        """Bulk delete by filter. ADR-004 — refuses empty filter.
+        """Bulk delete by filter. ADR-004 - refuses empty filter.
 
         Returns one :class:`DeletedRowAccounting` per deleted row. The
         admin route iterates these to delete the corresponding bodies in
-        the instance's body store (C1 audit closure — bodies were
+        the instance's body store (C1 audit closure - bodies were
         previously leaked until the orphan janitor's next sweep) and to
         release the saturation gate for rows that still held a slot
         (R8-4).
@@ -2122,7 +2122,7 @@ class SqliteUploadStore:
         VACUUM completes (SQLite VACUUM itself requires exclusive
         access; the lock just keeps Phantom's own writers honest).
 
-        ``:memory:`` stores are exempt — VACUUM on an in-memory
+        ``:memory:`` stores are exempt - VACUUM on an in-memory
         database is a no-op in SQLite but holding the write lock
         through it serves no purpose. The check on ``db_path`` is the
         right shape now that the ``tier`` attribute is gone.
@@ -2139,7 +2139,7 @@ class SqliteUploadStore:
         state: UploadState,
         cutoff: datetime,
     ) -> list[DeletedRowAccounting]:
-        """Reaper helper — delete terminal rows older than ``cutoff``.
+        """Reaper helper - delete terminal rows older than ``cutoff``.
 
         Returns per-row accounting captured in the same transaction so
         the reaper can release the gate for ``stored`` rows whose body
@@ -2168,7 +2168,7 @@ class SqliteUploadStore:
         state: UploadState,
         cutoff: datetime,
     ) -> list[UUID]:
-        """Reaper helper — list the chain_ids whose body should be discarded.
+        """Reaper helper - list the chain_ids whose body should be discarded.
 
         A chain_id-only projection (U12), the same shape
         :meth:`list_all_chain_ids` already returns: the consuming loop reads
@@ -2191,24 +2191,24 @@ class SqliteUploadStore:
         return [UUID(r["chain_id"]) for r in fetched]
 
     async def evict_terminal_over_limit(self, max_rows: int) -> list[DeletedRowAccounting]:
-        """Reaper helper (V3) — count-cap backstop on the ``uploads`` table.
+        """Reaper helper (V3) - count-cap backstop on the ``uploads`` table.
 
         Enforces ``retention.max_rows`` as a hard cap AFTER the reaper's
         time-based passes. When the table holds more than ``max_rows`` rows,
         deletes the oldest-DONE-first (ordered by ``updated_at`` ASC) until the
         total row count is at or below the cap, and returns the deleted
         chain_ids so the caller can delete their bodies + trim the idempotency
-        index. ``max_rows < 0`` is "unbounded" — a no-op (returns ``[]``),
+        index. ``max_rows < 0`` is "unbounded" - a no-op (returns ``[]``),
         preserving the historical time-only retention contract.
 
-        DURABILITY (invariant #1 — "no upload lost while running normally"):
-        ONLY fully-terminal rows (:data:`TERMINAL_STATES` —
+        DURABILITY (invariant #1 - "no upload lost while running normally"):
+        ONLY fully-terminal rows (:data:`TERMINAL_STATES` -
         succeeded/failed/cancelled/stored/corrupted) are eligible for eviction.
         In-flight rows (queued/attempting) and still-deliverable ``auth_expired``
         rows (the auth_kicker re-queues those on token refresh) are NEVER
         evicted, so the backstop cannot drop an undelivered upload. If the table
         is over the cap but the overage is all ineligible rows, the cap is left
-        unmet (fewer than the full overage are deleted) — durability wins over
+        unmet (fewer than the full overage are deleted) - durability wins over
         the count cap; the caller logs the shortfall.
 
         The count → select-oldest → delete sequence runs inside a single

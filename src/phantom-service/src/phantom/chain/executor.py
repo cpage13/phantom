@@ -1,10 +1,10 @@
-"""Chain executor — the load-bearing primitive.
+"""Chain executor - the load-bearing primitive.
 
 One call to :meth:`ChainExecutor.execute_one_step` runs **one step**
 of the chain identified by ``row.current_step_index``. The executor
 owns:
 
-1. The capture-TTL gate (ADR-011) — checked first.
+1. The capture-TTL gate (ADR-011) - checked first.
 2. ``{{step.var}}`` placeholder substitution in URL, headers, and body.
    A JSON body is substituted INSIDE the parsed structure and serialized
    ONCE at the end (F8), so ``json.dumps`` does the escaping and a captured
@@ -16,7 +16,7 @@ owns:
    immediately, so a brace span is forwarded as content. The raw-intake
    catch-all sets that marker, because an object key may legally contain
    braces.
-3. Auth injection — looks up ``token_cache.get(endpoint, uid)`` when the
+3. Auth injection - looks up ``token_cache.get(endpoint, uid)`` when the
    route is ``phantom_bearer``.
 4. Idempotency-header injection per the step's ``idempotency_header``.
 5. The HTTP send through :class:`UpstreamClient`, with EXACTLY ONE framing
@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 # X-Phantom-Idempotency-Key, X-Phantom-Instance, X-Phantom-Group-Id,
 # X-Phantom-Multifile-Id, X-Phantom-Order). These headers are
 # Phantom's internal control channel and must NEVER be forwarded to
-# upstream — that would violate the transparent-proxy invariant (producers
+# upstream - that would violate the transparent-proxy invariant (producers
 # that put X-Phantom-* into a chain step's headers would otherwise see
 # them leak through).
 _PHANTOM_RESERVED_HEADER_PREFIX = "x-phantom-"
@@ -192,7 +192,7 @@ class FailedAuth:
 
 @dataclass(frozen=True)
 class Failed4xx:
-    """Non-auth 4xx — terminal."""
+    """Non-auth 4xx - terminal."""
 
     status: int
     body: bytes
@@ -200,7 +200,7 @@ class Failed4xx:
 
 @dataclass(frozen=True)
 class Failed5xx:
-    """5xx — retry-eligible."""
+    """5xx - retry-eligible."""
 
     status: int
 
@@ -221,7 +221,7 @@ class CaptureExpiredStored:
 
 @dataclass(frozen=True)
 class CaptureExpiredRewind:
-    """ADR-011 reexecute=True — caller rewinds to ``rewind_to_step_index`` and re-queues."""
+    """ADR-011 reexecute=True - caller rewinds to ``rewind_to_step_index`` and re-queues."""
 
     producing_step: str
     rewind_to_step_index: int
@@ -357,10 +357,10 @@ class CaptureNotRenderable:
 class CaptureIncomplete:
     """A 2xx response was MISSING a capture a later step requires (finding R7-5-B).
 
-    The step returned a success status, but a capture this step DECLARES — and
-    that a downstream step REFERENCES via ``{{step.capture}}`` — extracted to
+    The step returned a success status, but a capture this step DECLARES - and
+    that a downstream step REFERENCES via ``{{step.capture}}`` - extracted to
     ``None`` (the response body was truncated / incomplete / a buggy proxy
-    returned 2xx before the body was whole — the D-05/D-13/PAR "don't-trust"
+    returned 2xx before the body was whole - the D-05/D-13/PAR "don't-trust"
     hazard). Advancing the step on the 2xx alone would strand the downstream
     step on an unresolvable template forever (the row wedges in ``attempting``
     holding a saturation slot). So this is classified as a RETRYABLE failure:
@@ -492,14 +492,14 @@ class ChainExecutor:
             resolve_route: Per-instance route policy lookup. The
                 composition root binds this to
                 :func:`phantom.routing.resolve_route`.
-            clock: A callable returning a UTC ``datetime`` — injectable
+            clock: A callable returning a UTC ``datetime`` - injectable
                 for deterministic tests.
             instance: The instance whose routes apply.
             signer_creds: OPTIONAL host-keyed destination-credential store for
                 the ``aws_sigv4`` auth mode (the SigV4 analogue of
                 ``token_cache``). ``None`` (the default) when no route uses
                 ``aws_sigv4``; an ``aws_sigv4`` route resolved while this is
-                ``None`` is treated as a missing credential — ``FailedAuth``
+                ``None`` is treated as a missing credential - ``FailedAuth``
                 that PARKS in ``auth_expired`` (NOT terminal). Defaulting to
                 ``None`` keeps every existing construction site unchanged.
         """
@@ -580,7 +580,7 @@ class ChainExecutor:
         for name, value in step.headers.items():
             lowered = name.lower()
             # Phantom's reserved header namespace (``X-Phantom-*``)
-            # must not be forwarded to upstream — transparent-proxy
+            # must not be forwarded to upstream - transparent-proxy
             # invariant. Strip case-insensitively.
             if lowered.startswith(_PHANTOM_RESERVED_HEADER_PREFIX):
                 logger.debug("stripping reserved phantom header from upstream: %s", name)
@@ -665,7 +665,7 @@ class ChainExecutor:
             )
             return RouteUnresolved(host=unrouted_host, step_name=step.name)
 
-        # (a') Send-deadline gate (ADR-032) — the give-up backstop, independent
+        # (a') Send-deadline gate (ADR-032) - the give-up backstop, independent
         # of the retry strategy. Placed here (after ``resolved`` exists, before
         # any signing/sending work) because the capture-TTL gate (a) at the top
         # of this method runs BEFORE ``resolved`` is computed and the deadline is
@@ -708,7 +708,7 @@ class ChainExecutor:
             substituted_headers[step.idempotency_header] = envelope.idempotency_key
 
         # (e) Send via the transport. The resolved route may carry a
-        # per-route timeout (§5.2) — pass it through; None falls back to
+        # per-route timeout (§5.2) - pass it through; None falls back to
         # the upstream client's constructor default.
         request = UpstreamRequest(
             method=step.method,
@@ -731,7 +731,7 @@ class ChainExecutor:
             # this step's declared captures unextracted. If a later step
             # REFERENCES one of those captures (``{{step.capture}}``), advancing
             # would strand it on an unresolvable ``None`` template FOREVER (the
-            # row wedges in ``attempting`` holding a saturation slot — invariant
+            # row wedges in ``attempting`` holding a saturation slot - invariant
             # #1 bent). Validate the required captures were actually produced;
             # a missing one is a RETRYABLE failure, not a silent advance.
             missing = self._missing_required_captures(step, envelope, new_captures)
@@ -868,7 +868,7 @@ class ChainExecutor:
         for producing_step, capture_name in placeholders:
             step_values = row.captured_values.steps.get(producing_step)
             if step_values is None or capture_name not in step_values.values:
-                # Not yet captured — substitute will detect; not a TTL miss.
+                # Not yet captured - substitute will detect; not a TTL miss.
                 continue
             expires_at = step_values.expires_at.get(capture_name)
             if expires_at is None:
@@ -883,7 +883,7 @@ class ChainExecutor:
                     None,
                 )
                 if rewind_index is None:
-                    # Producing step missing from envelope — fall back to stored.
+                    # Producing step missing from envelope - fall back to stored.
                     return CaptureExpiredStored(producing_step=producing_step)
                 return CaptureExpiredRewind(
                     producing_step=producing_step,
@@ -1203,13 +1203,13 @@ class ChainExecutor:
         references it via a ``{{step.capture}}`` placeholder (in its URL,
         headers, or body). Those are exactly the captures whose absence would
         wedge a downstream step on an unresolvable template. A required capture
-        that extracted to ``None`` (no JSONPath match — a truncated/incomplete
+        that extracted to ``None`` (no JSONPath match - a truncated/incomplete
         2xx body) is "missing".
 
         Captures this step declares but no later step references are NOT
         required: their absence cannot wedge anything, so a ``None`` there is
         tolerated (the step still succeeds). This keeps the validation precise
-        — it fires exactly when an incomplete body would otherwise strand the
+        - it fires exactly when an incomplete body would otherwise strand the
         chain, and never on a legitimately-absent optional field.
 
         Args:
@@ -1229,7 +1229,7 @@ class ChainExecutor:
             (i for i, s in enumerate(envelope.steps) if s.name == step.name),
             None,
         )
-        if step_index is None:  # pragma: no cover — step came from this envelope
+        if step_index is None:  # pragma: no cover - step came from this envelope
             return ()
         referenced: set[str] = set()
         for later in envelope.steps[step_index + 1 :]:

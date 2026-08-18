@@ -6,10 +6,10 @@ EXISTING ``uvicorn.run`` (``uvicorn/main.py:534-536``). This module supplies
 that PEM pair through one public entry point, :func:`resolve_tls_paths`, with
 two modes decided by whether the operator supplied paths:
 
-* **Operator-supplied** — both ``cert_path`` and ``key_path`` set: validated to
+* **Operator-supplied** - both ``cert_path`` and ``key_path`` set: validated to
   exist and returned verbatim. Phantom never regenerates an operator's cert
   (their lifecycle, their problem).
-* **Auto-gen** (the owner default) — both paths None: mint a self-signed cert
+* **Auto-gen** (the owner default) - both paths None: mint a self-signed cert
   (CN/SAN ``localhost`` + ``127.0.0.1``) at a STABLE path under the data dir,
   reusing a present-and-valid pair and REGENERATING a missing / expired /
   near-expiry one. This is STARTUP-time rotation: the launcher calls this once
@@ -18,16 +18,16 @@ two modes decided by whether the operator supplied paths:
   guarantees both-or-neither, so these two modes are exhaustive.
 
 Auto-gen keys are written UNENCRYPTED (``NoEncryption()``) at ``0o600`` on the
-same box as the producer — a passphrase adds nothing, and the launcher passes
+same box as the producer - a passphrase adds nothing, and the launcher passes
 ``ssl_keyfile_password`` ONLY for the operator-supplied case, so an auto-gen key
 MUST be unencrypted or uvicorn would later try to decrypt it with no password.
 
-Phantom never VERIFIES this cert — the trust model is "encrypt the local hop",
+Phantom never VERIFIES this cert - the trust model is "encrypt the local hop",
 not CA identity (clients use ``verify=off`` or pin the generated cert).
 
 **Out of scope (future work):** ``certbot`` / ACME for properly-signed certs
 when online (localhost has no domain, so self-signed is the norm); in-process
-LIVE rotation (regenerating the ``SSLContext`` mid-serve without a restart —
+LIVE rotation (regenerating the ``SSLContext`` mid-serve without a restart -
 uvicorn binds the context once at ``Server.startup``). Startup-time
 regenerate-on-expiry covers the owner requirement for a restart-on-deploy
 sidecar.
@@ -98,7 +98,7 @@ def resolve_tls_paths(tls: TlsCfg, data_dir: str) -> tuple[str, str]:
         tls: The validated ``server.tls`` config. Its XOR validator guarantees
             ``cert_path``/``key_path`` are both-set (operator-supplied) or
             both-None (auto-gen); this function relies on that exhaustiveness.
-        data_dir: ``storage.data_dir`` — the root under which the auto-gen pair
+        data_dir: ``storage.data_dir`` - the root under which the auto-gen pair
             is minted/reused at ``<data_dir>/tls/`` (stable across restarts).
 
     Returns:
@@ -185,7 +185,7 @@ def _generate_self_signed(tls_dir: Path, cert_path: Path, key_path: Path) -> Non
     """Mint a self-signed RSA cert (CN/SAN localhost + 127.0.0.1) and write it.
 
     The cert PEM is written world-readable-within-dir; the key PEM is written
-    ``0o600`` (unencrypted — auto-gen keys carry no passphrase). The ``tls/``
+    ``0o600`` (unencrypted - auto-gen keys carry no passphrase). The ``tls/``
     dir is created ``0o700``.
     """
     try:

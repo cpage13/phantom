@@ -1,4 +1,4 @@
-"""DiskPressureProbe — periodic disk-usage sampler for the saturation gate.
+"""DiskPressureProbe - periodic disk-usage sampler for the saturation gate.
 
 The gate's ``max_disk_bytes`` was a documented YAML knob that the code
 never consulted. Without it, a misconfigured producer would happily fill its

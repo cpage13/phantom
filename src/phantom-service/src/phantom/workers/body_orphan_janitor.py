@@ -1,4 +1,4 @@
-"""BodyOrphanJanitor — periodic orphan sweep on the body store.
+"""BodyOrphanJanitor - periodic orphan sweep on the body store.
 
 Closes invariant #4 (plan § 0.5): no :class:`FileBodyStore` ref set
 exists without a corresponding ``uploads`` row (plan § 2.3.14).
@@ -6,7 +6,7 @@ exists without a corresponding ``uploads`` row (plan § 2.3.14).
 The janitor is wired ONLY in modes where a file body store exists
 (``hybrid`` and ``all_disk``). The RAM binding's
 :meth:`RamBodyStore.list_orphans` returns ``[]`` by construction (RAM
-has no orphans — the dict is purged on chain drop), so the janitor
+has no orphans - the dict is purged on chain drop), so the janitor
 is a no-op when the body store is RAM-only.
 
 The janitor writes NOTHING to the ``uploads`` table; it operates
@@ -105,7 +105,7 @@ class BodyOrphanJanitor:
         # only defers real-orphan collection by one cadence.
         self._pending_orphans: set[UUID] = set()
         # Metrics surface (plan § 4.2.2). Counts orphans REMOVED per
-        # sweep — total across all sweeps since process start.
+        # sweep - total across all sweeps since process start.
         self._metrics = metrics_registry if metrics_registry is not None else MetricsRegistry()
         self._orphan_total = self._metrics.register_counter(
             "orphan_body_count_total",
@@ -113,7 +113,7 @@ class BodyOrphanJanitor:
         )
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        """Main loop — sweep, sleep, until stopped.
+        """Main loop - sweep, sleep, until stopped.
 
         The first sweep fires immediately on startup so a fresh-process
         scan catches anything left behind by a prior process. Subsequent

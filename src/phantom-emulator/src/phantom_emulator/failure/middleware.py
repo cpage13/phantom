@@ -61,7 +61,7 @@ def _scope_for_path(path: str) -> FailureScope:
         return FailureScope.UPSTREAM_FILES_GET
     if path.startswith("/oauth/token") or path.startswith("/.well-known/"):
         return FailureScope.AUTH_TOKEN
-    # The AAD tenant token alias (POST /{tenant}/oauth2/v2.0/token) — the
+    # The AAD tenant token alias (POST /{tenant}/oauth2/v2.0/token) - the
     # direct path azure-identity requests. Suffix-matched because the first
     # segment is the caller's tenant id, not a fixed prefix.
     if path.endswith("/oauth2/v2.0/token"):
@@ -122,7 +122,7 @@ async def _maybe_inject_failure(
             headers={"Retry-After": str(PAUSE_RETRY_AFTER_SECONDS)},
         )
 
-    # 401-after-N — increment first, then compare.
+    # 401-after-N - increment first, then compare.
     fs = state.failure_state
     if policy.auth_401_after_n_calls is not None and fs is not None:
         count = fs.record_call(scope)
@@ -172,7 +172,7 @@ async def _apply_response_modifiers(
 
     if policy.tcp_rst_on_request:
         # Approximate RST: tell the client to close immediately and
-        # truncate the body to zero. Not a real socket RST — see
+        # truncate the body to zero. Not a real socket RST - see
         # plan §10.1.
         logger.info("failure_inject: approximate_rst (Connection: close, empty body)")
         return Response(
@@ -273,7 +273,7 @@ def make_failure_middleware(
         scope = _scope_for_path(path)
 
         # T3 test-only gate: when installed, the first AUTH_TOKEN arrival is
-        # signalled and HELD here — before policy evaluation and dispatch —
+        # signalled and HELD here - before policy evaluation and dispatch -
         # so the test controls exactly when minting proceeds.
         gate = state.auth_token_gate
         if scope is FailureScope.AUTH_TOKEN and gate is not None:
