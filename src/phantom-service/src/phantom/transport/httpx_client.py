@@ -24,7 +24,10 @@ class HttpxUpstreamClient:
         """Construct the client.
 
         Args:
-            timeout_seconds: Per-request timeout.
+            timeout_seconds: Per-request timeout. Required with no default:
+                the composition root supplies it from
+                ``upstream.timeout_seconds``, which is the one place the
+                value is described, validated and exported.
             verify: TLS verification on/off.
             transport: Optional httpx transport (e.g., ``MockTransport``,
                 ``ASGITransport``) for test injection.

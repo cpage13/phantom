@@ -291,9 +291,15 @@ instances:
       - name: s3
         hosts: ["s3.amazonaws.com", "*.s3.amazonaws.com"]  # fnmatch, declaration order
         auth_mode: aws_sigv4        # phantom_bearer | none | aws_sigv4
-        timeout_seconds: 600        # optional; big S3 PUTs
+        timeout_seconds: 600        # optional; overrides upstream.timeout_seconds
 phantom_default_target: "https://s3.amazonaws.com"   # raw-intake default destination
+upstream:
+  timeout_seconds: 30.0       # global default for every route that omits its own
 ```
+
+`upstream.timeout_seconds` is the value a route falls back to when it declares
+no `timeout_seconds` of its own. It defaults to 30 seconds and is
+**restart-required**: the upstream client is built once at boot around it.
 
 Credentials can be declared at boot in a top-level `sigv4_credentials:` block.
 This block holds **env-var NAMES only, never the secret literal**; the named

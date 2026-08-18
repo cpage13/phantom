@@ -39,7 +39,7 @@ class ResolvedRoute:
             route (``phantom_bearer`` bearer-inject, ``aws_sigv4`` re-sign, or
             ``none``).
         timeout_seconds: Per-route HTTP timeout (None falls back to the
-            upstream client's default of 30 s).
+            configured global default, ``upstream.timeout_seconds``).
         send_deadline_seconds: Max wall-clock seconds a buffered upload may
             keep trying before it gives up to the terminal ``expired`` state
             (None = no deadline). Measured from ``row.received_at``; read by

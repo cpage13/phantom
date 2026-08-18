@@ -12,6 +12,7 @@ from phantom.config.settings import (
     SettingsError,
     load_settings,
 )
+from phantom.transport.httpx_client import HttpxUpstreamClient
 from pydantic import ValidationError
 
 # Every RetentionCfg window field bounded by the C11 hardening (ge=-1).
@@ -239,3 +240,31 @@ def test_config_yaml_example_loads_cleanly() -> None:
     instance = settings.instances[0]
     assert instance.id == "upstream"
     assert len(instance.routes) == 2
+
+
+def test_upstream_timeout_knob_parses_and_reaches_the_client(tmp_path: Path) -> None:
+    """``upstream.timeout_seconds`` is configurable and reaches the transport (CL12).
+
+    Objective: the knob the ``RouteCfg.timeout_seconds`` description has always
+    promised operators now exists AND is the value the composition root hands
+    ``HttpxUpstreamClient``. Success is both halves: a YAML value resolves onto
+    ``Settings``, and constructing the client the way ``create_app`` does puts
+    that same value on the httpx client it builds, and an omitted block still
+    resolves to the documented 30 s. A knob that parsed but was ignored at the
+    composition root would pass a parse-only assertion, which is why the reach
+    half is asserted rather than assumed.
+    """
+    p = tmp_path / "phantom.yaml"
+    p.write_text(yaml.safe_dump({"upstream": {"timeout_seconds": 5.0}}))
+
+    settings = load_settings(p)
+    assert settings.upstream.timeout_seconds == 5.0
+
+    client = HttpxUpstreamClient(timeout_seconds=settings.upstream.timeout_seconds)
+    assert client._timeout_seconds == 5.0
+
+    # And an omitted block still yields the 30 s the composition root used to
+    # carry as a literal, which is the number the exported description names.
+    bare = tmp_path / "bare.yaml"
+    bare.write_text("")
+    assert load_settings(bare).upstream.timeout_seconds == 30.0

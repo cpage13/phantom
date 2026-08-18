@@ -1019,7 +1019,7 @@ async def _build_instance_context(
         bodies_root,
         shard_prefix_chars=settings.storage.shard_prefix_chars,
     )
-    upstream_client = HttpxUpstreamClient(timeout_seconds=30.0)
+    upstream_client = HttpxUpstreamClient(timeout_seconds=settings.upstream.timeout_seconds)
 
     await ram_body_store.start()
     await file_body_store.start()

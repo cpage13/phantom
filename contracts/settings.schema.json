@@ -646,7 +646,7 @@
             }
           ],
           "default": null,
-          "description": "Optional per-route HTTP request timeout in seconds. None means use the global default (HttpxUpstreamClient.timeout_seconds, 30 s). Useful when S3 PUTs need a much longer ceiling (e.g. 600 for 10 min on big tars) than fast metadata POSTs. Plumbs through ResolvedRoute \u2192 UpstreamRequest \u2192 httpx per-call kwarg.",
+          "description": "Optional per-route HTTP request timeout in seconds. None means use the global default, ``upstream.timeout_seconds``. Useful when S3 PUTs need a much longer ceiling (e.g. 600 for 10 min on big tars) than fast metadata POSTs. Plumbs through ResolvedRoute \u2192 UpstreamRequest \u2192 httpx per-call kwarg.",
           "title": "Timeout Seconds"
         }
       },
@@ -1023,6 +1023,21 @@
       },
       "title": "TlsCfg",
       "type": "object"
+    },
+    "UpstreamCfg": {
+      "additionalProperties": false,
+      "description": "``upstream`` block: how Phantom talks to destination hosts.",
+      "properties": {
+        "timeout_seconds": {
+          "default": 30.0,
+          "description": "Default per-request HTTP timeout in seconds for upstream calls. A route may override it with its own ``timeout_seconds``; this is the value used when the route leaves that unset. Restart-required: the upstream client is constructed once at boot and builds one httpx client around this value.",
+          "exclusiveMinimum": 0.0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        }
+      },
+      "title": "UpstreamCfg",
+      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -1083,6 +1098,10 @@
     "storage": {
       "$ref": "#/$defs/StorageCfg",
       "description": "Two-tier storage (RAM + disk), data directory, codec selection."
+    },
+    "upstream": {
+      "$ref": "#/$defs/UpstreamCfg",
+      "description": "Outbound transport defaults for destination hosts (transport/httpx_client.py)."
     }
   },
   "title": "Settings",

@@ -738,6 +738,24 @@ class RetryCfg(BaseModel):
     )
 
 
+class UpstreamCfg(BaseModel):
+    """``upstream`` block: how Phantom talks to destination hosts."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    timeout_seconds: float = Field(
+        30.0,
+        gt=0.0,
+        description=(
+            "Default per-request HTTP timeout in seconds for upstream calls. "
+            "A route may override it with its own ``timeout_seconds``; this is "
+            "the value used when the route leaves that unset. Restart-required: "
+            "the upstream client is constructed once at boot and builds one "
+            "httpx client around this value."
+        ),
+    )
+
+
 class ObservabilityCfg(BaseModel):
     """``observability`` block."""
 
@@ -797,8 +815,8 @@ class RouteCfg(BaseModel):
         gt=0.0,
         description=(
             "Optional per-route HTTP request timeout in seconds. None means "
-            "use the global default (HttpxUpstreamClient.timeout_seconds, "
-            "30 s). Useful when S3 PUTs need a much longer ceiling (e.g. "
+            "use the global default, ``upstream.timeout_seconds``. "
+            "Useful when S3 PUTs need a much longer ceiling (e.g. "
             "600 for 10 min on big tars) than fast metadata POSTs. Plumbs "
             "through ResolvedRoute → UpstreamRequest → httpx per-call kwarg."
         ),
@@ -1139,6 +1157,12 @@ class Settings(BaseSettings):
     retry: RetryCfg = Field(
         default_factory=RetryCfg,  # type: ignore[arg-type]
         description="Sender worker pool size, poll cadence, and the default retry strategy.",
+    )
+    upstream: UpstreamCfg = Field(
+        default_factory=UpstreamCfg,  # type: ignore[arg-type]
+        description=(
+            "Outbound transport defaults for destination hosts (transport/httpx_client.py)."
+        ),
     )
     observability: ObservabilityCfg = Field(
         default_factory=ObservabilityCfg,  # type: ignore[arg-type]
