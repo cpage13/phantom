@@ -64,6 +64,16 @@ from phantom_client.models.chain import ChainEnvelope, ChainResponse
 
 _LOG = logging.getLogger(__name__)
 
+# What a query-string value may be. ``str`` covers every filter, id and enum
+# value the SDK sends; ``int`` is there for the one caller that passes a page
+# ``limit`` as a number (U16). ``bool`` and ``None`` are deliberately EXCLUDED
+# even though httpx accepts them: nothing passes them, and admitting a type no
+# caller uses is how a narrowed annotation drifts back to ``Any``. The PEP 695
+# ``type`` statement rather than ``TypeAlias``: it is 3.12 syntax and
+# ``phantom-client`` declares ``requires-python = ">=3.12"``, and ruff's UP040
+# rejects the older spelling.
+type QueryParamValue = str | int
+
 # Path constants — single source of truth for the v1 URL space.
 _PATH_SEND = "/v1/send"
 
@@ -311,14 +321,14 @@ class Transport:
         path: str,
         *,
         model: type[T],
-        params: dict[str, Any] | None = None,
+        params: dict[str, QueryParamValue] | None = None,
     ) -> T:
         """GET ``path`` and parse the response body against ``model``.
 
         Args:
             path: Path on the configured ``phantom_url``.
             model: Pydantic model class to validate the response body.
-            params: Optional query parameters.
+            params: Optional query parameters; values are ``str`` or ``int``.
 
         Returns:
             An instance of ``model``.
@@ -336,7 +346,7 @@ class Transport:
         *,
         body: BaseModel | dict[str, Any] | None,
         model: type[T],
-        params: dict[str, Any] | None = None,
+        params: dict[str, QueryParamValue] | None = None,
     ) -> T:
         """POST a JSON body and parse the response against ``model``."""
         payload = self._serialize_body(body)
@@ -359,7 +369,7 @@ class Transport:
         path: str,
         *,
         body: BaseModel | dict[str, Any] | None,
-        params: dict[str, Any] | None = None,
+        params: dict[str, QueryParamValue] | None = None,
     ) -> None:
         """PUT a JSON body; ignore the response body (204-style)."""
         payload = self._serialize_body(body)
@@ -379,7 +389,7 @@ class Transport:
         self,
         path: str,
         *,
-        params: dict[str, Any] | None = None,
+        params: dict[str, QueryParamValue] | None = None,
     ) -> None:
         """DELETE ``path``; ignore the response body."""
         # Opt OUT: its callers converge, but it is kept off for consistency
@@ -395,7 +405,7 @@ class Transport:
         *,
         body: BaseModel | dict[str, Any] | None,
         model: type[T],
-        params: dict[str, Any] | None = None,
+        params: dict[str, QueryParamValue] | None = None,
     ) -> T:
         """DELETE ``path`` with a JSON body; parse the response against ``model``."""
         payload = self._serialize_body(body)
@@ -418,7 +428,7 @@ class Transport:
         method: str,
         path: str,
         *,
-        params: dict[str, Any] | None = None,
+        params: dict[str, QueryParamValue] | None = None,
         content: bytes | str | None = None,
         headers: dict[str, str] | None = None,
     ) -> AsyncIterator[bytes]:
@@ -442,7 +452,7 @@ class Transport:
         Args:
             method: The HTTP method to stream.
             path: Path relative to the configured Phantom URL.
-            params: Optional query parameters.
+            params: Optional query parameters; values are ``str`` or ``int``.
             content: Optional request body.
             headers: Optional request headers.
 
@@ -545,7 +555,7 @@ class Transport:
         path: str,
         *,
         headers: Mapping[str, str] | None = None,
-        params: Mapping[str, Any] | None = None,
+        params: Mapping[str, QueryParamValue] | None = None,
         content: str | bytes | None = None,
         files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
         retry_if_may_have_landed: bool = False,
@@ -583,7 +593,7 @@ class Transport:
             method: The HTTP verb.
             path: The path on the configured ``phantom_url``.
             headers: Optional request headers.
-            params: Optional query parameters.
+            params: Optional query parameters; values are ``str`` or ``int``.
             content: Optional raw request body.
             files: Optional multipart parts.
             retry_if_may_have_landed: Whether a failure that may have executed

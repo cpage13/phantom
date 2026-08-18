@@ -30,7 +30,7 @@ import logging
 from collections.abc import AsyncIterator
 from datetime import datetime
 from types import TracebackType
-from typing import Any, Self
+from typing import Self
 from urllib.parse import quote
 from uuid import UUID
 
@@ -77,7 +77,7 @@ from phantom_client.poller import (
 from phantom_client.poller import (
     poll_until as _poll_until,
 )
-from phantom_client.transport import Transport
+from phantom_client.transport import QueryParamValue, Transport
 
 _LOG = logging.getLogger(__name__)
 
@@ -320,7 +320,7 @@ class PhantomClient:
             ``(rows, next_cursor)``. ``next_cursor`` is ``None`` when
             the result is the final page.
         """
-        params: dict[str, Any] = {"limit": limit, "sort": sort.value}
+        params: dict[str, QueryParamValue] = {"limit": limit, "sort": sort.value}
         if state is not None:
             params["state"] = state
         if route is not None:
@@ -415,7 +415,7 @@ class PhantomClient:
                 lookups below answer misses with ``found=false``
                 instead.
         """
-        params: dict[str, Any] = {}
+        params: dict[str, QueryParamValue] = {}
         if instance is not None:
             params["instance"] = instance
         return await self._transport.get_json(
@@ -447,7 +447,7 @@ class PhantomClient:
             ``matches`` (a list because Phantom enforces no global
             uniqueness on the key; in practice zero or one entry).
         """
-        params: dict[str, Any] = {}
+        params: dict[str, QueryParamValue] = {}
         if instance is not None:
             params["instance"] = instance
         return await self._transport.get_json(
@@ -485,7 +485,7 @@ class PhantomClient:
                 ``lookup_not_configured`` envelope); it refuses rather
                 than silently skipping an unconfigured instance.
         """
-        params: dict[str, Any] = {}
+        params: dict[str, QueryParamValue] = {}
         if instance is not None:
             params["instance"] = instance
         return await self._transport.get_json(
@@ -614,7 +614,7 @@ class PhantomClient:
         Per ADR-004, bearer values are NEVER returned — each slot
         carries ``(endpoint, uid, last_updated, status)`` only.
         """
-        params: dict[str, Any] = {}
+        params: dict[str, QueryParamValue] = {}
         if endpoint is not None:
             params["endpoint"] = endpoint
         if instance is not None:
@@ -682,7 +682,7 @@ class PhantomClient:
 
     async def get_stats(self, *, instance: str | None = None) -> StatsResponse:
         """Return the ``/v1/admin/stats`` snapshot."""
-        params: dict[str, Any] = {}
+        params: dict[str, QueryParamValue] = {}
         if instance is not None:
             params["instance"] = instance
         return await self._transport.get_json(_PATH_STATS, model=StatsResponse, params=params)
@@ -747,7 +747,7 @@ class PhantomClient:
             instance: Scope to one instance's per-instance data root; omit to
                 aggregate across every configured instance.
         """
-        params: dict[str, Any] = {}
+        params: dict[str, QueryParamValue] = {}
         if instance is not None:
             params["instance"] = instance
         return await self._transport.get_json(
@@ -784,7 +784,7 @@ class PhantomClient:
                 or did not land in the live tree (the service's 409
                 ``restore_noop`` envelope); the backup was not restored.
         """
-        params: dict[str, Any] = {"backup_id": str(backup_id)}
+        params: dict[str, QueryParamValue] = {"backup_id": str(backup_id)}
         if instance is not None:
             params["instance"] = instance
         return await self._transport.post_json(
