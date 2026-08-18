@@ -162,7 +162,6 @@ async def test_path_a_expire_frees_ram_bytes_and_the_slot(tmp_path: Path) -> Non
         expected_state="attempting",
         last_error=DEADLINE_LAST_ERROR,
         upstream_status=None,
-        release_saturation=True,
     )
 
     fresh = await h.store.get(row.chain_id)
@@ -195,7 +194,6 @@ async def test_path_b_expire_frees_disk_bytes_and_leaves_the_slot_alone(tmp_path
         expected_state="auth_expired",
         last_error=DEADLINE_LAST_ERROR,
         upstream_status=None,
-        release_saturation=False,
     )
 
     fresh = await h.store.get(row.chain_id)
@@ -241,7 +239,6 @@ async def test_expire_touches_no_bytes_when_the_stamp_does_not_flip(tmp_path: Pa
         expected_state="attempting",
         last_error=DEADLINE_LAST_ERROR,
         upstream_status=None,
-        release_saturation=True,
     )
 
     assert await h.ram.get_all(row.chain_id) == {BODY_REF_NAME: revived}, (

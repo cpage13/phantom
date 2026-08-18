@@ -731,9 +731,9 @@ class Sender:
         as over-deadline. Delegate to the shared ``expire_row`` writer (the single
         ``new_state="expired"`` call site, ADR-032 / ADR-015) which flips the row
         terminal-``expired``, discards the body, and releases the saturation slot
-        — passing the ``"attempting"`` CAS pre-state for this claimed-row path.
-        ``release_saturation=True``: the ``attempting`` row STILL HOLDS the slot it
-        was admitted with, so expiring it must release that slot (path A).
+        (passing the ``"attempting"`` CAS pre-state for this claimed-row path).
+        The row is ``attempting``, so it STILL HOLDS the slot it was admitted
+        with; the writer sees that in the row's own state and releases (path A).
         """
         await expire_row(
             store,
@@ -743,7 +743,6 @@ class Sender:
             expected_state="attempting",
             last_error=f"send_deadline:{result.deadline_seconds}s",
             upstream_status=None,
-            release_saturation=True,
         )
 
     async def _on_retryable_failure(

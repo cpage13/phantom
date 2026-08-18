@@ -153,11 +153,12 @@ class AuthKicker:
             # long). The shared expire_row writer flips it terminal-``expired``
             # and discards the body; the row then drops out of the next
             # list_non_terminal (it is now in TERMINAL_STATES), so it is never
-            # woken. ``release_saturation=False``: this parked ``auth_expired``
-            # row's slot was ALREADY released at park (``_on_auth_failure``), so
-            # the writer must NOT re-release it (a double-free that transiently
-            # under-counts in_flight and over-admits past the cap). ``continue``
-            # — do not fall through to the wake.
+            # woken. The row is ``auth_expired``, whose slot was ALREADY
+            # released at park (``_on_auth_failure``), so nothing here may
+            # re-release it (a double-free that transiently under-counts
+            # in_flight and over-admits past the cap); the writer reads that
+            # off the row's own state rather than being told. ``continue``:
+            # do not fall through to the wake.
             deadline = resolved.send_deadline_seconds
             if deadline is not None and (now - row.received_at).total_seconds() > deadline:
                 await expire_row(
@@ -168,7 +169,6 @@ class AuthKicker:
                     expected_state="auth_expired",
                     last_error=f"send_deadline:{deadline}s",
                     upstream_status=None,
-                    release_saturation=False,
                 )
                 continue
             # Probe the host that ACTUALLY rejected this row (D2/F6), not

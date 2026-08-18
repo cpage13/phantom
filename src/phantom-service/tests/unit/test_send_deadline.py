@@ -573,7 +573,8 @@ async def test_credential_kicker_sweep_does_not_double_release_slot(tmp_path: Pa
     a spurious ``release`` would decrement ``in_flight`` from 1 to 0, falsely
     freeing the in-flight row's slot and admitting a third upload past the cap.
 
-    After the fix (``release_saturation=False`` on the sweep): the body is still
+    After the fix (``row_holds_slot`` is False for a parked ``auth_expired``
+    row, so the sweep releases nothing): the body is still
     discarded, but ``in_flight`` stays at 1 and the gate still refuses a fresh
     admit — no over-admission.
     """
@@ -646,7 +647,8 @@ async def test_path_a_executor_gate_expiry_still_releases_its_held_slot(
 
     The fix only suppresses the path-B re-release; path A's ``attempting`` row
     was admitted and still holds its slot, so ``_on_send_deadline_expired``
-    (``release_saturation=True``) must drop ``in_flight`` back to 0.
+    (``row_holds_slot`` is True for an ``attempting`` row) must drop
+    ``in_flight`` back to 0.
     """
     instance = await _build_sender_instance(tmp_path)
     gate = instance.saturation

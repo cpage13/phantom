@@ -35,7 +35,7 @@ import logging
 
 from phantom.models.upload import UploadRow, UploadState
 from phantom.storage.interface import BodyStore, UploadStore
-from phantom.workers.saturation import SaturationGate
+from phantom.workers.saturation import SaturationGate, row_holds_slot
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,6 @@ async def expire_row(
     expected_state: UploadState,
     last_error: str,
     upstream_status: int | None,
-    release_saturation: bool,
 ) -> None:
     """Transition a row to the terminal ``expired`` state: dead, discard the body.
 
@@ -76,23 +75,29 @@ async def expire_row(
     which the next claim lands in a false ``corrupted``.
 
     The saturation release depends on whether the row STILL HOLDS its slot at
-    the moment it expires, and that differs by path:
+    the moment it expires, and that differs by path. THIS WRITER decides it,
+    from ``row_holds_slot(row.state, row.body_discarded_at)`` on the row it
+    was handed (CL10). The caller passes no flag: the two paths are already
+    distinguishable from the row's own persisted state, and a hand-derived
+    boolean only offered a fourth caller the chance to pass the wrong one.
 
-    * **Path A (executor give-up gate).** The row is ``attempting`` — it still
-      holds the slot it was admitted with. Expiring it must RELEASE that slot
-      (``release_saturation=True``). No single existing terminal path both
-      discards and releases in this shape, so the two legs are composed here in
-      the correct order: flip the state under a CAS guard, discard the body,
-      then release the slot off the discard outcome's in-transaction pre-zero
-      size (never the stale ``row.body_size_bytes``).
-    * **Path B (kicker parked-row sweep).** The row is ``auth_expired`` — its
-      slot was ALREADY released at park time by ``_on_auth_failure`` (the body
-      was RETAINED, the accounting zeroed). Releasing again here would
-      double-free: ``SaturationGate.release`` floors at zero so the counters
-      never go negative, but under a concurrent in-flight row the extra
-      decrement transiently UNDER-counts ``in_flight``, briefly admitting one
-      upload past the saturation cap. So the sweep passes
-      ``release_saturation=False`` — body still discarded, slot NOT re-released.
+    * **Path A (executor give-up gate).** The row is ``attempting``, which is
+      in ``SLOT_HOLDING_STATES``, so the predicate is True: it still holds the
+      slot it was admitted with and expiring it must RELEASE that slot. No
+      single existing terminal path both discards and releases in this shape,
+      so the two legs are composed here in the correct order: flip the state
+      under a CAS guard, discard the body, then release the slot off the
+      discard outcome's in-transaction pre-zero size (never the stale
+      ``row.body_size_bytes``).
+    * **Path B (kicker parked-row sweep).** The row is ``auth_expired``, which
+      is NOT in ``SLOT_HOLDING_STATES``, so the predicate is False: its slot
+      was ALREADY released at park time by ``_on_auth_failure`` (the body was
+      RETAINED, the accounting zeroed). Releasing again would double-free:
+      ``SaturationGate.release`` floors at zero so the counters never go
+      negative, but under a concurrent in-flight row the extra decrement
+      transiently UNDER-counts ``in_flight``, briefly admitting one upload
+      past the saturation cap. The body is still discarded; only the slot
+      release is gated.
 
     Args:
         store: The upload store owning the row's metadata.
@@ -110,11 +115,6 @@ async def expire_row(
         last_error: One-line summary persisted on the row (e.g.
             ``"send_deadline:Ns"``).
         upstream_status: The most recent upstream status, or ``None``.
-        release_saturation: Whether the row HOLDS a saturation slot at expiry.
-            ``True`` for path A (the ``attempting`` row still holds its admit);
-            ``False`` for path B (the parked ``auth_expired`` row's slot was
-            already released at park). The body is discarded regardless; only
-            the slot release is gated.
     """
     rowcount = await store.record_attempt_result(
         row.chain_id,
@@ -147,14 +147,17 @@ async def expire_row(
         # defends path A's release against a concurrent mover, which is what
         # it did before F3 gave it the byte delete to guard as well.
         return
-    # RELEASE only on path A (``release_saturation``), using the OUTCOME's
+    # RELEASE only when the row STILL HOLDS a slot, using the OUTCOME's
     # pre-zero size. Reaching here is NOT enough on its own: a path-B
     # ``auth_expired`` row's body is still present at sweep time, so its
     # discard DOES flip, yet its saturation slot was already released at park
     # (``_on_auth_failure``), so releasing again would double-free.
-    # ``release_saturation`` is what distinguishes the holds-a-slot path (A)
-    # from the already-released park path (B).
-    if release_saturation:
+    # ``row_holds_slot`` is what distinguishes the holds-a-slot path (A) from
+    # the already-released park path (B): ``attempting`` is in
+    # ``SLOT_HOLDING_STATES`` and ``auth_expired`` is not. The predicate reads
+    # the row THIS call was handed, which is the same fact the three callers
+    # used to hand-derive and pass in as a boolean the callee could not check.
+    if row_holds_slot(row.state, row.body_discarded_at):
         await saturation.release(outcome.body_size_bytes)
     # F3: the bytes themselves, not just the accounting. ADR-032 says an
     # expired row's body is discarded at the transition; before this fix
