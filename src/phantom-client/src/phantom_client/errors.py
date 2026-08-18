@@ -40,12 +40,18 @@ class PhantomClientError(Exception):
 
 
 class PhantomTransportError(PhantomClientError):
-    """Network-class failure where Phantom did not see the request.
+    """Network-class failure, which may or may not have reached Phantom.
 
-    Retried by :class:`phantom_client.transport.Transport` per
-    :class:`phantom_client.config.RetryPolicy`. Each retry carries the
-    same ``X-Phantom-Idempotency-Key`` so Phantom dedupes if it actually
-    received an earlier attempt.
+    The base of both classes, so it asserts neither. A failure that
+    PROVABLY never landed (connect refused, connect timeout, pool
+    timeout) was retried by :class:`phantom_client.transport.Transport`
+    per :class:`phantom_client.config.RetryPolicy` before this surfaced.
+    A failure that MAY HAVE LANDED (a read or write timeout, a reset, a
+    server disconnect mid-response) surfaces immediately for any call
+    that did not opt into re-sending it, which is every mutating admin
+    call: the request may already have executed. Treat it as an unknown
+    outcome and read the resource's state rather than repeating the
+    request.
     """
 
 

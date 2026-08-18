@@ -163,13 +163,22 @@ header constants with `build_request_headers` /
   Multipart parts are named `envelope` and `body_refs[<name>]` per
   ADR-010, and every part carries a non-empty filename so binary
   bodies round-trip byte-identically.
-- **Retries are transport-class only.** The SDK retries on
-  `httpx.ConnectError`, `httpx.ReadTimeout`, `httpx.WriteTimeout`,
-  and `httpx.PoolTimeout` up to `RetryPolicy.max_attempts`. It
-  **never retries 4xx/5xx**. Phantom IS the retry engine. Every
-  attempt carries the same `X-Phantom-Idempotency-Key` (defaults
-  to `str(envelope.chain_id)`) so Phantom dedupes if it actually
-  received the earlier attempt.
+- **Retries are transport-class only, and split by whether the request
+  may already have landed.** Failures that provably never reached
+  Phantom (`httpx.ConnectError`, `httpx.ConnectTimeout`,
+  `httpx.PoolTimeout`) are always retried up to
+  `RetryPolicy.max_attempts`. Failures that may have landed
+  (`httpx.ReadTimeout`, `httpx.WriteTimeout`, a reset or a server
+  disconnect mid-response) are retried only for `submit_chain`, reads,
+  and the token/credential pushes. On `replay`, `cancel`,
+  `delete_upload`, `bulk_delete` and the token invalidations they raise
+  `PhantomTimeoutError` (or `PhantomNetworkError`) after ONE attempt,
+  because the service may already have executed the call. Check the
+  chain's state before repeating it. The SDK **never retries 4xx/5xx**:
+  Phantom IS the retry engine. `submit_chain` is the one call that
+  carries an `X-Phantom-Idempotency-Key` (defaulting to
+  `str(envelope.chain_id)`), which is what makes its re-send safe: a
+  re-arrival is deduped by admission's atomic claim.
 - **`TERMINAL_STATES`** is the default stop-set for `poll_until` and
   covers every terminal `ChainState`: `succeeded`, `failed`, `stored`,
   `cancelled`, `expired`, `corrupted` (reached on body-verification

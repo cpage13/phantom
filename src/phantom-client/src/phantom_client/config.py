@@ -48,10 +48,12 @@ class Timeouts(BaseModel):
 class RetryPolicy(BaseModel):
     """Retry policy for transport-class failures.
 
-    The SDK retries on connection refused, read timeout, and similar
-    transport errors. It does NOT retry on 5xx — Phantom IS the retry
-    engine. Each retry carries the same ``X-Phantom-Idempotency-Key``
-    so Phantom dedupes if it actually received the earlier attempt.
+    This policy governs retry CADENCE (how many attempts, how long
+    between them). It does not govern retry SAFETY: which failures are
+    eligible at all is the two-class split documented on
+    :mod:`phantom_client.transport`, where a failure that may have
+    landed server-side is retried only for calls that opt in. The SDK
+    never retries a 5xx: Phantom IS the retry engine.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")

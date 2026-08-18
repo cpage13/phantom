@@ -13,11 +13,22 @@ Key behaviors:
   ``body_refs`` is non-empty. The multipart shape uses parts named
   ``envelope`` (the JSON-serialized envelope) and ``body_refs[<name>]``
   per body_ref (ADR-010).
-- Retries happen **only** for transport-class failures (connect refused,
-  read/write/pool timeouts). 5xx responses are passed through to the
-  caller untouched — Phantom IS the retry engine, so doubling up muddies
-  idempotency. Every attempt carries the same
-  ``X-Phantom-Idempotency-Key`` so Phantom dedupes a re-arrival.
+- Retries happen **only** for transport-class failures, and they split into
+  two classes. A failure that PROVABLY never landed (connect refused, connect
+  timeout, pool timeout, an unbuildable request) is always retried. A failure
+  that MAY HAVE LANDED (read/write timeout, a reset, a server disconnect
+  mid-response) is retried only for calls that opt in, because the server may
+  have executed the request and lost only the response. 5xx responses are
+  passed through to the caller untouched: Phantom IS the retry engine, so
+  doubling up muddies idempotency.
+- Only ``submit_chain`` carries an ``X-Phantom-Idempotency-Key``, which is why
+  it is the one mutating call that opts into may-have-landed retries: its
+  re-arrival is deduped by admission's atomic claim. ``get_json`` opts in
+  because it is read-only and ``put_json`` because its callers overwrite one
+  slot. The three mutating admin helpers do NOT, so a read timeout on a
+  replay, a cancel or a bulk delete surfaces as
+  :class:`~phantom_client.errors.PhantomTimeoutError` rather than being
+  re-sent; the caller checks the chain's state and decides.
 - Non-2xx responses are parsed as the ADR-010 ``ErrorEnvelope`` and
   raised as a typed :class:`~phantom_client.errors.PhantomHttpError`
   subclass.
@@ -263,18 +274,25 @@ class Transport:
         envelope_json = envelope.model_dump_json(by_alias=True)
 
         if body_refs:
+            # Opt in: this is the ONE call that sends
+            # X-Phantom-Idempotency-Key on every attempt, and admission's
+            # atomic claim turns a re-arrival into a 200 replay.
             response = await self._send_with_retry(
                 "POST",
                 _PATH_SEND,
                 headers=headers,
                 files=self._build_multipart(envelope_json, body_refs),
+                retry_if_may_have_landed=True,
             )
         else:
+            # Opt in: same call, other encoding. Both arms or neither, or one
+            # encoding silently loses its retry.
             response = await self._send_with_retry(
                 "POST",
                 _PATH_SEND,
                 headers={**headers, "Content-Type": "application/json"},
                 content=envelope_json,
+                retry_if_may_have_landed=True,
             )
         self._raise_for_status(response)
         try:
@@ -305,7 +323,10 @@ class Transport:
         Returns:
             An instance of ``model``.
         """
-        response = await self._send_with_retry("GET", path, params=params)
+        # Opt in: read-only, so a re-arrival changes nothing.
+        response = await self._send_with_retry(
+            "GET", path, params=params, retry_if_may_have_landed=True
+        )
         self._raise_for_status(response)
         return self._parse_json(response, model)
 
@@ -319,12 +340,16 @@ class Transport:
     ) -> T:
         """POST a JSON body and parse the response against ``model``."""
         payload = self._serialize_body(body)
+        # Opt OUT: its callers are replay (which re-queues a row that may have
+        # succeeded since, delivering the upload twice), cancel and quarantine
+        # restore. A lost response costs one manual operator retry.
         response = await self._send_with_retry(
             "POST",
             path,
             params=params,
             content=payload,
             headers={"Content-Type": "application/json"},
+            retry_if_may_have_landed=False,
         )
         self._raise_for_status(response)
         return self._parse_json(response, model)
@@ -338,12 +363,15 @@ class Transport:
     ) -> None:
         """PUT a JSON body; ignore the response body (204-style)."""
         payload = self._serialize_body(body)
+        # Opt in: its only callers are the token and credential pushes, which
+        # are pure overwrites of one slot; a second write stores the same value.
         response = await self._send_with_retry(
             "PUT",
             path,
             params=params,
             content=payload,
             headers={"Content-Type": "application/json"},
+            retry_if_may_have_landed=True,
         )
         self._raise_for_status(response)
 
@@ -354,7 +382,11 @@ class Transport:
         params: dict[str, Any] | None = None,
     ) -> None:
         """DELETE ``path``; ignore the response body."""
-        response = await self._send_with_retry("DELETE", path, params=params)
+        # Opt OUT: its callers converge, but it is kept off for consistency
+        # with the other DELETE helper; the cost is one manual operator retry.
+        response = await self._send_with_retry(
+            "DELETE", path, params=params, retry_if_may_have_landed=False
+        )
         self._raise_for_status(response)
 
     async def delete_json[T: BaseModel](
@@ -367,12 +399,16 @@ class Transport:
     ) -> T:
         """DELETE ``path`` with a JSON body; parse the response against ``model``."""
         payload = self._serialize_body(body)
+        # Opt OUT: its caller is bulk_delete, which is NOT convergent: the
+        # filter is re-evaluated against the live table on every call, so a
+        # retry sweeps up rows the first request never saw.
         response = await self._send_with_retry(
             "DELETE",
             path,
             params=params,
             content=payload,
             headers={"Content-Type": "application/json"},
+            retry_if_may_have_landed=False,
         )
         self._raise_for_status(response)
         return self._parse_json(response, model)
@@ -472,8 +508,57 @@ class Transport:
         params: Mapping[str, Any] | None = None,
         content: str | bytes | None = None,
         files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
+        retry_if_may_have_landed: bool = False,
     ) -> httpx.Response:
-        """Send a single request, retrying transport-class failures per policy."""
+        """Send a single request, retrying transport failures per policy.
+
+        Transport failures split into two classes, and only the caller knows
+        whether the second one is safe to retry:
+
+        * **Never landed.** ``ConnectError``, ``ConnectTimeout``,
+          ``PoolTimeout``, ``LocalProtocolError`` and ``UnsupportedProtocol``.
+          The request was never delivered, so a retry cannot duplicate
+          anything. Always retried.
+        * **May have landed.** Everything else ``httpx`` raises from the
+          request call: ``ReadTimeout`` and ``WriteTimeout``, and the
+          ``HTTPError`` catch-all's members such as ``ReadError``,
+          ``RemoteProtocolError``, ``CloseError``, ``ProxyError``,
+          ``DecodingError`` and ``TooManyRedirects``. Each is reachable AFTER
+          the server received bytes, so the server may have executed the
+          request and only the response was lost. Retried ONLY when the caller
+          passes ``retry_if_may_have_landed=True``.
+
+        The retry decision and the surfaced error TYPE are independent axes.
+        A ``ConnectTimeout`` is never-landed AND a timeout, so it keeps its
+        ``PhantomTimeoutError`` mapping; the clause order below is load-bearing
+        for that, because ``ConnectTimeout`` and ``PoolTimeout`` subclass
+        ``TimeoutException`` and ``ConnectError`` is a ``NetworkError`` sibling
+        of ``ReadError``.
+
+        ``HTTPStatusError`` is outside the split: it comes from
+        ``raise_for_status()``, never from the request call this wraps, and 5xx
+        responses are deliberately passed through to the caller.
+
+        Args:
+            method: The HTTP verb.
+            path: The path on the configured ``phantom_url``.
+            headers: Optional request headers.
+            params: Optional query parameters.
+            content: Optional raw request body.
+            files: Optional multipart parts.
+            retry_if_may_have_landed: Whether a failure that may have executed
+                server-side is safe to re-send. True only for calls that are
+                read-only, that carry an idempotency key the service dedupes
+                on, or whose effect is a pure overwrite.
+
+        Returns:
+            The :class:`httpx.Response`, which may still be a non-2xx.
+
+        Raises:
+            PhantomTransportError or subclass: On a never-landed failure after
+                exhausting the policy, or immediately on a may-have-landed
+                failure the caller did not opt in for.
+        """
         client = self._require_client()
         policy = self._config.retry_policy
         last_error: Exception | None = None
@@ -504,16 +589,33 @@ class Transport:
                     len(response.content),
                 )
                 return response
+            except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+                # NEVER DELIVERED, but still a timeout for callers: a dropped
+                # SYN is the most common "Phantom unreachable" shape on a real
+                # producer network, and an exhausted pool never reached the
+                # wire at all. Both keep the PhantomTimeoutError mapping the
+                # committed exhaustion pin requires. This clause MUST precede
+                # the broad TimeoutException clause below, which they subclass.
+                last_error = PhantomTimeoutError(f"timeout: {exc}")
             except httpx.ConnectError as exc:
+                # Never delivered: the connection itself was refused.
                 last_error = PhantomConnectError(f"connect refused: {exc}")
+            except (httpx.LocalProtocolError, httpx.UnsupportedProtocol) as exc:
+                # No request was ever built: a malformed local request and an
+                # unsupported URL scheme both fail before the wire.
+                last_error = PhantomNetworkError(f"network error: {exc}")
             except httpx.TimeoutException as exc:
-                # Covers ConnectTimeout too: a dropped SYN (the most common
-                # "Phantom unreachable" shape on a real producer network) is
-                # a timeout condition for callers, not a generic network
-                # fault, so it must surface as PhantomTimeoutError.
+                # ReadTimeout / WriteTimeout: the server MAY have received and
+                # executed this request, and only the response was lost (F12).
+                if not retry_if_may_have_landed:
+                    raise PhantomTimeoutError(f"timeout: {exc}") from exc
                 last_error = PhantomTimeoutError(f"timeout: {exc}")
             except httpx.HTTPError as exc:
-                # Catch-all for other network-class failures.
+                # Not provably undelivered: a reset or a server disconnect can
+                # land AFTER the request executed (ReadError,
+                # RemoteProtocolError). Same gate.
+                if not retry_if_may_have_landed:
+                    raise PhantomNetworkError(f"network error: {exc}") from exc
                 last_error = PhantomNetworkError(f"network error: {exc}")
             if attempt < max_attempts:
                 delay = _compute_backoff(policy, attempt)

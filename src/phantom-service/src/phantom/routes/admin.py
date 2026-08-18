@@ -1058,6 +1058,28 @@ async def replay_upload(
 ) -> UploadRow | Response:
     """Reset attempts and re-queue.
 
+    **This endpoint is NOT idempotent, deliberately.** Replay means "deliver
+    this again", so a second call is a second instruction rather than a
+    repeat of the first: the CAS re-queues from seven states INCLUDING
+    ``succeeded``, so replaying a chain that has since been delivered
+    delivers it a second time. There is no idempotency claim on this path
+    (the ``idempotency_index`` is ingress-only) and no request key is
+    consulted.
+
+    **What that means for a lost response.** A read timeout does not tell you
+    the replay did not happen: it may have landed, re-queued the row and
+    delivered it, with only the response lost. The SDK therefore does NOT
+    auto-retry this call on a may-have-landed transport failure (F12); it
+    raises and leaves the decision to you. The safe check is the chain's own
+    state through ``GET /v1/admin/chains/{chain_id}``, not a second POST. A
+    caller with its own blind retry loop (``curl --retry``, a shell wrapper)
+    can still double-deliver.
+
+    The one natural guard is retention-dependent: the body-discard precheck
+    below refuses a row whose body is gone, and at the default
+    ``succeeded_body_seconds`` of 0 the body goes the moment the row
+    succeeds, so a retry 409s. Any non-zero window leaves the door open.
+
     M-W4-F7 audit closure: ``replay`` refuses when the row is currently
     ``attempting`` (a sender is actively driving it). The store raises
     :class:`ReplayRefusedAttemptingError` from its in-write-lock state
@@ -1207,6 +1229,18 @@ async def bulk_delete_uploads(
     An all-None filter is refused with the 422
     ``bulk_delete_filter_empty`` envelope (ADR-004: an empty filter
     would mean "delete every row").
+
+    **This endpoint is NOT idempotent.** The filter is re-evaluated against
+    the LIVE table on every call, so its blast radius is not fixed to what
+    the first request saw: a repeat can delete rows that became eligible in
+    between (a chain that reached the filtered state, or crossed the
+    ``since`` boundary, after the first call ran). A lost response is
+    therefore not safe to answer with a second identical request. The SDK
+    does not auto-retry this call on a may-have-landed transport failure
+    (F12); re-read the affected rows and narrow the filter instead.
+
+    Making the radius fixed would need the request to carry the row set it
+    intended, which is a different feature.
 
     Raises:
         BulkDeleteFilterEmptyError: When no filter field is set (422

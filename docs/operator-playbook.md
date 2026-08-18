@@ -680,6 +680,17 @@ has three producers. Fetch an affected row and branch on its
   which is safe when the upstream honours the step's
   `idempotency_header` and unsafe when it does not; check that before
   replaying a multi-step chain.
+
+  **Replay is not idempotent, and a lost response is not a failed
+  replay.** The re-queue CAS accepts a `succeeded` row, so a second POST
+  is a second delivery rather than a repeat of the first. If the
+  response never arrives, do NOT post again: read
+  `GET /v1/admin/chains/{chain_id}` and branch on the chain's state. The
+  SDK does this for you by refusing to auto-retry the call on a
+  read timeout; a shell loop or `curl --retry` does not. The same rule
+  covers `DELETE /v1/admin/chains`: its filter is re-evaluated against
+  the live table per call, so a repeat can sweep up rows the first call
+  never saw.
 - Anything else means uploads are exhausting their retries (a sick
   upstream, or retry params too tight) or a capture TTL expired.
 
