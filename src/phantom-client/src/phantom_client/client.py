@@ -517,7 +517,7 @@ class PhantomClient:
 
     async def fetch_body(self, chain_id: UUID) -> AsyncIterator[bytes]:
         """Stream the upload's body bytes as chunks."""
-        return self._transport.stream_bytes(_PATH_UPLOAD_BODY.format(chain_id=chain_id))
+        return self._transport.stream_request("GET", _PATH_UPLOAD_BODY.format(chain_id=chain_id))
 
     async def fetch_bundle(self, chain_id: UUID) -> UploadBundle:
         """Return metadata + body as a single :class:`UploadBundle`."""
@@ -526,30 +526,28 @@ class PhantomClient:
         )
 
     async def extract(self, filter: ExtractFilter) -> AsyncIterator[bytes]:  # noqa: A002 — match plan signature
-        """Stream a tar archive of every row matching the filter."""
-        # Send the filter body via a streaming POST.
-        client = self._transport._require_client()
-        return self._extract_iter(client, filter)
+        """Stream a tar archive of every row matching the filter.
 
-    async def _extract_iter(
-        self, client: httpx.AsyncClient, filter_: ExtractFilter
-    ) -> AsyncIterator[bytes]:
-        body = filter_.model_dump_json(by_alias=True)
-        async with client.stream(
+        The not-started check is EAGER, and deliberately so: this is a plain
+        coroutine returning a generator, so ``await client.extract(f)`` on an
+        unstarted client raises at the await rather than at the first chunk.
+        Do not simplify the call away by returning the stream directly; that
+        would move the raise to first iteration, which is an observable
+        change for every caller that awaits before it drains.
+        """
+        self._transport.require_started()
+        # A streaming POST: the filter rides in the body, the archive streams
+        # back through the shared core.
+        return self._transport.stream_request(
             "POST",
             _PATH_UPLOADS_EXTRACT,
-            content=body,
+            content=filter.model_dump_json(by_alias=True),
             headers={"Content-Type": "application/json"},
-        ) as response:
-            if response.status_code >= 400:
-                await response.aread()
-                self._transport._raise_for_status(response)
-            async for chunk in response.aiter_bytes():
-                yield chunk
+        )
 
     async def export_tar(self) -> AsyncIterator[bytes]:
         """Stream the full ``/v1/admin/export.tar`` archive (ADR-005)."""
-        return self._transport.stream_bytes(_PATH_EXPORT_TAR)
+        return self._transport.stream_request("GET", _PATH_EXPORT_TAR)
 
     # -----------------------------------------------------------------
     # Lifecycle ops.

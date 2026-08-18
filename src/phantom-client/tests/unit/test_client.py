@@ -408,6 +408,24 @@ async def test_extract_streams_with_filter_body() -> None:
     assert out == b"filtered-tar"
 
 
+@pytest.mark.asyncio
+async def test_extract_raises_at_the_await_on_an_unstarted_client() -> None:
+    """extract's not-started check is EAGER: the raise lands at the await.
+
+    Objective: pin the one observable CL9 could have moved. ``extract`` is a
+    coroutine that checks first and then returns a stream, so awaiting it on
+    an unstarted client raises immediately; a naive unification that returned
+    ``stream_request`` directly would defer that raise to the first
+    ``__anext__``, which nothing else in the suite would notice.
+
+    Success: ``await client.extract(...)`` raises RuntimeError with no
+    iteration at all.
+    """
+    client = PhantomClient(ClientConfig(phantom_url="http://test"))
+    with pytest.raises(RuntimeError):
+        await client.extract(ExtractFilter(state="failed"))
+
+
 # ---------------------------------------------------------------------------
 # Tokens.
 # ---------------------------------------------------------------------------

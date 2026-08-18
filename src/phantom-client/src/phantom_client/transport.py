@@ -413,26 +413,66 @@ class Transport:
         self._raise_for_status(response)
         return self._parse_json(response, model)
 
-    async def stream_bytes(
+    async def stream_request(
         self,
+        method: str,
         path: str,
         *,
         params: dict[str, Any] | None = None,
+        content: bytes | str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> AsyncIterator[bytes]:
-        """Stream the response body of GET ``path`` as bytes chunks.
+        """Stream the response body of ``method path`` as bytes chunks.
 
-        Used for body fetches, export.tar, and bulk extract. No retry on
-        partial-stream failures — the upstream is the recovery surface.
+        Method-general because the streaming core is: open a stream, drain
+        and raise on a 4xx/5xx, then yield chunks. That core is the same for
+        the GET body fetches, for export.tar, and for the POST-with-a-filter
+        bulk extract, which used to reach through two private members of this
+        class to re-implement it.
+
+        No retry on partial-stream failures: the upstream is the recovery
+        surface. That rule is about streaming in general rather than about
+        GET, which is why it lives here.
+
+        An async generator, deliberately, so the not-started check runs LAZILY
+        on first iteration exactly as it did before. A caller that needs the
+        check EAGERLY calls :meth:`require_started` first; the eagerness is a
+        property of the caller, not of this method.
+
+        Args:
+            method: The HTTP method to stream.
+            path: Path relative to the configured Phantom URL.
+            params: Optional query parameters.
+            content: Optional request body.
+            headers: Optional request headers.
+
+        Yields:
+            Response body chunks, in order.
         """
         client = self._require_client()
-        # Use a streaming GET so memory stays bounded.
-        async with client.stream("GET", path, params=params) as response:
+        # Stream rather than buffer so memory stays bounded.
+        async with client.stream(
+            method, path, params=params, content=content, headers=headers
+        ) as response:
             if response.status_code >= 400:
                 # Drain so we can parse the error envelope.
                 await response.aread()
                 self._raise_for_status(response)
             async for chunk in response.aiter_bytes():
                 yield chunk
+
+    def require_started(self) -> None:
+        """Raise if the transport has not been started.
+
+        The public form of the not-started check. A caller that must raise at
+        ``await`` time rather than at first iteration (``PhantomClient.extract``
+        does) calls this before returning a stream, which is what it used to
+        reach into ``_require_client`` for.
+
+        Raises:
+            RuntimeError: When ``start()`` has not been called.
+        """
+        self._require_client()
 
     # -----------------------------------------------------------------
     # Internals.

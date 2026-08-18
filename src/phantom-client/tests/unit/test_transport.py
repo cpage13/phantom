@@ -470,10 +470,10 @@ async def test_delete_json_passes_filter_body(
 
 
 @pytest.mark.asyncio
-async def test_stream_bytes_yields_chunks(
+async def test_stream_request_yields_chunks(
     transport_factory: Callable[..., Transport],
 ) -> None:
-    """stream_bytes yields response chunks until exhausted."""
+    """stream_request yields response chunks until exhausted."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"abcdef")
@@ -482,7 +482,7 @@ async def test_stream_bytes_yields_chunks(
     await transport.start()
     try:
         out = b""
-        async for chunk in transport.stream_bytes("/v1/admin/export.tar"):
+        async for chunk in transport.stream_request("GET", "/v1/admin/export.tar"):
             out += chunk
     finally:
         await transport.aclose()
@@ -490,10 +490,10 @@ async def test_stream_bytes_yields_chunks(
 
 
 @pytest.mark.asyncio
-async def test_stream_bytes_4xx_raises(
+async def test_stream_request_4xx_raises(
     transport_factory: Callable[..., Transport],
 ) -> None:
-    """stream_bytes drains the response and raises on 4xx."""
+    """stream_request drains the response and raises on 4xx."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -513,7 +513,7 @@ async def test_stream_bytes_4xx_raises(
     await transport.start()
     try:
         with pytest.raises(Exception) as exc:
-            async for _chunk in transport.stream_bytes("/v1/admin/chains/abc/body"):
+            async for _chunk in transport.stream_request("GET", "/v1/admin/chains/abc/body"):
                 pass
         from phantom_client.errors import PhantomBadRequestError
 
