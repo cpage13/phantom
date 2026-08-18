@@ -100,7 +100,7 @@ async def test_h9_cancel_during_attempt_preserves_cancelled_state(tmp_path: Path
 
     # Sender's record_attempt_result fires next, expecting attempting.
     # The WHERE state='attempting' predicate filters it out.
-    rowcount = await store.record_attempt_result(
+    write = await store.record_attempt_result(
         chain_id,
         new_state="succeeded",
         attempts=1,
@@ -113,9 +113,9 @@ async def test_h9_cancel_during_attempt_preserves_cancelled_state(tmp_path: Path
         last_step_completed="put_s3",
         expected_state="attempting",
     )
-    assert rowcount == 0, (
+    assert write.rowcount == 0, (
         f"record_attempt_result must return 0 when row is no longer attempting; "
-        f"got {rowcount} (the H3 race regression test would catch a regression "
+        f"got {write.rowcount} (the H3 race regression test would catch a regression "
         f"where the predicate is removed)"
     )
 
@@ -147,7 +147,7 @@ async def test_h9_replay_during_attempt_preserves_queued_state(tmp_path: Path) -
     assert ok is True
 
     # Sender's record_attempt_result is rejected by the WHERE predicate.
-    rowcount = await store.record_attempt_result(
+    write = await store.record_attempt_result(
         chain_id,
         new_state="failed",
         attempts=2,
@@ -160,7 +160,7 @@ async def test_h9_replay_during_attempt_preserves_queued_state(tmp_path: Path) -
         last_step_completed="put_s3",
         expected_state="attempting",
     )
-    assert rowcount == 0
+    assert write.rowcount == 0
 
     fresh = await store.get(chain_id)
     assert fresh is not None
