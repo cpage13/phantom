@@ -552,8 +552,8 @@ class UploadStore(Protocol):
         """
         ...
 
-    def iter_rows(self) -> AsyncIterator[UploadRow]:
-        """Stream every row.
+    def iter_rows(self, *, deliverable_only: bool = False) -> AsyncIterator[UploadRow]:
+        """Stream every row, or only the still-deliverable ones.
 
         Used by recovery and the invariant-audit coroutine
         (Phase 3) for row-walk passes. Implementations may iterate the
@@ -565,6 +565,31 @@ class UploadStore(Protocol):
         the generator is awaited via ``async for``. Implementations
         use ``async def`` + ``yield`` (which itself is type-compatible
         with this Protocol).
+
+        Args:
+            deliverable_only: When True, the walk yields only rows outside
+                :data:`TERMINAL_STATES` whose ``body_discarded_at`` is NULL.
+                Both halves are carve-outs the invariant auditor used to apply
+                in Python, and both are stated here because this is now where
+                the decision lives (U10).
+
+                The TERMINAL half is finding R9-PM-3: a row in a terminal
+                state is FINISHED and its body is legitimately gone (a
+                ``succeeded`` row's body is deleted on delivery without ever
+                stamping ``body_discarded_at``), so auditing body presence on
+                it fires spurious ``missing_body_*`` violations every sweep.
+                ``auth_expired`` is deliberately NOT terminal and is still
+                walked, because it is still deliverable and its body MUST be
+                present.
+
+                The STAMP half is the H4 carve-out (R6-3): the reaper aged
+                that row's body out by policy, so there is no invariant left
+                to check.
+
+                The default is False and it is load-bearing rather than
+                polite. Recovery's two walks MUST keep seeing terminal and
+                discarded rows: one of them reconstructs the saturation ledger
+                at boot, and filtering it would silently under-count the gate.
         """
         ...
 

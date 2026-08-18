@@ -1581,12 +1581,22 @@ class SqliteUploadStore:
             )
             await conn.commit()
 
-    async def iter_rows(self) -> AsyncIterator[UploadRow]:
+    async def iter_rows(self, *, deliverable_only: bool = False) -> AsyncIterator[UploadRow]:
         """Stream every row via a cursor on the read-only connection.
 
         Used by recovery and the invariant-audit
         coroutine (Phase 3). The cursor stays open for the duration of
         iteration; callers MUST consume promptly.
+
+        ``deliverable_only`` adds ``WHERE state NOT IN (TERMINAL_STATES) AND
+        body_discarded_at IS NULL``, which is exactly the pair of ``continue``
+        blocks the auditor used to run in Python, in the same order and over
+        the same snapshot (U10). See the Protocol for what each half means and
+        why the default must stay False. The predicate removes ROWS from the
+        walk, not columns from the row: this caller reads ``body_hashes``,
+        whose decode is the expensive part and also the point of the pass, so
+        the win is fewer decodes rather than a different access path. A
+        ``NOT IN`` is not a seek, so the plan stays a SCAN by design.
 
         WRITE-DURING-WALK posture (V1/V2 history, revised by cycle-7
         task 4.1): the walk used to hold its ``SELECT`` cursor on the
@@ -1603,7 +1613,13 @@ class SqliteUploadStore:
         semantics easy to reason about.
         """
         conn = self._read_connection()
-        async with conn.execute("SELECT * FROM uploads") as cursor:
+        sql = "SELECT * FROM uploads"
+        params: tuple[str, ...] = ()
+        if deliverable_only:
+            placeholders = ",".join("?" * len(TERMINAL_STATES))
+            sql += f" WHERE state NOT IN ({placeholders}) AND body_discarded_at IS NULL"
+            params = tuple(TERMINAL_STATES)
+        async with conn.execute(sql, params) as cursor:
             async for row in cursor:
                 yield _row_to_upload(row)
 

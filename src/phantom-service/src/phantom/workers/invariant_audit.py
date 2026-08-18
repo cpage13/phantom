@@ -51,7 +51,6 @@ from typing import TYPE_CHECKING
 
 from phantom.observability.metrics import MetricsRegistry
 from phantom.storage.interface import TERMINAL_STATES
-from phantom.workers.saturation import is_deliverable
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -185,23 +184,17 @@ class InvariantAuditor:
         mid-sweep) are skipped via the
         :meth:`_row_cleared_since_snapshot` live re-read instead of
         bumping false violations (R5-1).
+
+        The walk is FILTERED IN SQL (U10): ``deliverable_only=True`` carries
+        the terminal carve-out (R9-PM-3) and the H4 discard carve-out (R6-3)
+        that used to be two ``continue`` blocks here, so the retained history
+        is no longer decoded once per period only to be discarded. The
+        rationale for both now lives on the store parameter that applies them.
+        The FRESH re-read below is untouched and must stay: it asks the same
+        question of a live row to decide whether a row legally finished
+        mid-sweep, which is a different question from what to walk.
         """
-        async for row in self._store.iter_rows():
-            # Terminal carve-out (finding R9-PM-3). A row in a terminal
-            # state is FINISHED; its body is legitimately gone (a
-            # ``succeeded`` row's body is deleted on delivery without
-            # stamping ``body_discarded_at``, so the H4 carve-out below
-            # would miss it). Auditing body presence on a finished row
-            # would fire spurious ``missing_body_*`` / ``body_hash_set_mismatch``
-            # violations on every sweep — operational noise that masks REAL
-            # corruption. ``auth_expired`` is NOT terminal (still
-            # deliverable; its body MUST be present) so it is still audited.
-            if row.state in TERMINAL_STATES:
-                continue
-            # H4 carve-out: a legitimately absent body, so there is no
-            # invariant to check (auth_expired retention path).
-            if not is_deliverable(row):
-                continue
+        async for row in self._store.iter_rows(deliverable_only=True):
             # Invariant #1 + #3 checks per body_hash entry.
             present_names: set[str] = set()
             # Lazily resolved on the FIRST miss; one live re-read per
