@@ -118,11 +118,12 @@ repos:
         pass_filenames: false
 
       - id: forbid-bare-numeric-literals-in-production
-        # CL11 — was an informational shell hook that could not fail: an
-        # unconditional exit 0, a regex blind to keyword arguments, no
-        # scripts/ coverage, and an invalid BSD-grep character range that
-        # made its own grep exit 2 into /dev/null. The replacement is an AST
-        # checker with a self-test, and it is a HARD gate.
+        # CL11: was an informational shell hook that could not fail, for
+        # four independent reasons: an unconditional exit 0, a regex blind
+        # to keyword arguments, no scripts/ coverage, and an invalid
+        # BSD-grep character range that made its own grep exit 2 into
+        # /dev/null. The replacement is an AST checker with a self-test,
+        # and it is a HARD gate.
         name: forbid bare numeric literals in production code
         entry: uv run python scripts/check_numeric_literals.py
         language: system
