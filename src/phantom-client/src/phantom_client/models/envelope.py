@@ -17,18 +17,32 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from phantom_client.errors import PhantomEnvelopeError
-from phantom_client.models.chain import ChainState
 
-# Header names — duplicated here as constants so the stripper doesn't
-# depend on importing ``phantom_client.headers`` (which lives at the
-# package root and would create a back-edge). The public source of
-# truth for these names is :mod:`phantom_client.headers`.
-_H_UPLOAD_ID = "X-Phantom-Upload-Id"
-_H_GROUP_ID = "X-Phantom-Group-Id"
-_H_STATUS = "X-Phantom-Status"
-_H_ATTEMPTS = "X-Phantom-Attempts"
-_H_NEXT_ATTEMPT_AT = "X-Phantom-Next-Attempt-At"
-_H_SUGGESTED_POLL_AFTER = "X-Phantom-Suggested-Poll-After"
+# The six response-header names, imported from the module that declares them
+# and aliased to the short local names the stripper below already reads (U4).
+# These used to be re-declared literals here, under a comment claiming an
+# import would create a back-edge; ``phantom_client.headers`` imports only
+# ``phantom_client.config``, which imports nothing from the package, so no
+# such edge exists. The aliases are kept so the stripper's body does not move.
+from phantom_client.headers import (
+    X_PHANTOM_ATTEMPTS as _H_ATTEMPTS,
+)
+from phantom_client.headers import (
+    X_PHANTOM_GROUP_ID as _H_GROUP_ID,
+)
+from phantom_client.headers import (
+    X_PHANTOM_NEXT_ATTEMPT_AT as _H_NEXT_ATTEMPT_AT,
+)
+from phantom_client.headers import (
+    X_PHANTOM_STATUS as _H_STATUS,
+)
+from phantom_client.headers import (
+    X_PHANTOM_SUGGESTED_POLL_AFTER as _H_SUGGESTED_POLL_AFTER,
+)
+from phantom_client.headers import (
+    X_PHANTOM_UPLOAD_ID as _H_UPLOAD_ID,
+)
+from phantom_client.models.chain import ChainState
 
 
 class ResponseHeaders(BaseModel):
