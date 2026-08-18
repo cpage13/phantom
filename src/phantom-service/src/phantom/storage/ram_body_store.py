@@ -27,6 +27,9 @@ class RamBodyStore:
     def __init__(self) -> None:
         """Initialize an empty store."""
         self._bodies: dict[UUID, dict[str, bytes]] = {}
+        # Running sum of every stored byte. Maintained at the three points
+        # that mutate ``_bodies``, all of which already hold ``_lock`` (U11).
+        self._total_bytes = 0
         self._lock = asyncio.Lock()
         self._started = False
 
@@ -38,6 +41,7 @@ class RamBodyStore:
         """Drop every body."""
         async with self._lock:
             self._bodies.clear()
+            self._total_bytes = 0
         self._started = False
 
     async def put(self, chain_id: UUID, body_refs: dict[str, bytes]) -> int:
@@ -56,9 +60,14 @@ class RamBodyStore:
         Returns:
             Total bytes stored for this upload.
         """
+        stored = sum(len(b) for b in body_refs.values())
         async with self._lock:
+            # REPLACE semantics, so the delta is measured against the whole
+            # entry this call displaces, not against the bytes written (U11).
+            displaced = sum(len(b) for b in self._bodies.get(chain_id, {}).values())
             self._bodies[chain_id] = dict(body_refs)
-        return sum(len(b) for b in body_refs.values())
+            self._total_bytes += stored - displaced
+        return stored
 
     async def get(self, chain_id: UUID, name: str) -> bytes:
         """Read one named body_ref."""
@@ -84,12 +93,28 @@ class RamBodyStore:
     async def delete(self, chain_id: UUID) -> None:
         """Drop all body_refs for ``chain_id``. Idempotent."""
         async with self._lock:
-            self._bodies.pop(chain_id, None)
+            dropped = self._bodies.pop(chain_id, {})
+            self._total_bytes -= sum(len(b) for b in dropped.values())
 
     async def total_bytes(self) -> int:
-        """Saturation accounting — sum of stored body bytes."""
+        """Saturation accounting — sum of stored body bytes.
+
+        Returns a RUNNING COUNTER rather than re-summing every ref of every
+        entry (U11). The sum was O(all refs) under ``_lock``, which every
+        other method also takes, and the RAM-pressure watcher samples it once
+        per tick AND again after each of up to 64 enqueued candidates, so the
+        cost peaked exactly when the store was largest.
+
+        The counter is maintained at the three points that mutate
+        ``_bodies``: :meth:`stop` zeroes it, :meth:`put` applies the
+        replaced entry's delta, and :meth:`delete` subtracts what it popped.
+
+        The lock is KEPT deliberately. It costs nothing once the body is
+        O(1), and dropping it would change this store's concurrency contract
+        in a change whose whole point is that no observable moves.
+        """
         async with self._lock:
-            return sum(len(b) for refs in self._bodies.values() for b in refs.values())
+            return self._total_bytes
 
     async def list_chain_ids(self) -> list[UUID]:
         """Return the set of chain_ids with stored bodies."""

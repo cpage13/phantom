@@ -60,6 +60,19 @@ class DeletedRowAccounting:
 
 
 @dataclass(frozen=True)
+class PersistCandidateState:
+    """The columns the RAM-pressure watcher reads off a migration candidate.
+
+    ``state`` and ``updated_at`` are the whole input to the loop's freshness
+    window (F-P8-A), so U11 reads those two rather than decoding a full
+    :class:`~phantom.models.upload.UploadRow` per candidate.
+    """
+
+    state: UploadState
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
 class ParkedCandidate:
     """The columns a kicker rescan reads off one parked row.
 
@@ -590,6 +603,26 @@ class UploadStore(Protocol):
                 polite. Recovery's two walks MUST keep seeing terminal and
                 discarded rows: one of them reconstructs the saturation ledger
                 at boot, and filtering it would silently under-count the gate.
+        """
+        ...
+
+    async def get_persist_candidate_state(self, chain_id: UUID) -> PersistCandidateState | None:
+        """The two columns the RAM-pressure loop reads off a migration candidate.
+
+        A narrow read rather than :meth:`get` (U11): the loop re-reads each of
+        up to 64 candidates per pressure tick to apply its freshness window,
+        and needs only ``state`` and ``updated_at``.
+
+        The re-read's TIMING is deliberate and unchanged. Folding these two
+        columns into :meth:`list_oldest_ram_bodies` would make the loop judge
+        every candidate against a snapshot taken before the first enqueue,
+        and the loop awaits an enqueue and a re-sample per candidate, so by
+        the 64th that snapshot is measurably stale. What U11 narrows is the
+        read's WIDTH, not when it happens.
+
+        Returns:
+            The candidate's state and stamp, or ``None`` when no row with
+            that ``chain_id`` exists, which is the arm the caller already had.
         """
         ...
 

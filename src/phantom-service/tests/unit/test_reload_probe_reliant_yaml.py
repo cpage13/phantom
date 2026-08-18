@@ -66,6 +66,7 @@ from phantom.instances.settings_holder import SettingsHolder
 from phantom.instances.snapshot import InstanceSettingsSnapshot, _build_snapshot
 from phantom.models.upload import UploadRow
 from phantom.runtime.reload import apply_reload
+from phantom.storage.interface import PersistCandidateState
 from phantom.strategies import build_retry_strategy
 from phantom.workers.ram_pressure import RamPressureWatcher
 from phantom.workers.saturation import SaturationGate
@@ -183,9 +184,11 @@ class _OneCandidateStore:
         del limit
         return [self._chain_id]
 
-    async def get(self, chain_id: UUID) -> UploadRow | None:
-        """Return the seeded ``queued`` row for the candidate chain_id."""
-        return self._row if chain_id == self._chain_id else None
+    async def get_persist_candidate_state(self, chain_id: UUID) -> PersistCandidateState | None:
+        """Return the seeded ``queued`` row's state and stamp for the candidate."""
+        if chain_id != self._chain_id:
+            return None
+        return PersistCandidateState(state=self._row.state, updated_at=self._row.updated_at)
 
 
 class _WatcherInstance:

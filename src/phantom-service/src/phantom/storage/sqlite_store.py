@@ -68,6 +68,7 @@ from phantom.storage.interface import (
     DiscardOutcome,
     InsertClaimOutcome,
     ParkedCandidate,
+    PersistCandidateState,
     ReplayOutcome,
     StateTally,
 )
@@ -1622,6 +1623,34 @@ class SqliteUploadStore:
         async with conn.execute(sql, params) as cursor:
             async for row in cursor:
                 yield _row_to_upload(row)
+
+    async def get_persist_candidate_state(self, chain_id: UUID) -> PersistCandidateState | None:
+        """The two columns the RAM-pressure loop reads off a migration candidate.
+
+        Two columns and a hand decode instead of ``SELECT *`` plus a strict
+        row build (U11); see the Protocol for why the read stays per
+        candidate rather than folding into the candidate query.
+        """
+        conn = self._read_connection()
+        async with conn.execute(
+            "SELECT state, updated_at FROM uploads WHERE chain_id = ?",
+            (str(chain_id),),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        state = row["state"]
+        if state not in _VALID_UPLOAD_STATES:
+            logger.warning(
+                "unknown state %r on chain_id=%s; treating the candidate as absent",
+                state,
+                chain_id,
+            )
+            return None
+        return PersistCandidateState(
+            state=state,
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
 
     async def list_oldest_ram_bodies(self, limit: int) -> list[UUID]:
         """Return the oldest ``body_location='ram'`` chain_ids.

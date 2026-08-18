@@ -252,11 +252,13 @@ class RamPressureWatcher:
             # later re-enqueues. Without this bound, a slow upstream that
             # pins every oldest RAM row in ``attempting`` lets RAM blow
             # past the ceiling unbounded (F-P8-A).
-            row = await self._instance.store.get(chain_id)
+            candidate = await self._instance.store.get_persist_candidate_state(chain_id)
             if (
-                row is not None
-                and row.state == "attempting"
-                and _is_fresh_attempt(row.updated_at, now=now, window_seconds=fresh_window_seconds)
+                candidate is not None
+                and candidate.state == "attempting"
+                and _is_fresh_attempt(
+                    candidate.updated_at, now=now, window_seconds=fresh_window_seconds
+                )
             ):
                 continue
             try:
@@ -273,7 +275,9 @@ class RamPressureWatcher:
                 )
                 continue
             # Optimistic re-sample — the controller may have already
-            # cleared some RAM.
+            # cleared some RAM. The sample is O(1) since U11 (a running
+            # counter, not a walk of every ref), which is what makes
+            # re-sampling once per candidate reasonable rather than a cost.
             current = await self._instance.ram_body_store.total_bytes()
             if current < max_bytes:
                 logger.info(

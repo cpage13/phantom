@@ -59,6 +59,7 @@ from uuid import UUID, uuid4
 from phantom.config.settings import BodyStoreCfg
 from phantom.instances.snapshot import InstanceSettingsSnapshot
 from phantom.models.upload import UploadRow
+from phantom.storage.interface import PersistCandidateState
 from phantom.workers.ram_pressure import RamPressureWatcher
 
 from .conftest import make_snapshot
@@ -115,7 +116,8 @@ class _OneCandidateStore:
     """Upload store exposing exactly one oldest RAM-resident chain.
 
     ``list_oldest_ram_bodies`` yields the single seeded chain_id;
-    ``get`` returns a ``queued`` row for it (state != ``attempting`` so
+    ``get_persist_candidate_state`` reports it ``queued`` (state !=
+    ``attempting`` so
     the fresh-attempt skip never applies and a healthy ceiling breach
     enqueues it).
     """
@@ -129,9 +131,11 @@ class _OneCandidateStore:
         del limit
         return [self._chain_id]
 
-    async def get(self, chain_id: UUID) -> UploadRow | None:
-        """Return the seeded ``queued`` row for the candidate chain_id."""
-        return self._row if chain_id == self._chain_id else None
+    async def get_persist_candidate_state(self, chain_id: UUID) -> PersistCandidateState | None:
+        """Return the seeded ``queued`` row's state and stamp for the candidate."""
+        if chain_id != self._chain_id:
+            return None
+        return PersistCandidateState(state=self._row.state, updated_at=self._row.updated_at)
 
 
 class _FakeInstance:
