@@ -333,6 +333,17 @@ class ChainAdminDetail(BaseModel):
         None,
         description="Short error string from most recent failed attempt; None if never failed.",
     )
+    auth_blocked_host: str | None = Field(
+        None,
+        description=(
+            "While this chain is parked in ``auth_expired``: the host whose "
+            "credential is blocking it, and therefore the host a fresh token "
+            "or credential push has to name for the chain to resume. On a "
+            "multi-host chain this is not the chain's endpoint. Once the "
+            "chain has left ``auth_expired`` the value is historical rather "
+            "than current. None on a chain that has never parked on auth."
+        ),
+    )
     metadata: dict[str, str] = Field(
         default_factory=dict,
         description=(

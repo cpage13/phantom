@@ -117,11 +117,14 @@ class AuthKicker:
             # Placed AFTER the cheap state + body_discarded_at filters (a
             # discarded/non-parked row is skipped before any resolve) and
             # BEFORE the freshness gate. ``row_resolved_route`` resolves the
-            # PERSISTED ``row.endpoint`` through ``resolve_route`` — the only
-            # raising call in the copied loop (resolve_route raises ValueError
-            # on no-match; since F5 froze the route block at boot the cause is
-            # a chain admitted with a step whose host matches no route, not a
-            # route removed by hot-reload, which can no longer happen).
+            # RECORDED blocked host (``row.auth_blocked_host or
+            # row.endpoint``, D2/F6) through ``resolve_route``, the SAME
+            # expression the freshness probe below uses, so the partition and
+            # the wake key share one host axis. It is the only raising call in
+            # the copied loop (resolve_route raises ValueError on no-match;
+            # since F5 froze the route block at boot the cause is a chain
+            # admitted with a step whose host matches no route, not a route
+            # removed by hot-reload, which can no longer happen).
             # Wrap it per row and SKIP on raise: a single un-routable
             # parked row must NOT abort the rescan pass (which would strand
             # every row ordered behind it forever under the 1 s rescan). One
@@ -130,9 +133,9 @@ class AuthKicker:
                 resolved = row_resolved_route(row, self._instance)
             except ValueError:
                 logger.warning(
-                    "AuthKicker: no route matches endpoint=%s for chain_id=%s; "
+                    "AuthKicker: no route matches blocked_host=%s for chain_id=%s; "
                     "skipping this row (left in auth_expired for the next rescan)",
-                    row.endpoint,
+                    row.auth_blocked_host or row.endpoint,
                     row.chain_id,
                 )
                 continue
@@ -168,7 +171,19 @@ class AuthKicker:
                     release_saturation=False,
                 )
                 continue
-            slot = await self._instance.token_cache.get(row.endpoint, row.uid)
+            # Probe the host that ACTUALLY rejected this row (D2/F6), not
+            # ``row.endpoint``: the executor authenticates against the CURRENT
+            # step's host while ``endpoint`` is pinned to the FIRST step's,
+            # so on a multi-host chain probing the endpoint finds a fresh slot
+            # for a host the row is not blocked on and re-queues it into a
+            # 1 Hz livelock. ``row.uid`` is unchanged: a chain has one uid, so
+            # the recorded host is the only part of the slot key the row was
+            # missing. The ``or`` is D2's fallback for a row whose column is
+            # NULL; under the current schema policy a version bump discards
+            # the DB rather than migrating it, so that population is empty and
+            # the fallback is defence in depth.
+            probe_host = row.auth_blocked_host or row.endpoint
+            slot = await self._instance.token_cache.get(probe_host, row.uid)
             if slot is None or slot.status != "fresh":
                 continue
             # Re-admit through the saturation gate (§3.1 symmetry).
@@ -185,9 +200,9 @@ class AuthKicker:
                 )
                 continue
             logger.info(
-                "AuthKicker waking row chain_id=%s for endpoint=%s uid=%s",
+                "AuthKicker waking row chain_id=%s for blocked_host=%s uid=%s",
                 row.chain_id,
-                row.endpoint,
+                probe_host,
                 row.uid,
             )
             # M-W4-F7 (Phase 2 § 3.2.8): the kicker writes from

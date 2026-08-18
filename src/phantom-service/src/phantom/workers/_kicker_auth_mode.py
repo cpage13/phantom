@@ -1,4 +1,4 @@
-"""Shared kicker helper: a parked row's current-step resolved route.
+"""Shared kicker helper: a parked row's blocked-host resolved route.
 
 Both :class:`phantom.workers.auth_kicker.AuthKicker` and
 :class:`phantom.workers.credential_kicker.CredentialKicker` walk the SAME
@@ -18,17 +18,22 @@ from phantom.routing import ResolvedRoute, resolve_route
 
 
 def row_resolved_route(row: UploadRow, instance: InstanceContext) -> ResolvedRoute:
-    """Resolve the row's destination route from its persisted host.
+    """Resolve the row's destination route from its recorded blocked host.
 
-    Reads ``row.endpoint`` — the already-normalized current-step hostname
-    (``models/upload.py``: "Hostname of the current step's target", the ADR-002
-    cache axis), set once at admission and never mutated — and resolves it
-    through the importable :func:`phantom.routing.resolve_route`. This is the
-    SAME host axis the cred-slot key and the freshness oracle use
-    (``signer_creds.get(row.endpoint)``), so the guard and the freshness gate
-    stay coherent; deriving it any other way (re-parsing the envelope,
-    recomputing the step URL) risks resolving a different host → a different
-    route → the wrong kicker.
+    Reads ``row.auth_blocked_host or row.endpoint``, the host whose credential
+    slot actually rejected the row when the sender parked it (D2/F6), falling
+    back to the FIRST step's admission-time host only for a row whose column is
+    NULL. Resolves it through the importable
+    :func:`phantom.routing.resolve_route`. This is the SAME expression the
+    cred-slot key and the freshness oracle use, so the guard and the freshness
+    gate stay coherent; deriving it any other way (``row.endpoint`` alone,
+    re-parsing the envelope, recomputing the step URL) risks resolving a
+    different host → a different route → the wrong kicker. That is not
+    hypothetical: routes carry per-route ``auth_mode`` and admission
+    route-checks only the FIRST step, so a chain whose step 1 is on a
+    ``phantom_bearer`` route and whose step 2 is on an ``aws_sigv4`` route is
+    legal config, and a row parked on the sigv4 host but partitioned on the
+    bearer endpoint would be claimed by the kicker that can never wake it.
 
     Returns the WHOLE :class:`~phantom.routing.ResolvedRoute` (not just the
     ``auth_mode``) so the caller's auth_mode guard (``.auth_mode``) AND its
@@ -44,12 +49,14 @@ def row_resolved_route(row: UploadRow, instance: InstanceContext) -> ResolvedRou
         The destination :class:`~phantom.routing.ResolvedRoute`.
 
     Raises:
-        ValueError: When no route matches ``row.endpoint``. Since F5 froze
+        ValueError: When no route matches the RECORDED host. Since F5 froze
             the route block at boot, a route can no longer vanish from under
             a parked row at reload time; what survives is a chain admitted
             with a step whose host matches no route, because admission
-            route-checks only the FIRST step and tolerates a miss. The
-            CALLER wraps this per row and SKIPS that row: it must NOT abort
-            the rescan pass.
+            route-checks only the FIRST step and tolerates a miss, plus a
+            third cause since D2: a row parked on a hostless step URL records
+            the sanitised ``<no-host>`` token, which matches no route unless
+            a catch-all pattern covers it. The CALLER wraps this per row and
+            SKIPS that row: it must NOT abort the rescan pass.
     """
-    return resolve_route(row.endpoint, instance.cfg)
+    return resolve_route(row.auth_blocked_host or row.endpoint, instance.cfg)

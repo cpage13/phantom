@@ -187,15 +187,16 @@ def _metadata_kvs_json_path(key: str) -> str:
 # stamp does not equal this value is treated as pre-version / wrong-schema and
 # deleted, then the instance boots fresh (population of zero — no field DB can
 # hold real undelivered uploads yet; see ADR-025's scoped exception and
-# § 4S.0). Version 2 is the cycle-7 uploads revision (group_id, multifile_id,
-# send_order, sent_at replacing batch_id / order_in_batch), bumped WITHOUT a
-# registered migration: the discard-and-boot-fresh path IS the clean break
-# while the population is zero. When ``schema.sql`` next changes shape, bump
-# this again and, once field DBs hold real data, register a forward
+# § 4S.0). Version 2 was the cycle-7 uploads revision (group_id, multifile_id,
+# send_order, sent_at replacing batch_id / order_in_batch); version 3 adds
+# ``auth_blocked_host`` (D2/F6). Both bumps landed WITHOUT a registered
+# migration: the discard-and-boot-fresh path IS the clean break while the
+# population is zero. When ``schema.sql`` next changes shape, bump this again
+# and, once field DBs hold real data, register a forward
 # :class:`phantom.runtime.startup_checks.SchemaMigration` in the § 4S.3 seam.
 # ``startup_checks.py`` and the tests import THIS constant, never a
 # re-declared literal, so the version lives in exactly one place.
-SCHEMA_VERSION: int = 2
+SCHEMA_VERSION: int = 3
 
 
 def is_chain_id_collision(exc: sqlite3.IntegrityError) -> bool:
@@ -356,6 +357,7 @@ def _row_to_upload(row: aiosqlite.Row) -> UploadRow:
         body_discarded_at=(
             datetime.fromisoformat(row["body_discarded_at"]) if row["body_discarded_at"] else None
         ),
+        auth_blocked_host=_optional_row_value(row, "auth_blocked_host"),
         upstream_status_code=(
             int(row["upstream_status_code"]) if row["upstream_status_code"] is not None else None
         ),
@@ -419,6 +421,7 @@ def _params_for_insert(row: UploadRow) -> dict[str, Any]:
         "storage_encoding": row.storage_encoding,
         "body_size_bytes": row.body_size_bytes,
         "body_discarded_at": (row.body_discarded_at.isoformat() if row.body_discarded_at else None),
+        "auth_blocked_host": row.auth_blocked_host,
         "upstream_status_code": row.upstream_status_code,
         "upstream_response_headers_json": row.upstream_response_headers_json,
         "last_step_completed": row.last_step_completed,
@@ -773,7 +776,7 @@ class SqliteUploadStore:
                     chain_envelope_json, captured_values_json, current_step_index,
                     idempotency_key, capture_reexecution_active,
                     storage_encoding,
-                    body_size_bytes, body_discarded_at,
+                    body_size_bytes, body_discarded_at, auth_blocked_host,
                     upstream_status_code, upstream_response_headers_json,
                     last_step_completed, body_hashes_json,
                     chain_id_at_ingress
@@ -785,7 +788,7 @@ class SqliteUploadStore:
                     :chain_envelope_json, :captured_values_json, :current_step_index,
                     :idempotency_key, :capture_reexecution_active,
                     :storage_encoding,
-                    :body_size_bytes, :body_discarded_at,
+                    :body_size_bytes, :body_discarded_at, :auth_blocked_host,
                     :upstream_status_code, :upstream_response_headers_json,
                     :last_step_completed, :body_hashes_json,
                     :chain_id_at_ingress
@@ -857,7 +860,7 @@ class SqliteUploadStore:
                         chain_envelope_json, captured_values_json, current_step_index,
                         idempotency_key, capture_reexecution_active,
                         storage_encoding,
-                        body_size_bytes, body_discarded_at,
+                        body_size_bytes, body_discarded_at, auth_blocked_host,
                         upstream_status_code, upstream_response_headers_json,
                         last_step_completed, body_hashes_json,
                         chain_id_at_ingress
@@ -869,7 +872,7 @@ class SqliteUploadStore:
                         :chain_envelope_json, :captured_values_json, :current_step_index,
                         :idempotency_key, :capture_reexecution_active,
                         :storage_encoding,
-                        :body_size_bytes, :body_discarded_at,
+                        :body_size_bytes, :body_discarded_at, :auth_blocked_host,
                         :upstream_status_code, :upstream_response_headers_json,
                         :last_step_completed, :body_hashes_json,
                         :chain_id_at_ingress
@@ -1005,6 +1008,7 @@ class SqliteUploadStore:
         last_step_completed: str | None,
         expected_state: UploadState = "attempting",
         stamp_sent_at: bool = False,
+        auth_blocked_host: str | None = None,
     ) -> int:
         """Persist one attempt's result.
 
@@ -1025,6 +1029,19 @@ class SqliteUploadStore:
         clearing ``sent_at``, so a replayed-then-resucceeded row keeps
         its ORIGINAL stamp.
 
+        ``auth_blocked_host`` (D2/F6) is written UNCONDITIONALLY from a
+        parameter defaulting to ``None``, so every transition THROUGH
+        THIS WRITER leaves the column consistent with the state it just
+        wrote: the sender's park passes the host whose credential slot
+        rejected the row, and every other transition through here clears
+        it. That is only half the story, and the other half is the read
+        rule: THREE live CAS writers (``replay``, ``cancel``,
+        ``mark_corrupted``) change ``state`` without this writer, so a
+        row can leave ``auth_expired`` carrying its last recorded host.
+        The column is therefore AUTHORITATIVE only while the row is in
+        ``auth_expired``, which is the only state either kicker reads it
+        in; off-park it is inert history that no reader acts on.
+
         Returns the number of rows updated (0 or 1).
         """
         conn = self._require_conn()
@@ -1044,7 +1061,8 @@ class SqliteUploadStore:
                   upstream_response_headers_json = :upstream_headers_json,
                   captured_values_json = COALESCE(:captured_values_json, captured_values_json),
                   current_step_index = COALESCE(:current_step_index, current_step_index),
-                  last_step_completed = COALESCE(:last_step_completed, last_step_completed)
+                  last_step_completed = COALESCE(:last_step_completed, last_step_completed),
+                  auth_blocked_host = :auth_blocked_host
                 WHERE chain_id = :chain_id
                   AND state = :expected_state
                 """,
@@ -1063,6 +1081,7 @@ class SqliteUploadStore:
                     ),
                     "current_step_index": current_step_index,
                     "last_step_completed": last_step_completed,
+                    "auth_blocked_host": auth_blocked_host,
                     "expected_state": expected_state,
                 },
             )

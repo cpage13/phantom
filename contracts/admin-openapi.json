@@ -233,6 +233,18 @@
             "title": "Attempts",
             "type": "integer"
           },
+          "auth_blocked_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "While this chain is parked in ``auth_expired``: the host whose credential is blocking it, which is the host a fresh token or credential push has to name for the row to wake. On a multi-host chain this is NOT the chain's ``endpoint``, and pushing to the endpoint achieves nothing. Once the chain has left ``auth_expired`` the value is historical rather than current: it records the last credential that blocked the row, and nothing acts on it. None on a chain that has never parked on auth.",
+            "title": "Auth Blocked Host"
+          },
           "body_location": {
             "description": "Which body store currently holds the chain's body bytes. 'ram' = the RAM body store; 'file' = the file body store (PersistController flipped after fsync per plan \u00a7 0.5 invariant #6). Replaces the pre-Phase-1 tier + committed pair.",
             "enum": [
@@ -1773,6 +1785,18 @@
             "title": "Attempts",
             "type": "integer"
           },
+          "auth_blocked_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The host whose credential slot rejected this row, recorded when the sender parks it in ``auth_expired`` (D2/F6). AUTHORITATIVE only while the row is in ``auth_expired``, which is the only state either kicker reads it in; overwritten on every park, and inert history on a row a CAS writer (replay, cancel, mark_corrupted) moved out of that state. Distinct from ``endpoint``, which is the FIRST step's host: the executor authenticates against the CURRENT step's host, so on a multi-host chain the two differ and only this one identifies the credential the row is actually waiting on. None on a row that has never parked on auth.",
+            "title": "Auth Blocked Host"
+          },
           "body_discarded_at": {
             "anyOf": [
               {
@@ -1850,7 +1874,7 @@
             "type": "integer"
           },
           "endpoint": {
-            "description": "Hostname of the current step's target \u2014 ADR-002 cache axis.",
+            "description": "Hostname of the chain's FIRST step, computed once at admission and never updated. The admission-time cache axis (ADR-002): it is what the ingress bearer-cache write is keyed on. It is NOT the host a later step authenticates against, so the kickers' wake probe keys on ``auth_blocked_host`` instead (D2/F6).",
             "title": "Endpoint",
             "type": "string"
           },

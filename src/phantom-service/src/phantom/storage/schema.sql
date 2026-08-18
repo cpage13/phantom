@@ -49,6 +49,18 @@ CREATE TABLE IF NOT EXISTS uploads (
     storage_encoding                 TEXT NOT NULL DEFAULT 'original',
     body_size_bytes                  INTEGER NOT NULL DEFAULT 0,
     body_discarded_at                TEXT,
+    -- The host whose credential slot rejected THIS row, recorded when the
+    -- sender parks it in ``auth_expired`` (D2/F6). The executor authenticates
+    -- against the CURRENT step's host while ``endpoint`` is pinned to the
+    -- FIRST step's host, so on a multi-host chain the two differ and a wake
+    -- probe keyed on ``endpoint`` re-admits a row whose actual blocker is
+    -- still bad. Both kickers key their freshness probe on this column.
+    -- AUTHORITATIVE only while the row is in ``auth_expired``, which is the
+    -- only state either kicker reads it in. Overwritten on every park. A row
+    -- moved out of ``auth_expired`` by a CAS writer (replay, cancel,
+    -- mark_corrupted) keeps its last value as inert history: nothing reads it
+    -- there, and the admin field description says so.
+    auth_blocked_host                TEXT,
     upstream_status_code             INTEGER,
     upstream_response_headers_json   TEXT,
     last_step_completed              TEXT,

@@ -22,9 +22,10 @@ near-pure building blocks so the phase is independently verifiable:
   present but WITHOUT an ``uploads`` table -> BOOT_AS_IS.
 * The cycle-7 revision gate legs (plan 06_09 phase 1): the derived column set
   carries ``group_id`` / ``multifile_id`` / ``send_order`` / ``sent_at`` and
-  neither old name; ``SCHEMA_VERSION`` is pinned at 2; a version-1-stamped
-  old-shape DB discards and boots fresh stamped 2; a current-stamped DB
-  missing a required column discards and boots fresh.
+  neither old name; ``SCHEMA_VERSION`` is pinned at 3 (D2/F6 added
+  ``auth_blocked_host`` on top of the cycle-7 revision); a version-1-stamped
+  old-shape DB discards and boots fresh at the current stamp; a
+  current-stamped DB missing a required column discards and boots fresh.
 
 There are NO schema-backup reconciliation or marker tests in this phase: the
 discard is a self-contained, marker-less unlink (nothing is preserved).
@@ -91,8 +92,9 @@ def _make_db_without_uploads_table(db_path: Path) -> None:
 
 
 # The version stamp the cycle-6 (pre-revision) schema carried. The cycle-7
-# revision bumped SCHEMA_VERSION to 2; a DB stamped 1 is the old
-# batch_id / order_in_batch shape and must discard at the gate.
+# revision bumped SCHEMA_VERSION to 2 and D2/F6 bumped it again to 3; a DB
+# stamped 1 is the old batch_id / order_in_batch shape and must discard at
+# the gate, exactly as any other stale stamp does.
 _CYCLE6_SCHEMA_VERSION = 1
 
 
@@ -247,16 +249,18 @@ def test_expected_columns_reflect_cycle7_revision() -> None:
     assert "order_in_batch" not in EXPECTED_UPLOADS_COLUMNS
 
 
-def test_schema_version_is_cycle7_revision() -> None:
-    """``SCHEMA_VERSION`` is 2: the cycle-7 uploads revision.
+def test_schema_version_tracks_every_schema_shape_change() -> None:
+    """``SCHEMA_VERSION`` is 3: cycle-7's revision plus D2/F6's new column.
 
-    Deliberately pinned: the cycle-7 clean break REQUIRES the bump (a
-    version-1 DB carries the old batch_id shape and must discard at the
-    gate). When the schema next changes shape, bump the constant and
-    update this pin in the same change.
+    Deliberately pinned: each clean break REQUIRES the bump, because no
+    migration is registered and the gate discards a DB whose stamp does not
+    match. Version 2 was the cycle-7 uploads revision (a version-1 DB carries
+    the old batch_id shape); version 3 added ``auth_blocked_host`` (D2/F6).
+    When the schema next changes shape, bump the constant and update this pin
+    in the same change.
     """
-    expected_cycle7_version = 2
-    assert expected_cycle7_version == SCHEMA_VERSION
+    expected_current_version = 3
+    assert expected_current_version == SCHEMA_VERSION
 
 
 async def test_fresh_start_db_columns_superset_of_expected(tmp_path: Path) -> None:
@@ -389,7 +393,7 @@ async def test_gate_db_without_uploads_table_boots_as_is(tmp_path: Path) -> None
 
 
 async def test_gate_version1_old_shape_db_discards_and_boots_fresh(tmp_path: Path) -> None:
-    """A version-1-stamped old-shape (batch_id-era) DB is DELETED; fresh boot stamps 2.
+    """A version-1-stamped old-shape (batch_id-era) DB is DELETED; fresh boot re-stamps.
 
     The cycle-7 clean break: no migration is registered, so the gate
     routes the cycle-6 schema (stamped 1, batch_id / order_in_batch

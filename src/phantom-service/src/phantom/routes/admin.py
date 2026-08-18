@@ -644,6 +644,7 @@ async def get_upload(
         captured=captured,
         attempts=row.attempts,
         last_error=row.last_error,
+        auth_blocked_host=row.auth_blocked_host,
         metadata=metadata,
         steps=steps,
     )

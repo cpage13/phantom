@@ -669,7 +669,13 @@ class Sender:
     async def _on_auth_failure(
         self, store: UploadStore, row: UploadRow, result: FailedAuth
     ) -> None:
-        """Park the row in ``auth_expired`` and notify the AD minter if any."""
+        """Park the row in ``auth_expired`` and notify the AD minter if any.
+
+        Records the host whose credential slot actually rejected this row
+        (D2/F6). That is the CURRENT step's host, which on a multi-host chain
+        is not ``row.endpoint``, and it is the key both kickers probe when they
+        decide whether the row can wake.
+        """
         rowcount = await store.record_attempt_result(
             row.chain_id,
             new_state="auth_expired",
@@ -681,6 +687,7 @@ class Sender:
             captured_values=None,
             current_step_index=None,
             last_step_completed=None,
+            auth_blocked_host=result.blocked_host,
         )
         if rowcount == 0:
             await self._no_op_total.inc()
@@ -700,11 +707,17 @@ class Sender:
         if minter is None:
             return
         try:
-            await minter.on_401(row.endpoint, row.uid, result.observed_at)
+            # The BLOCKED host, not ``row.endpoint`` (D2/F6): the minter is
+            # being told which credential was rejected, and on a multi-host
+            # chain the row's endpoint is a different host whose credential is
+            # fine. ``AdMinter.on_401`` discards all three arguments today, so
+            # this fixes no live bug; it stops the wrong key being the one on
+            # offer the moment anyone uses those parameters.
+            await minter.on_401(result.blocked_host, row.uid, result.observed_at)
         except Exception:
             logger.warning(
-                "minter.on_401 raised for endpoint=%s uid=%s; ignored",
-                row.endpoint,
+                "minter.on_401 raised for blocked_host=%s uid=%s; ignored",
+                result.blocked_host,
                 row.uid,
                 exc_info=True,
             )

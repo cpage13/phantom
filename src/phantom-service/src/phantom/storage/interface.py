@@ -232,6 +232,7 @@ class UploadStore(Protocol):
         last_step_completed: str | None,
         expected_state: UploadState = "attempting",
         stamp_sent_at: bool = False,
+        auth_blocked_host: str | None = None,
     ) -> int:
         """Persist the result of one attempt against this row.
 
@@ -250,6 +251,19 @@ class UploadStore(Protocol):
         timestamp written to ``updated_at``. Passed True ONLY by the
         sender's chain-done success branch; the stamp survives operator
         replay (the NULL guard keeps the original delivery time).
+
+        ``auth_blocked_host`` (D2/F6) records the host whose credential
+        slot rejected this row; the sender's ``auth_expired`` park is
+        the only caller that passes one. What THIS writer guarantees:
+        the column is written UNCONDITIONALLY from a parameter
+        defaulting to ``None``, so every transition through it leaves
+        the column consistent with the state it just wrote. The limit,
+        stated in the same breath: THREE live CAS writers (``replay``,
+        ``cancel``, ``mark_corrupted``) change ``state`` without going
+        through here, so a row can leave ``auth_expired`` still
+        carrying its recorded host. The column is AUTHORITATIVE only
+        while the row is in ``auth_expired`` (the only state either
+        kicker reads it in); off-park it is inert history.
 
         Returns the number of rows updated (0 or 1).
         """

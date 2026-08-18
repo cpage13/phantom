@@ -141,11 +141,13 @@ def _hop_by_hop_names(headers: Mapping[str, str]) -> frozenset[str]:
     return _HOP_BY_HOP_HEADERS | listed
 
 
-# Placeholder written into ``RouteUnresolved.host`` when the step URL carries
-# no parseable host. NEVER substitute the raw URL here: the URL is
-# post-substitution producer data that can carry a query string with presigned
-# credentials, and ``RouteUnresolved.host`` is persisted verbatim into
-# ``last_error``, which the admin API surfaces.
+# Placeholder written into ``RouteUnresolved.host`` and into
+# ``FailedAuth.blocked_host`` when the step URL carries no parseable host.
+# NEVER substitute the raw URL here: the URL is post-substitution producer
+# data that can carry a query string with presigned credentials,
+# ``RouteUnresolved.host`` is persisted verbatim into ``last_error``, and
+# ``FailedAuth.blocked_host`` is persisted into ``uploads.auth_blocked_host``
+# (D2/F6); the admin API surfaces both.
 _NO_HOST_TOKEN = "<no-host>"
 
 # The AWS SigV4 query-string ("presigned") credential set, lower-cased. A
@@ -226,10 +228,21 @@ class Succeeded:
 
 @dataclass(frozen=True)
 class FailedAuth:
-    """Phantom-injected auth was rejected (401/403)."""
+    """Phantom-injected auth was rejected (401/403).
+
+    Attributes:
+        status: The upstream status, 401 or 403.
+        observed_at: When the rejection was observed.
+        blocked_host: The lower-cased host whose credential slot rejected this
+            row, which is the CURRENT step's host and NOT necessarily
+            ``row.endpoint`` (D2/F6). Both kickers key their freshness probe on
+            it, so a wrong value here re-creates the livelock rather than
+            merely mis-reporting it.
+    """
 
     status: int
     observed_at: datetime
+    blocked_host: str
 
 
 @dataclass(frozen=True)
@@ -674,9 +687,20 @@ class ChainExecutor:
             return deadline_check
 
         if resolved.auth_mode == "phantom_bearer":
+            # The host this row is authenticating against, SANITISED because it
+            # is PERSISTED (D2/F6): it rides ``FailedAuth.blocked_host`` into
+            # ``uploads.auth_blocked_host``, which the admin API surfaces on
+            # four paths. Neither ``_hostname(full_url)`` nor ``dest_host``
+            # below is what it receives: both carry the raw-input fallback,
+            # which is fine for a CACHE KEY (never persisted) and forbidden
+            # here, because a hostless step URL would splice its path and its
+            # credential-bearing query string into the admin API. A hostless
+            # URL records the fixed ``_NO_HOST_TOKEN`` literal instead.
+            parsed_host = urlparse(full_url).hostname
+            blocked = parsed_host.lower() if parsed_host else _NO_HOST_TOKEN
             slot = await self._cache.get(_hostname(full_url), row.uid)
             if slot is None or slot.status == "bad":
-                return FailedAuth(status=401, observed_at=self._clock())
+                return FailedAuth(status=401, observed_at=self._clock(), blocked_host=blocked)
             substituted_headers["Authorization"] = slot.bearer
         elif resolved.auth_mode == "aws_sigv4":
             # F4 precedence: Phantom's signature is authoritative on this route
@@ -702,10 +726,17 @@ class ChainExecutor:
             # store exists) and returns FailedAuth, which PARKS the row in
             # ``auth_expired`` (NOT terminal) to await a credential re-push.
             dest_host = HostCredKey(_hostname(full_url))
+            # The sanitised persisted host, same rule and same reason as the
+            # bearer arm above (D2/F6). ``dest_host`` is the credential-store
+            # KEY and keeps the raw-input fallback; ``blocked`` is what the row
+            # records. Stripping the presigned query span never touches the
+            # host, so this is the same host ``dest_host`` names.
+            parsed_host = urlparse(full_url).hostname
+            blocked = parsed_host.lower() if parsed_host else _NO_HOST_TOKEN
             row_cred = await self._signer_creds_for(dest_host)
             if row_cred is None or row_cred.status == "bad":
                 await self._mark_signer_creds_bad(dest_host)
-                return FailedAuth(status=401, observed_at=self._clock())
+                return FailedAuth(status=401, observed_at=self._clock(), blocked_host=blocked)
             try:
                 # Re-sign THIS request now (fresh X-Amz-Date) over the rehydrated
                 # body. botocore mutates ``substituted_headers`` in place; the
@@ -724,7 +755,7 @@ class ChainExecutor:
                     dest_host,
                 )
                 await self._mark_signer_creds_bad(dest_host)
-                return FailedAuth(status=401, observed_at=self._clock())
+                return FailedAuth(status=401, observed_at=self._clock(), blocked_host=blocked)
         elif resolved.auth_mode == "none":
             pass  # forward as-is — no Phantom-injected auth.
         else:  # pragma: no cover — exhaustive over the Literal above.
@@ -785,6 +816,15 @@ class ChainExecutor:
                 upstream_headers=response.headers,
             )
         if response.status in {401, 403}:
+            # The sanitised persisted host again (D2/F6). Recomputed rather
+            # than reused: this return is SHARED by all three ``auth_mode``
+            # arms, and the ``none`` arm computed nothing. That arm is also the
+            # one worth naming: a 401 from a route Phantom never authenticated
+            # records a blocked host for a slot that does not exist, so the row
+            # parks and no kicker owns it. That park is pre-existing behaviour
+            # which D2 makes visible in the column rather than changes.
+            parsed_host = urlparse(full_url).hostname
+            blocked = parsed_host.lower() if parsed_host else _NO_HOST_TOKEN
             if resolved.auth_mode == "phantom_bearer":
                 # Mark the slot bad so the sender knows what to do.
                 await self._cache.mark_bad(_hostname(full_url), row.uid)
@@ -793,7 +833,9 @@ class ChainExecutor:
                 # slot to ``bad`` so the row stays parked until a fresh
                 # credential re-push freshens it (the kicker wakes on ``fresh``).
                 await self._mark_signer_creds_bad(HostCredKey(_hostname(full_url)))
-            return FailedAuth(status=response.status, observed_at=self._clock())
+            return FailedAuth(
+                status=response.status, observed_at=self._clock(), blocked_host=blocked
+            )
         if 400 <= response.status < 500:
             return Failed4xx(status=response.status, body=response.body)
         if response.status >= 500:

@@ -195,7 +195,13 @@ class UploadRow(BaseModel):
     )
     endpoint: str = Field(
         ...,
-        description="Hostname of the current step's target — ADR-002 cache axis.",
+        description=(
+            "Hostname of the chain's FIRST step, computed once at admission "
+            "and never updated. The admission-time cache axis (ADR-002): it "
+            "is what the ingress bearer-cache write is keyed on. It is NOT "
+            "the host a later step authenticates against, so the kickers' "
+            "wake probe keys on ``auth_blocked_host`` instead (D2/F6)."
+        ),
     )
     uid: str = Field(
         ...,
@@ -253,6 +259,22 @@ class UploadRow(BaseModel):
         None,
         description=(
             "When the reaper deleted the body (per retention windows); None if body still present."
+        ),
+    )
+    auth_blocked_host: str | None = Field(
+        None,
+        description=(
+            "The host whose credential slot rejected this row, recorded when "
+            "the sender parks it in ``auth_expired`` (D2/F6). AUTHORITATIVE "
+            "only while the row is in ``auth_expired``, which is the only "
+            "state either kicker reads it in; overwritten on every park, and "
+            "inert history on a row a CAS writer (replay, cancel, "
+            "mark_corrupted) moved out of that state. Distinct from "
+            "``endpoint``, which is the FIRST step's host: the executor "
+            "authenticates against the CURRENT step's host, so on a "
+            "multi-host chain the two differ and only this one identifies "
+            "the credential the row is actually waiting on. None on a row "
+            "that has never parked on auth."
         ),
     )
     upstream_status_code: int | None = Field(
