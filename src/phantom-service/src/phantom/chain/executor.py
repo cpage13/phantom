@@ -145,15 +145,6 @@ def _hop_by_hop_names(headers: Mapping[str, str]) -> frozenset[str]:
     return _HOP_BY_HOP_HEADERS | listed
 
 
-# Placeholder written into ``RouteUnresolved.host`` and into
-# ``FailedAuth.blocked_host`` when the step URL carries no parseable host.
-# NEVER substitute the raw URL here: the URL is post-substitution producer
-# data that can carry a query string with presigned credentials,
-# ``RouteUnresolved.host`` is persisted verbatim into ``last_error``, and
-# ``FailedAuth.blocked_host`` is persisted into ``uploads.auth_blocked_host``
-# (D2/F6); the admin API surfaces both.
-_NO_HOST_TOKEN = "<no-host>"
-
 _TEXT_SCALARS: tuple[type, ...] = (str, int, float, bool)
 """Capture types that can be spliced into a TEXT context (F8).
 

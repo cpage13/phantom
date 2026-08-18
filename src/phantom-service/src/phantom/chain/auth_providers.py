@@ -37,11 +37,13 @@ from phantom.storage.interface import CredentialStore, TokenCache
 
 logger = logging.getLogger(__name__)
 
-# The literal recorded in place of a host when a step URL carries none (F1,
-# D2/F6). NEVER the raw URL: a step URL is post-substitution producer data and
-# can carry a presigned ``X-Amz-Signature`` in its query string, while this
-# value is persisted into ``uploads.auth_blocked_host`` and ``last_error``,
-# both of which the admin API surfaces.
+# Placeholder written into ``RouteUnresolved.host`` and into
+# ``FailedAuth.blocked_host`` when the step URL carries no parseable host.
+# NEVER substitute the raw URL here: the URL is post-substitution producer
+# data that can carry a query string with presigned credentials,
+# ``RouteUnresolved.host`` is persisted verbatim into ``last_error``, and
+# ``FailedAuth.blocked_host`` is persisted into ``uploads.auth_blocked_host``
+# (D2/F6); the admin API surfaces both.
 NO_HOST_TOKEN = "<no-host>"
 
 # The AWS SigV4 query-string ("presigned") credential set, lower-cased. A
