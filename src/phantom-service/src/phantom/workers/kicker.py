@@ -20,10 +20,14 @@ Everything else was already line-for-line identical: the rescan cadence, the
 H4 skip, the auth_mode partition, the send-deadline sweep, the re-admit, the
 guarded write and both of its refusal legs.
 
-The wake path reads the RECORDED blocked host (``row.auth_blocked_host or
-row.endpoint``, D2/F6) exactly ONCE per row and feeds it to both the route
-resolution (through :func:`row_resolved_route`) and the freshness probe, so
-the partition and the wake key can never sit on different host axes.
+The wake path reads the RECORDED blocked host (``auth_blocked_host or
+endpoint``, D2/F6) exactly ONCE per candidate and feeds it to both the route
+resolution (through :func:`resolved_route_for_host`) and the freshness probe,
+so the partition and the wake key can never sit on different host axes.
+
+The rescan reads a PROJECTION, not whole rows (CL5): the state filter and the
+H4 deliverability filter live in the store's statement, and the seven columns
+this loop actually touches come back undecoded by pydantic.
 """
 
 from __future__ import annotations
@@ -43,8 +47,8 @@ from phantom.models.token import TokenStatus
 from phantom.routing import AuthMode
 from phantom.storage.interface import CredentialStore, TokenCache
 from phantom.workers._expire import expire_row
-from phantom.workers._kicker_auth_mode import row_resolved_route
-from phantom.workers.saturation import AdmissionGranted, SlotDelta, is_deliverable
+from phantom.workers._kicker_auth_mode import resolved_route_for_host
+from phantom.workers.saturation import AdmissionGranted, SlotDelta
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +273,19 @@ class Kicker:
         Single persistent store (plan § 2.3.6): one store holds every row
         regardless of body_location. The flavour's oracle is the freshness
         oracle.
+
+        The pass reads :meth:`UploadStore.list_parked_candidates`, a seven
+        column projection whose statement carries the state filter and the H4
+        deliverability filter this loop used to apply in Python over every
+        non-terminal row (CL5). The candidates arrive oldest-parked first,
+        which is a DECLARED order rather than the physical row order the
+        unfiltered scan happened to return.
+
+        One freshness lookup is issued per distinct ``(probe_host, uid)`` slot
+        per pass, memoised in a dict that lives and dies inside this call. That
+        bound is deliberate: freshness is asked at SCAN time (see the class
+        docstring), and a memo covering one pass is no staler than the
+        candidate list the pass is judging.
         """
         if not self._oracle.configured:
             # No store of this kind for this instance, so there is nothing
@@ -277,27 +294,40 @@ class Kicker:
             return
         now = datetime.now(tz=UTC)
         store = self._instance.store
-        rows = await store.list_non_terminal()
-        for row in rows:
-            if row.state != "auth_expired":
-                continue
-            if not is_deliverable(row):
-                # H4 carve-out (R6-3); see ``is_deliverable`` for what the
-                # stamp means. Leave the row parked in ``auth_expired``.
-                continue
+        candidates = await store.list_parked_candidates()
+        # ONE freshness lookup per distinct slot key per tick. Parked rows
+        # cluster on few slots by construction: a row parks because ITS
+        # ``(endpoint, uid)`` slot went bad, and one bad credential parks every
+        # row behind it, so the un-deduped form issued a SELECT per row for the
+        # same answer. The dict is built and discarded inside this pass and
+        # that bound IS the safety argument: freshness must be asked at SCAN
+        # time, not at wake time (see the note on the wake path below), and
+        # within one pass every candidate is already being judged against a
+        # row list read before the first probe, so a value read once and reused
+        # here is no staler than the list it is applied to. A cache that
+        # outlived the tick would reintroduce exactly that bug.
+        #
+        # The key is the PAIR even for the host-keyed flavour, whose oracle
+        # ignores ``uid``: keying on the pair can only under-share (one extra
+        # lookup per distinct uid on a sigv4 route), while keying on the host
+        # alone would be right for one flavour and would wake a row against
+        # another identity's slot in the other.
+        probe_cache: dict[tuple[str, str], SlotStatus | None] = {}
+        for candidate in candidates:
             # The host that ACTUALLY rejected this row (D2/F6), not
-            # ``row.endpoint``: the executor authenticates or signs against
+            # ``endpoint``: the executor authenticates or signs against
             # the CURRENT step's host while ``endpoint`` is pinned to the
             # FIRST step's, so on a multi-host chain probing the endpoint
             # finds a fresh slot for a host the row is not blocked on and
             # re-queues it into a 1 Hz livelock. Computed ONCE here and used
             # by the no-route warning and the freshness probe alike; the
-            # route resolution below reads the same expression through
-            # ``row_resolved_route``. The ``or`` is D2's fallback for a row
+            # route resolution below is HANDED this same string, through
+            # ``resolved_route_for_host``, so only one copy of the expression
+            # exists (J1). The ``or`` is D2's fallback for a row
             # whose column is NULL; under the current schema policy a version
             # bump discards the DB rather than migrating it, so that
             # population is empty and the fallback is defence in depth.
-            probe_host = row.auth_blocked_host or row.endpoint
+            probe_host = candidate.auth_blocked_host or candidate.endpoint
             # auth_mode GUARD (plan §2.5): both flavours walk the SAME
             # auth_expired rows on the SAME saturation gate, so each must wake
             # ONLY rows of its kind, or the two would double-admit one row and
@@ -314,14 +344,14 @@ class Kicker:
             # resolve feeds BOTH the auth_mode partition and the deadline
             # sweep.
             try:
-                resolved = row_resolved_route(row, self._instance)
+                resolved = resolved_route_for_host(probe_host, self._instance)
             except ValueError:
                 logger.warning(
                     "%s: no route matches blocked_host=%s for chain_id=%s; "
                     "skipping this row (left in auth_expired for the next rescan)",
                     self._flavour.name,
                     probe_host,
-                    row.chain_id,
+                    candidate.chain_id,
                 )
                 continue
             if resolved.auth_mode != self._flavour.auth_mode:
@@ -337,15 +367,28 @@ class Kicker:
             # while its slot is still bad or absent, which is the whole point:
             # it has waited too long). The shared expire_row writer flips it
             # terminal-``expired`` and discards the body; the row then drops
-            # out of the next list_non_terminal (it is now in TERMINAL_STATES),
-            # so it is never woken. The row is ``auth_expired``, whose slot was
+            # out of the next candidate scan (``expired`` is not the park
+            # state), so it is never woken. The row is ``auth_expired``, whose slot was
             # ALREADY released at park (``_on_auth_failure``), so nothing here
             # may re-release it (a double-free that transiently under-counts
             # in_flight and over-admits past the cap); the writer reads that
             # off the row's own state rather than being told. ``continue``: do
             # not fall through to the wake.
             deadline = resolved.send_deadline_seconds
-            if deadline is not None and (now - row.received_at).total_seconds() > deadline:
+            if deadline is not None and (now - candidate.received_at).total_seconds() > deadline:
+                # The ONE arm that needs the whole row: ``expire_row`` is typed
+                # on :class:`UploadRow` and reads ``chain_id``, ``attempts``
+                # and ``body_discarded_at`` off it, and three phases own that
+                # signature, so CL5's projection re-reads instead of widening
+                # it. The cost is one ``SELECT *`` on a path that fires at most
+                # once in a row's lifetime, against a hot path that fires every
+                # second. The re-read is if anything MORE correct than the
+                # scan's snapshot: ``expire_row``'s own CAS guard already
+                # refuses a row that moved, and ``None`` here means the row was
+                # deleted between the scan and the re-read.
+                row = await store.get(candidate.chain_id)
+                if row is None:
+                    continue
                 await expire_row(
                     self._instance.store,
                     self._instance.saturation,
@@ -356,11 +399,15 @@ class Kicker:
                     upstream_status=None,
                 )
                 continue
-            # ``row.uid`` is unchanged by D2: a chain has one uid, so the
+            # ``uid`` is unchanged by D2: a chain has one uid, so the
             # recorded host is the only part of the slot key the row was
             # missing. The host-keyed flavour ignores it, deliberately and
-            # visibly, inside its own oracle.
-            status = await self._oracle.lookup(probe_host, row.uid)
+            # visibly, inside its own oracle. Memoised for this pass only; see
+            # ``probe_cache`` above for why one tick is the whole bound.
+            probe_key = (probe_host, candidate.uid)
+            if probe_key not in probe_cache:
+                probe_cache[probe_key] = await self._oracle.lookup(probe_host, candidate.uid)
+            status = probe_cache[probe_key]
             if status != "fresh":
                 continue
             # Re-admit through the saturation gate (§3.1 symmetry). The sender
@@ -368,17 +415,17 @@ class Kicker:
             # must take a slot back before it rejoins the in-flight set. On
             # refusal: log and leave the row in auth_expired, and the next
             # rescan tries again.
-            result = await self._instance.saturation.admit(row.body_size_bytes)
+            result = await self._instance.saturation.admit(candidate.body_size_bytes)
             if not isinstance(result, AdmissionGranted):
                 logger.warning(
                     "%s refused wake for chain_id=%s (saturated); "
                     "leaving in auth_expired for next rescan",
                     self._flavour.name,
-                    row.chain_id,
+                    candidate.chain_id,
                 )
                 continue
             reservation = result.reservation
-            self._log_wake(row.chain_id, probe_host, row.uid)
+            self._log_wake(candidate.chain_id, probe_host, candidate.uid)
             # M-W4-F7 (Phase 2 § 3.2.8): the kicker writes from
             # auth_expired -> queued. Pass the expected_state explicitly so
             # the default ``attempting`` predicate doesn't reject the update;
@@ -401,9 +448,9 @@ class Kicker:
             # with no live row behind the count.
             try:
                 write = await store.record_attempt_result(
-                    row.chain_id,
+                    candidate.chain_id,
                     new_state="queued",
-                    attempts=row.attempts,
+                    attempts=candidate.attempts,
                     next_attempt_at=now,
                     last_error=None,
                     upstream_status=None,
@@ -425,7 +472,7 @@ class Kicker:
                     "admitted slot returned, row stays auth_expired "
                     "for the next rescan",
                     self._flavour.name,
-                    row.chain_id,
+                    candidate.chain_id,
                 )
                 raise
             # ONE settle covers all three post-write legs, because the gate's
@@ -441,7 +488,7 @@ class Kicker:
             # the reservation consumes that arm) and is passed truthfully
             # rather than as a zero that would be a lie about the row.
             await self._instance.saturation.settle(
-                SlotDelta.from_attempt(write, size_bytes=row.body_size_bytes),
+                SlotDelta.from_attempt(write, size_bytes=candidate.body_size_bytes),
                 consumes=reservation,
             )
             if not write.landed:
@@ -454,7 +501,7 @@ class Kicker:
                     "from auth_expired before update; admitted slot "
                     "returned",
                     self._flavour.name,
-                    row.chain_id,
+                    candidate.chain_id,
                 )
 
     def _log_wake(self, chain_id: UUID, probe_host: str, uid: str) -> None:

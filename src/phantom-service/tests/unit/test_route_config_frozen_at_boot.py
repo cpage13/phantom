@@ -51,7 +51,7 @@ from phantom.routes.admission import (
 from phantom.routing import resolve_route
 from phantom.runtime.reload import apply_reload
 from phantom.strategies import build_retry_strategy
-from phantom.workers._kicker_auth_mode import row_resolved_route
+from phantom.workers._kicker_auth_mode import resolved_route_for_host
 from phantom.workers.saturation import SaturationGate
 from pydantic import ValidationError
 
@@ -218,7 +218,8 @@ async def test_reloaded_auth_mode_does_not_split_the_readers_view(
 
     row = make_upload_row(endpoint=_BOOT_HOST)
 
-    assert row_resolved_route(row, producer.ctx).auth_mode == "phantom_bearer"
+    probe_host = row.auth_blocked_host or row.endpoint
+    assert resolved_route_for_host(probe_host, producer.ctx).auth_mode == "phantom_bearer"
     assert resolve_route(row.endpoint, producer.ctx.cfg).auth_mode == "phantom_bearer"
 
 

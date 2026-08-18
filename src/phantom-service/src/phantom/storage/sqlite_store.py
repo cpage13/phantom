@@ -67,6 +67,7 @@ from phantom.storage.interface import (
     DeletedRowAccounting,
     DiscardOutcome,
     InsertClaimOutcome,
+    ParkedCandidate,
     ReplayOutcome,
     StateTally,
 )
@@ -102,6 +103,11 @@ _SYNCHRONOUS_TO_PRAGMA_INT: dict[str, int] = {
 }
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+
+# The one park state. Named rather than inlined because
+# :meth:`SqliteUploadStore.list_parked_candidates` binds it as a query
+# parameter and a bare literal there reads as an arbitrary string.
+_PARKED_STATE: Final[UploadState] = "auth_expired"
 
 # The metadata key the producer-side adapter stamps into every submission's
 # metadata key-value store. The by-local-uuid admin lookup is PINNED to this
@@ -1386,6 +1392,48 @@ class SqliteUploadStore:
         async with conn.execute(sql, tuple(TERMINAL_STATES)) as cur:
             fetched = await cur.fetchall()
         return [_row_to_upload(r) for r in fetched]
+
+    async def list_parked_candidates(self) -> list[ParkedCandidate]:
+        """Parked, still-deliverable rows, projected to the kicker's columns.
+
+        Seven columns and a hand decode, in the shape
+        :func:`_accounting_from_sql_row` and :meth:`list_oldest_ram_bodies`
+        already established, rather than ``SELECT *`` plus a strict
+        :class:`UploadRow` build per row (CL5).
+
+        Both predicates were Python filters over :meth:`list_non_terminal`
+        until CL5: the state test, and the H4 deliverability stamp
+        (:func:`phantom.workers.saturation.is_deliverable`, R6-3). A stamped
+        ``body_discarded_at`` means the reaper aged this row's body out, so
+        waking it would land it in ``corrupted`` and burn a saturation slot.
+
+        ``state = ?`` seeks ``idx_uploads_state_next_attempt``'s leading
+        column, where ``list_non_terminal``'s ``NOT IN`` cannot; the
+        ``ORDER BY`` costs one temp B-tree, which is the price of a declared
+        oldest-first wake order (see the Protocol docstring).
+        """
+        conn = self._read_connection()
+        sql = (
+            "SELECT chain_id, endpoint, uid, auth_blocked_host, received_at, "
+            "body_size_bytes, attempts "
+            "FROM uploads "
+            "WHERE state = ? AND body_discarded_at IS NULL "
+            "ORDER BY received_at ASC"
+        )
+        async with conn.execute(sql, (_PARKED_STATE,)) as cur:
+            fetched = await cur.fetchall()
+        return [
+            ParkedCandidate(
+                chain_id=UUID(r["chain_id"]),
+                endpoint=r["endpoint"],
+                uid=r["uid"],
+                auth_blocked_host=_optional_row_value(r, "auth_blocked_host"),
+                received_at=datetime.fromisoformat(r["received_at"]),
+                body_size_bytes=int(r["body_size_bytes"]),
+                attempts=int(r["attempts"]),
+            )
+            for r in fetched
+        ]
 
     async def counts_by_state(self) -> dict[UploadState, StateTally]:
         """Row count and summed body bytes per state, in one read.

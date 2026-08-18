@@ -60,6 +60,31 @@ class DeletedRowAccounting:
 
 
 @dataclass(frozen=True)
+class ParkedCandidate:
+    """The columns a kicker rescan reads off one parked row.
+
+    A projection rather than a whole :class:`~phantom.models.upload.UploadRow`
+    (CL5): the rescan runs every second against a backlog nothing bounds, and
+    decoding a strict row per candidate cost more than the query that found it.
+    Every field here is read by :meth:`phantom.workers.kicker.Kicker._rescan`;
+    nothing else is selected.
+
+    ``body_size_bytes`` is carried even though the wake's
+    :meth:`phantom.workers.saturation.SlotDelta.from_attempt` arm that reads it
+    never fires on this path, because the gate is handed the row's true size
+    rather than a zero that would be a lie about the row (ADR-036).
+    """
+
+    chain_id: UUID
+    endpoint: str
+    uid: str
+    auth_blocked_host: str | None
+    received_at: datetime
+    body_size_bytes: int
+    attempts: int
+
+
+@dataclass(frozen=True)
 class AttemptWriteOutcome:
     """Result of :meth:`UploadStore.record_attempt_result`.
 
@@ -432,6 +457,36 @@ class UploadStore(Protocol):
 
     async def list_non_terminal(self) -> list[UploadRow]:
         """Every row whose state is not in the terminal set."""
+        ...
+
+    async def list_parked_candidates(self) -> list[ParkedCandidate]:
+        """Parked, still-deliverable rows, projected to the kicker's columns.
+
+        ``WHERE state = 'auth_expired' AND body_discarded_at IS NULL``,
+        ordered oldest first. Both predicates were Python filters over
+        :meth:`list_non_terminal`'s result set until CL5 moved them into the
+        statement; because they read fields of rows fetched by one SELECT,
+        evaluating them inside that SELECT selects exactly the same rows.
+
+        The stamp half is the H4 carve-out (R6-3) that
+        :func:`phantom.workers.saturation.is_deliverable` states in full: a
+        stamped ``body_discarded_at`` means the reaper discarded the body by
+        retention policy, so waking the row would land it in ``corrupted`` on
+        the sender's next claim and burn a saturation slot on a row that can
+        never succeed. The predicate lives in SQL now; the reason lives here.
+
+        The order is DECLARED rather than incidental. Today's scan and the
+        index seek return the same sequence, because the single writer of
+        ``auth_expired`` stores a NULL ``next_attempt_at`` and equal index
+        keys fall back to rowid order, but nothing pins that invariant. Under
+        a saturated gate the rescan skips refused rows and retries next tick,
+        so WHICH rows wake in a tick is order dependent, and oldest-parked
+        first is the fairness property an operator expects of a backlog.
+
+        Returns:
+            One :class:`ParkedCandidate` per parked row, oldest
+            ``received_at`` first.
+        """
         ...
 
     async def counts_by_state(self) -> dict[UploadState, StateTally]:
