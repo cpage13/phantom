@@ -52,8 +52,13 @@ require updating ``STATUS_FOR_CODE`` and the ADR-010 error table.
 ``storage_corruption`` and ``codec_round_trip_drift`` are terminal
 chain-level codes surfaced on admin responses for rows that failed
 body verification at send time; they are never returned over HTTP at
-ingress and have no canonical HTTP status (mapped to ``500`` only as a
-defensive default).
+ingress.
+
+Since N2 ``storage_corruption`` is ALSO an admin error BODY, returned by
+the two single-chain body reads when the store holds fewer body_refs than
+the row declares, so its ``500`` is a real response status on that path
+rather than only a defensive default. ``codec_round_trip_drift`` remains a
+``last_error`` value alone.
 """
 
 

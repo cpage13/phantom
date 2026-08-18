@@ -82,7 +82,11 @@ from phantom.observability.metrics import MetricsRegistry
 from phantom.routes._version import ADMIN_ROUTER_PREFIX
 from phantom.routing import host_key_for
 from phantom.runtime.reload import RELOAD_FAILURE_ERRORS, apply_reload
-from phantom.storage.errors import ReplayBodyDiscardedError, ReplayRefusedAttemptingError
+from phantom.storage.errors import (
+    BodyMissingError,
+    ReplayBodyDiscardedError,
+    ReplayRefusedAttemptingError,
+)
 from phantom.storage.integrity import (
     list_quarantines,
     load_backup_manifest,
@@ -899,18 +903,38 @@ def _local_uuid_for_row(row: UploadRow) -> UUID | None:
         return None
 
 
+def _refuse_incomplete_body(row: UploadRow, body: dict[str, bytes]) -> None:
+    """Raise when the store returned fewer body_refs than the row declares.
+
+    N2, the read-side twin of the sender's F2 check. ``BodyStore.get_all``
+    returns what the store HAS: a declared ref whose file was never written,
+    or was removed before the traversal began, is simply absent from the
+    returned dict rather than raising. ADR-014 treats a body as an atomic
+    unit, so a short answer is a missing body and these surfaces must refuse
+    it instead of streaming a truncated 200.
+
+    Raises:
+        BodyMissingError: When any declared ref is absent, carrying the
+            sorted missing names.
+    """
+    missing = set(row.body_hashes.keys()) - set(body.keys())
+    if missing:
+        raise BodyMissingError(row.chain_id, sorted(missing))
+
+
 @router.get("/chains/{chain_id}/body")
 async def get_upload_body(
     chain_id: UUID,
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
 ) -> StreamingResponse:
-    """Stream the body bytes."""
+    """Stream the body bytes, or refuse when any declared body_ref is absent."""
     ctx, row = await _find_upload_with_ctx(dispatcher, chain_id)
     if row is None or ctx is None:
         raise NotFoundError(f"chain {chain_id} not found")
     # Single body store reference; HybridBodyStore
     # routes the read to the RAM or file half by RAM-presence.
     body = await ctx.body_store.get_all(row.chain_id)
+    _refuse_incomplete_body(row, body)
     payload = b"".join(body.values())
     return StreamingResponse(_chunk_bytes(payload), media_type="application/octet-stream")
 
@@ -930,15 +954,18 @@ async def get_upload_bundle(
     chain_id: UUID,
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
 ) -> Response:
-    """Return metadata + body as a simple JSON envelope.
+    """Return metadata + body as a simple JSON envelope, or refuse a short body.
 
     A real multipart implementation would require an SDK; the simple
     JSON envelope is sufficient for admin tooling and the v1 milestone.
+    An envelope carrying fewer body_refs than the row declares is refused
+    with ``storage_corruption`` rather than returned as a 200 (N2).
     """
     ctx, row = await _find_upload_with_ctx(dispatcher, chain_id)
     if row is None or ctx is None:
         raise NotFoundError(f"chain {chain_id} not found")
     body = await ctx.body_store.get_all(row.chain_id)
+    _refuse_incomplete_body(row, body)
     bundle = {
         "metadata": json.loads(row.model_dump_json()),
         "body_refs": {name: data.hex() for name, data in body.items()},
@@ -951,7 +978,12 @@ async def extract_uploads(
     filter_body: Annotated[ExtractFilter, Body()],
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
 ) -> StreamingResponse:
-    """Stream a tar of matching bodies plus a manifest.json."""
+    """Stream a tar of matching bodies plus a manifest.json.
+
+    Each manifest entry carries ``missing_body_refs``, the declared refs the
+    archive does NOT contain, empty for a complete chain (N2). The stream
+    cannot refuse: its 200 is already on the wire when a shortfall is found.
+    """
     targets = _scope_instances(dispatcher, filter_body.instance)
     return StreamingResponse(
         _build_tar_stream(targets, filter_body),
@@ -963,7 +995,11 @@ async def extract_uploads(
 async def export_tar(
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
 ) -> StreamingResponse:
-    """Stream every buffered body + manifest.json (ADR-005)."""
+    """Stream every buffered body + manifest.json (ADR-005).
+
+    Each manifest entry carries ``missing_body_refs``, the declared refs the
+    archive does NOT contain, empty for a complete chain (N2).
+    """
     targets = list(dispatcher.all_instances())
     return StreamingResponse(
         _build_tar_stream(
@@ -1041,13 +1077,36 @@ async def _build_tar_stream(
                         "sent_at": (row.sent_at.isoformat() if row.sent_at else None),
                         "body_size_bytes": row.body_size_bytes,
                         "storage_encoding": row.storage_encoding,
+                        # N2: which declared body_refs are NOT in this archive,
+                        # empty for a complete chain. The tar path cannot
+                        # refuse the way the two single-chain reads do: this
+                        # generator is handed to StreamingResponse, so by the
+                        # time the shortfall is known the 200 and its headers
+                        # are already on the wire and an exception would
+                        # truncate a response the client was told was fine.
+                        # So the refusal is DATA. Before N2 a manifest entry
+                        # described a chain whose bytes were absent from the
+                        # archive with nothing anywhere saying so.
+                        "missing_body_refs": [],
                     }
                 )
                 # Pack the body bytes through the mode-selected body store.
                 try:
                     body = await ctx.body_store.get_all(row.chain_id)
                 except KeyError:
+                    # The whole-directory case of the same shortfall, not a
+                    # silent drop: every declared ref is missing.
+                    manifest[-1]["missing_body_refs"] = sorted(row.body_hashes.keys())
+                    logger.warning(
+                        "export: no body files for chain_id=%s; the archive "
+                        "omits them and the manifest entry records every "
+                        "declared body_ref as missing",
+                        row.chain_id,
+                    )
                     continue
+                manifest[-1]["missing_body_refs"] = sorted(
+                    set(row.body_hashes.keys()) - set(body.keys())
+                )
                 for name, data in body.items():
                     info = tarfile.TarInfo(name=f"bodies/{row.chain_id}/{name}")
                     info.size = len(data)
@@ -2089,6 +2148,20 @@ ADMIN_ERROR_SPECS: dict[type[Exception], AdminErrorSpec[Any]] = {
             "Supply '<key>:<value>' with non-empty key and value."
         ),
         details=lambda exc: {"key_value_match": exc.raw},
+    ),
+    BodyMissingError: AdminErrorSpec[BodyMissingError](
+        code="storage_corruption",
+        message=lambda exc: (
+            f"Chain {exc.chain_id} declares body_refs that the body store "
+            f"does not have: {', '.join(exc.missing)}. The read is refused "
+            "rather than answered short, because ADR-014 treats a body as an "
+            "atomic unit. Inspect the row via GET /v1/admin/chains/"
+            f"{exc.chain_id}; the bytes are not recoverable from this surface."
+        ),
+        details=lambda exc: {
+            "chain_id": str(exc.chain_id),
+            "missing_body_refs": list(exc.missing),
+        },
     ),
     BulkDeleteFilterEmptyError: AdminErrorSpec[BulkDeleteFilterEmptyError](
         code="bulk_delete_filter_empty",

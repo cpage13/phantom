@@ -2474,7 +2474,7 @@
     },
     "/v1/admin/chains/extract": {
       "post": {
-        "description": "Stream a tar of matching bodies plus a manifest.json.",
+        "description": "Stream a tar of matching bodies plus a manifest.json.\n\nEach manifest entry carries ``missing_body_refs``, the declared refs the\narchive does NOT contain, empty for a complete chain (N2). The stream\ncannot refuse: its 200 is already on the wire when a shortfall is found.",
         "operationId": "extract_uploads_v1_admin_chains_extract_post",
         "requestBody": {
           "content": {
@@ -2584,7 +2584,7 @@
     },
     "/v1/admin/chains/{chain_id}/body": {
       "get": {
-        "description": "Stream the body bytes.",
+        "description": "Stream the body bytes, or refuse when any declared body_ref is absent.",
         "operationId": "get_upload_body_v1_admin_chains__chain_id__body_get",
         "parameters": [
           {
@@ -2623,7 +2623,7 @@
     },
     "/v1/admin/chains/{chain_id}/bundle": {
       "get": {
-        "description": "Return metadata + body as a simple JSON envelope.\n\nA real multipart implementation would require an SDK; the simple\nJSON envelope is sufficient for admin tooling and the v1 milestone.",
+        "description": "Return metadata + body as a simple JSON envelope, or refuse a short body.\n\nA real multipart implementation would require an SDK; the simple\nJSON envelope is sufficient for admin tooling and the v1 milestone.\nAn envelope carrying fewer body_refs than the row declares is refused\nwith ``storage_corruption`` rather than returned as a 200 (N2).",
         "operationId": "get_upload_bundle_v1_admin_chains__chain_id__bundle_get",
         "parameters": [
           {
@@ -2795,7 +2795,7 @@
     },
     "/v1/admin/export.tar": {
       "get": {
-        "description": "Stream every buffered body + manifest.json (ADR-005).",
+        "description": "Stream every buffered body + manifest.json (ADR-005).\n\nEach manifest entry carries ``missing_body_refs``, the declared refs the\narchive does NOT contain, empty for a complete chain (N2).",
         "operationId": "export_tar_v1_admin_export_tar_get",
         "responses": {
           "200": {

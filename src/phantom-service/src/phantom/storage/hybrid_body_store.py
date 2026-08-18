@@ -129,6 +129,15 @@ class HybridBodyStore:
         commit-last-column flip lands. RAM-side :class:`KeyError` (no
         entry for ``chain_id``) is the explicit fall-through-to-disk
         path — see :func:`contextlib.suppress` rationale on :meth:`get`.
+
+        COMPLETENESS CAVEAT (N2): a NON-EMPTY RAM entry short-circuits the
+        disk read outright, with no merge and no comparison against the row's
+        declared refs. That is safe only while
+        :meth:`phantom.storage.ram_body_store.RamBodyStore.put` replaces whole
+        entries, which makes a partial RAM entry unreachable through ``put``
+        today. A future partial migration would turn this line into a silent
+        truncation, which is why every caller owns the declared-versus-returned
+        comparison rather than trusting the store to be complete.
         """
         with contextlib.suppress(KeyError):
             ram_refs = await self._ram.get_all(chain_id)

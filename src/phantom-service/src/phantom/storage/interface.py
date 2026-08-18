@@ -903,7 +903,16 @@ class BodyStore(Protocol):
         ...
 
     async def get_all(self, chain_id: UUID) -> dict[str, bytes]:
-        """Read every body_ref for ``chain_id`` as ``{name: bytes}``."""
+        """Read every body_ref for ``chain_id`` as ``{name: bytes}``.
+
+        COMPLETENESS IS THE CALLER'S: this returns what the store HAS, and it
+        does not compare that against the row's declared ``body_hashes``. A
+        whole missing chain directory raises ``KeyError``, but a declared ref
+        whose file was never written, or was removed before the traversal
+        began, is simply ABSENT from the returned mapping. Every caller that
+        cares owns the ``declared - returned`` comparison: the sender's load
+        path (F2) and the three admin read surfaces (N2).
+        """
         ...
 
     async def has_body_ref(self, chain_id: UUID, name: str) -> bool:
