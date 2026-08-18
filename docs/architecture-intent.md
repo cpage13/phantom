@@ -656,7 +656,9 @@ bugs.
 18. **Config distribution follows ADR-031.** Live-snapshot read at
     every point of use is canonical; the push/rebuild exceptions and
     the restart-required set are enumerated in the ADR-013 table; the
-    knob-matrix contract test enforces the table.
+    knob-matrix contract test enforces the table, both halves of it
+    (the reloadable rows assert the value moved, the D1 route-block
+    rows assert it did not).
 
 ### Reliability invariants: runtime enforcement breakdown
 

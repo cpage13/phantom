@@ -10,17 +10,20 @@ and asserts the consumer-visible truth.
 
 Observation level per mechanism, deliberately:
 
-* live-read rows assert the LIVE SNAPSHOT (or the repointed ``cfg``)
-  carries the new value - the per-tick/per-request consumer reads are
+* live-read rows assert the LIVE SNAPSHOT carries the new value - the
+  per-tick/per-request consumer reads are
   pinned component-by-component by the tests the ADR-013 table cites
   (R6-2 watcher, T1 janitor cadence, hot-reload e2e, ...); this module
   pins the YAML-to-snapshot leg those tests assume.
 * push rows assert the pushed artifact (the gate's caps).
 * rebuild rows assert the rebuilt artifact (the strategy object; the
   codec factory's product).
+* restart rows assert the consumer-visible value is UNCHANGED after a
+  real reload, which is the mirror of the other three and the only
+  shape that can express a knob which must not move (D1/F5).
 
-``test_matrix_mirrors_the_adr_table`` pins the case set against a
-hand-maintained literal mirror of the table's reloadable rows (the ADR
+``test_matrix_mirrors_the_adr_table`` pins BOTH case sets against
+hand-maintained literal mirrors of the table's rows (the ADR
 markdown itself is not parsed, so a knob added ONLY to the ADR text
 must be brought here by review - C7 enforcement-scope note); a
 distribution regression fails its knob's case. This converts the
@@ -70,6 +73,15 @@ _SAT_DISK_B = 999_999
 _RETRY_INTERVALS_B = [9, 9]
 _LOOKUP_CAPTURE_B = "create_file"
 _LOOKUP_PATH_B = "$.id"
+# Distinct from the probe-derived defaults so the before != expected
+# guard holds on any host.
+_SAT_LARGE_THRESHOLD_B = 7_654_321
+_SAT_MAX_LARGE_B = 3
+
+# Values the restart cases rewrite the frozen blocks to. Each must differ
+# from the base payload's value or the anti-vacuity guard trips.
+_OTHER_HOST = "other.example.com"
+_OTHER_DATA_DIR = "inst-a-moved"
 
 
 @dataclass(frozen=True)
@@ -90,6 +102,15 @@ class _KnobCase:
     mutate: Callable[[dict[str, Any]], None]
     observe: Callable[[_Producer], object]
     expected: object
+
+
+@dataclass(frozen=True)
+class _RestartKnobCase:
+    """One ADR-013 restart-required row: how to change it, where to prove it did NOT move."""
+
+    knob: str
+    mutate: Callable[[dict[str, Any]], None]
+    observe: Callable[[_Producer], object]
 
 
 def _base_yaml_payload(data_dir: Path) -> dict[str, Any]:
@@ -267,11 +288,15 @@ _CASES: tuple[_KnobCase, ...] = (
         mutate=lambda raw: raw["instances"][0].update(
             {"admin_lookup": {"capture_name": _LOOKUP_CAPTURE_B, "json_path": _LOOKUP_PATH_B}}
         ),
-        # The lookup route reads the binding per request off the
-        # repointed cfg.
+        # The lookup routes read the binding per request off the live
+        # snapshot, which is where F5 moved it when the cfg repoint was
+        # deleted.
         observe=lambda producer: (
-            (producer.ctx.cfg.admin_lookup.capture_name, producer.ctx.cfg.admin_lookup.json_path)
-            if producer.ctx.cfg.admin_lookup is not None
+            (
+                _snapshot(producer).admin_lookup.capture_name,
+                _snapshot(producer).admin_lookup.json_path,
+            )
+            if _snapshot(producer).admin_lookup is not None
             else None
         ),
         expected=(_LOOKUP_CAPTURE_B, _LOOKUP_PATH_B),
@@ -299,6 +324,22 @@ _CASES: tuple[_KnobCase, ...] = (
         expected=_SAT_DISK_B,
     ),
     _KnobCase(
+        knob="saturation.large_body_threshold_bytes",
+        mutate=lambda raw: raw.setdefault("saturation", {}).update(
+            {"large_body_threshold_bytes": _SAT_LARGE_THRESHOLD_B}
+        ),
+        observe=lambda producer: producer.ctx.saturation.large_body_threshold_bytes,
+        expected=_SAT_LARGE_THRESHOLD_B,
+    ),
+    _KnobCase(
+        knob="saturation.max_large_in_flight",
+        mutate=lambda raw: raw.setdefault("saturation", {}).update(
+            {"max_large_in_flight": _SAT_MAX_LARGE_B}
+        ),
+        observe=lambda producer: producer.ctx.saturation.max_large_in_flight,
+        expected=_SAT_MAX_LARGE_B,
+    ),
+    _KnobCase(
         knob="retry.default_strategy",
         mutate=lambda raw: raw.setdefault("retry", {}).update(
             {
@@ -311,6 +352,25 @@ _CASES: tuple[_KnobCase, ...] = (
         # The rebuilt artifact (the ADR-031 rebuild exception).
         observe=lambda producer: type(producer.ctx.retry_strategy).__name__,
         expected="FixedIntervalsStrategy",
+    ),
+)
+
+
+_RESTART_CASES: tuple[_RestartKnobCase, ...] = (
+    _RestartKnobCase(
+        knob="instance.routes",
+        mutate=lambda raw: raw["instances"][0]["routes"][0].update({"auth_mode": "aws_sigv4"}),
+        observe=lambda producer: producer.ctx.cfg.routes[0].auth_mode,
+    ),
+    _RestartKnobCase(
+        knob="instance.host_prefixes",
+        mutate=lambda raw: raw["instances"][0].update({"host_prefixes": [_OTHER_HOST]}),
+        observe=lambda producer: list(producer.ctx.cfg.host_prefixes),
+    ),
+    _RestartKnobCase(
+        knob="instance.data_dir",
+        mutate=lambda raw: raw["instances"][0].update({"data_dir": _OTHER_DATA_DIR}),
+        observe=lambda producer: producer.ctx.cfg.data_dir,
     ),
 )
 
@@ -343,13 +403,49 @@ async def test_reloaded_knob_reaches_its_consumer(case: _KnobCase, tmp_path: Pat
     )
 
 
-async def test_matrix_mirrors_the_adr_table() -> None:
-    """The matrix covers every reloadable row of the ADR-013 table.
+@pytest.mark.parametrize("case", _RESTART_CASES, ids=lambda c: c.knob)
+async def test_restart_required_knob_does_not_reach_its_consumer(
+    case: _RestartKnobCase, tmp_path: Path
+) -> None:
+    """One real reload per frozen knob; the consumer-visible value must NOT move.
 
-    This literal set mirrors the table's reloadable rows (the
-    restart-required rows are pinned elsewhere: topology by
+    The mirror of ``test_reloaded_knob_reaches_its_consumer`` for the D1
+    set (ADR-013): ``routes``, ``host_prefixes`` and ``data_dir`` are
+    frozen at boot and a reload refuses them with a WARNING. The second
+    assertion is the anti-vacuity guard: the rewritten YAML really does
+    carry the new value, so a case cannot pass because its mutation was
+    a no-op.
+    """
+    producer = _boot_producer(tmp_path)
+    before = copy.deepcopy(case.observe(producer))
+
+    raw = copy.deepcopy(producer.raw)
+    case.mutate(raw)
+    producer.settings_path.write_text(yaml.safe_dump(raw))
+    reloaded = Settings.reload_from_yaml(producer.settings_path)
+    assert reloaded.instances[0] != producer.ctx.cfg, (
+        f"test bug: knob {case.knob}'s mutation produced an identical instance block"
+    )
+
+    await apply_reload(producer.holder, producer.settings_path, [producer.ctx])
+
+    assert case.observe(producer) == before, (
+        f"knob {case.knob} reached its consumer after a reload; it is "
+        "restart-required (D1/ADR-013) and the boot snapshot must be frozen"
+    )
+
+
+async def test_matrix_mirrors_the_adr_table() -> None:
+    """The matrix covers BOTH halves of the ADR-013 table.
+
+    Two literal sets, one per half. The reloadable set mirrors the
+    table's live-read, push and rebuild rows; the restart set mirrors
+    the D1 rows, which used to be "pinned elsewhere" and were in fact
+    pinned nowhere, which is exactly how ``routes`` came to be live-read
+    without anyone noticing. Two of the elsewhere-pins remain true and
+    are still elsewhere: topology by
     ``test_reload_instance_removed.py``, ad_mint by the reload unit
-    tests). Adding a knob to the matrix without this mirror set, or
+    tests. Adding a knob to either tuple without its mirror set, or
     removing a case, fails here; the ADR markdown is not parsed, so a
     table edit must be brought to BOTH in the same commit. Async only
     to sit cleanly under the module-wide asyncio pytestmark (the body
@@ -372,6 +468,15 @@ async def test_matrix_mirrors_the_adr_table() -> None:
         "saturation.max_in_flight",
         "saturation.max_in_flight_bytes",
         "saturation.max_disk_bytes",
+        "saturation.large_body_threshold_bytes",
+        "saturation.max_large_in_flight",
         "retry.default_strategy",
     }
     assert {case.knob for case in _CASES} == expected_rows
+
+    expected_restart_rows = {
+        "instance.routes",
+        "instance.host_prefixes",
+        "instance.data_dir",
+    }
+    assert {case.knob for case in _RESTART_CASES} == expected_restart_rows
