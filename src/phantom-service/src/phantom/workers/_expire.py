@@ -19,10 +19,6 @@ edge. :mod:`phantom.workers.sender` does not import the kickers and the kickers
 do not import the sender, so a leaf module imported by all three creates no
 cycle.
 
-The send-deadline TRANSITION sites that CALL this writer (the executor gate and
-the parked-``auth_expired`` sweeps) are added separately; until they land,
-``expire_row`` has no callers and nothing produces the ``expired`` state.
-
 See:
 - ADR-032: the ``expired`` terminal state.
 - ADR-015: state transitions owned by the sender (and why this one writer

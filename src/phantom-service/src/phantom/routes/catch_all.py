@@ -39,8 +39,12 @@ header it signed with throwaway credentials; it knows nothing of Phantom's
   :func:`phantom.routes.send.resolve_and_admit` prelude then runs the
   identical degraded-guard → dispatch → :func:`admit_chain` tail that
   ``POST /v1/send`` uses, so the synthesized envelope is buffered exactly
-  like a producer-supplied one. Forwarding is AS-IS — Phantom does not
-  re-sign in Phase 1 (the ``aws_sigv4`` signer is Phase 2). The
+  like a producer-supplied one. Forwarding is AS-IS only where the resolved
+  route says ``auth_mode: none``: the route's mode decides bearer injection
+  or SigV4 re-signing, and it decides that regardless of how the chain was
+  created, because :mod:`phantom.routing` resolves by hostname with no
+  envelope-origin branch (ADR-033). A raw-intake request on an ``aws_sigv4``
+  route IS re-signed. The
   synthesized chain is marked LITERAL (``templated=False``): it has no
   captures, and its URL carries an object key that may legally contain a
   ``{{...}}`` span, which would otherwise fail substitution at send time
