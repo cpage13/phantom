@@ -42,6 +42,7 @@ from phantom.chain.executor import (
     CaptureExpiredRewind,
     CaptureExpiredStored,
     CaptureIncomplete,
+    CaptureNotRenderable,
     Failed4xx,
     Failed5xx,
     FailedAuth,
@@ -299,6 +300,18 @@ class Sender:
         if isinstance(result, TemplateUnresolved):
             await self._on_terminal_failure(
                 store, row, last_error=f"template_unresolved:{result.token()}"
+            )
+            return
+        if isinstance(result, CaptureNotRenderable):
+            # F8. Terminal ``failed`` and NOT retryable: the capture is already
+            # persisted, so re-rendering it produces the identical refusal and a
+            # retry only burns the budget. Like Q3's arm above, the whole payload
+            # is the variant's own ``token()``, which is identifiers and closed
+            # literals only; the captured VALUE never reaches ``last_error``.
+            # Must stay ABOVE the exhaustiveness tail, which crashes loudly on an
+            # unhandled union member by design.
+            await self._on_terminal_failure(
+                store, row, last_error=f"capture_not_renderable:{result.token()}"
             )
             return
         if isinstance(result, RouteUnresolved):

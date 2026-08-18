@@ -5,11 +5,17 @@ of the chain identified by ``row.current_step_index``. The executor
 owns:
 
 1. The capture-TTL gate (ADR-011) — checked first.
-2. ``{{step.var}}`` placeholder substitution in URL, headers, and JSON body.
-   Skipped ENTIRELY for a chain marked ``templated=False`` (N3): no
-   substitution runs and the capture-TTL gate returns immediately, so a
-   brace span is forwarded as content. The raw-intake catch-all sets that
-   marker, because an object key may legally contain braces.
+2. ``{{step.var}}`` placeholder substitution in URL, headers, and body.
+   A JSON body is substituted INSIDE the parsed structure and serialized
+   ONCE at the end (F8), so ``json.dumps`` does the escaping and a captured
+   quote or backslash cannot produce malformed output; the three text
+   contexts have no serializer, so they run a type gate instead and refuse
+   a capture that cannot be spliced as text. Substitution is skipped
+   ENTIRELY for a chain marked ``templated=False`` (N3): nothing is
+   substituted, nothing is refused and the capture-TTL gate returns
+   immediately, so a brace span is forwarded as content. The raw-intake
+   catch-all sets that marker, because an object key may legally contain
+   braces.
 3. Auth injection — looks up ``token_cache.get(endpoint, uid)`` when the
    route is ``phantom_bearer``.
 4. Idempotency-header injection per the step's ``idempotency_header``.
@@ -22,17 +28,20 @@ owns:
    forwarded.
 6. Capture extraction from the response (JSONPath, first-match).
 7. Result classification (Succeeded / 4xx / 5xx / FailedAuth /
-   FailedNetwork / TemplateUnresolved / CaptureExpiredStored /
-   RouteUnresolved / InlineBodyInvalid). ``TemplateUnresolved`` carries
-   IDENTIFIERS ONLY (step, site, placeholder names): it is persisted into
-   ``last_error``, which the admin API surfaces, and a step URL or a header
-   value can carry credential material.
+   FailedNetwork / TemplateUnresolved / CaptureNotRenderable /
+   CaptureExpiredStored / RouteUnresolved / InlineBodyInvalid).
+   ``TemplateUnresolved`` carries IDENTIFIERS ONLY (step, site, placeholder
+   names): it is persisted into ``last_error``, which the admin API
+   surfaces, and a step URL or a header value can carry credential
+   material. ``CaptureNotRenderable`` carries the same rule for the same
+   reason, and its hazard is larger: a capture is upstream response data.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -41,7 +50,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from phantom.chain.jsonpath import extract, find_placeholders, substitute
+from phantom.chain.jsonpath import extract, find_placeholders, substitute, whole_placeholder
 from phantom.chain.parser import (
     InlineBodyDecodeError,
     decode_inline_body_b64,
@@ -155,6 +164,20 @@ _SIGV4_PRESIGN_QUERY_PARAMS: frozenset[str] = frozenset(
         "x-amz-signedheaders",
     }
 )
+
+
+_TEXT_SCALARS: tuple[type, ...] = (str, int, float, bool)
+"""Capture types that can be spliced into a TEXT context (F8).
+
+``bool`` is an ``int`` subclass so it is already covered, and it is listed for
+the reader rather than for the check. ``None`` is admitted separately at the
+gate, because it renders as the string ``"None"`` exactly as it does today and
+the required-capture guard already turns a referenced-but-absent capture into a
+retryable ``CaptureIncomplete`` before substitution runs.
+"""
+
+_CONTROL_CHARS = re.compile(r"[\r\n\x00]")
+"""Characters that make a header value un-sendable: ``h11`` refuses them."""
 
 
 def _strip_presigned_query(url: str) -> str:
@@ -310,6 +333,69 @@ class TemplateUnresolved:
 
 
 @dataclass(frozen=True)
+class CaptureNotRenderable:
+    """A capture cannot be rendered into the context its placeholder sits in (F8).
+
+    Two reasons, and both are terminal. A NON-SCALAR (a captured object or
+    array) can only be delivered as structure, and only one position offers
+    that: a JSON body node that is exactly one placeholder and is not a key.
+    Anywhere else, the result has to be a string, and the old path spliced a
+    PYTHON REPR (``{'a': 1}``) into it, which the upstream accepted as
+    plausible data. A CONTROL CHARACTER (CR, LF or NUL) in a captured header
+    value cannot be sent at all: ``h11`` refuses to build the request, httpx
+    surfaces that as an ``HTTPError``, the executor classified it
+    ``FailedNetwork`` and the row burned its whole retry budget on a request
+    that could never exist.
+
+    Terminal ``failed`` rather than retryable, because a retry is provably
+    futile: the capture is already persisted, so re-rendering it produces the
+    same refusal.
+
+    Carries IDENTIFIERS ONLY, never the captured value, and that is a proven
+    property rather than a hope. ``TemplateUnresolved`` carries the same rule
+    because ``last_error`` reached an admin surface holding a presigned URL; a
+    capture is UPSTREAM RESPONSE DATA, which is the same hazard class and can
+    be worse. Every field below is an identifier or a closed literal.
+
+    Attributes:
+        step_name: The CONSUMING step, whose template holds the placeholder.
+            Regex-constrained to ``^[a-z][a-z0-9_]*$`` by ``ChainStep``.
+        site: WHICH PART of the step refused, as a closed ``Literal``, the
+            same three members ``TemplateUnresolved`` uses.
+        placeholder: ``producing_step.capture_name``. Both halves are bounded
+            by ``_PLACEHOLDER_RE``'s ``[a-z][a-z0-9_]*`` groups, so neither
+            can carry URL or JSON text.
+        reason: Which rule refused, as a closed ``Literal``.
+        header_name: The header whose value refused, and ``None`` for the
+            ``url`` and ``body`` sites. Safe for the same reason
+            ``TemplateUnresolved``'s is: admission rejects any header name
+            that is not an RFC 7230 token. The header VALUE is never included.
+    """
+
+    step_name: str
+    site: Literal["url", "header", "body"]
+    placeholder: str
+    reason: Literal["non_scalar", "control_character"]
+    header_name: str | None = None
+
+    def token(self) -> str:
+        """Render the operator-visible ``last_error`` payload.
+
+        THE single formatter, on the variant rather than in the sender for the
+        same reason ``TemplateUnresolved``'s is: no consumer anywhere can
+        format this type a different way, so the redaction guarantee is total.
+
+        Returns:
+            ``"<step>:<site>:<placeholder>:<reason>"``, with the header site
+            rendered as ``header[<name>]``. Examples:
+            ``upload:body:login.meta:non_scalar``,
+            ``upload:header[X-Trace]:login.tag:control_character``.
+        """
+        where = f"header[{self.header_name}]" if self.site == "header" else self.site
+        return f"{self.step_name}:{where}:{self.placeholder}:{self.reason}"
+
+
+@dataclass(frozen=True)
 class CaptureIncomplete:
     """A 2xx response was MISSING a capture a later step requires (finding R7-5-B).
 
@@ -396,6 +482,7 @@ ExecuteStepResult = (
     | CaptureExpiredStored
     | CaptureExpiredRewind
     | TemplateUnresolved
+    | CaptureNotRenderable
     | CaptureIncomplete
     | SendDeadlineExpired
     | RouteUnresolved
@@ -463,6 +550,20 @@ class ChainExecutor:
 
         # (b) Substitute placeholders in URL, headers, body. A chain marked
         # ``templated=False`` (N3) passes every template through verbatim.
+        # Each text site runs the F8 type gate FIRST: outside a JSON body
+        # there is no serializer to make correct output structural, so a
+        # capture that cannot be spliced as text is refused rather than
+        # rendered as a Python repr.
+        values = self._captures_as_dict(row.captured_values)
+        url_refusal = self._first_unrenderable(
+            step.url,
+            values,
+            templated=envelope.templated,
+            step_name=step.name,
+            site="url",
+        )
+        if url_refusal is not None:
+            return url_refusal
         substituted_url, ok = self._substitute_or_literal(
             step.url, row.captured_values, templated=envelope.templated
         )
@@ -487,6 +588,16 @@ class ChainExecutor:
                 # framing over a fixed-length body on EVERY retry.
                 logger.debug("stripping hop-by-hop header from upstream: %s", name)
                 continue
+            header_refusal = self._first_unrenderable(
+                value,
+                values,
+                templated=envelope.templated,
+                step_name=step.name,
+                site="header",
+                header_name=name,
+            )
+            if header_refusal is not None:
+                return header_refusal
             rendered, header_ok = self._substitute_or_literal(
                 value, row.captured_values, templated=envelope.templated
             )
@@ -500,7 +611,7 @@ class ChainExecutor:
             substituted_headers[name] = rendered
 
         try:
-            body_bytes, body_content_type, sub_ok = self._render_body(
+            body_bytes, body_content_type, sub_ok, body_refusal = self._render_body(
                 step, row.captured_values, body_refs, templated=envelope.templated
             )
         except InlineBodyDecodeError as exc:
@@ -512,6 +623,11 @@ class ChainExecutor:
                 exc.reason,
             )
             return InlineBodyInvalid(step_name=exc.step_name, reason=exc.reason)
+        # The refusal arm PRECEDES the unresolved arm, and the order is
+        # load-bearing: a body can be both (one placeholder missing, another
+        # non-scalar) and the refusal is the more specific diagnosis.
+        if body_refusal is not None:
+            return body_refusal
         if not sub_ok:
             body_template = self._body_as_template(step)
             return TemplateUnresolved(
@@ -821,6 +937,166 @@ class ChainExecutor:
         return substitute(template, ChainExecutor._captures_as_dict(captured))
 
     @staticmethod
+    def _first_unrenderable(
+        template: str,
+        values: dict[str, dict[str, Any]],
+        *,
+        templated: bool,
+        step_name: str,
+        site: Literal["url", "header", "body"],
+        header_name: str | None = None,
+    ) -> CaptureNotRenderable | None:
+        """Return the first placeholder whose value cannot be spliced as TEXT.
+
+        THE ONE type gate (F8), used by the URL site, the header site, the
+        text-body arm and the JSON walker's text path. A type gate rather than
+        an escaper, deliberately: outside a JSON body there is no serializer to
+        make correct output structural, and percent-encoding the URL would
+        break working chains (a capture holding a path segment ``a/b`` is a
+        legitimate template use that ``a%2Fb`` would destroy). The producer
+        wrote the template and owns its encoding; Phantom's job is to refuse
+        values that cannot be spliced at all.
+
+        A literal chain (N3) has nothing to refuse because nothing is
+        substituted, so the flag is honoured HERE and the three non-JSON call
+        sites need no conditional of their own.
+
+        Args:
+            template: The raw text about to be substituted.
+            values: The flattened captures, ``step -> {capture: value}``.
+            templated: The envelope's marker. ``False`` refuses nothing.
+            step_name: The consuming step, for the returned variant.
+            site: Which part of the step is being rendered.
+            header_name: The header under render, for the ``header`` site.
+
+        Returns:
+            The refusal, or ``None`` when every referenced capture renders.
+        """
+        if not templated:
+            return None
+        for producing, name in find_placeholders(template):
+            step_values = values.get(producing)
+            if step_values is None or name not in step_values:
+                continue  # unresolved is TemplateUnresolved's business, not ours
+            value = step_values[name]
+            reason: Literal["non_scalar", "control_character"]
+            if not (value is None or isinstance(value, _TEXT_SCALARS)):
+                reason = "non_scalar"
+            elif site == "header" and isinstance(value, str) and _CONTROL_CHARS.search(value):
+                reason = "control_character"
+            else:
+                continue
+            return CaptureNotRenderable(
+                step_name=step_name,
+                site=site,
+                placeholder=f"{producing}.{name}",
+                reason=reason,
+                header_name=header_name,
+            )
+        return None
+
+    def _render_json_body(
+        self,
+        value: dict[str, Any],
+        captured: CapturedValues,
+        *,
+        templated: bool,
+        step_name: str,
+    ) -> tuple[dict[str, Any], bool, CaptureNotRenderable | None]:
+        """Substitute placeholders INSIDE the parsed body, before serialization.
+
+        The F8 fix. ``ChainBodyJson.value`` is already a parsed ``dict``, so
+        the rule is to never leave that form until the bytes are produced. The
+        CALLER serializes, which is what makes malformed output impossible:
+        every string this returns is escaped by ``json.dumps``, not by us. An
+        escaper has to be correct for every input; a serializer is correct by
+        construction.
+
+        Three placeholder positions, and only one of them can take structure.
+        A WHOLE-VALUE node (exactly one placeholder, not a key) takes a
+        captured ``dict`` or ``list`` as real structure. An EMBEDDED node (any
+        other text around it, or two adjacent placeholders) must produce a
+        string, so a non-scalar is refused. A KEY is a string position that can
+        NEVER take structure: Python raises ``TypeError: unhashable type`` at
+        dict construction, which would escape into a sender that catches only
+        ``sqlite3.OperationalError`` and crash-loop the service, on an input
+        that succeeds today. ``is_key`` is threaded through the walk for that
+        one reason.
+
+        Every SCALAR falls through to the text path, including in the
+        whole-value position, so a captured number, boolean or null renders
+        through ``str()`` byte-identically to the old path. Type preservation
+        is deliberately NOT implemented: whether an upstream wants ``7`` or
+        ``"7"`` is a schema question Phantom cannot see, so F8 fixes what is
+        broken and leaves what works.
+
+        Args:
+            value: The parsed JSON body from the envelope.
+            captured: The chain's captured values.
+            templated: The envelope's ``templated`` marker (N3).
+            step_name: The consuming step, for any refusal raised.
+
+        Returns:
+            ``(substituted, all_resolved, refusal_or_None)``.
+        """
+        if not templated:
+            return value, True, None  # N3's rule, applied once to the whole body
+        resolved = True
+        values = self._captures_as_dict(captured)
+
+        def walk(node: Any, *, is_key: bool) -> tuple[Any, CaptureNotRenderable | None]:
+            """Rebuild ``node`` with every placeholder resolved in place."""
+            nonlocal resolved
+            if isinstance(node, dict):
+                out: dict[str, Any] = {}
+                for raw_key, raw_value in node.items():
+                    new_key, bad = walk(raw_key, is_key=True)
+                    if bad is not None:
+                        return None, bad
+                    new_value, bad = walk(raw_value, is_key=False)
+                    if bad is not None:
+                        return None, bad
+                    out[new_key] = new_value
+                return out, None
+            if isinstance(node, list):
+                items: list[Any] = []
+                for item in node:
+                    new_item, bad = walk(item, is_key=False)
+                    if bad is not None:
+                        return None, bad
+                    items.append(new_item)
+                return items, None
+            if not isinstance(node, str):
+                return node, None
+            whole = whole_placeholder(node)
+            if whole is not None and not is_key:
+                producing, name = whole
+                step_values = values.get(producing)
+                if step_values is None or name not in step_values:
+                    resolved = False
+                    return node, None  # TemplateUnresolved is the caller's answer
+                whole_value = step_values[name]
+                if isinstance(whole_value, dict | list):
+                    return whole_value, None  # the ONLY type that changes shape
+                # Every SCALAR falls through to the text path, so a captured
+                # number, boolean or null renders through str() exactly as it
+                # does today. The type-preservation restraint is enforced HERE.
+            bad = self._first_unrenderable(
+                node, values, templated=True, step_name=step_name, site="body"
+            )
+            if bad is not None:
+                return None, bad
+            rendered, ok = self._substitute_or_literal(node, captured, templated=True)
+            if not ok:
+                resolved = False
+            return rendered, None
+
+        substituted, refusal = walk(value, is_key=False)
+        if refusal is not None:
+            return {}, False, refusal
+        return substituted, resolved, None
+
+    @staticmethod
     def _captures_as_dict(
         captured: CapturedValues,
     ) -> dict[str, dict[str, Any]]:
@@ -829,7 +1105,16 @@ class ChainExecutor:
 
     @staticmethod
     def _body_as_template(step: ChainStep) -> str | None:
-        """Return the body content as a string for placeholder detection."""
+        """Return the body content as a string for placeholder NAME extraction.
+
+        NOT a rendering path. Since F8 a JSON body is rendered by walking the
+        PARSED structure and serializing once at the end, so nothing sends what
+        this returns. It survives for the three callers that need the set of
+        placeholder NAMES a body references and do not care about its bytes:
+        the capture-TTL gate, the ``TemplateUnresolved`` body arm, and
+        ``_missing_required_captures``'s scan of later steps. Do not re-add a
+        caller that renders from this string; that ordering is the F8 defect.
+        """
         if isinstance(step.body, ChainBodyText):
             return step.body.value
         if isinstance(step.body, ChainBodyJson):
@@ -843,8 +1128,13 @@ class ChainExecutor:
         body_refs: dict[str, bytes],
         *,
         templated: bool,
-    ) -> tuple[bytes, str | None, bool]:
+    ) -> tuple[bytes, str | None, bool, CaptureNotRenderable | None]:
         """Produce the outbound body bytes + Content-Type for ``step``.
+
+        The JSON arm substitutes into the PARSED body and serializes LAST
+        (F8), which is what makes malformed output impossible rather than
+        escaped. Every other arm renders text or bytes and cannot refuse
+        anything structurally, so each returns ``None`` as the fourth member.
 
         Args:
             step: The step whose body is being rendered.
@@ -856,25 +1146,43 @@ class ChainExecutor:
                 body verbatim.
 
         Returns:
-            ``(bytes, content_type_or_None, all_resolved)``.
+            ``(bytes, content_type_or_None, all_resolved, refusal_or_None)``.
+            The fourth member is a :class:`CaptureNotRenderable` when a
+            captured value cannot be rendered into the position its
+            placeholder sits in; the caller returns it before the
+            unresolved arm, because it is the more specific diagnosis.
         """
         if step.body is None:
-            return b"", None, True
+            return b"", None, True, None
         if isinstance(step.body, ChainBodyJson):
-            value_template = json.dumps(step.body.value)
-            rendered, ok = self._substitute_or_literal(
-                value_template, captured, templated=templated
+            substituted, ok, bad = self._render_json_body(
+                step.body.value, captured, templated=templated, step_name=step.name
             )
+            if bad is not None:
+                return b"", None, False, bad
             if not ok:
-                return b"", None, False
-            return rendered.encode("utf-8"), "application/json", True
+                return b"", None, False, None
+            # ``json.dumps`` runs LAST and it is the whole fix: every string
+            # the walker produced is escaped by the serializer, so a quote, a
+            # backslash, a newline or a control character in a captured value
+            # cannot produce malformed output.
+            return json.dumps(substituted).encode("utf-8"), "application/json", True, None
         if isinstance(step.body, ChainBodyText):
+            refusal = self._first_unrenderable(
+                step.body.value,
+                self._captures_as_dict(captured),
+                templated=templated,
+                step_name=step.name,
+                site="body",
+            )
+            if refusal is not None:
+                return b"", None, False, refusal
             rendered, ok = self._substitute_or_literal(
                 step.body.value, captured, templated=templated
             )
             if not ok:
-                return b"", None, False
-            return rendered.encode("utf-8"), step.body.content_type, True
+                return b"", None, False, None
+            return rendered.encode("utf-8"), step.body.content_type, True, None
         if isinstance(step.body, ChainBodyBytes):
             # Raises InlineBodyDecodeError, which execute_one_step classifies.
             # The parser owns the decode rule AND its exception taxonomy, so
@@ -884,13 +1192,14 @@ class ChainExecutor:
                 decode_inline_body_b64(step.body.value_b64, step_name=step.name),
                 step.body.content_type,
                 True,
+                None,
             )
         if isinstance(step.body, ChainBodyRef):
             data = body_refs.get(step.body.name)
             if data is None:
-                return b"", None, False
-            return data, step.body.content_type, True
-        return b"", None, True  # pragma: no cover — exhaustive above
+                return b"", None, False, None
+            return data, step.body.content_type, True, None
+        return b"", None, True, None  # pragma: no cover: exhaustive above
 
     def _absolute_url(self, url: str, envelope: ChainEnvelope) -> str:
         """Resolve ``url`` against ``envelope.default_target`` if needed."""

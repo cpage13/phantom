@@ -14,6 +14,7 @@ from phantom.chain.executor import (
     CaptureExpiredRewind,
     CaptureExpiredStored,
     CaptureIncomplete,
+    CaptureNotRenderable,
     ChainExecutor,
     ExecuteStepResult,
     Failed4xx,
@@ -32,6 +33,7 @@ from phantom.chain.jsonpath import (
     find_placeholders,
     substitute,
     validate_path,
+    whole_placeholder,
 )
 from phantom.chain.parser import (
     ENVELOPE_MAX_BYTES,
@@ -48,6 +50,7 @@ __all__ = [
     "CaptureExpiredRewind",
     "CaptureExpiredStored",
     "CaptureIncomplete",
+    "CaptureNotRenderable",
     "ChainExecutor",
     "ExecuteStepResult",
     "Failed4xx",
@@ -70,4 +73,5 @@ __all__ = [
     "parse_multipart_request",
     "substitute",
     "validate_path",
+    "whole_placeholder",
 ]
