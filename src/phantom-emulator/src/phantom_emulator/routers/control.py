@@ -9,18 +9,20 @@ and is expected to be bound to loopback in shared environments.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import signal
 from datetime import UTC, datetime
 from typing import Annotated, Any
-from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from phantom_emulator.auth.modes import AuthMode
+from phantom_emulator.control_models import (
+    ControlStatusResponse,
+    ReceivedResponse,
+)
 from phantom_emulator.failure.injection import FailurePolicy
 from phantom_emulator.routers._deps import get_state
 from phantom_emulator.state import EmulatorState
@@ -33,110 +35,6 @@ StateDep = Annotated[EmulatorState, Depends(get_state)]
 
 
 # -- Request / response models ------------------------------------------------
-
-
-class ReceivedEntry(BaseModel):
-    """One row of the ``/control/received`` log."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    upload_token: str = Field(..., description="The opaque token from the upload URL.")
-    file_id: UUID = Field(..., description="The emulator-minted FileInformation.id.")
-    metadata_kvs: dict[str, str] = Field(
-        ...,
-        description=(
-            "The metadata.keyValueStore the metadata POST carried (preserves phantom_local_uuid)."
-        ),
-    )
-    x_amz_meta_headers: dict[str, str] = Field(
-        ..., description="The x-amz-meta-* headers the PUT carried."
-    )
-    headers: dict[str, str] = Field(
-        default_factory=dict,
-        description=(
-            "Every inbound HTTP header on the PUT, lowercased keys with "
-            "original values. Captures the full request envelope so "
-            "transparent-proxy tests can audit byte-equality of "
-            "``Authorization``, absence of ``X-Phantom-*``, preservation "
-            "of ``User-Agent`` and custom producer headers. Multi-value "
-            'headers join on ``", "`` per Starlette\'s header-dict '
-            "semantics. Authorization values are recorded verbatim — "
-            "tests opt-in to assert against them."
-        ),
-    )
-    body_size: int = Field(..., ge=0, description="Bytes accepted on the PUT.")
-    body_hash: str = Field(
-        ...,
-        description=(
-            "SHA-256 hex of the received body bytes — used by "
-            "transparent-proxy E2E tests to assert byte-identity against "
-            "the agent's pre-submit hash."
-        ),
-    )
-    content_encoding: str | None = Field(
-        None,
-        description=(
-            "Value of the PUT's ``Content-Encoding`` header (or ``None`` "
-            "if the header was unset). Lets transparent-proxy tests "
-            "assert header preservation alongside byte-identity."
-        ),
-    )
-    accepted_at: datetime = Field(..., description="Server-side acceptance time.")
-    idempotency_key: str | None = Field(
-        None,
-        description="Idempotency-Key from the create call (if any).",
-    )
-
-
-class ReceivedResponse(BaseModel):
-    """Envelope for the received-log response."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    received: list[ReceivedEntry] = Field(..., description="Accepted bodies, oldest first.")
-
-
-class ControlStatusResponse(BaseModel):
-    """``/control/status`` payload."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    uptime_seconds: int = Field(
-        ...,
-        ge=0,
-        description="Seconds since this emulator process started.",
-    )
-    issued_tokens_count: int = Field(
-        ...,
-        ge=0,
-        description="Number of JWTs issued by ``POST /oauth/token`` since boot.",
-    )
-    accepted_bodies_count: int = Field(
-        ...,
-        ge=0,
-        description="Number of upload bodies the emulator has accepted on the PUT path.",
-    )
-    pending_uploads_count: int = Field(
-        ...,
-        ge=0,
-        description="Number of presigned URLs minted but not yet PUT-completed.",
-    )
-    global_paused: bool = Field(
-        ...,
-        description="True when ``POST /control/pause`` has been called and resume hasn't fired.",
-    )
-    policies: list[FailurePolicy] = Field(
-        ...,
-        description="Currently-installed policies (per ``POST /control/inject-failure``).",
-    )
-    auth_mode_default: AuthMode = Field(
-        ...,
-        description="Default auth mode applied when no per-path override matches.",
-    )
-    auth_mode_overrides: dict[str, AuthMode] = Field(
-        ...,
-        description="Path-prefix overrides of the default auth mode.",
-    )
 
 
 class ExtraClaimsBody(BaseModel):
@@ -208,27 +106,12 @@ async def status(
 async def received(
     state: StateDep,
 ) -> ReceivedResponse:
-    """In-memory log of accepted upload bodies."""
-    entries: list[ReceivedEntry] = []
-    for token, body in sorted(state.accepted_bodies.items(), key=lambda kv: kv[1].accepted_at):
-        pending = state.pending_uploads.get(token)
-        kvs = pending.metadata_kvs if pending is not None else {}
-        file_id = pending.file_id if pending is not None else UUID(int=0)
-        entries.append(
-            ReceivedEntry(
-                upload_token=token,
-                file_id=file_id,
-                metadata_kvs=kvs,
-                x_amz_meta_headers=body.headers,
-                headers=body.all_headers,
-                body_size=len(body.body),
-                body_hash=hashlib.sha256(body.body).hexdigest(),
-                content_encoding=body.content_encoding,
-                accepted_at=body.accepted_at,
-                idempotency_key=state.accepted_idempotency_keys.get(token),
-            )
-        )
-    return ReceivedResponse(received=entries)
+    """In-memory log of accepted upload bodies.
+
+    The projection lives on :meth:`EmulatorState.received` so the in-process
+    oracle reads the same one (U3).
+    """
+    return ReceivedResponse(received=state.received())
 
 
 @router.post("/control/inject-failure", status_code=204)
@@ -261,7 +144,7 @@ async def pause(
     state: StateDep,
 ) -> Response:
     """Refuse all upstream requests with 503 until resumed."""
-    state.global_paused = True
+    state.pause()
     logger.info("global_paused=True")
     return Response(status_code=204)
 
@@ -271,7 +154,7 @@ async def resume(
     state: StateDep,
 ) -> Response:
     """Restore normal upstream serving."""
-    state.global_paused = False
+    state.resume()
     logger.info("global_paused=False")
     return Response(status_code=204)
 
@@ -305,23 +188,7 @@ async def expire_all_now(
     drives the request immediately, the emulator's verify path returns
     401 because the cached expires_at is now in the past.
     """
-    past = datetime.fromtimestamp(0, tz=UTC)
-    for issued in state.issued_tokens.values():
-        issued.expires_at = past
-    state.static_jwt = None
-    # In static-token mode, re-mint a fresh static token so subsequent
-    # mints succeed.
-    if state.cfg.auth.default_mode is AuthMode.STATIC_TOKEN and state.jwt_minter is not None:
-        token, expires_at = state.jwt_minter.mint(client_id="static-client")
-        state.static_jwt = token
-        from phantom_emulator.state import IssuedToken
-
-        state.issued_tokens[token] = IssuedToken(
-            client_id="static-client",
-            expires_at=expires_at,
-            jwt=token,
-            extra_claims={},
-        )
+    state.expire_all_now()
     logger.info("expire_all_now: aged %d tokens", len(state.issued_tokens))
     return Response(status_code=204)
 
@@ -331,8 +198,7 @@ async def revoke_tokens(
     state: StateDep,
 ) -> Response:
     """Drop every issued JWT."""
-    state.issued_tokens.clear()
-    state.static_jwt = None
+    state.revoke_tokens()
     logger.info("revoke_tokens")
     return Response(status_code=204)
 
@@ -343,7 +209,7 @@ async def set_extra_claims(
     state: StateDep,
 ) -> Response:
     """Stage extra claims for the next minted JWT."""
-    state.extra_claims = dict(body.claims)
+    state.set_extra_claims(body.claims)
     logger.info("set_extra_claims keys=%s", list(body.claims))
     return Response(status_code=204)
 
@@ -354,10 +220,7 @@ async def set_auth_mode(
     state: StateDep,
 ) -> Response:
     """Set the default auth mode (scope=='*') or a per-scope override."""
-    if body.scope == "*":
-        state.cfg.auth.default_mode = body.mode
-    else:
-        state.auth_mode_overrides[body.scope] = body.mode
+    state.set_auth_mode(body.mode, body.scope)
     logger.info("set_auth_mode mode=%s scope=%s", body.mode, body.scope)
     return Response(status_code=204)
 
@@ -368,7 +231,7 @@ async def set_presigned_ttl(
     state: StateDep,
 ) -> Response:
     """Set the default presigned URL lifetime for new mints."""
-    state.cfg.upstream.presigned_ttl_seconds = body.seconds
+    state.set_presigned_ttl(body.seconds)
     logger.info("set_presigned_ttl seconds=%d", body.seconds)
     return Response(status_code=204)
 
@@ -391,8 +254,6 @@ async def clear_received(
     state: StateDep,
 ) -> Response:
     """Drop latest accepted bodies and append-only upstream events."""
-    state.accepted_bodies.clear()
-    state.accepted_idempotency_keys.clear()
-    state.upstream_events.clear()
+    state.clear_received()
     logger.info("clear_received")
     return Response(status_code=204)

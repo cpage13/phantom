@@ -8,21 +8,30 @@ property. See plan §1 "No persistence across restarts."
 The container module :class:`EmulatorState` is constructed once at
 startup by :mod:`phantom_emulator.app` and threaded into routers via
 the FastAPI ``Depends`` mechanism.
+
+It also OWNS the control-surface projections and mutations (U3). They are
+functions of this state, so both readers delegate here: the HTTP router
+under ``/control/*`` and the in-process :class:`phantom_emulator.server.Server`
+oracle. That is what keeps the e2e tier (which reads the HTTP surface) and
+the conformance tier (which reads the oracle) looking at ONE implementation
+rather than at two copies that can drift apart.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import random
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.config import AppConfig
+from phantom_emulator.control_models import ReceivedEntry
 
 if TYPE_CHECKING:  # pragma: no cover — typing-only imports
     from phantom_emulator.auth.jwks import RsaKeyPair
@@ -391,3 +400,109 @@ class EmulatorState:
     failure_state: FailureInjectionState | None = None
     jwt_minter: JwtMinter | None = None
     rsa_keys: RsaKeyPair | None = None
+
+    # ------------------------------------------------------------------
+    # Control-surface projections and mutations (U3).
+    #
+    # The HTTP router (``routers/control.py``) and the in-process oracle
+    # (``server.Server``) both used to carry their own copy of each of
+    # these. Two copies of a projection read by two TEST TIERS is how the
+    # tiers come to disagree about what the emulator saw, and the
+    # disagreement presents as cross-tier flakiness rather than as a bug.
+    # They live here because they are functions of this state, and both
+    # surfaces delegate. Each route KEEPS its own ``logger.info``: the log
+    # line belongs to the HTTP surface, so hoisting the mutation alone
+    # leaves both surfaces exactly the behaviour they had.
+    # ------------------------------------------------------------------
+
+    def pause(self) -> None:
+        """Refuse every upstream request until :meth:`resume`."""
+        self.global_paused = True
+
+    def resume(self) -> None:
+        """Restore normal upstream serving."""
+        self.global_paused = False
+
+    def expire_all_now(self) -> None:
+        """Age every issued JWT past its ``exp``, re-minting the static token.
+
+        In static-token mode the pre-minted JWT is cleared and re-minted, so
+        subsequent mints succeed against a fresh token rather than a
+        deliberately expired one.
+        """
+        past = datetime.fromtimestamp(0, tz=UTC)
+        for issued in self.issued_tokens.values():
+            issued.expires_at = past
+        self.static_jwt = None
+        if self.cfg.auth.default_mode is AuthMode.STATIC_TOKEN and self.jwt_minter is not None:
+            token, expires_at = self.jwt_minter.mint(client_id="static-client")
+            self.static_jwt = token
+            self.issued_tokens[token] = IssuedToken(
+                client_id="static-client",
+                expires_at=expires_at,
+                jwt=token,
+                extra_claims={},
+            )
+
+    def revoke_tokens(self) -> None:
+        """Drop every issued JWT, including the static one."""
+        self.issued_tokens.clear()
+        self.static_jwt = None
+
+    def set_extra_claims(self, claims: dict[str, Any]) -> None:
+        """Stage extra claims for the next minted JWT."""
+        self.extra_claims = dict(claims)
+
+    def set_auth_mode(self, mode: AuthMode, scope: str = "*") -> None:
+        """Set the default auth mode (``scope=="*"``) or a per-scope override."""
+        if scope == "*":
+            self.cfg.auth.default_mode = mode
+        else:
+            self.auth_mode_overrides[scope] = mode
+
+    def set_presigned_ttl(self, seconds: int) -> None:
+        """Set the default presigned URL lifetime for new mints."""
+        self.cfg.upstream.presigned_ttl_seconds = seconds
+
+    def received(self) -> list[ReceivedEntry]:
+        """Project the token-keyed latest accepted-body view, oldest first.
+
+        The item's real content: this walks ``accepted_bodies`` in
+        acceptance order, joins each against ``pending_uploads`` for the file
+        id and metadata, hashes the body and assembles the entry. Both
+        control surfaces read THIS, so the e2e tier (over HTTP) and the
+        conformance tier (in process) can no longer disagree about what the
+        emulator received.
+
+        Returns:
+            One :class:`ReceivedEntry` per accepted body, oldest first.
+        """
+        entries: list[ReceivedEntry] = []
+        for token, body in sorted(
+            self.accepted_bodies.items(),
+            key=lambda kv: kv[1].accepted_at,
+        ):
+            pending = self.pending_uploads.get(token)
+            kvs = pending.metadata_kvs if pending is not None else {}
+            file_id = pending.file_id if pending is not None else UUID(int=0)
+            entries.append(
+                ReceivedEntry(
+                    upload_token=token,
+                    file_id=file_id,
+                    metadata_kvs=kvs,
+                    x_amz_meta_headers=body.headers,
+                    headers=body.all_headers,
+                    body_size=len(body.body),
+                    body_hash=hashlib.sha256(body.body).hexdigest(),
+                    content_encoding=body.content_encoding,
+                    accepted_at=body.accepted_at,
+                    idempotency_key=self.accepted_idempotency_keys.get(token),
+                )
+            )
+        return entries
+
+    def clear_received(self) -> None:
+        """Drop the latest accepted bodies and the append-only event log."""
+        self.accepted_bodies.clear()
+        self.accepted_idempotency_keys.clear()
+        self.upstream_events.clear()

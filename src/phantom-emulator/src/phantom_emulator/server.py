@@ -11,7 +11,6 @@ See plan §4.14.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import socket
 from typing import Any
@@ -20,13 +19,13 @@ import uvicorn
 
 from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.config import AppConfig
+from phantom_emulator.control_models import ReceivedEntry
 from phantom_emulator.failure.injection import (
     ErrorRate5xxEvent,
     FailurePolicy,
     FailureScope,
 )
-from phantom_emulator.routers.control import ReceivedEntry
-from phantom_emulator.state import EmulatorState, IssuedToken, UpstreamEvent
+from phantom_emulator.state import EmulatorState, UpstreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +91,13 @@ class Server:
         """Install or replace a failure policy.
 
         Mirrors ``POST /control/inject-failure``.
+
+        NOT hoisted, and this is a recorded divergence rather than an
+        oversight (U3): this oracle guards the uninitialised failure state
+        with ``assert``, which ``-O`` strips, while the route raises
+        ``RuntimeError``, which it does not. Hoisting either body would
+        change the OTHER surface's failure behaviour, so both bodies stay
+        and the difference is carried to the human instead.
         """
         assert self.state.failure_state is not None
         self.state.failure_state.set_policy(policy)
@@ -100,6 +106,9 @@ class Server:
         """Drop every installed failure policy.
 
         Mirrors ``POST /control/clear-failures``.
+
+        NOT hoisted: the same assert-versus-raise divergence recorded on
+        :meth:`inject_failure`.
         """
         assert self.state.failure_state is not None
         self.state.failure_state.clear_all()
@@ -117,72 +126,59 @@ class Server:
     def pause(self) -> None:
         """Refuse upstream requests until :meth:`resume`.
 
-        Mirrors ``POST /control/pause``.
+        The in-process face of ``POST /control/pause``; both delegate to
+        :meth:`EmulatorState.pause`.
         """
-        self.state.global_paused = True
+        self.state.pause()
 
     def resume(self) -> None:
         """Restore normal upstream serving.
 
-        Mirrors ``POST /control/resume``.
+        The in-process face of ``POST /control/resume``; both delegate to
+        :meth:`EmulatorState.resume`.
         """
-        self.state.global_paused = False
+        self.state.resume()
 
     def expire_all_now(self) -> None:
         """Age every issued JWT past its ``exp``.
 
-        Mirrors ``POST /control/expire-all-now``.
+        The in-process face of ``POST /control/expire-all-now``; both delegate
+        to :meth:`EmulatorState.expire_all_now`, including its static-token
+        re-mint.
         """
-        from datetime import UTC, datetime
-
-        past = datetime.fromtimestamp(0, tz=UTC)
-        for issued in self.state.issued_tokens.values():
-            issued.expires_at = past
-        self.state.static_jwt = None
-        if (
-            self.state.cfg.auth.default_mode is AuthMode.STATIC_TOKEN
-            and self.state.jwt_minter is not None
-        ):
-            token, expires_at = self.state.jwt_minter.mint(client_id="static-client")
-            self.state.static_jwt = token
-            self.state.issued_tokens[token] = IssuedToken(
-                client_id="static-client",
-                expires_at=expires_at,
-                jwt=token,
-                extra_claims={},
-            )
+        self.state.expire_all_now()
 
     def revoke_tokens(self) -> None:
         """Drop every issued JWT.
 
-        Mirrors ``POST /control/revoke-tokens``.
+        The in-process face of ``POST /control/revoke-tokens``; both delegate
+        to :meth:`EmulatorState.revoke_tokens`.
         """
-        self.state.issued_tokens.clear()
-        self.state.static_jwt = None
+        self.state.revoke_tokens()
 
     def set_extra_claims(self, claims: dict[str, Any]) -> None:
         """Stage extra claims for the next minted JWT.
 
-        Mirrors ``POST /control/auth/extra-claims``.
+        The in-process face of ``POST /control/auth/extra-claims``; both
+        delegate to :meth:`EmulatorState.set_extra_claims`.
         """
-        self.state.extra_claims = dict(claims)
+        self.state.set_extra_claims(claims)
 
     def set_auth_mode(self, mode: AuthMode, scope: str = "*") -> None:
         """Set the default auth mode (scope=='*') or a per-scope override.
 
-        Mirrors ``POST /control/auth/mode``.
+        The in-process face of ``POST /control/auth/mode``; both delegate to
+        :meth:`EmulatorState.set_auth_mode`.
         """
-        if scope == "*":
-            self.state.cfg.auth.default_mode = mode
-        else:
-            self.state.auth_mode_overrides[scope] = mode
+        self.state.set_auth_mode(mode, scope)
 
     def set_presigned_ttl(self, seconds: int) -> None:
         """Set the default presigned URL lifetime.
 
-        Mirrors ``POST /control/presigned-ttl``.
+        The in-process face of ``POST /control/presigned-ttl``; both delegate
+        to :meth:`EmulatorState.set_presigned_ttl`.
         """
-        self.state.cfg.upstream.presigned_ttl_seconds = seconds
+        self.state.set_presigned_ttl(seconds)
 
     def set_idempotency_dedup_window(self, seconds: int) -> None:
         """Set the create-response idempotency cache lifetime for new entries."""
@@ -192,6 +188,9 @@ class Server:
         """Reseed the failure-injection RNG.
 
         Mirrors ``POST /control/seed``.
+
+        NOT hoisted: the same assert-versus-raise divergence recorded on
+        :meth:`inject_failure`.
         """
         assert self.state.failure_state is not None
         self.state.failure_state.set_seed(seed)
@@ -199,33 +198,13 @@ class Server:
     def received(self) -> list[ReceivedEntry]:
         """Return the token-keyed latest accepted-body view.
 
-        Mirrors ``GET /control/received``.
+        The in-process face of ``GET /control/received``. THE projection now
+        has one implementation, :meth:`EmulatorState.received`, which this
+        oracle and the HTTP route both read; before U3 each assembled its
+        own, so the conformance tier and the e2e tier could disagree about
+        what the emulator saw.
         """
-        from uuid import UUID
-
-        entries: list[ReceivedEntry] = []
-        for token, body in sorted(
-            self.state.accepted_bodies.items(),
-            key=lambda kv: kv[1].accepted_at,
-        ):
-            pending = self.state.pending_uploads.get(token)
-            kvs = pending.metadata_kvs if pending is not None else {}
-            file_id = pending.file_id if pending is not None else UUID(int=0)
-            entries.append(
-                ReceivedEntry(
-                    upload_token=token,
-                    file_id=file_id,
-                    metadata_kvs=kvs,
-                    x_amz_meta_headers=body.headers,
-                    headers=body.all_headers,
-                    body_size=len(body.body),
-                    body_hash=hashlib.sha256(body.body).hexdigest(),
-                    content_encoding=body.content_encoding,
-                    accepted_at=body.accepted_at,
-                    idempotency_key=self.state.accepted_idempotency_keys.get(token),
-                )
-            )
-        return entries
+        return self.state.received()
 
     def upstream_events(self) -> list[UpstreamEvent]:
         """Return a snapshot of the append-only two-step upstream event log."""
@@ -234,11 +213,10 @@ class Server:
     def clear_received(self) -> None:
         """Drop latest accepted bodies and append-only upstream events.
 
-        Mirrors ``POST /control/clear-received``.
+        The in-process face of ``POST /control/clear-received``; both delegate
+        to :meth:`EmulatorState.clear_received`.
         """
-        self.state.accepted_bodies.clear()
-        self.state.accepted_idempotency_keys.clear()
-        self.state.upstream_events.clear()
+        self.state.clear_received()
 
     async def drain(self, *, timeout_seconds: float = DEFAULT_DRAIN_TIMEOUT_SECONDS) -> None:
         """Wait briefly for in-flight requests to settle.
