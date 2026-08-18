@@ -452,6 +452,50 @@ aws-chunked payload on an `aws_sigv4` route cannot validate upstream, because
 the per-chunk signatures chain from the client's seed signature that Phantom
 replaces.
 
+## 1.12 A captured value cannot be rendered into the next step
+
+**Trigger.** A step captures a value from its upstream's response and a later
+step references it with `{{step.capture}}`. The capture is upstream data, so
+Phantom does not choose its shape: it can carry a double quote, a backslash, a
+newline, or it can be a whole JSON object or array rather than a scalar.
+
+**What happens.** A JSON body is now substituted inside the parsed object and
+serialized once at the end, so the serializer escapes every captured string
+and malformed output is structurally impossible rather than guarded against.
+A captured object or array replaces a body node as real structure when that
+node is exactly one placeholder and is not an object key. Everywhere else the
+result has to be a string, so a captured object or array is refused, and the
+URL, header values and a text body follow the same type gate because they have
+no serializer to escape into. A captured header value containing CR, LF or NUL
+is refused for the same reason: the request cannot be built. A refusal
+terminates the row `failed` with
+`last_error="capture_not_renderable:<step>:<site>:<placeholder>:<reason>"`.
+
+**What you observe.** Before this fix, two different outcomes and neither was
+legible. An escape-bearing capture produced malformed JSON, the upstream
+answered 400, and the row died `failed` with `last_error=4xx_status_400`
+blaming the producer's chain for a value Phantom corrupted on the way out. A
+captured object was delivered as a Python repr inside a JSON string
+(`"{'a': 1}"`), the request was well-formed, the upstream ACCEPTED it and the
+row SUCCEEDED, so nothing anywhere observed the corruption. A CR/LF header
+capture never reached the wire at all: `h11` refused to build the request,
+which classified as a retryable network fault, so the row burned its whole
+retry budget on a request that could never exist and ended in `stored`. Now
+the escape case delivers correctly, the object case delivers real structure,
+and the refusals are immediate and named. The `last_error` token deliberately
+carries identifiers and closed literals only: the captured value is upstream
+response data and never reaches the admin API or the logs.
+
+**Operator repair.** A refusal is terminal and NOT retryable, because the
+capture is already persisted and re-rendering produces the identical refusal.
+The token names the step, the site, the placeholder and the reason, which is
+what a producer needs to change the template or the capture's JSONPath. A
+replay after fixing the chain restarts at step 0, with the same
+already-delivered-step caveat as any other replay.
+
+**Mode notes.** Mode-independent: rendering is a template decision, not a
+storage one.
+
 ---
 
 # Part 2. Contributor-facing: failure-mode → proving-test map
@@ -521,6 +565,7 @@ contention tests are the highest-value durability coverage.
 | Idempotency replay returns the prior response | [`tests/e2e/test_multipart_idempotent_replay.py`](../tests/e2e/test_multipart_idempotent_replay.py) | A replay returns `200` with the prior `ChainResponse` (ADR-019). |
 | Ambiguous outcome (ack lost after upstream store) → exactly-once | [`tests/e2e/regression/test_r75a_ambiguous_outcome_exactly_once.py`](../tests/e2e/regression/test_r75a_ambiguous_outcome_exactly_once.py) | A re-send after a lost ack does not double-deliver. |
 | 2xx missing a declared capture → retry, not a wedge | [`tests/e2e/regression/test_r75_2xx_missing_capture_no_wedge.py`](../tests/e2e/regression/test_r75_2xx_missing_capture_no_wedge.py) | A success response lacking a required capture is treated as retryable, not a wedged multi-step chain. |
+| A captured value with a quote in it → delivered, not corrupted | [`tests/e2e/regression/test_f8_capture_quote_in_json_body.py`](../tests/e2e/regression/test_f8_capture_quote_in_json_body.py) | A quote-bearing capture resent as a JSON body reaches the upstream as valid JSON and the chain succeeds, instead of producing malformed output the upstream rejects with a 400. |
 
 ## 2.6 RAM-ceiling and unbounded-table bounds
 

@@ -181,10 +181,49 @@ When the envelope contains no `body_ref` bodies, submission is a single JSON req
 Exactly one substitution form is supported: `{{step_name.capture_name}}`.
 
 - Substitution evaluates server-side (Phantom-the-service) just before each step executes.
-- Substitution is string-level: the placeholder is replaced with the captured value's string representation. For values captured as objects (e.g., a nested JSON), the substitution context (URL / header / JSON body string field) determines serialization.
+- Substitution is string-level everywhere except one position, and the context decides which rule applies. See "Substitution is per-context" below, which supersedes the original string-level-everywhere wording (finding F8 of the review-08-12 cycle).
 - No nested templates. No expressions. No auth-fields-from-Phantom (no `{{auth.bearer}}`, no `{{now}}`). The caller supplies everything else explicitly.
 - Unresolved placeholders at execution time cause the step (and the chain) to fail fast with a 4xx-shaped admin error — they do not retry.
 - Substitution is CONDITIONAL on the envelope's `templated` flag. A chain marked `templated: false` interprets no brace span anywhere: the parser's static placeholder pass is skipped at admission, the capture-TTL gate returns immediately, and all four substitution sites (URL, header values, JSON body, text body) pass their text through verbatim.
+
+## Substitution is per-context (amendment, 2026-08-17)
+
+The original "string-level, the context determines serialization" rule left
+the serialization unspecified, and what the implementation did was splice
+`str(value)` into the ALREADY-SERIALIZED JSON body. A captured value carrying
+any character JSON escapes produced malformed output that the upstream
+rejected, and a captured object was delivered as a Python repr inside a JSON
+string on a request that succeeded. Finding F8 of the review-08-12 cycle
+records both. The rule is now stated per context.
+
+A **JSON body** is substituted inside the PARSED object and serialized once at
+the end, so the serializer does the escaping and malformed output is
+structurally impossible. Three positions, and only one of them can take
+structure:
+
+| Position | Example | Rule |
+|---|---|---|
+| Whole-value | `{"meta": "{{s.obj}}"}` | The string is exactly one placeholder and is not a key. A captured object or array replaces the node AS STRUCTURE. Every scalar renders as text. |
+| Embedded | `{"name": "file-{{s.id}}.txt"}` | Other text around the placeholder, or two adjacent placeholders. The result must be a string, so a captured object or array is REFUSED. |
+| Object key | `{"{{s.obj}}": 1}` | A key is a string position that can never take structure. Scalars splice as text; a captured object or array is REFUSED. |
+
+The **URL**, a **header value** and a **text body** have no serializer, so
+their rule is a type gate rather than an escaper: a scalar splices as text and
+a captured object or array is refused. No percent-encoding is added to the
+URL, because a capture holding a path segment is a legitimate template use
+that encoding would break; the template owns its own encoding. A captured
+header value containing CR, LF or NUL is refused as well, because `h11`
+cannot build the request and the row would otherwise retry to exhaustion.
+
+Scalars are NOT type-converted. A captured number still renders as its string
+form, because whether the upstream wants `7` or `"7"` is a schema question
+Phantom cannot see. A typed placeholder syntax is future work.
+
+A refusal is terminal, not retryable: the capture is already persisted, so
+re-rendering produces the same refusal. It is recorded on the row as
+`last_error="capture_not_renderable:<step>:<site>:<placeholder>:<reason>"`,
+which carries identifiers and closed literals only. The captured VALUE never
+appears, because a capture is upstream response data.
 
 ## phantom-client method
 
