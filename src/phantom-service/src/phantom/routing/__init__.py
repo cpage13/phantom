@@ -18,6 +18,7 @@ from typing import Literal, TypeAlias
 from urllib.parse import urlparse
 
 from phantom.config.settings import InstanceCfg
+from phantom.models.chain import ChainEnvelope
 
 # The outbound-auth mode a route declares. Named here (rather than left as a
 # bare inline Literal) so consumers that branch on it — the executor's auth
@@ -51,10 +52,70 @@ class ResolvedRoute:
     send_deadline_seconds: int | None = None
 
 
-def _hostname(url: str) -> str:
-    """Return the hostname portion of ``url`` (lower-cased) or the URL itself."""
+type HostKey = str
+"""A URL normalised down to the string Phantom keys hosts on.
+
+Usually a hostname, and NOT always one: see :func:`host_key_for`. The alias
+exists so ``dict[HostKey, ...]`` at the credential and token stores reads as
+what it is rather than as ``dict[str, ...]``.
+"""
+
+
+def host_key_for(url: str) -> HostKey:
+    """Normalise ``url`` to the key Phantom looks hosts up by.
+
+    **The fallback is the part to read.** When ``urlparse`` finds no host,
+    for example because the step URL is a bare path, this returns the ENTIRE
+    INPUT STRING lower-cased. That is the historical behaviour of the four
+    helpers this one replaces, and it is deliberate here: a lookup key that
+    misses is harmless, while silently substituting a placeholder would make
+    two different pathless URLs share a cache slot. The name says ``host_key``
+    rather than ``hostname`` for exactly this reason.
+
+    **The output is UNSANITISED and must not be persisted or logged as-is.**
+    A step URL is post-substitution producer data and can carry a query
+    string holding a presigned ``X-Amz-Signature`` and ``X-Amz-Credential``,
+    so under the fallback that credential material ends up inside the return
+    value. Any caller writing a host into a persisted column (D2's
+    ``uploads.auth_blocked_host``), into ``last_error`` (F1's
+    ``RouteUnresolved.host``) or into a log line applies the § 4 / § 1.1.2
+    sanitiser instead: parse the host, and record the fixed ``<no-host>``
+    token when there is none. Lookup keys are the only safe consumer of the
+    fallback, because they are never surfaced.
+
+    Args:
+        url: An absolute URL, or any string a caller wants keyed.
+
+    Returns:
+        The lower-cased hostname, or the lower-cased whole input when the
+        URL carries no parseable host.
+    """
     parsed = urlparse(url)
     return (parsed.hostname or url).lower()
+
+
+def resolve_first_step_url(envelope: ChainEnvelope) -> str:
+    """Resolve the first step's URL, applying ``default_target`` if needed.
+
+    A chain's first step may carry a path rather than an absolute URL, in
+    which case the envelope's ``default_target`` supplies the origin. Both
+    ingress routes need the resolved value before admission (for the route
+    check, the degraded-boot guard and the admission-time endpoint), and
+    both held a byte-identical copy of this until CL1.
+
+    Args:
+        envelope: The submitted chain envelope.
+
+    Returns:
+        The first step's absolute URL when one can be formed, else the
+        step's own ``url`` unchanged.
+    """
+    first_step_url = envelope.steps[0].url
+    if envelope.default_target and "://" not in first_step_url:
+        first_step_url = str(envelope.default_target).rstrip("/") + (
+            first_step_url if first_step_url.startswith("/") else "/" + first_step_url
+        )
+    return first_step_url
 
 
 def resolve_route(url: str, instance_cfg: InstanceCfg) -> ResolvedRoute:
@@ -70,7 +131,7 @@ def resolve_route(url: str, instance_cfg: InstanceCfg) -> ResolvedRoute:
     Raises:
         ValueError: When no route matches (caller maps to ``invalid_target``).
     """
-    host = _hostname(url)
+    host = host_key_for(url)
     for route in instance_cfg.routes:
         for pattern in route.hosts:
             if fnmatch.fnmatchcase(host, pattern.lower()):
@@ -85,4 +146,11 @@ def resolve_route(url: str, instance_cfg: InstanceCfg) -> ResolvedRoute:
     )
 
 
-__all__ = ["AuthMode", "ResolvedRoute", "resolve_route"]
+__all__ = [
+    "AuthMode",
+    "HostKey",
+    "ResolvedRoute",
+    "host_key_for",
+    "resolve_first_step_url",
+    "resolve_route",
+]

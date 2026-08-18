@@ -69,7 +69,7 @@ from phantom.models.chain import (
 )
 from phantom.models.credential import CredCacheRow, HostCredKey
 from phantom.models.upload import CapturedStepValues, CapturedValues, UploadRow
-from phantom.routing import ResolvedRoute
+from phantom.routing import ResolvedRoute, host_key_for
 from phantom.storage.interface import CredentialStore, TokenCache
 from phantom.transport.interface import UpstreamClient, UpstreamRequest
 
@@ -660,11 +660,11 @@ class ChainExecutor:
         try:
             resolved = self._resolve_route(full_url, self._instance)
         except ValueError:
-            # Sanitised host for the persisted token. NOT ``_hostname``: that
-            # helper returns the WHOLE INPUT when urlparse finds no host
-            # (``chain/executor.py`` ``_hostname``), and a step URL legitimately
-            # can be a bare path, so reusing it would splice the path and its
-            # query string into ``last_error``.
+            # Sanitised host for the persisted token. NOT ``host_key_for``: that
+            # helper (``phantom.routing``) returns the WHOLE INPUT when urlparse
+            # finds no host, and a step URL legitimately can be a bare path, so
+            # reusing it would splice the path and its query string into
+            # ``last_error``. Its own docstring states that contract.
             parsed_host = urlparse(full_url).hostname
             unrouted_host = parsed_host.lower() if parsed_host else _NO_HOST_TOKEN
             logger.warning(
@@ -690,7 +690,7 @@ class ChainExecutor:
             # The host this row is authenticating against, SANITISED because it
             # is PERSISTED (D2/F6): it rides ``FailedAuth.blocked_host`` into
             # ``uploads.auth_blocked_host``, which the admin API surfaces on
-            # four paths. Neither ``_hostname(full_url)`` nor ``dest_host``
+            # four paths. Neither ``host_key_for(full_url)`` nor ``dest_host``
             # below is what it receives: both carry the raw-input fallback,
             # which is fine for a CACHE KEY (never persisted) and forbidden
             # here, because a hostless step URL would splice its path and its
@@ -698,7 +698,7 @@ class ChainExecutor:
             # URL records the fixed ``_NO_HOST_TOKEN`` literal instead.
             parsed_host = urlparse(full_url).hostname
             blocked = parsed_host.lower() if parsed_host else _NO_HOST_TOKEN
-            slot = await self._cache.get(_hostname(full_url), row.uid)
+            slot = await self._cache.get(host_key_for(full_url), row.uid)
             if slot is None or slot.status == "bad":
                 return FailedAuth(status=401, observed_at=self._clock(), blocked_host=blocked)
             substituted_headers["Authorization"] = slot.bearer
@@ -715,7 +715,7 @@ class ChainExecutor:
                     "stripped client presigned credentials on aws_sigv4 route for "
                     "chain_id=%s dest_host=%s",
                     row.chain_id,
-                    _hostname(full_url),
+                    host_key_for(full_url),
                 )
             full_url = stripped
             # SigV4 signer arm (COPY of the bearer arm above): the host-keyed
@@ -725,7 +725,7 @@ class ChainExecutor:
             # whose botocore chain yields nothing — marks the slot bad (when a
             # store exists) and returns FailedAuth, which PARKS the row in
             # ``auth_expired`` (NOT terminal) to await a credential re-push.
-            dest_host = HostCredKey(_hostname(full_url))
+            dest_host = HostCredKey(host_key_for(full_url))
             # The sanitised persisted host, same rule and same reason as the
             # bearer arm above (D2/F6). ``dest_host`` is the credential-store
             # KEY and keeps the raw-input fallback; ``blocked`` is what the row
@@ -827,12 +827,12 @@ class ChainExecutor:
             blocked = parsed_host.lower() if parsed_host else _NO_HOST_TOKEN
             if resolved.auth_mode == "phantom_bearer":
                 # Mark the slot bad so the sender knows what to do.
-                await self._cache.mark_bad(_hostname(full_url), row.uid)
+                await self._cache.mark_bad(host_key_for(full_url), row.uid)
             elif resolved.auth_mode == "aws_sigv4":
                 # Symmetric to the bearer mark-bad: flip the host-keyed cred
                 # slot to ``bad`` so the row stays parked until a fresh
                 # credential re-push freshens it (the kicker wakes on ``fresh``).
-                await self._mark_signer_creds_bad(HostCredKey(_hostname(full_url)))
+                await self._mark_signer_creds_bad(HostCredKey(host_key_for(full_url)))
             return FailedAuth(
                 status=response.status, observed_at=self._clock(), blocked_host=blocked
             )
@@ -1369,12 +1369,6 @@ class ChainExecutor:
         merged_steps = dict(existing.steps)
         merged_steps[step.name] = step_values
         return CapturedValues(steps=merged_steps)
-
-
-def _hostname(url: str) -> str:
-    """Hostname helper used by the executor for cache lookups."""
-    parsed = urlparse(url)
-    return (parsed.hostname or url).lower()
 
 
 def _placeholder_names(template: str) -> tuple[str, ...]:

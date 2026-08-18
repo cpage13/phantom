@@ -5,10 +5,10 @@ from __future__ import annotations
 import fnmatch
 import logging
 from collections.abc import Iterable, Sequence
-from urllib.parse import urlparse
 
 from phantom.config.settings import InstanceCfg
 from phantom.instances.context import InstanceContext
+from phantom.routing import host_key_for
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +19,6 @@ class InstanceNotFoundError(KeyError):
 
 class NoMatchingInstanceError(ValueError):
     """No instance's ``host_prefixes`` matched the URL."""
-
-
-def _host_of(url: str) -> str:
-    """Lower-cased hostname of ``url`` (the whole string if it has no host)."""
-    return (urlparse(url).hostname or url).lower()
 
 
 def _matches_host_prefixes(host: str, host_prefixes: Iterable[str]) -> bool:
@@ -76,7 +71,7 @@ def resolve_configured_instance_id(
             if cfg.id == instance_header:
                 return cfg.id
         return None
-    host = _host_of(url)
+    host = host_key_for(url)
     for cfg in instance_cfgs:
         if _matches_host_prefixes(host, cfg.host_prefixes):
             return cfg.id
@@ -127,7 +122,7 @@ class InstanceDispatcher:
                 "Routing by explicit X-Phantom-Instance header (advanced path)",
             )
             return ctx
-        host = _host_of(url)
+        host = host_key_for(url)
         for ctx in self._ordered:
             if _matches_host_prefixes(host, ctx.cfg.host_prefixes):
                 return ctx

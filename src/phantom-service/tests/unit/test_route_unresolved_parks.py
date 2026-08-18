@@ -346,7 +346,7 @@ async def test_hostless_step_url_never_leaks_the_path_or_query_into_last_error(
 
     Objective: pin the token sanitisation rule. ``ChainStep.url`` may legally be
     a bare path, and ``_absolute_url`` returns it unchanged when the envelope
-    carries no ``default_target``, so a naive reuse of ``_hostname`` (which
+    carries no ``default_target``, so a naive reuse of ``host_key_for`` (which
     returns the WHOLE INPUT when urlparse finds no host) would splice a
     presigned query string into ``last_error``, which the admin API surfaces
     verbatim.

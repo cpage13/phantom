@@ -81,7 +81,7 @@ keyed by `HostCredKey` = the lower-cased resolved destination host alone (no
 a SigV4 forward step is synthesized by Phantom (it has no caller-supplied
 credential id), so the `uid` axis has no value to carry and is dropped. ADR-002
 is untouched: `uid` stays inert under `aws_sigv4`. The executor looks the
-credential up by `HostCredKey(_hostname(full_url))`; a missing or failed
+credential up by `HostCredKey(host_key_for(full_url))`; a missing or failed
 credential marks the slot bad and parks the row `auth_expired` (ADR-032), which
 the sigv4-flavoured `Kicker` (the SigV4 analogue of the bearer flavour) wakes
 on a fresh push. The store is persistent at rest, surviving restart (mirrors ADR-003).
@@ -94,7 +94,7 @@ A credential reaches the store two ways, both carrying a required `service`:
   (`phantom.routes.admin`), body the discriminated `CredentialPushBody`
   (`sigv4_static` resolved literals, or a `profile_ref`). It replies `204 No
   Content` with no body, so the `secret_access_key` is never echoed; the
-  `{dest_host}` segment is normalized through the SAME `_hostname` helper the
+  `{dest_host}` segment is normalized through the SAME `host_key_for` helper the
   executor uses, so push-key == lookup-key by construction.
 - **Boot-time config**: the top-level `sigv4_credentials: list[SigV4CredentialCfg]`,
   which holds env-var NAMES only (`access_key_id_env`, `secret_access_key_env`,

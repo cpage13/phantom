@@ -61,7 +61,7 @@ The ``{EMULATOR_URL}`` substitution token (TASK 1.3a) carries the live
 ephemeral emulator base URL into ``phantom_default_target`` at merge time —
 here the BARE token (no ``/raw`` suffix) so the rewritten step URL hits the
 path-style SigV4 sink. The credential lookup (executor) and the admin-push key
-both normalize through the same ``_hostname`` helper, which strips the port, so
+both normalize through the same ``host_key_for`` helper, which strips the port, so
 both key on the loopback host (``127.0.0.1``) BY CONSTRUCTION.
 """
 
@@ -185,7 +185,7 @@ def _sigv4_overrides() -> dict[str, object]:
 def _emulator_host(stack: E2EStack) -> str:
     """Return the destination host the SigV4 signer keys credentials on.
 
-    The executor looks up credentials under ``_hostname(full_url)`` (the
+    The executor looks up credentials under ``host_key_for(full_url)`` (the
     port-stripped, lower-cased hostname of the rewritten step URL), and the
     admin push normalizes its ``{dest_host}`` segment through the SAME helper.
     Deriving the host from ``stack.emulator_url`` (e.g. ``http://127.0.0.1:PORT``

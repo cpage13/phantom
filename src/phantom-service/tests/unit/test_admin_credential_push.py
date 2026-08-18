@@ -7,7 +7,7 @@ the 2026-06-23 directive. These tests prove the acceptance criteria:
 * a push STORES the credential in every instance's ``signer_creds`` store and
   returns ``204`` with NO body — the ``secret_access_key`` is never echoed
   (ADR-004, status-only);
-* the ``{dest_host}`` segment is NORMALIZED through the same ``_hostname``
+* the ``{dest_host}`` segment is NORMALIZED through the same ``host_key_for``
   helper the executor uses, so a mixed-case push key equals the executor's
   forward-time lookup key (the silent-miss class is closed);
 * the push FIRES the credential-store wake handler end-to-end: a parked
@@ -188,13 +188,13 @@ async def test_push_stores_credential_and_normalizes_host(
     app, _instance, signer_creds = wired
     client = TestClient(app)
 
-    # Push with MIXED CASE; the handler must normalize via the same _hostname the
+    # Push with MIXED CASE; the handler must normalize via the same host_key_for the
     # executor's forward lookup uses.
     resp = client.put(f"/v1/admin/credentials/{_SIGV4_HOST_MIXED}", json=_push_body())
     assert resp.status_code == 204, resp.text
 
-    # push-key == lookup-key: the executor looks up HostCredKey(_hostname(url));
-    # _hostname lower-cases, so the slot must resolve under the LOWER-CASED host.
+    # push-key == lookup-key: the executor looks up HostCredKey(host_key_for(url));
+    # host_key_for lower-cases, so the slot must resolve under the LOWER-CASED host.
     row = await signer_creds.get(HostCredKey(_SIGV4_HOST))
     assert row is not None
     assert row.dest_host == _SIGV4_HOST

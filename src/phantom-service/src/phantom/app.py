@@ -34,7 +34,7 @@ from fastapi import FastAPI
 from pydantic import ValidationError
 
 from phantom import __version__
-from phantom.chain.executor import ChainExecutor, _hostname, default_clock
+from phantom.chain.executor import ChainExecutor, default_clock
 from phantom.compression import BodyCodec, select_codec
 from phantom.config.probe import probe_machine
 from phantom.config.settings import (
@@ -60,7 +60,7 @@ from phantom.routes import admin as admin_routes
 from phantom.routes import catch_all as catch_all_routes
 from phantom.routes import health as health_routes
 from phantom.routes import send as send_routes
-from phantom.routing import resolve_route
+from phantom.routing import host_key_for, resolve_route
 from phantom.runtime.lock_retry import BootOpenLockError, retry_on_transient_lock
 from phantom.runtime.reload import (
     make_sighup_handler,
@@ -480,7 +480,7 @@ async def _materialize_config_credentials(
     For each entry: resolve its env-var NAMES to literals (B1, at boot), build a
     RESOLVED-value :class:`SigV4StaticCreds` / :class:`ProfileRefCred`, and
     ``set`` it under the normalized destination-host key with
-    ``source="config"`` — the SAME host normalization (``_hostname``) and the
+    ``source="config"``, the SAME host normalization (``host_key_for``) and the
     SAME store ``set`` the runtime admin push uses, so by lookup time a
     config-declared credential is indistinguishable from an admin-pushed one. An
     empty list is a no-op (the bearer-only default). Runs once per instance
@@ -496,7 +496,7 @@ async def _materialize_config_credentials(
             (fail-fast; propagates out of :func:`_build_instance_context`).
     """
     for cfg in credentials:
-        key = HostCredKey(_hostname(cfg.dest_host))
+        key = HostCredKey(host_key_for(cfg.dest_host))
         creds = _config_credential_to_internal(cfg)
         await store.set(key, creds, source="config")
         logger.info(

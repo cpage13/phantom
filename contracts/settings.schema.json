@@ -786,7 +786,7 @@
           "title": "Access Key Id Env"
         },
         "dest_host": {
-          "description": "Destination host this credential is keyed on. Normalized through the same ``_hostname`` helper the executor uses for its forward-time lookup, so the config key equals the lookup key by construction.",
+          "description": "Destination host this credential is keyed on. Normalized through the same ``host_key_for`` helper the executor uses for its forward-time lookup, so the config key equals the lookup key by construction.",
           "minLength": 1,
           "title": "Dest Host",
           "type": "string"

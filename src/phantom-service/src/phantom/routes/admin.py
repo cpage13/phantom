@@ -35,7 +35,6 @@ from fastapi import APIRouter, Body, Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
 
-from phantom.chain.executor import _hostname
 from phantom.config.settings import AdminLookupCfg
 from phantom.instances.context import InstanceContext, instance_storage_paths
 from phantom.instances.dispatcher import InstanceDispatcher
@@ -80,6 +79,7 @@ from phantom.models.errors import STATUS_FOR_CODE, ErrorCode, error_response
 from phantom.models.upload import BodyLocation, UploadRow, UploadState
 from phantom.observability.metrics import MetricsRegistry
 from phantom.routes._version import ADMIN_ROUTER_PREFIX
+from phantom.routing import host_key_for
 from phantom.runtime.reload import RELOAD_FAILURE_ERRORS, apply_reload
 from phantom.storage.errors import ReplayBodyDiscardedError, ReplayRefusedAttemptingError
 from phantom.storage.integrity import (
@@ -1408,10 +1408,10 @@ async def push_credential_one(
     SigV4 step has no caller-supplied ``uid``), and the structured
     :data:`CredentialPushBody` (vs the bare token string).
 
-    The ``{dest_host}`` segment is normalized through the SAME ``_hostname``
+    The ``{dest_host}`` segment is normalized through the SAME ``host_key_for``
     helper the executor uses for its forward-time credential lookup
-    (``chain/executor.py``), so the push key equals the lookup key
-    ``HostCredKey(_hostname(full_url))`` BY CONSTRUCTION — a host pushed as
+    (``phantom.routing``), so the push key equals the lookup key
+    ``HostCredKey(host_key_for(full_url))`` BY CONSTRUCTION: a host pushed as
     ``S3.amazonaws.com`` resolves a request to ``s3.amazonaws.com`` (the
     silent-miss class the token push left latent is closed here).
 
@@ -1448,7 +1448,7 @@ async def push_credential_one(
     Returns:
         An empty ``204`` response.
     """
-    key = HostCredKey(_hostname(dest_host))
+    key = HostCredKey(host_key_for(dest_host))
     creds = credential_body_to_internal(body)
     for ctx in dispatcher.all_instances():
         if ctx.signer_creds is None:

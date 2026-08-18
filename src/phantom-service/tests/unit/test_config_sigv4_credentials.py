@@ -15,7 +15,7 @@ These tests prove the acceptance criteria:
   error (:class:`ConfigCredentialError`), never a silent skip;
 * the default (empty ``sigv4_credentials``) is a no-op: the store stays empty;
 * host normalization matches the admin push — a mixed-case ``dest_host`` is
-  materialized under the same ``_hostname``-normalized key the executor looks up.
+  materialized under the same ``host_key_for``-normalized key the executor looks up.
 """
 
 from __future__ import annotations
@@ -135,7 +135,7 @@ async def test_config_credential_resolves_env_name_at_boot(
 
     assert ctx.signer_creds is not None
     # Normalization: the mixed-case dest_host is keyed under the same form the
-    # executor's forward-time _hostname lookup produces.
+    # executor's forward-time host_key_for lookup produces.
     row = await ctx.signer_creds.get(HostCredKey(_DEST_HOST_NORMALIZED))
     assert row is not None, "config credential was not materialized into the store"
     assert row.source == "config"

@@ -68,7 +68,7 @@ BLOCKED_HOST: str = "objects.example.com"
 NO_HOST_TOKEN: str = "<no-host>"
 
 # A hostless step URL carrying credential material in its query string. This is
-# the shape the sanitisation rule exists for: ``_hostname`` returns the WHOLE
+# the shape the sanitisation rule exists for: ``host_key_for`` returns the WHOLE
 # INPUT when urlparse finds no host, and the recorded value is persisted and
 # surfaced on four admin paths.
 HOSTLESS_STEP_URL: str = "/v1/files/x?sig=SECRET"
@@ -734,7 +734,7 @@ async def test_a_hostless_step_url_never_leaks_a_query_string_into_the_column(
 ) -> None:
     """The bearer arm records the placeholder, never the raw path and query.
 
-    Objective: the sanitisation rule. ``_hostname`` is not a hostname function:
+    Objective: the sanitisation rule. ``host_key_for`` is not a hostname function:
     it returns the WHOLE INPUT lower-cased when urlparse finds no host, and a
     step URL can legitimately be a bare path carrying a presigned query string.
     ``auth_blocked_host`` is persisted and surfaced on four admin paths, so it
@@ -752,7 +752,7 @@ async def test_the_sigv4_arm_sanitises_the_recorded_host_too(tmp_path: Path) -> 
 
     Objective: pin the rule on the OTHER arm. The bearer test exercises the
     slot-check site only, and the sigv4 sites are the ones where passing
-    ``str(dest_host)`` would be identity over ``_hostname`` and would reinstate
+    ``str(dest_host)`` would be identity over ``host_key_for`` and would reinstate
     exactly the raw-input fallback the rule forbids.
 
     Success: the same assertions as the bearer case.

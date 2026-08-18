@@ -19,7 +19,7 @@ Mechanics that make it self-contained (verified against the harness):
 * ``config_overrides`` deep-merges generically, and ``sigv4_credentials`` is a
   declared ``Settings`` field, so the block validates and merges.
 * Credentials key on the destination HOST ALONE (port-stripped via the executor's
-  ``_hostname``), so ``dest_host: "127.0.0.1"`` matches the ephemeral
+  ``host_key_for``), so ``dest_host: "127.0.0.1"`` matches the ephemeral
   ``http://127.0.0.1:PORT`` emulator target without any URL-substitution token.
 
 The SAME AWS-doc example pair the keystone uses is supplied here through the env

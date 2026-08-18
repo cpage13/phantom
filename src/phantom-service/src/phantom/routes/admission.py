@@ -45,7 +45,6 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
-from urllib.parse import urlparse
 from uuid import UUID
 
 from phantom.chain.parser import envelope_from_persistence_json
@@ -62,7 +61,7 @@ from phantom.models.upload import (
     StorageHash,
     UploadRow,
 )
-from phantom.routing import ResolvedRoute, resolve_route
+from phantom.routing import ResolvedRoute, host_key_for, resolve_first_step_url, resolve_route
 from phantom.storage.interface import InsertClaimOutcome
 from phantom.storage.sqlite_store import is_transient_lock_error
 from phantom.workers.saturation import (
@@ -207,12 +206,6 @@ def _validate_step_headers(envelope: ChainEnvelope, *, instance_id: str) -> None
                         ),
                         instance_id=instance_id,
                     )
-
-
-def _hostname(url: str) -> str:
-    """Lowercase hostname helper."""
-    parsed = urlparse(url)
-    return (parsed.hostname or url).lower()
 
 
 def _resolved_route_or_none(url: str, instance_ctx: InstanceContext) -> ResolvedRoute | None:
@@ -687,8 +680,8 @@ async def _build_row(
     Returns:
         The :class:`_PreparedRow` for the persist stage.
     """
-    first_step_url = _resolve_first_step_url(inputs.envelope)
-    endpoint = _hostname(first_step_url)
+    first_step_url = resolve_first_step_url(inputs.envelope)
+    endpoint = host_key_for(first_step_url)
     resolved = _resolved_route_or_none(first_step_url, instance_ctx)
     if inputs.authorization and resolved is not None and resolved.auth_mode == "phantom_bearer":
         await instance_ctx.token_cache.set(
@@ -1278,16 +1271,6 @@ async def admit_chain(
         # terminal state.
         slot.commit()
         return AdmissionOutcome(row=prepared.row, status_code=202)
-
-
-def _resolve_first_step_url(envelope: ChainEnvelope) -> str:
-    """Resolve the first step's URL, applying ``default_target`` if needed."""
-    first_step_url = envelope.steps[0].url
-    if envelope.default_target and "://" not in first_step_url:
-        first_step_url = str(envelope.default_target).rstrip("/") + (
-            first_step_url if first_step_url.startswith("/") else "/" + first_step_url
-        )
-    return first_step_url
 
 
 # Retry-After value (seconds) attached to every 503 response per

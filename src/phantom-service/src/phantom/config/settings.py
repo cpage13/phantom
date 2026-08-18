@@ -852,7 +852,7 @@ class SigV4CredentialCfg(BaseModel):
         min_length=1,
         description=(
             "Destination host this credential is keyed on. Normalized through "
-            "the same ``_hostname`` helper the executor uses for its "
+            "the same ``host_key_for`` helper the executor uses for its "
             "forward-time lookup, so the config key equals the lookup key by "
             "construction."
         ),

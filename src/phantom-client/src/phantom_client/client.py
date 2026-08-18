@@ -674,7 +674,7 @@ class PhantomClient:
 
         Args:
             dest_host: Destination host key (normalized server-side via the same
-                ``_hostname`` rule the executor uses for lookup).
+                ``host_key_for`` rule the executor uses for lookup).
             credential: A :class:`SigV4StaticCredBody` (static key-pair) or
                 :class:`ProfileRefCredBody` (profile / default chain). Construct it
                 with a :class:`SigningService` member (e.g. ``service=SigningService.S3``),

@@ -41,6 +41,7 @@ from phantom.routes.admission import (
     admit_chain,
 )
 from phantom.routes.envelope import build_response_headers
+from phantom.routing import resolve_first_step_url
 from phantom.runtime.startup_checks import DegradedInstance
 
 logger = logging.getLogger(__name__)
@@ -239,7 +240,7 @@ async def resolve_and_admit(
        :func:`admit_chain`.
 
     The destination host is taken from the envelope's first step
-    (``_resolve_first_step_url``); both callers must therefore have already
+    (``resolve_first_step_url``); both callers must therefore have already
     rewritten ``steps[0].url`` to a REAL upstream host (the raw-intake
     adapter does this from its destination carriers; ``post_send`` inherits
     it from the producer-supplied envelope). Extracting this prelude keeps
@@ -273,7 +274,7 @@ async def resolve_and_admit(
         :class:`Response` to return verbatim (degraded guard, routing
         failure, or any :class:`ChainAdmissionError` admission refused).
     """
-    first_step_url = _resolve_first_step_url(envelope)
+    first_step_url = resolve_first_step_url(envelope)
 
     degraded = _degraded_guard_response(
         instance_cfgs=instance_cfgs,
@@ -637,16 +638,6 @@ def _degraded_guard_response(
             "degrade_reason": degraded.reason.value,
         },
     )
-
-
-def _resolve_first_step_url(envelope: ChainEnvelope) -> str:
-    """Resolve the first step's URL, applying ``default_target`` if needed."""
-    first_step_url = envelope.steps[0].url
-    if envelope.default_target and "://" not in first_step_url:
-        first_step_url = str(envelope.default_target).rstrip("/") + (
-            first_step_url if first_step_url.startswith("/") else "/" + first_step_url
-        )
-    return first_step_url
 
 
 def _build_chain_response(
