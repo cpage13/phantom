@@ -40,6 +40,7 @@ import logging
 import sqlite3
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, get_args
@@ -340,6 +341,26 @@ def _row_to_upload(row: aiosqlite.Row) -> UploadRow:
         body_hashes=_decode_body_hashes(row["body_hashes_json"]),
         chain_id_at_ingress=_optional_row_value(row, "chain_id_at_ingress"),
     )
+
+
+@dataclass(frozen=True)
+class ResumeCursor:
+    """The keyset a ``list_uploads`` page resumes from.
+
+    Both fields are ``str`` and stay ``str`` (U14): they are the ISO and UUID
+    TEXT the SQL comparison binds, and parsing them into ``datetime`` and
+    ``UUID`` only to re-serialise them for ``(received_at, chain_id) > (?, ?)``
+    would add two conversions and two failure modes for no reader. The house
+    rule asks for a frozen dataclass here, not for richer field types, and the
+    two decisions are separable.
+
+    The field NAMES are the cursor payload's JSON keys, so the key list exists
+    once rather than as a literal dict in the encoder and a literal tuple in
+    the decoder.
+    """
+
+    received_at: str
+    chain_id: str
 
 
 # Exception group intentionally bound to a module-level constant. ruff 0.15.x
@@ -1148,7 +1169,7 @@ class SqliteUploadStore:
         if cursor is not None:
             decoded = self.decode_resume_cursor(cursor)
             wheres.append("(received_at, chain_id) > (?, ?)")
-            params.extend([decoded["received_at"], decoded["chain_id"]])
+            params.extend([decoded.received_at, decoded.chain_id])
         where_clause = (" WHERE " + " AND ".join(wheres)) if wheres else ""
         # Default sort: ``received_at`` (always set; ``datetime``) and
         # ``chain_id`` (primary key; ``UUID`` text). ``next_attempt_at`` is
@@ -1190,36 +1211,42 @@ class SqliteUploadStore:
         opaquely — it carries the cursor through to the next request
         without inspecting its contents.
         """
-        payload = {
-            "received_at": row.received_at.isoformat(),
-            "chain_id": str(row.chain_id),
-        }
+        payload = asdict(
+            ResumeCursor(
+                received_at=row.received_at.isoformat(),
+                chain_id=str(row.chain_id),
+            )
+        )
         return base64.urlsafe_b64encode(
             json.dumps(payload).encode("utf-8"),
         ).decode("ascii")
 
     @staticmethod
-    def decode_resume_cursor(cursor: str) -> dict[str, str]:
-        """Decode a list_uploads-format cursor into the inner key dict.
+    def decode_resume_cursor(cursor: str) -> ResumeCursor:
+        """Decode a list_uploads-format cursor into its typed keyset.
 
-        Inverse of :meth:`build_resume_cursor_for`. The result has
-        ``received_at`` and ``chain_id`` keys as ISO/UUID strings. The
-        admin handler passes the decoded inner cursor verbatim back
-        into :meth:`list_uploads` via the ``cursor`` parameter — this
-        method is the explicit decode point so the format coupling
-        lives on the store rather than spreading across callers.
+        Inverse of :meth:`build_resume_cursor_for`. The admin handler NEVER
+        calls this: the cursor crosses the admin boundary as an opaque
+        ``str``, and ``routes/admin.py`` forwards it without inspecting it.
+        :meth:`list_uploads` decodes it internally, one call site, which is
+        what keeps the format coupling on the store instead of spreading
+        across callers.
+
+        Raises:
+            ValueError: When the payload is not an object, or a required
+                field is absent or not a string.
         """
         decoded_bytes = base64.urlsafe_b64decode(cursor.encode("ascii"))
         parsed = json.loads(decoded_bytes)
         if not isinstance(parsed, dict):
             raise ValueError("cursor payload must be an object")
-        result: dict[str, str] = {}
-        for key in ("received_at", "chain_id"):
-            value = parsed.get(key)
+        values: dict[str, str] = {}
+        for field in fields(ResumeCursor):
+            value = parsed.get(field.name)
             if not isinstance(value, str):
-                raise ValueError(f"cursor payload missing required string field {key!r}")
-            result[key] = value
-        return result
+                raise ValueError(f"cursor payload missing required string field {field.name!r}")
+            values[field.name] = value
+        return ResumeCursor(**values)
 
     async def list_by_key_value(
         self,
