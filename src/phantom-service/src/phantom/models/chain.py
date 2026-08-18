@@ -61,7 +61,16 @@ class ChainBodyJson(BaseModel):
         description=(
             "JSON object serialized as the request body. String values may "
             "contain {{step_name.capture_name}} placeholders, resolved "
-            "server-side just before each step executes."
+            "server-side just before each step executes. Substitution happens "
+            "inside the parsed object and the body is serialized last, so a "
+            "captured quote, backslash or newline is escaped correctly. A "
+            "string that is EXACTLY one placeholder and is not an object key "
+            "takes a captured object or array as real structure. Everywhere "
+            "else the placeholder renders as text, so the capture must be a "
+            "string, number, boolean or null; a captured object or array in "
+            "an embedded position (any other text around it) or in an object "
+            "KEY fails the step. Scalars are not type-converted: a captured "
+            "number renders as its string form."
         ),
     )
 
@@ -74,7 +83,12 @@ class ChainBodyText(BaseModel):
     kind: Literal["text"] = Field("text", description="Discriminator tag.")
     value: str = Field(
         ...,
-        description="Text body; may contain {{step.var}} placeholders.",
+        description=(
+            "Text body; may contain {{step.var}} placeholders. A text body has "
+            "no serializer to escape into, so every referenced capture must be "
+            "a string, number, boolean or null and renders as its string form; "
+            "a captured object or array fails the step."
+        ),
     )
     content_type: str = Field(
         "text/plain",
@@ -191,12 +205,22 @@ class ChainStep(BaseModel):
         ...,
         description=(
             "Target URL or path; may contain {{step_name.capture_name}} "
-            "placeholders resolved at execution time."
+            "placeholders resolved at execution time. Every referenced capture "
+            "must be a string, number, boolean or null and is spliced as its "
+            "string form with no percent-encoding added, so the template owns "
+            "its own encoding; a captured object or array fails the step."
         ),
     )
     headers: dict[str, str] = Field(
         default_factory=dict,
-        description="Outbound headers. Values may contain {{step.var}} placeholders.",
+        description=(
+            "Outbound headers. Values may contain {{step.var}} placeholders. "
+            "Every referenced capture must be a string, number, boolean or "
+            "null and renders as its string form; a captured object or array "
+            "fails the step, and so does a captured string containing a "
+            "carriage return, line feed or NUL, which cannot be sent in a "
+            "header value."
+        ),
     )
     body: ChainBody | None = Field(
         None,

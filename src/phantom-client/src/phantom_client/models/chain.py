@@ -69,7 +69,12 @@ class ChainBodyJson(BaseModel):
     The ``value`` is a JSON object serialized as the request body when
     Phantom executes this step. String values inside may contain
     ``{{step_name.capture_name}}`` placeholders that Phantom substitutes
-    server-side just before sending the step.
+    server-side just before sending the step. Phantom substitutes into the
+    parsed object and serializes it last, so a captured quote, backslash or
+    newline is escaped correctly rather than breaking the body. A string that
+    is exactly one placeholder and is not an object key takes a captured
+    object or array as real structure; everywhere else the capture must be a
+    scalar, because the result has to be a string.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
@@ -79,7 +84,16 @@ class ChainBodyJson(BaseModel):
         ...,
         description=(
             "JSON object serialized as the request body. May contain "
-            "{{step.var}} placeholders in string values."
+            "{{step.var}} placeholders in string values. Substitution happens "
+            "inside the parsed object and the body is serialized last, so a "
+            "captured quote, backslash or newline is escaped correctly. A "
+            "string that is EXACTLY one placeholder and is not an object key "
+            "takes a captured object or array as real structure. Everywhere "
+            "else the placeholder renders as text, so the capture must be a "
+            "string, number, boolean or null; a captured object or array in "
+            "an embedded position (any other text around it) or in an object "
+            "KEY fails the step. Scalars are not type-converted: a captured "
+            "number renders as its string form."
         ),
     )
 
@@ -92,7 +106,12 @@ class ChainBodyText(BaseModel):
     kind: Literal["text"] = Field("text", description="Discriminator tag.")
     value: str = Field(
         ...,
-        description="Text body. May contain {{step.var}} placeholders.",
+        description=(
+            "Text body. May contain {{step.var}} placeholders. A text body has "
+            "no serializer to escape into, so every referenced capture must be "
+            "a string, number, boolean or null and renders as its string form; "
+            "a captured object or array fails the step."
+        ),
     )
     content_type: str = Field(
         "text/plain",
@@ -234,13 +253,21 @@ class ChainStep(BaseModel):
         ...,
         description=(
             "Target URL or path; may contain {{step_name.capture_name}} "
-            "placeholders resolved at execution time."
+            "placeholders resolved at execution time. Every referenced capture "
+            "must be a string, number, boolean or null and is spliced as its "
+            "string form with no percent-encoding added, so the template owns "
+            "its own encoding; a captured object or array fails the step."
         ),
     )
     headers: dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "Outbound headers. Values may contain {{step_name.capture_name}} placeholders."
+            "Outbound headers. Values may contain {{step_name.capture_name}} "
+            "placeholders. Every referenced capture must be a string, number, "
+            "boolean or null and renders as its string form; a captured object "
+            "or array fails the step, and so does a captured string containing "
+            "a carriage return, line feed or NUL, which cannot be sent in a "
+            "header value."
         ),
     )
     body: ChainBody | None = Field(
