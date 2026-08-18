@@ -2511,7 +2511,7 @@
     },
     "/v1/admin/chains/{chain_id}": {
       "delete": {
-        "description": "Hard delete one chain + its body.\n\nReleases the saturation gate when the deleted row still held a slot\n(R8-4), using the accounting captured atomically with the DELETE.",
+        "description": "Hard delete one chain + its body.\n\nSettles the saturation gate against the removal (R8-4), using the\naccounting captured atomically with the DELETE.",
         "operationId": "delete_upload_v1_admin_chains__chain_id__delete",
         "parameters": [
           {
@@ -2662,7 +2662,7 @@
     },
     "/v1/admin/chains/{chain_id}/cancel": {
       "post": {
-        "description": "Transition the row to ``cancelled`` if non-terminal.\n\nThe cancel path OWNS the gate release for the row it cancels\n(R8-4): the sender's M-W4-F7 no-op deliberately skips release when\nits in-flight UPDATE finds the state changed, deferring to whoever\nchanged it. The release decision uses the store's in-transaction\n``previous_state`` (not the route's pre-fetch, which can race a\nsender/kicker transition) through the one shared\n:func:`row_holds_slot` predicate.",
+        "description": "Transition the row to ``cancelled`` if non-terminal.\n\nThe cancel path OWNS the gate accounting for the row it cancels\n(R8-4): the sender's M-W4-F7 no-op deliberately skips its own\nsettlement when its in-flight UPDATE finds the state changed,\ndeferring to whoever changed it. The decision is made from the\nstore's in-transaction ``previous_state`` and stamp (not the\nroute's pre-fetch, which can race a sender/kicker transition),\nwhich the gate settles through :meth:`SaturationGate.settle`.",
         "operationId": "cancel_upload_v1_admin_chains__chain_id__cancel_post",
         "parameters": [
           {

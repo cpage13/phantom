@@ -205,7 +205,7 @@ the write-purpose against `uploads` per the single-writer manifest (plan
 | **DiskPressureProbe** | `workers/disk_pressure.py` | Background probe of `shutil.disk_usage(data_dir).free`; refuses admission via the saturation gate when the threshold is breached. Ported to the composition root TaskGroup in Phase 1. | None (signals saturation gate). | Periodic (every few seconds). |
 | **ColdBackupScheduler** (optional, Phase 4) | `workers/cold_backup.py` | Periodic SQLite online-backup snapshots to `<data_dir>/backups/`. Off by default; opt-in via `db_integrity.backup_enabled`. | None (read-only on `uploads`; writes to `backups/`). | Periodic (`backup_period_seconds`, default 86400). |
 | **MetricsRegistry** (Phase 3) | `observability/metrics.py` | NOT a coroutine; an in-process registry (`counter` / `gauge`) consulted by every emit site. Surfaced via `GET /v1/admin/observability/*`. | None. | Inline. |
-| **Saturation gate** | `workers/saturation.py` | NOT a coroutine; a counter cache consulted synchronously by the ingress handler. Returns a typed `AdmissionResult` discriminated union; the route dispatches via `isinstance`. Hot-reload-aware via `update_caps`. Phase 2 H1 closure: `release()` runs in `try/finally`. | None. | Inline on ingress. |
+| **Saturation gate** | `workers/saturation.py` | NOT a coroutine; a counter cache consulted synchronously by the ingress handler. Returns a typed `AdmissionResult` discriminated union; the route dispatches via `isinstance`. Two layers since ADR-036: the primitives (`admit` / `release` / `reconcile_admit`) own the arithmetic, and `settle` / `unwind` own the crossing decision and the reservation handshake. Hot-reload-aware via `update_caps`. Phase 2 H1 closure: the admission scope's `unwind()` runs in `try/finally`. | None. | Inline on ingress. |
 | **Recovery sweep** | `workers/recovery.py` | `run_recovery` does two things: (1) reset `attempting → queued`; (2) one collect-then-write integrity walk (`body_hashes` ↔ `BodyStore.has_body_ref` per declared ref) that quarantines every non-terminal, non-discarded row with a missing body to `corrupted`. That one walk covers both vanished `body_location='file'` files and `body_location='ram'` rows (the RAM store is empty after restart by design), subject to the invariant #1 carve-out for `body_discarded_at IS NOT NULL`. The `BodyOrphanJanitor` is NOT part of this sweep; the lifespan spawns it separately. | UPDATE boot-time corrections; transition to `corrupted` for integrity-guard hits. | Lifespan startup, before sender pool starts. |
 | **Chain executor** | `chain/executor.py` | NOT a coroutine; called synchronously by the sender per step. One call = one step. Owns capture-TTL gate, substitution, idempotency-header injection, auth injection, send, classify response. Header handling at egress is a strip then an inject: Phantom's reserved `X-Phantom-*` namespace and the full hop-by-hop set (RFC 7230 section 6.1, plus `Transfer-Encoding`, `Content-Length`, `Expect`, `Host`, and whatever `Connection` names) are dropped from every step, so exactly one framing mechanism reaches the wire; `aws-chunked` companions describe the body and are kept. Auth injection branches on the route's `auth_mode`: `phantom_bearer` injects the cached bearer; `aws_sigv4` re-signs via `sign_sigv4` (`chain/sigv4_signer.py`) from a host-keyed credential, parking the row in `auth_expired` on a `SigV4SigningError`; `none` forwards as-is. Emits DEBUG-level structured logs with `captures` and `sensitive_captures` extras (gated on `isEnabledFor`). | None (sender does the UPDATE). | Sender call. |
 
@@ -627,15 +627,20 @@ bugs.
 16. **The saturation ledger balances.** Exactly one gate charge per
     admitted row; release ownership is a pure function of
     `(state, body_discarded_at)` through the single
-    `row_holds_slot` predicate (`workers/saturation.py`). The sender
-    releases on the terminal transitions it drives and on the
-    auth_expired park; `stored` holds until its body discard or its
-    removal, whichever first; every row-removal path (admin cancel /
-    delete / bulk delete, the reaper's three removal legs) releases on
+    `row_holds_slot` predicate (`workers/saturation.py`), and since
+    ADR-036 that function is applied INSIDE the gate, once, from the
+    store outcome's in-transaction pre-image: a caller hands over a
+    `SlotDelta` and never computes a crossing of its own. The sender
+    settles the terminal transitions it drives and the auth_expired
+    park; `stored` holds until its body discard or its removal,
+    whichever first; every row-removal path (admin cancel / delete /
+    bulk delete, the reaper's three removal legs) settles on
     accounting captured atomically with the removal; every re-queue of
     a released row (replay, the `Kicker` wake) re-admits through the
-    gate. Boot recovery reconstructs those same charges from persisted rows
-    before workers start. The gate idles at zero. (R8-4 / R8-6.)
+    gate, holding a `SlotReservation` that the write either consumes or
+    returns. Boot recovery SEEDS those same charges from persisted rows
+    before workers start, which is the one gate mutation with no write
+    behind it. The gate idles at zero. (R8-4 / R8-6 / ADR-036.)
 17. **Irreversible cross-worker effects confirm-then-act on live
     state.** A worker acting on another owner's rows re-reads the live
     truth at the decision instant instead of trusting a snapshot: the
