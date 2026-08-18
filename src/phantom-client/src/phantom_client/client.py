@@ -102,7 +102,6 @@ _PATH_LOOKUP_BY_LOCAL_UUID = "/v1/admin/uploads/by-local-uuid/{local_uuid}"
 
 _PATH_TOKENS = "/v1/admin/tokens"
 _PATH_TOKEN_FOR = "/v1/admin/tokens/{endpoint}/{uid}"
-_PATH_TOKEN_ENDPOINT = "/v1/admin/tokens/{endpoint}"
 
 # Destination SigV4 credential push — host-keyed, the analogue of the
 # per-(endpoint, uid) token slot above (the executor looks it up by host).
@@ -632,24 +631,9 @@ class PhantomClient:
             body={"token": token},
         )
 
-    async def push_token_for_endpoint(self, *, endpoint: str, token: str) -> None:
-        """Push a bearer into every uid known for ``endpoint``."""
-        await self._transport.put_json(
-            _PATH_TOKEN_ENDPOINT.format(endpoint=endpoint),
-            body={"token": token},
-        )
-
-    async def push_token_global(self, *, token: str) -> None:
-        """Push a bearer into every slot regardless of endpoint."""
-        await self._transport.put_json(_PATH_TOKENS, body={"token": token})
-
     async def invalidate_token(self, *, endpoint: str, uid: str) -> None:
         """Mark the ``(endpoint, uid)`` slot as bad (status=bad)."""
         await self._transport.delete_no_body(_PATH_TOKEN_FOR.format(endpoint=endpoint, uid=uid))
-
-    async def invalidate_all_tokens(self) -> None:
-        """Mark every slot as bad."""
-        await self._transport.delete_no_body(_PATH_TOKENS)
 
     # -----------------------------------------------------------------
     # Destination credentials (SigV4 re-sign surface).
