@@ -15,9 +15,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from phantom.app import _ensure_data_root_writable
-
 from phantom import app as app_module
+from phantom.app import _ensure_data_root_writable
 
 
 def test_first_boot_fsyncs_the_data_root_into_its_parent(

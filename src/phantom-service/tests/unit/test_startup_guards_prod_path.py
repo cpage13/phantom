@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING
 
 import aiosqlite
 import pytest
+from phantom import app as app_module
 from phantom.app import create_app
 from phantom.config.settings import (
     BodyStoreCfg,
@@ -66,8 +67,6 @@ from phantom.runtime.startup_checks import (
 from phantom.storage.integrity import list_quarantines
 from phantom.storage.sqlite_store import SqliteUploadStore
 from phantom.storage.token_cache import SqliteTokenCache
-
-from phantom import app as app_module
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
