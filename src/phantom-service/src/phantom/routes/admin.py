@@ -1388,10 +1388,31 @@ async def bulk_delete_uploads(
 async def list_tokens(
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
     endpoint: str | None = Query(None),
+    instance: str | None = Query(None),
 ) -> TokenListResponse:
-    """List token slots (NO bearer values; ADR-004)."""
+    """List token slots (NO bearer values; ADR-004).
+
+    ``instance`` scopes the listing the way every sibling list route already
+    does, through :func:`_scope_instances`. It was the one omission: the SDK
+    sent the parameter and FastAPI silently discarded it, so a multi-instance
+    operator debugging a parked row was handed the union across every instance
+    with no attribution. ``TokenSlot`` carries no instance id, so the same
+    ``(endpoint, uid)`` pair appeared N times indistinguishably, and a healthy
+    slot belonging to one instance read as proof that another had a good
+    credential.
+
+    Args:
+        dispatcher: Instance dispatcher dependency.
+        endpoint: Optional destination-host filter.
+        instance: Optional instance id. Unknown ids raise
+            :class:`UnknownInstanceError`, which the app handler renders as a
+            421, matching every other scoped route.
+
+    Returns:
+        The token slots for the scoped instances, without bearer values.
+    """
     out = []
-    for ctx in dispatcher.all_instances():
+    for ctx in _scope_instances(dispatcher, instance):
         out.extend(await ctx.token_cache.list_slots(endpoint=endpoint))
     return TokenListResponse(tokens=out)
 
