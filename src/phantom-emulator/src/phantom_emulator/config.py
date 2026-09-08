@@ -179,12 +179,13 @@ class S3Cfg(BaseModel):
     """Known SigV4 test credentials the path-style PUT/GET validates against.
 
     The validator (:func:`phantom_emulator.routers.s3._verify_sigv4`)
-    recomputes the inbound SigV4 signature and compares. It consumes
-    ``access_key_id`` (the credential-id equality check),
-    ``secret_access_key`` (the recompute key), and ``body_max_bytes``
-    (the 413 cap). ``region`` / ``service`` document the expected
-    credential scope but are NOT consumed by the recompute - the
-    request's own credential scope drives the comparison.
+    recomputes the inbound SigV4 signature and compares. Every field is
+    load-bearing: ``access_key_id`` (the credential-id equality check),
+    ``secret_access_key`` (the recompute key), ``region`` / ``service``
+    (the endpoint's credential scope, checked against the scope the request
+    declares and then used to derive the signing key, so a request signed
+    for another region or service is refused 403 rather than validated
+    against its own declaration), and ``body_max_bytes`` (the 413 cap).
 
     Defaults are the public AWS-doc example pair so a test that signs
     client-side with the same pair round-trips with zero overlay.
@@ -321,10 +322,15 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"config root must be a YAML mapping, got {type(raw).__name__}")
 
-    # Environment variables still overlay after merging YAML - Pydantic
-    # Settings' precedence is env > init kwargs > defaults. To preserve
-    # that, we construct the AppConfig with YAML-derived overrides; env
-    # then wins per Pydantic's normal Settings flow.
+    # LOAD-BEARING, NOT REDUNDANT. Pydantic Settings ranks init kwargs
+    # ABOVE env vars (init settings are the highest-priority source), so
+    # ``AppConfig.model_validate(raw)`` would let a YAML value beat
+    # ``PHANTOM_EMULATOR_*``: with the env var set to 9999,
+    # ``model_validate({"server": {"port": 1234}})`` returns 1234. The
+    # emulator wants the opposite precedence (env > YAML > defaults), and
+    # the only reason it holds is that the env vars are merged INTO the
+    # mapping first, here. Deleting this call silently inverts the
+    # precedence for every key a YAML file happens to set.
     overlay = _apply_env_overlay(raw)
     logger.debug("Loaded config from %s", p)
     return AppConfig.model_validate(overlay)
@@ -333,11 +339,11 @@ def load_config(path: str | Path | None = None) -> AppConfig:
 def _apply_env_overlay(raw: dict[str, Any]) -> dict[str, Any]:
     """Merge ``PHANTOM_EMULATOR_*`` env vars into the raw YAML mapping.
 
-    This is a belt-and-braces overlay so callers can rely on
-    :func:`load_config` honoring env vars even when the YAML path
-    explicitly provides a value. Pydantic Settings already honors env
-    vars on bare ``AppConfig()``; this helper applies the same merging
-    rule when YAML is in play.
+    This is the mechanism, not a convenience. Pydantic Settings honors env
+    vars on a bare ``AppConfig()``, but ranks explicit init kwargs above
+    them, so a YAML value passed to ``model_validate`` would otherwise win
+    over the env var. Merging the env vars into the mapping first is what
+    gives :func:`load_config` its intended env > YAML > defaults order.
 
     Args:
         raw: The parsed YAML mapping.

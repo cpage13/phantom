@@ -15,6 +15,13 @@ The emulator can present several auth shapes to inbound requests:
 The policy table threads the per-mode data; ``authenticate`` runs the
 check for a single request against a single policy.
 
+``oauth_client_credentials`` carries one piece of emulator state into an
+otherwise stateless check: the set of credentials the control surface has
+revoked or expired (``phantom_emulator.state.CredentialLedger``). A JWT's
+signature and ``exp`` cannot be changed after issue, so without that set
+``POST /control/revoke-tokens`` and ``POST /control/expire-all-now`` would
+be silent no-ops in the default mode.
+
 See plan §4.5.
 """
 
@@ -25,6 +32,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
+
+import jwt
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import
     from phantom_emulator.auth.jwt_minter import JwtMinter
@@ -53,12 +62,18 @@ class AuthModePolicy:
         api_key_secret: Required value of the ``X-API-Key`` header in
             ``api_key`` mode.
         static_jwt: The pre-minted JWT for ``static_token`` mode.
+        invalidated_credentials: Snapshot of the credential ledger's
+            revoked/expired set. Consulted in ``oauth_client_credentials``
+            mode only: the other modes have their own control (the
+            allowlist, the shared secret, the cleared ``static_jwt``) and
+            are already answerable to the control surface.
     """
 
     mode: AuthMode
     plain_bearer_allowlist: frozenset[str] = field(default_factory=frozenset)
     api_key_secret: str | None = None
     static_jwt: str | None = None
+    invalidated_credentials: frozenset[str] = field(default_factory=frozenset)
 
 
 def authenticate(
@@ -78,6 +93,14 @@ def authenticate(
     Returns:
         ``True`` if the request satisfies the policy; ``False``
         otherwise.
+
+    Raises:
+        jwt.PyJWTError: when ``oauth_client_credentials`` verification fails
+            for a reason that is not an invalid token, for example key
+            material PyJWT refuses. A broken emulator configuration surfaces
+            instead of masquerading as a rejected caller.
+        ValueError: when the minter has no key material for its configured
+            signing mode. Same reason.
     """
     mode = policy.mode
     if mode is AuthMode.NONE:
@@ -101,14 +124,40 @@ def authenticate(
     if mode is AuthMode.OAUTH_CLIENT_CREDENTIALS:
         if bearer is None:
             return False
+        if bearer in policy.invalidated_credentials:
+            logger.debug("bearer rejected: revoked or expired by the control surface")
+            return False
         try:
             jwt_minter.verify(bearer)
-        except Exception as exc:  # decoding/verification errors
+        except jwt.InvalidTokenError as exc:
+            # Every PyJWT failure that means "this token is not acceptable"
+            # derives from InvalidTokenError: bad signature, expired, wrong
+            # audience or issuer, undecodable. Anything else (InvalidKeyError,
+            # a TypeError from key material that is None) is a broken emulator
+            # configuration and MUST NOT read as a rejected caller.
             logger.debug("JWT verify failed: %s", exc)
             return False
         return True
 
     return False  # pragma: no cover - exhaustive enum
+
+
+def bearer_credential(headers: Mapping[str, str]) -> str | None:
+    """Return the bearer credential a request presented, if any.
+
+    The same extraction :func:`authenticate` performs, exposed so a caller
+    that has just authenticated a request can record the credential on the
+    ledger (:meth:`phantom_emulator.state.CredentialLedger.note_accepted`)
+    without re-implementing the header parse.
+
+    Args:
+        headers: Mapping of request headers (case-insensitive lookup).
+
+    Returns:
+        The credential with any ``Bearer `` prefix stripped, or ``None``
+        when the request carried no usable ``Authorization`` value.
+    """
+    return _strip_bearer(_header(headers, "authorization"))
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:

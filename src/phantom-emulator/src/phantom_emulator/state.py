@@ -119,8 +119,14 @@ class PendingUpload:
             other keys byte-for-byte).
         created_at: When the URL was issued.
         presigned_ttl_seconds: Lifetime of the URL.
-        signature: Opaque signature stub baked into the URL; the PUT
-            handler verifies the inbound URL carries the same value.
+        signature: Opaque signature stub baked into the URL as ``sig``;
+            the PUT handler compares the inbound query parameter against
+            this value and answers 403 SignatureDoesNotMatch when it is
+            missing or different.
+        expires_epoch: The ``expires`` query parameter baked into the URL
+            (whole seconds since the epoch, ``created_at`` plus the TTL).
+            Carried rather than recomputed so the PUT handler compares
+            against the value that was actually signed into the URL.
     """
 
     upload_token: UploadToken
@@ -130,6 +136,7 @@ class PendingUpload:
     created_at: datetime
     presigned_ttl_seconds: int
     signature: str
+    expires_epoch: int
 
 
 @dataclass
@@ -283,6 +290,63 @@ class MintAttempt:
 
 
 @dataclass
+class CredentialLedger:
+    """Emulator-side validity overlay for bearer credentials.
+
+    A JWT is stateless. The default ``oauth_client_credentials`` check is a
+    signature plus ``exp`` decode against the signing key, so nothing the
+    control surface does to the emulator's own bookkeeping can invalidate a
+    token that is already in a caller's hands. Revoke and expire have to be
+    observable to the caller, so the emulator records every credential it
+    issues or accepts here and the verify path consults this ledger after
+    the decode contract and before answering ``True``.
+
+    Membership is the mechanism, not identity: a credential the emulator has
+    never issued and never seen is judged on its own merits, which is what
+    keeps a test-minted JWT (signed with the shared secret, never presented
+    to this process) working. A credential that has been presented once is
+    in ``seen``, so a later revoke catches it even though the emulator did
+    not mint it. Both sets are bounded by the number of distinct credentials
+    one emulator process handles, which for test infrastructure is a handful.
+
+    Attributes:
+        seen: Every credential the emulator has issued or authenticated.
+        invalidated: The subset the control surface has revoked or expired.
+            The verify path rejects these.
+    """
+
+    seen: set[str] = field(default_factory=set)
+    invalidated: set[str] = field(default_factory=set)
+
+    def note_issued(self, token: str) -> None:
+        """Record a credential the emulator just minted, reinstating it.
+
+        Minting is deterministic over the claim set, so a re-mint inside the
+        same whole second reproduces a just-invalidated token byte for byte.
+        The emulator has deliberately issued this one as valid, so issuance
+        wins over the earlier invalidation and the recovery path works.
+        """
+        self.seen.add(token)
+        self.invalidated.discard(token)
+
+    def note_accepted(self, token: str) -> None:
+        """Record a credential that just passed authentication.
+
+        Never reinstates: acceptance is reached only after
+        :meth:`is_invalidated` has already cleared the credential.
+        """
+        self.seen.add(token)
+
+    def invalidate_all(self) -> None:
+        """Invalidate every credential issued or accepted so far."""
+        self.invalidated.update(self.seen)
+
+    def is_invalidated(self, token: str) -> bool:
+        """Whether the control surface has revoked or expired ``token``."""
+        return token in self.invalidated
+
+
+@dataclass
 class AuthTokenGate:
     """Test-only gate on the AUTH_TOKEN middleware path (T3 lifecycle).
 
@@ -313,6 +377,10 @@ class EmulatorState:
     Attributes:
         cfg: The application configuration this state was built from.
         issued_tokens: Active tokens keyed by their JWT string.
+        credentials: Validity overlay consulted by the stateless JWT verify
+            path, so ``revoke_tokens`` and ``expire_all_now`` are observable
+            in ``oauth_client_credentials`` mode. See
+            :class:`CredentialLedger`.
         extra_claims: Claims to inject into the next mint (drained on
             use or persisted depending on test setup; per the plan,
             stored for the next mint and cleared after).
@@ -360,6 +428,7 @@ class EmulatorState:
     seed: int = 0
 
     issued_tokens: dict[str, IssuedToken] = field(default_factory=dict)
+    credentials: CredentialLedger = field(default_factory=CredentialLedger)
     extra_claims: dict[str, Any] = field(default_factory=dict)
     pending_uploads: dict[UploadToken, PendingUpload] = field(default_factory=dict)
     file_id_to_token: dict[UUID, UploadToken] = field(default_factory=dict)
@@ -424,19 +493,32 @@ class EmulatorState:
         self.global_paused = False
 
     def expire_all_now(self) -> None:
-        """Age every issued JWT past its ``exp``, re-minting the static token.
+        """Age every credential past its expiry, re-minting the static token.
+
+        The recorded ``expires_at`` of each issued token moves to the epoch,
+        and the credential ledger is invalidated so the stateless
+        ``oauth_client_credentials`` decode path answers 401 as well: the
+        ``exp`` claim inside an already-issued JWT cannot be moved, so
+        without the ledger this control is invisible in the default mode.
+        A credential the emulator merely accepted (a test-minted bearer it
+        never issued) is in play just as much as one it minted, so it expires
+        here too.
 
         In static-token mode the pre-minted JWT is cleared and re-minted, so
         subsequent mints succeed against a fresh token rather than a
-        deliberately expired one.
+        deliberately expired one. The re-mint is recorded as an issuance,
+        which reinstates it even when it reproduces the aged token byte for
+        byte.
         """
         past = datetime.fromtimestamp(0, tz=UTC)
         for issued in self.issued_tokens.values():
             issued.expires_at = past
+        self.credentials.invalidate_all()
         self.static_jwt = None
         if self.cfg.auth.default_mode is AuthMode.STATIC_TOKEN and self.jwt_minter is not None:
             token, expires_at = self.jwt_minter.mint(client_id="static-client")
             self.static_jwt = token
+            self.credentials.note_issued(token)
             self.issued_tokens[token] = IssuedToken(
                 client_id="static-client",
                 expires_at=expires_at,
@@ -445,7 +527,17 @@ class EmulatorState:
             )
 
     def revoke_tokens(self) -> None:
-        """Drop every issued JWT, including the static one."""
+        """Revoke every credential the emulator has issued or accepted.
+
+        Clearing the ``issued_tokens`` bookkeeping is invisible to the
+        default ``oauth_client_credentials`` mode, whose check is a stateless
+        JWT decode that never reads that dict. Revocation therefore marks the
+        credential ledger the decode path consults, so a bearer that was
+        valid a moment ago now 401s and the caller has to obtain a fresh one.
+        ``static_token`` mode is unaffected by the ledger and keeps working
+        through the cleared ``static_jwt`` it already relied on.
+        """
+        self.credentials.invalidate_all()
         self.issued_tokens.clear()
         self.static_jwt = None
 
@@ -463,6 +555,10 @@ class EmulatorState:
     def set_presigned_ttl(self, seconds: int) -> None:
         """Set the default presigned URL lifetime for new mints."""
         self.cfg.upstream.presigned_ttl_seconds = seconds
+
+    def set_idempotency_dedup_window(self, seconds: int) -> None:
+        """Set the create-response idempotency cache lifetime for new entries."""
+        self.cfg.upstream.idempotency_dedup_window_seconds = seconds
 
     def received(self) -> list[ReceivedEntry]:
         """Project the token-keyed latest accepted-body view, oldest first.
@@ -502,7 +598,33 @@ class EmulatorState:
         return entries
 
     def clear_received(self) -> None:
-        """Drop the latest accepted bodies and the append-only event log."""
+        """Drop every record of what the emulator has received.
+
+        ONE reset for the whole received-side surface, so a store added later
+        has an obvious home and cannot be silently left behind. That omission
+        is what let ``idempotency_cache`` survive a reset: its entries live up
+        to ``idempotency_dedup_window_seconds`` (an hour by default) and are
+        pruned only lazily on a same-key lookup, so a second scenario reusing
+        a literal ``Idempotency-Key`` transparently received the first one's
+        cached file id and upload token. What this resets:
+
+        - ``accepted_bodies`` and ``accepted_idempotency_keys``: the
+          token-keyed latest-value views of the upload PUT.
+        - ``upstream_events``: the append-only create/PUT event oracle.
+        - ``s3_objects`` and ``raw_bodies``: the SigV4-validated sink and the
+          auth-free raw sink stores.
+        - ``idempotency_cache``: cached create responses.
+
+        Deliberately NOT reset, because each is owned elsewhere:
+        ``pending_uploads`` and ``file_id_to_token`` are issued state an
+        in-flight chain still resolves its upload URL against (and the join
+        behind :meth:`received`), credential state belongs to
+        :meth:`revoke_tokens`, and failure policies belong to
+        ``FailureInjectionState.clear_all``.
+        """
         self.accepted_bodies.clear()
         self.accepted_idempotency_keys.clear()
         self.upstream_events.clear()
+        self.s3_objects.clear()
+        self.raw_bodies.clear()
+        self.idempotency_cache.clear()

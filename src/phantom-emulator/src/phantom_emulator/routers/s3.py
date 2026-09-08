@@ -168,6 +168,11 @@ def _verify_sigv4(
     via the lower-level ``canonical_request`` / ``string_to_sign`` /
     ``signature`` methods. Never calls ``add_auth`` (module docstring).
 
+    The credential SCOPE is the exception to recompute-from-declared: the
+    declared region and service are checked against the configured ones and
+    the signing key is derived from the configuration, because a scope taken
+    from the request validates only against itself.
+
     Args:
         request: The inbound FastAPI request.
         body: The already-read request body (the PUT body, or ``b""`` for
@@ -184,7 +189,8 @@ def _verify_sigv4(
     Raises:
         HTTPException: ``403 SignatureDoesNotMatch`` on any failure
             (missing/garbled ``Authorization``, wrong credential id,
-            a missing/unequal expected session token,
+            a missing/unequal expected session token, a credential scope
+            declaring a region or service other than the configured ones,
             credential-scope date mismatch, a declared header absent from
             the request, declared-headers divergence, or a signature
             mismatch). ``400`` when ``x-amz-content-sha256`` is absent, and
@@ -202,6 +208,28 @@ def _verify_sigv4(
     if m is None:
         raise _SIG_MISMATCH
     if not hmac.compare_digest(m["akid"], s3cfg.access_key_id):
+        raise _SIG_MISMATCH
+
+    # TIE THE CREDENTIAL SCOPE TO THE ENDPOINT. A real bucket lives in one
+    # region and answers for one service, and a request scoped to any other
+    # is refused however well it is signed. Validating the declared scope
+    # against the CONFIGURED region/service before the recompute is what
+    # makes that true here: recomputing with the request's own declared
+    # scope alone is self-validating, so a request signed for us-west-2 (or
+    # for "execute-api") verified against itself and the emulator certified
+    # a signature real S3 would have rejected.
+    if not hmac.compare_digest(m["region"], s3cfg.region) or not hmac.compare_digest(
+        m["service"], s3cfg.service
+    ):
+        logger.warning(
+            "credential scope mismatch on %s %s: signed %s/%s, endpoint is %s/%s",
+            request.method,
+            request.url.path,
+            m["region"],
+            m["service"],
+            s3cfg.region,
+            s3cfg.service,
+        )
         raise _SIG_MISMATCH
 
     # ENFORCE the signed payload-hash header (PUT and GET), as real S3 does: a
@@ -233,9 +261,11 @@ def _verify_sigv4(
     aws_req = AWSRequest(method=request.method, url=url, data=body, headers=headers)
 
     creds = Credentials(s3cfg.access_key_id, s3cfg.secret_access_key)
-    # service/region from the inbound credential SCOPE, so the request's
-    # own scope drives the comparison.
-    auth = SigV4Auth(creds, m["service"], m["region"])
+    # service/region from the CONFIGURED endpoint identity. They equal the
+    # declared scope by the guard above, and deriving the signing key from
+    # configuration rather than from the request keeps the scope check
+    # load-bearing instead of decorative.
+    auth = SigV4Auth(creds, s3cfg.service, s3cfg.region)
     # Pin the timestamp from the inbound X-Amz-Date. Only add_auth ever
     # SETS context['timestamp']; the lower-level methods only READ it
     # (string_to_sign appends it; scope/signature slice [0:8]).

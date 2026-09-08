@@ -84,6 +84,33 @@ async def test_pause_resume_via_typed_surface() -> None:
         await server.stop()
 
 
+async def test_idempotency_dedup_window_matches_the_http_surface() -> None:
+    """The oracle setter and ``POST /control/idempotency-dedup-window`` agree.
+
+    Objective: this setter was the one sibling that reached around
+    :class:`EmulatorState` into the config object, and it had no HTTP twin, so
+    the two control surfaces were not the mirror the rest of the file claims.
+    Both now go through the same state method.
+
+    Expected outcome: driving either surface moves the value the create path
+    reads, and the two land on the same field.
+    """
+    server = await start_server(AppConfig(server=ServerCfg(port=0)))
+    try:
+        server.set_idempotency_dedup_window(13)
+        assert server.state.cfg.upstream.idempotency_dedup_window_seconds == 13
+
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{server.url()}/control/idempotency-dedup-window",
+                json={"seconds": 21},
+            )
+        assert r.status_code == 204
+        assert server.state.cfg.upstream.idempotency_dedup_window_seconds == 21
+    finally:
+        await server.stop()
+
+
 async def test_received_empty_initially() -> None:
     server = await start_server(AppConfig(server=ServerCfg(port=0)))
     try:

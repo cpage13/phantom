@@ -61,6 +61,8 @@ def _sign(
     token: str | None = None,
     extra_headers: dict[str, str] | None = None,
     signer: type[SigV4Auth] = S3SigV4Auth,
+    region: str = _REGION,
+    service: str = _SERVICE,
 ) -> dict[str, str]:
     """Client-side SigV4-sign a request and return the wire headers.
 
@@ -87,6 +89,11 @@ def _sign(
         signer: The botocore signer class to sign with. Default ``S3SigV4Auth``
             (emits the content-sha256 header); pass base ``SigV4Auth`` to keep a
             pre-set ``UNSIGNED-PAYLOAD`` literal intact.
+        region: Credential-scope region to sign for. Default is the one the
+            emulator is configured with; another value produces a request
+            correctly signed for the WRONG endpoint.
+        service: Credential-scope service to sign for. Same contract as
+            ``region``.
 
     Returns:
         The full header dict to send on the wire (``Authorization`` +
@@ -97,7 +104,7 @@ def _sign(
         headers.update(extra_headers)
     aws_req = AWSRequest(method=method, url=f"{_BASE_URL}{path}", data=body, headers=headers)
     creds = Credentials(_ACCESS_KEY_ID, secret, token)
-    signer(creds, _SERVICE, _REGION).add_auth(aws_req)
+    signer(creds, service, region).add_auth(aws_req)
     return dict(aws_req.headers.items())
 
 
@@ -211,6 +218,59 @@ async def test_wrong_secret_rejected(
 
     assert r.status_code == 403
     assert r.json()["detail"] == "SignatureDoesNotMatch"
+
+
+async def test_wrong_region_scope_rejected(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """A request correctly signed for ANOTHER region -> 403, nothing stored.
+
+    Objective: a real bucket lives in one region and refuses a signature
+    scoped to any other. The validator derived its signing key from the
+    request's OWN declared scope, so a us-west-2 request was checked against a
+    us-west-2 key and validated against itself: the emulator certified a
+    signature real S3 would have rejected, and no test could catch a signer
+    that scoped its credential wrongly.
+
+    Expected outcome: 403 SignatureDoesNotMatch, and the body is not stored.
+    """
+    client, state = client_and_state
+    body = b"signed-for-the-wrong-region"
+    headers = _sign("PUT", "/mybucket/wrongregion", body, extra_headers=_TEXT, region="us-west-2")
+
+    r = await client.put("/mybucket/wrongregion", content=body, headers=headers)
+
+    assert r.status_code == 403
+    assert r.json()["detail"] == "SignatureDoesNotMatch"
+    assert ("mybucket", "wrongregion") not in state.s3_objects
+
+
+async def test_wrong_service_scope_rejected(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """A request correctly signed for ANOTHER service -> 403, nothing stored.
+
+    Objective: the service half of the credential scope was self-validating in
+    exactly the same way as the region half, so a credential scoped to a
+    non-S3 service reached the S3 sink and was accepted.
+
+    Expected outcome: 403 SignatureDoesNotMatch, and the body is not stored.
+    """
+    client, state = client_and_state
+    body = b"signed-for-the-wrong-service"
+    headers = _sign(
+        "PUT",
+        "/mybucket/wrongservice",
+        body,
+        extra_headers=_TEXT,
+        service="execute-api",
+    )
+
+    r = await client.put("/mybucket/wrongservice", content=body, headers=headers)
+
+    assert r.status_code == 403
+    assert r.json()["detail"] == "SignatureDoesNotMatch"
+    assert ("mybucket", "wrongservice") not in state.s3_objects
 
 
 async def test_missing_authorization_rejected(

@@ -38,6 +38,7 @@ def test_create_app_routes_present(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "POST /control/auth/extra-claims" in paths
     assert "POST /control/auth/mode" in paths
     assert "POST /control/presigned-ttl" in paths
+    assert "POST /control/idempotency-dedup-window" in paths
     assert "POST /control/seed" in paths
     assert "POST /control/clear-received" in paths
     assert "POST /control/shutdown" in paths

@@ -165,6 +165,70 @@ async def test_5xx_with_full_probability(
     assert state.failure_state.call_counts == {}
 
 
+async def test_response_modifiers_apply_to_a_synthetic_response(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """A policy pairing ``unavailable_until`` with a body cutoff -> a truncated 503.
+
+    Objective: the five knobs are documented as ONE ordered pipeline, but the
+    response modifiers only ever saw the real handler's response. A policy
+    whose gate fired had its modifiers silently dropped, so the compound
+    faults an upstream actually produces (a 503 whose body is cut off
+    mid-frame) were unreachable, and a caller who installed both got no signal
+    that half the policy was ignored.
+
+    Expected outcome: the gate decides the status, and the modifier then
+    shapes that same response.
+    """
+    client, state = client_and_state
+    assert state.failure_state is not None
+    state.failure_state.set_policy(
+        FailurePolicy(
+            scope=FailureScope.UPSTREAM_FILES_CREATE,
+            unavailable_until=datetime.now(UTC) + timedelta(hours=1),
+            body_cutoff_at_bytes=7,
+        )
+    )
+
+    r = await client.post("/v1/files/create")
+
+    assert r.status_code == 503
+    assert len(r.content) == 7
+
+
+async def test_latency_applies_to_a_synthetic_response(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """A policy pairing the 401 gate with ``latency_ms`` -> a SLOW 401.
+
+    Objective: the latency sleep is step 4 of the same pipeline and was
+    likewise skipped whenever an earlier gate produced the response, so "the
+    upstream is rejecting us and taking its time about it" could not be
+    staged, which is the shape that exercises a client's timeout handling.
+
+    Expected outcome: the 401 still comes back, and not before the configured
+    delay has elapsed.
+    """
+    client, state = client_and_state
+    assert state.failure_state is not None
+    state.failure_state.set_policy(
+        FailurePolicy(
+            scope=FailureScope.UPSTREAM_FILES_CREATE,
+            auth_401_after_n_calls=0,
+            latency_ms=150,
+        )
+    )
+
+    t0 = time.monotonic()
+    r = await client.post("/v1/files/create")
+    elapsed_ms = (time.monotonic() - t0) * 1000
+
+    assert r.status_code == 401
+    # Same fuzz allowance as test_latency_applies: we only need to confirm
+    # the sleep happened at all.
+    assert elapsed_ms >= 100
+
+
 async def test_global_pause_short_circuits(
     client_and_state: tuple[httpx.AsyncClient, EmulatorState],
 ) -> None:

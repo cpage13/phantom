@@ -28,6 +28,7 @@ See plan §4.11.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -37,7 +38,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from phantom_emulator.auth.modes import AuthModePolicy, authenticate
+from phantom_emulator.auth.modes import AuthModePolicy, authenticate, bearer_credential
 from phantom_emulator.routers._deps import get_state
 from phantom_emulator.state import (
     AcceptedBody,
@@ -45,6 +46,7 @@ from phantom_emulator.state import (
     EmulatorState,
     IdempotencyEntry,
     MetadataCreateEvent,
+    PendingUpload,
     UpstreamEventKind,
 )
 from phantom_emulator.upload.correlation import echo_metadata_kvs, extract_metadata_kvs
@@ -59,6 +61,19 @@ StateDep = Annotated[EmulatorState, Depends(get_state)]
 # Idempotency-Key request header name (canonical per RFC 9110-style).
 IDEMPOTENCY_HEADER: str = "idempotency-key"
 
+# Query parameters the synthetic presigned URL carries. The PUT handler
+# checks BOTH against the record minted for the token, so a forwarded PUT
+# that drops or rewrites the query is rejected the way real S3 rejects it.
+SIGNATURE_PARAM: str = "sig"
+EXPIRES_PARAM: str = "expires"
+
+# The single rejection an unusable presigned URL earns, whatever made it
+# unusable: unknown token, bad or missing signature, wrong or missing
+# expiry, elapsed TTL. Real S3 answers a mismatched signature with this
+# code, and the emulator keeps one vocabulary for the whole family (the
+# same code and detail ``routers/s3.py`` uses).
+_SIG_MISMATCH = HTTPException(status_code=403, detail="SignatureDoesNotMatch")
+
 
 def _resolve_auth_policy(state: EmulatorState, path: str) -> AuthModePolicy:
     """Return the :class:`AuthModePolicy` that governs ``path``.
@@ -72,33 +87,76 @@ def _resolve_auth_policy(state: EmulatorState, path: str) -> AuthModePolicy:
         plain_bearer_allowlist=frozenset(state.plain_bearer_allowlist),
         api_key_secret=state.api_key_secret,
         static_jwt=state.static_jwt,
+        invalidated_credentials=frozenset(state.credentials.invalidated),
     )
 
 
 def _enforce_auth(request: Request, state: EmulatorState) -> None:
-    """Raise ``401`` when the inbound request fails the configured policy."""
+    """Raise ``401`` when the inbound request fails the configured policy.
+
+    An accepted bearer is recorded on the credential ledger, which is what
+    later makes ``revoke_tokens`` / ``expire_all_now`` bite on a credential
+    the emulator never minted itself.
+    """
     if state.jwt_minter is None:
         raise HTTPException(status_code=500, detail="jwt_minter not initialized")
     policy = _resolve_auth_policy(state, request.url.path)
     headers = dict(request.headers.items())
     if not authenticate(headers, policy, state.jwt_minter):
         raise HTTPException(status_code=401, detail="invalid_token")
+    presented = bearer_credential(headers)
+    if presented is not None:
+        state.credentials.note_accepted(presented)
 
 
 def _presigned_store(state: EmulatorState, base_url: str) -> PresignedTokenStore:
-    """Lazily build the per-request presigned URL store.
+    """Build the presigned URL minter for one create call.
 
-    The store keeps state in its own ``_pending`` dict but writes back
-    to :attr:`EmulatorState.pending_uploads` and
-    :attr:`EmulatorState.file_id_to_token` after each mint so the GET
-    stub and the PUT path can resolve tokens.
+    The store is a mint-only helper here: the freshly minted record is
+    written straight onto :attr:`EmulatorState.pending_uploads` and
+    :attr:`EmulatorState.file_id_to_token` by the caller, which is what the
+    GET stub and the PUT path resolve against. The store instance itself is
+    discarded with the request.
     """
     ttl = state.cfg.upstream.presigned_ttl_seconds
-    store = PresignedTokenStore(base_url=base_url, default_ttl_seconds=ttl)
-    # Hydrate the store from existing pending uploads so a fresh
-    # request can still resolve previously-minted tokens.
-    store.pending.update(state.pending_uploads)
-    return store
+    return PresignedTokenStore(base_url=base_url, default_ttl_seconds=ttl)
+
+
+def _verify_presigned_query(request: Request, pending: PendingUpload) -> None:
+    """Check the inbound presigned query against the URL the emulator minted.
+
+    Real S3 rejects a presigned PUT whose signature or expiry has been
+    stripped or altered, so the emulator does too: without this the whole
+    query is decoration and a forwarder could drop it unnoticed.
+
+    Args:
+        request: The inbound PUT.
+        pending: The record minted for this upload token.
+
+    Raises:
+        HTTPException: ``403 SignatureDoesNotMatch`` when ``sig`` is absent
+            or different, or when ``expires`` is absent, not an integer, or
+            not the value minted into the URL.
+    """
+    presented_sig = request.query_params.get(SIGNATURE_PARAM)
+    if presented_sig is None or not hmac.compare_digest(
+        presented_sig.encode("utf-8"), pending.signature.encode("utf-8")
+    ):
+        logger.info("put_upload rejected: %s missing or mismatched", SIGNATURE_PARAM)
+        raise _SIG_MISMATCH
+
+    presented_expires = request.query_params.get(EXPIRES_PARAM)
+    if presented_expires is None:
+        logger.info("put_upload rejected: %s missing", EXPIRES_PARAM)
+        raise _SIG_MISMATCH
+    try:
+        expires_epoch = int(presented_expires)
+    except ValueError:
+        logger.info("put_upload rejected: %s is not an integer", EXPIRES_PARAM)
+        raise _SIG_MISMATCH from None
+    if expires_epoch != pending.expires_epoch:
+        logger.info("put_upload rejected: %s disagrees with the minted URL", EXPIRES_PARAM)
+        raise _SIG_MISMATCH
 
 
 def _maybe_cached_response(
@@ -269,25 +327,34 @@ async def put_upload(
 ) -> Response:
     """Accept a body for a previously-minted upload token.
 
-    Returns ``403`` for unknown or expired tokens; ``413`` if the body
-    exceeds :attr:`UpstreamCfg.body_max_bytes`. Stores the bytes plus
-    any ``x-amz-meta-*`` headers on :class:`EmulatorState`.
+    The URL is checked whole, not just its path: the inbound ``sig`` and
+    ``expires`` query parameters must be the ones minted onto this token's
+    record, so a PUT that reaches the right path with a stripped, truncated
+    or rewritten query is rejected exactly as real S3 rejects it.
+
+    Returns ``403 SignatureDoesNotMatch`` for an unknown token, a signature
+    or expiry that does not match the minted URL, and a token whose TTL has
+    elapsed; ``413`` if the body exceeds
+    :attr:`UpstreamCfg.body_max_bytes`. Stores the bytes plus any
+    ``x-amz-meta-*`` headers on :class:`EmulatorState`.
     """
     pending = state.pending_uploads.get(token)
     if pending is None:
-        raise HTTPException(status_code=403, detail="SignatureDoesNotMatch")
+        raise _SIG_MISMATCH
 
     # Honor a per-policy signature-mismatch override.
     fs = state.failure_state
     if fs is not None:
         policy = fs.resolve(_scope_for_policy_lookup(token))
         if policy is not None and policy.presigned_signature_mismatch:
-            raise HTTPException(status_code=403, detail="SignatureDoesNotMatch")
+            raise _SIG_MISMATCH
+
+    _verify_presigned_query(request, pending)
 
     now = datetime.now(UTC)
     expires_at = pending.created_at + timedelta(seconds=pending.presigned_ttl_seconds)
     if now >= expires_at:
-        raise HTTPException(status_code=403, detail="SignatureDoesNotMatch")
+        raise _SIG_MISMATCH
 
     body = await request.body()
     if len(body) > state.cfg.upstream.body_max_bytes:

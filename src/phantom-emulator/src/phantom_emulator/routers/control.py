@@ -71,6 +71,14 @@ class PresignedTtlBody(BaseModel):
     seconds: int = Field(..., ge=0, description="New default TTL.")
 
 
+class IdempotencyDedupWindowBody(BaseModel):
+    """Body for ``POST /control/idempotency-dedup-window``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seconds: int = Field(..., ge=1, description="New dedup window for entries written from now.")
+
+
 class SeedBody(BaseModel):
     """Body for ``POST /control/seed``."""
 
@@ -182,12 +190,13 @@ async def shutdown(
 async def expire_all_now(
     state: StateDep,
 ) -> Response:
-    """Age every issued JWT past its ``exp``.
+    """Expire every credential the emulator has issued or accepted.
 
-    In HS256 mode this is observability-only (Phantom won't see a
-    server-side ``exp`` change without re-decoding); but if the test
-    drives the request immediately, the emulator's verify path returns
-    401 because the cached expires_at is now in the past.
+    The recorded ``expires_at`` moves to the epoch AND the credential
+    ledger is marked, because the ``exp`` claim inside a token already in
+    a caller's hands cannot be moved. Every mode therefore answers 401 to
+    a credential that was valid a moment ago, and the caller has to obtain
+    a fresh one. See :meth:`EmulatorState.expire_all_now`.
     """
     state.expire_all_now()
     logger.info("expire_all_now: aged %d tokens", len(state.issued_tokens))
@@ -198,7 +207,13 @@ async def expire_all_now(
 async def revoke_tokens(
     state: StateDep,
 ) -> Response:
-    """Drop every issued JWT."""
+    """Revoke every credential the emulator has issued or accepted.
+
+    The bookkeeping is cleared and the credential ledger is marked, so a
+    bearer that authenticated a moment ago now 401s in the default
+    ``oauth_client_credentials`` mode too. See
+    :meth:`EmulatorState.revoke_tokens`.
+    """
     state.revoke_tokens()
     logger.info("revoke_tokens")
     return Response(status_code=204)
@@ -237,6 +252,21 @@ async def set_presigned_ttl(
     return Response(status_code=204)
 
 
+@router.post("/control/idempotency-dedup-window", status_code=204)
+async def set_idempotency_dedup_window(
+    body: IdempotencyDedupWindowBody,
+    state: StateDep,
+) -> Response:
+    """Set the create-response idempotency cache lifetime for new entries.
+
+    Existing entries keep the expiry they were written with; the window
+    applies to entries created from now on.
+    """
+    state.set_idempotency_dedup_window(body.seconds)
+    logger.info("set_idempotency_dedup_window seconds=%d", body.seconds)
+    return Response(status_code=204)
+
+
 @router.post("/control/seed", status_code=204)
 async def set_seed(
     body: SeedBody,
@@ -254,7 +284,12 @@ async def set_seed(
 async def clear_received(
     state: StateDep,
 ) -> Response:
-    """Drop latest accepted bodies and append-only upstream events."""
+    """Drop every record of what the emulator has received.
+
+    Accepted bodies, the append-only event log, both sink stores, and the
+    idempotency cache. See :meth:`EmulatorState.clear_received` for the
+    full list and for what it deliberately leaves alone.
+    """
     state.clear_received()
     logger.info("clear_received")
     return Response(status_code=204)

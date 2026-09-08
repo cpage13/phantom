@@ -7,10 +7,22 @@ checks for each inbound request:
 1. **Global pause.** When ``state.global_paused`` is True, every
    request to an upstream endpoint returns 503 Retry-After. Control
    endpoints (``/control/*``) bypass the pause to remain reachable.
+   This is a hard short-circuit that precedes policy evaluation
+   entirely: no policy knob shapes a paused response.
 2. **Per-scope policy.** Map the URL path to a :class:`FailureScope`,
    resolve the policy, and apply its knobs in order: unavailable_until
    gate, 401-after-N gate, 5xx coin flip, latency sleep, and response
    modifiers (body cutoff, slow trickle, approximate RST).
+
+Step 2 is ONE pipeline over one policy, so the later knobs apply to
+whatever response the earlier ones produced. A policy that pairs
+``unavailable_until`` (or the 401 gate, or the 5xx flip) with
+``latency_ms`` and a response modifier yields a slow, truncated 503:
+the gates decide the response, and the sleep and the modifiers then
+apply to it exactly as they would to the real handler's. Skipping them
+whenever a gate fired would make the compound faults an upstream
+really produces (a 503 that trickles, a 401 that resets) unreachable,
+and would silently drop knobs a caller installed.
 
 The middleware never modifies request bodies; it injects failures
 either before the handler runs or by wrapping the outbound response.
@@ -98,7 +110,11 @@ async def _maybe_inject_failure(
     scope: FailureScope,
     policy: FailurePolicy | None,
 ) -> Response | None:
-    """Return a synthetic Response if the policy demands one.
+    """Return a synthetic Response if the policy's gates demand one.
+
+    Steps 1 to 3 of the pipeline (unavailable_until, 401-after-N, the 5xx
+    coin flip). The latency sleep and the response modifiers are applied by
+    the caller to whichever response goes out, synthetic or handler-made.
 
     Args:
         request: The inbound request (used only for ``url.path``).
@@ -146,12 +162,26 @@ async def _maybe_inject_failure(
             status_code=503,
         )
 
+    return None
+
+
+async def _apply_latency(
+    request: Request,
+    state: EmulatorState,
+    policy: FailurePolicy | None,
+) -> None:
+    """Sleep the policy's configured latency, if any.
+
+    Step 4 of the pipeline. Runs whether or not a gate produced a synthetic
+    response, so ``latency_ms`` paired with a 503 or a 401 models the slow
+    failure an upstream really returns.
+    """
+    if policy is None:
+        return
     latency = _pick_latency(policy.latency_ms, state)
     if latency is not None and latency > 0:
         logger.debug("failure_inject: sleep %dms at %s", latency, request.url.path)
         await asyncio.sleep(latency / 1000.0)
-
-    return None
 
 
 async def _apply_response_modifiers(
@@ -160,8 +190,13 @@ async def _apply_response_modifiers(
 ) -> Response:
     """Wrap the outbound response per policy knobs.
 
-    Handles ``body_cutoff_at_bytes``, ``slow_trickle_bytes_per_sec``,
-    and ``tcp_rst_on_request``. Returns the (possibly wrapped) response.
+    Step 5 of the pipeline. Handles ``body_cutoff_at_bytes``,
+    ``slow_trickle_bytes_per_sec``, and ``tcp_rst_on_request``. Returns the
+    (possibly wrapped) response.
+
+    The response may be the handler's or a synthetic one an earlier gate
+    produced; both are shaped the same way, which is what makes the five
+    knobs one pipeline rather than two disjoint sets.
 
     When the inbound ``response`` is a streaming response (FastAPI's
     BaseHTTPMiddleware always wraps handler returns as such), we drain
@@ -292,11 +327,11 @@ def make_failure_middleware(
         if state.failure_state is not None and _is_upstream_path(path):
             policy = state.failure_state.resolve(scope)
 
+        # One ordered pipeline: gates, then the sleep, then the modifiers
+        # over whichever response is going out.
         synthetic = await _maybe_inject_failure(request, state, scope, policy)
-        if synthetic is not None:
-            return synthetic
-
-        response = await call_next(request)
+        await _apply_latency(request, state, policy)
+        response = synthetic if synthetic is not None else await call_next(request)
         return await _apply_response_modifiers(response, policy)
 
     return _middleware

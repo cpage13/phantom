@@ -4,8 +4,10 @@ Real S3 presigned URLs encode an expiry and a HMAC signature in their
 query string. The emulator mirrors that shape so callers can't simply
 strip query parameters and still hit the endpoint, while keeping the
 crypto stub (the signature is a fresh opaque token stored on the
-pending-upload record). The PUT handler reconstructs the same
-signature from the inbound URL and compares.
+pending-upload record). There is nothing to recompute from, so the PUT
+handler compares the inbound ``sig`` and ``expires`` parameters against the
+values recorded here when the URL was minted, and answers
+``403 SignatureDoesNotMatch`` on any difference.
 
 See plan §4.8.
 """
@@ -34,10 +36,15 @@ SIGNATURE_BYTES: int = 32
 class PresignedTokenStore:
     """Mints and resolves synthetic presigned-style upload tokens.
 
-    Maintains its own mapping between opaque tokens and pending
-    uploads. Stores live on :class:`phantom_emulator.state.EmulatorState`;
-    this class is a typed wrapper around that map so the upstream
-    router doesn't have to manipulate the dict directly.
+    Owns the URL shape: token, ``expires`` and ``sig`` are decided here and
+    recorded on the :class:`~phantom_emulator.state.PendingUpload` the mint
+    returns, which is what the PUT handler validates the inbound URL
+    against. The instance keeps its own token map, but the emulator's
+    durable copy of a minted record is the one the upstream router writes
+    onto :attr:`phantom_emulator.state.EmulatorState.pending_uploads`; the
+    router builds a store per create call and discards it, so
+    :meth:`resolve` and :meth:`is_expired` serve callers that hold a
+    longer-lived store.
     """
 
     def __init__(self, *, base_url: str, default_ttl_seconds: int) -> None:
@@ -99,6 +106,7 @@ class PresignedTokenStore:
             created_at=current,
             presigned_ttl_seconds=ttl,
             signature=signature,
+            expires_epoch=expires_epoch,
         )
         self._pending[upload_token] = record
         logger.debug(
