@@ -148,6 +148,23 @@ async def test_mixed_workload_drains_the_gate_to_zero() -> None:
         for chain_id in parked:
             await _await_first_attempt(pc, chain_id)
 
+        # FALSIFIABILITY GATE. Everything below asserts the ledger DRAINS, and
+        # the gauge starts at zero, so a gate that charged nothing at all would
+        # satisfy the drain poll on its first probe. That is not a hypothetical
+        # weakness: it cannot distinguish "every charge was correctly released"
+        # from "no charge was ever made", and the second removes the saturation
+        # cap entirely, which is the more dangerous of the two.
+        #
+        # Two rows are parked against a dead upstream right now, so this is the
+        # one moment in the run when the balance is provably non-zero. Pin it
+        # here, and the drain assertion below becomes falsifiable.
+        held = await _saturation_balance(stack.phantom_admin_url)
+        assert held > 0.0, (
+            "saturation_balance is zero while two rows are parked against a "
+            "dead upstream; the gate is not charging at all, so the drain "
+            "assertion below would pass vacuously"
+        )
+
         await pc.cancel(parked[0])
         await pc.delete_upload(parked[1])
         emulator.clear_failures()
