@@ -569,3 +569,51 @@ async def test_no_expectation_token_signed_request_still_validates(
     response = await client.put("/mybucket/sts/disarmed.bin", content=body, headers=headers)
     assert response.status_code == 200
     assert state.s3_objects[("mybucket", "sts/disarmed.bin")].body == body
+
+
+async def test_body_swapped_after_signing_is_refused(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """Objective: the oracle witnesses a signed-versus-transmitted body mismatch.
+
+    Expected: 400 ``XAmzContentSHA256Mismatch`` and nothing stored.
+
+    This is the case that made every byte-identity assertion in the e2e and
+    conformance suites unfalsifiable. ``canonical_request`` reads
+    ``x-amz-content-sha256`` verbatim when it is present, and Phantom always
+    signs with ``S3SigV4Auth``, which emits and signs it, so the body never
+    enters the signature. Headers signed over one payload therefore recompute
+    to a valid signature over ANY other payload: before this check the request
+    below returned 200 and stored the swapped bytes.
+    """
+    client, state = client_and_state
+    signed_body = b"the-body-that-was-signed"
+    sent_body = b"a-completely-different-body-of-another-length"
+    headers = _sign("PUT", "/mybucket/swapped", signed_body, extra_headers=_TEXT)
+
+    response = await client.put("/mybucket/swapped", content=sent_body, headers=headers)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "XAmzContentSHA256Mismatch"
+    assert ("mybucket", "swapped") not in state.s3_objects
+
+
+async def test_truncated_body_after_signing_is_refused(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """Objective: a truncated forward is caught, not silently accepted.
+
+    Expected: 400 ``XAmzContentSHA256Mismatch``. Truncation is the realistic
+    shape of this defect class (a partial body-store read, a stream consumed
+    twice, a cut-off retry), and it is invisible to a signature recompute for
+    the same reason a wholesale swap is.
+    """
+    client, state = client_and_state
+    signed_body = b"0123456789" * 16
+    headers = _sign("PUT", "/mybucket/truncated", signed_body, extra_headers=_TEXT)
+
+    response = await client.put("/mybucket/truncated", content=signed_body[:-1], headers=headers)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "XAmzContentSHA256Mismatch"
+    assert ("mybucket", "truncated") not in state.s3_objects

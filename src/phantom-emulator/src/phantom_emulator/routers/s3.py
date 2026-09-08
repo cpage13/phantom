@@ -18,6 +18,19 @@ header for this request: x-amz-content-sha256"`` - exactly as real S3 does
 ``aws_sigv4`` signer now signs S3 with ``S3SigV4Auth``, which emits + signs
 that header, so both sides agree on the SIGNED header set.
 
+It then SEPARATELY verifies that the signed digest describes the bytes that
+actually arrived, rejecting ``400 XAmzContentSHA256Mismatch`` when it does
+not. That second check is not redundant, it is the whole point of the
+oracle: because ``canonical_request`` reads the header verbatim rather than
+hashing ``data``, the body never enters the signature, so the recompute
+alone proves the digest is AUTHENTIC and says nothing about whether it is
+TRUE. Without the comparison a request that signs one body and transmits
+another recomputes clean, and every byte-identity assertion in the e2e and
+conformance suites passes on a request the emulator cannot actually vouch
+for. Payload-hash SENTINELS (``UNSIGNED-PAYLOAD`` and the ``STREAMING-*``
+forms) carry no digest, so byte identity is unverifiable for them by
+construction and they are exempt.
+
 The validator NEVER calls botocore's :meth:`SigV4Auth.add_auth`. That is a
 *client* signing path: it stamps wall-clock-now over the inbound
 ``X-Amz-Date`` and (for the S3 subclass) recomputes the payload hash -
@@ -44,6 +57,7 @@ See ``.agent/lifecycle/emulator_signing_DESIGNER.md`` §4-§5 and
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import re
@@ -100,6 +114,30 @@ _MISSING_CONTENT_SHA256 = HTTPException(
     detail="Missing required header for this request: x-amz-content-sha256",
 )
 
+# The 400 real S3 returns when the signed ``x-amz-content-sha256`` digest does
+# not describe the body that actually arrived. DISTINCT from the 403 above: a
+# 403 means the signature did not recompute, a 400 here means it DID recompute
+# and the authenticated payload claim is a lie about the bytes on the wire.
+_CONTENT_SHA256_MISMATCH = HTTPException(
+    status_code=400,
+    detail="XAmzContentSHA256Mismatch",
+)
+
+# Payload-hash sentinels AWS defines in place of a literal digest. For these
+# the canonical request carries the sentinel string itself, so there is no
+# digest to check the body against and the oracle cannot assert byte identity.
+# Everything else in the header position MUST be a real hex sha256.
+_PAYLOAD_HASH_SENTINELS: frozenset[str] = frozenset(
+    {
+        "UNSIGNED-PAYLOAD",
+        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+        "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
+    }
+)
+
 
 def _guard_reserved_bucket(bucket: str) -> None:
     """Reject a first path segment reserved by another emulator router.
@@ -149,7 +187,12 @@ def _verify_sigv4(
             a missing/unequal expected session token,
             credential-scope date mismatch, a declared header absent from
             the request, declared-headers divergence, or a signature
-            mismatch). Returns ``None`` on a faithful recompute match.
+            mismatch). ``400`` when ``x-amz-content-sha256`` is absent, and
+            ``400 XAmzContentSHA256Mismatch`` when it is present, is not a
+            sentinel, and does not equal ``sha256(body)`` - the case where
+            the signature recomputes but the authenticated payload claim
+            does not describe the bytes received. Returns ``None`` on a
+            faithful recompute AND a matching payload digest.
     """
     if expected_session_token is not None:
         presented = request.headers.get("x-amz-security-token")
@@ -215,6 +258,30 @@ def _verify_sigv4(
     expected = auth.signature(string_to_sign, aws_req)
     if not hmac.compare_digest(expected, m["sig"]):
         raise _SIG_MISMATCH
+
+    # ORACLE FIDELITY: the recompute above proves the payload-hash header is
+    # AUTHENTIC, not that it is TRUE. ``canonical_request`` reads
+    # ``x-amz-content-sha256`` verbatim whenever it is present (botocore
+    # ``SigV4Auth.canonical_request``: ``if 'X-Amz-Content-SHA256' in
+    # request.headers: body_checksum = request.headers[...]``) and only falls
+    # back to hashing ``data=body`` when the header is absent from the signed
+    # set. Since Phantom always signs with ``S3SigV4Auth``, which emits and
+    # signs that header, the body NEVER entered the signature at all: a request
+    # that signs one body and transmits a different one recomputes to a
+    # matching signature. Hash the received bytes and compare, so the emulator
+    # can actually witness the byte-identity it exists to certify.
+    declared_hash = request.headers["x-amz-content-sha256"]
+    if declared_hash not in _PAYLOAD_HASH_SENTINELS:
+        actual_hash = hashlib.sha256(body).hexdigest()
+        if not hmac.compare_digest(actual_hash.lower(), declared_hash.lower()):
+            logger.warning(
+                "payload hash mismatch on %s %s: signed %s over %d received bytes",
+                request.method,
+                request.url.path,
+                declared_hash,
+                len(body),
+            )
+            raise _CONTENT_SHA256_MISMATCH
 
 
 @router.api_route("/{bucket}/{key:path}", methods=list(UPLOAD_METHODS))
