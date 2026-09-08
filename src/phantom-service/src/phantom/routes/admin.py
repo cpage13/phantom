@@ -2304,6 +2304,57 @@ def register_admin_error_handlers(app: FastAPI) -> None:
         RequestValidationError,
         request_validation_exception_handler,  # type: ignore[arg-type]
     )
+    app.add_exception_handler(Exception, _unhandled_admin_error)
+
+
+async def _unhandled_admin_error(request: Request, exc: Exception) -> Response:
+    """Render any unhandled exception as the ADR-017 ``internal_error`` envelope.
+
+    ADR-017 states that every error response carries an ``ErrorEnvelope``, and
+    it documents a 500 ``internal_error`` row. Until this handler existed that
+    was an unenforced CONVENTION: only the enumerated spec types and
+    ``RequestValidationError`` were registered, so anything else reached
+    starlette's default and returned a bare ``500 Internal Server Error`` with a
+    non-JSON body. The SDK decodes admin failures through
+    ``EXCEPTION_FOR_CODE``, so those responses did not surface as a typed
+    exception at all: the caller got a decode failure instead, exactly when it
+    most needed to know what went wrong.
+
+    The escapes were not hypothetical. A malformed pagination cursor raised a
+    base64 decoding error, a JSON decoding error, or ``ValueError`` out of the
+    listing route, depending on how it was malformed; a body read on a chain
+    whose bytes retention had already discarded raised ``KeyError``; a bulk
+    delete filtered only by instance raised ``ValueError`` from the store's
+    empty-filter guard; and a body-store failure during an
+    idempotency-collision rollback raised ``OSError``.
+
+    Patching each site is the bandaid. Registering the fallback makes the
+    envelope contract STRUCTURALLY true rather than maintained by hand, so the
+    next unhandled raise is a typed 500 the SDK can classify rather than a
+    decode error. The individual sites are still worth fixing on their own
+    merits, because a 500 is the wrong ANSWER for several of them; this handler
+    only guarantees the SHAPE.
+
+    Args:
+        request: The failing request, used for its correlation id.
+        exc: The unhandled exception.
+
+    Returns:
+        A ``500`` response carrying the canonical envelope. The
+        exception's message is deliberately NOT echoed: an unhandled error's
+        text is uncontrolled and can carry a path, a query or a credential.
+    """
+    logger.exception(
+        "unhandled admin error on %s %s",
+        request.method,
+        request.url.path,
+    )
+    return _admin_error(
+        code="internal_error",
+        message="The admin API failed to handle this request.",
+        instance_id="unrouted",
+        details={"exception_class": type(exc).__name__},
+    )
 
 
 def _scope_instances(dispatcher: InstanceDispatcher, instance: str | None) -> list[InstanceContext]:
