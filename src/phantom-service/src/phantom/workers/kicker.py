@@ -461,6 +461,15 @@ class Kicker:
                     current_step_index=None,
                     last_step_completed=None,
                     expected_state="auth_expired",
+                    # The candidate scan filtered on the stamp, but several
+                    # awaits sit between that scan and this write (the
+                    # freshness probe, the admit). A reaper body-discard
+                    # landing in that window leaves the state guard satisfied
+                    # and the row bodyless, and the size admitted above is the
+                    # pre-discard one. Guarding the CAS on deliverability makes
+                    # the write a clean no-op instead, which the settle below
+                    # already handles: it sees no crossing and unwinds.
+                    require_deliverable=True,
                 )
             except Exception:
                 # Unwind FIRST, then surface the fault. The failed write

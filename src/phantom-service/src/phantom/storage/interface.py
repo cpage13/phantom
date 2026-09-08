@@ -351,6 +351,7 @@ class UploadStore(Protocol):
         expected_state: UploadState = "attempting",
         stamp_sent_at: bool = False,
         auth_blocked_host: str | None = None,
+        require_deliverable: bool = False,
     ) -> AttemptWriteOutcome:
         """Persist the result of one attempt against this row.
 
@@ -382,6 +383,20 @@ class UploadStore(Protocol):
         carrying its recorded host. The column is AUTHORITATIVE only
         while the row is in ``auth_expired`` (the only state either
         kicker reads it in); off-park it is inert history.
+
+        ``require_deliverable`` adds ``AND body_discarded_at IS NULL``
+        to the CAS guard, for a caller re-queueing a row FOR DELIVERY.
+        The state guard alone cannot see a concurrent body-discard, and
+        the kicker's write sits several awaits after its candidate scan
+        (a freshness probe and an admit), so without this the CAS lands
+        on a row the reaper has just stamped and zeroed while the size
+        already admitted is the pre-discard one. The row is then live
+        with no body and a charge nothing can return: the sender's
+        ``BodyMissingError`` settles on the zeroed field, so the row
+        count comes back but the bytes and the large-class slot are
+        stranded for the process lifetime. OPT-IN, because the sender
+        legitimately transitions stamped rows into terminal states and
+        this guard would refuse those writes.
 
         Returns:
             An :class:`AttemptWriteOutcome` whose ``rowcount`` is the

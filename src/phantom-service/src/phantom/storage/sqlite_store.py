@@ -1004,6 +1004,7 @@ class SqliteUploadStore:
         expected_state: UploadState = "attempting",
         stamp_sent_at: bool = False,
         auth_blocked_host: str | None = None,
+        require_deliverable: bool = False,
     ) -> AttemptWriteOutcome:
         """Persist one attempt's result.
 
@@ -1048,9 +1049,27 @@ class SqliteUploadStore:
         guard at all, and on a NON-landed write the pre-image is the
         only account of what actually happened.
 
+        ``require_deliverable`` adds ``AND body_discarded_at IS NULL`` to
+        that guard. A caller re-queueing a row FOR DELIVERY needs it,
+        because the state guard alone cannot see a concurrent
+        body-discard: the kicker scans a candidate whose stamp is NULL,
+        awaits a freshness probe and an admit, and by the time it writes
+        the reaper may have stamped the row and zeroed its size. The CAS
+        then landed on a bodyless row, re-queueing it with a live charge
+        for a pre-discard size it no longer has; the sender's later
+        ``BodyMissingError`` settled on the now-zero field, so
+        ``release(0)`` returned the row count but stranded the bytes AND
+        the large-class slot for the process lifetime, refusing fresh
+        healthy uploads. It is OPT-IN because the sender legitimately
+        transitions stamped rows into terminal states, which this guard
+        would refuse.
+
         Returns:
             An :class:`AttemptWriteOutcome` whose ``rowcount`` is the
             number of rows updated (0 or 1), carrying that pre-image.
+            A ``rowcount`` of 0 under ``require_deliverable`` means the
+            state matched but the body was already discarded, which the
+            settlement layer reads as a no-op and unwinds.
         """
         conn = self._require_conn()
         now_iso = datetime.now(tz=UTC).isoformat()
@@ -1078,7 +1097,18 @@ class SqliteUploadStore:
                   auth_blocked_host = :auth_blocked_host
                 WHERE chain_id = :chain_id
                   AND state = :expected_state
-                """,
+                """
+                # A caller that is re-queueing a row FOR DELIVERY adds the
+                # deliverability guard, so the CAS cannot land on a row whose
+                # body a concurrent discard removed between the caller's scan
+                # and this write. Without it the kicker woke bodyless rows and
+                # admitted their stale pre-discard size, stranding the bytes
+                # and a large-class slot for the process lifetime.
+                + (
+                    "\n                  AND body_discarded_at IS NULL"
+                    if require_deliverable
+                    else ""
+                ),
                 {
                     "chain_id": str(chain_id),
                     "state": new_state,
