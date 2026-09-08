@@ -257,6 +257,24 @@ jobs:
           export UV_NO_SYNC=1
           uv run python scripts/check_kv_query_uses_json_each.py
 
+  # Await-inside-a-state-lock gate. Runs --selftest FIRST, because the shell
+  # hook this replaced was inert for its entire life and nobody had ever
+  # watched it reject anything; a gate with no executed proof of rejection is
+  # indistinguishable from one that cannot fail.
+  falsifiability-await-in-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run python scripts/check_await_in_lock.py --selftest
+          uv run python scripts/check_await_in_lock.py
+
   # Atomic-admission contract: the upload row INSERT + idempotency_index
   # INSERT must wrap in ONE SQLite transaction. Complements the runtime test
   # at tests/e2e/crash_recovery/test_crash_admission_atomic.py.

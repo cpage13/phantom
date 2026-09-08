@@ -81,9 +81,16 @@ repos:
       # and `except (A, B):` are equivalent tuple-of-exception-types.
       # See execution_05_25.md Finding F-P0-D.
 
-      - id: forbid-await-in-lock
-        name: forbid await inside async with X_lock (best-effort)
-        entry: bash scripts/precommit/forbid_await_in_lock.sh
+      # AST gate, replacing scripts/precommit/forbid_await_in_lock.sh, whose
+      # pattern matched a BARE name (`[a-zA-Z_]+_lock:`) while every real
+      # acquisition is an attribute (`self._lock`), so it matched zero lines
+      # in the whole tree and could never fail. Widening that regex was not
+      # available either: it would condemn `_write_txn`, whose entire purpose
+      # is to await inside the write lock. The checker distinguishes the two
+      # kinds of lock; see its module docstring.
+      - id: forbid-await-in-state-lock
+        name: forbid await inside a lock guarding in-memory state
+        entry: uv run python scripts/check_await_in_lock.py
         language: system
         pass_filenames: false
 

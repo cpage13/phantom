@@ -151,9 +151,21 @@ class PersistController:
                 return existing
             handle: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             self._in_flight[chain_id] = handle
-            await self._queue.put(chain_id)
-            await self._queue_depth.set(self._queue.qsize())
-            return handle
+            # ``put_nowait`` rather than ``await put``: the queue is unbounded
+            # (``asyncio.Queue()``, no maxsize) so the two are equivalent, and
+            # the synchronous form keeps the dedupe-map write and the enqueue
+            # atomic with no suspension point between them. A caller that finds
+            # the handle in ``_in_flight`` is therefore guaranteed the chain is
+            # already queued.
+            self._queue.put_nowait(chain_id)
+            depth = self._queue.qsize()
+
+        # Emit AFTER releasing: ``Gauge.set`` takes its own lock, and awaiting a
+        # second lock while holding this one widens the critical section and
+        # creates a lock-ordering hazard. ``SaturationGate`` emits its gauges
+        # the same way for the same reason.
+        await self._queue_depth.set(depth)
+        return handle
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Main loop - drain the queue, migrate each chain_id, signal handle.
