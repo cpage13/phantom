@@ -30,6 +30,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from phantom.models.errors import STATUS_FOR_CODE
+from phantom.models.upload import UploadRow
 from phantom.routes.admin import register_admin_error_handlers, router
 
 
@@ -132,3 +133,77 @@ def test_every_reachable_escape_class_returns_the_envelope(label: str, exc: Exce
     body = response.json()
     assert body["error"]["code"] == "internal_error", f"{label} escaped the envelope"
     assert body["error"]["details"]["exception_class"] == type(exc).__name__
+
+
+@pytest.mark.asyncio
+async def test_the_export_walks_past_one_page(tmp_path) -> None:
+    """Objective: the export archives every matching row, not one capped page.
+
+    Expected: a store holding more rows than one page yields all of them.
+
+    ADR-005 specifies an archive containing every buffered file's body. The
+    builder took ONE capped chunk and discarded the store's continuation
+    cursor, with no truncation marker anywhere in the archive or its manifest.
+    The default row retention is ten times the old cap and the export
+    deliberately includes terminal states, which is where rows accumulate, so a
+    device holding more rows than the cap answered 200 with a well-formed
+    archive that was missing bodies and an operator's recovery looked complete.
+
+    The omission was systematically biased too: the listing is ordered
+    received_at ASC, so the rows silently dropped were the MOST RECENT, which
+    are precisely the ones wanted during an incident.
+    """
+    from datetime import UTC, datetime, timedelta
+    from uuid import uuid4
+
+    from phantom.routes import admin as admin_routes
+    from phantom.storage.sqlite_store import SqliteUploadStore
+
+    store = SqliteUploadStore(str(tmp_path / "uploads.db"))
+    await store.start()
+    try:
+        base = datetime(2026, 9, 8, tzinfo=UTC)
+        total = admin_routes._EXPORT_TAR_PAGE_SIZE + 7
+        for i in range(total):
+            await store.insert(
+                UploadRow.model_validate(
+                    {
+                        "chain_id": uuid4(),
+                        "instance_id": "primary",
+                        "group_id": uuid4(),
+                        "send_order": 0,
+                        "route_name": "files",
+                        "state": "stored",
+                        "body_location": "file",
+                        "received_at": base + timedelta(seconds=i),
+                        "updated_at": base + timedelta(seconds=i),
+                        "endpoint": "files.example.com",
+                        "uid": "u",
+                        "chain_envelope_json": "{}",
+                        "idempotency_key": f"k{i}",
+                        "capture_reexecution_active": False,
+                    }
+                )
+            )
+
+        walked = []
+        cursor = None
+        while True:
+            page, cursor = await store.list_uploads(
+                state=None,
+                route=None,
+                since=None,
+                limit=admin_routes._EXPORT_TAR_PAGE_SIZE,
+                cursor=cursor,
+            )
+            walked.extend(page)
+            if cursor is None:
+                break
+
+        assert len(walked) == total, (
+            f"the cursor walk reached {len(walked)} of {total} rows; a single "
+            "capped call would have stopped at the page size and dropped the "
+            "most recent rows silently"
+        )
+    finally:
+        await store.stop()

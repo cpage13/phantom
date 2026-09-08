@@ -15,7 +15,7 @@ operator (or a tool over the SDK) reasonably expects them to filter.
     chunk, _ = await ctx.store.list_uploads(
         state=filter_body.state,
         route=filter_body.route,
-        limit=_EXPORT_TAR_PER_INSTANCE_LIMIT,
+        limit=<a per-instance cap>,
     )
 
 ``since`` and ``chain_ids`` are dropped on the floor - silently. The
@@ -30,8 +30,8 @@ Why it matters: a silent no-op filter is worse than an error. An
 operator narrowing an emergency recovery to "just these three chain_ids"
 or "everything since the outage started" gets a tar containing the
 entire buffer - on a producer with thousands of buffered bodies that is a
-much larger transfer than intended (the per-instance cap is 10,000
-rows), it exposes bodies the operator did not ask to pull, and it gives
+much larger transfer than intended, it exposes bodies the operator did
+not ask to pull, and it gives
 no signal that the narrowing was ignored. The contract the model
 publishes is simply not met.
 

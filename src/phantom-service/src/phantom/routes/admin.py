@@ -117,7 +117,12 @@ _STILL_MOVING_STATES: Final[frozenset[ChainState]] = frozenset({"queued", "attem
 # in-memory tar builder from runaway buffer growth without losing
 # real-world coverage. Operators needing more granular slices should use the
 # ``state`` / ``route`` filter to scope the export.
-_EXPORT_TAR_PER_INSTANCE_LIMIT = 10_000
+# Page size for the export's row walk. NOT a cap on the export: the walk
+# follows the store's continuation cursor to exhaustion, and this only bounds
+# how many rows are decoded per query. It was previously a hard per-instance
+# LIMIT whose overflow was discarded silently, which made the archive lie about
+# its own completeness.
+_EXPORT_TAR_PAGE_SIZE = 1_000
 
 
 def _admin_error(
@@ -1059,12 +1064,34 @@ async def _build_tar_stream(
                         continue
                     chunk.append(row)
             else:
-                chunk, _ = await ctx.store.list_uploads(
-                    state=filter_body.state,
-                    route=filter_body.route,
-                    since=filter_body.since,
-                    limit=_EXPORT_TAR_PER_INSTANCE_LIMIT,
-                )
+                # PAGE to exhaustion rather than taking one capped chunk.
+                # ADR-005 specifies an archive containing every buffered file's
+                # body, and the previous single call discarded the store's
+                # continuation cursor and stopped at the cap with no marker
+                # anywhere in the archive or its manifest.
+                #
+                # The default row retention is ten times that cap, and the
+                # export deliberately includes terminal states, which is where
+                # rows accumulate. So a device holding more rows than the cap
+                # answered with a 200 and a well-formed archive that was
+                # missing bodies, and the operator's recovery looked complete.
+                # The omission was also systematically biased: the listing is
+                # ordered received_at ASC, so the rows silently dropped were
+                # the MOST RECENT ones, which are precisely the ones an
+                # operator running an export during an incident wants.
+                chunk = []
+                cursor: str | None = None
+                while True:
+                    page, cursor = await ctx.store.list_uploads(
+                        state=filter_body.state,
+                        route=filter_body.route,
+                        since=filter_body.since,
+                        limit=_EXPORT_TAR_PAGE_SIZE,
+                        cursor=cursor,
+                    )
+                    chunk.extend(page)
+                    if cursor is None:
+                        break
             for row in chunk:
                 manifest.append(
                     {
