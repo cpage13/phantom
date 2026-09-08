@@ -382,6 +382,7 @@ async def test_cancel_of_a_stored_row_releases() -> None:
         row=None,  # type: ignore[arg-type]
         previous_state="stored",
         previous_body_discarded_at=None,
+        body_size_bytes=2048,
     )
 
     await gate.settle(SlotDelta.from_cancel(outcome, size_bytes=2048))
@@ -404,6 +405,7 @@ async def test_cancel_of_a_stamped_stored_row_is_a_no_op() -> None:
         row=None,  # type: ignore[arg-type]
         previous_state="stored",
         previous_body_discarded_at=_STAMP,
+        body_size_bytes=0,
     )
 
     await gate.settle(SlotDelta.from_cancel(outcome, size_bytes=0))

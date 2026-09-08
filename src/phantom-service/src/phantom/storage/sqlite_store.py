@@ -2057,7 +2057,7 @@ class SqliteUploadStore:
         now_iso = datetime.now(tz=UTC).isoformat()
         async with self._write_txn(conn):
             async with conn.execute(
-                "SELECT state, body_discarded_at FROM uploads WHERE chain_id = ?",
+                "SELECT state, body_discarded_at, body_size_bytes FROM uploads WHERE chain_id = ?",
                 (str(chain_id),),
             ) as cur:
                 fetched = await cur.fetchone()
@@ -2073,8 +2073,18 @@ class SqliteUploadStore:
             await conn.commit()
         previous_state: UploadState | None = None
         previous_discarded_at: datetime | None = None
+        # The release BASIS, read in the same pre-image as the predicate inputs.
+        # The route used to take it from the post-commit row read below, which
+        # the reaper's body-discard pass can zero in the window between this
+        # commit and that read: the cancel then released 0 bytes, so the row
+        # count came back while the bytes stayed charged forever, and the
+        # reaper's own discard settled a previous_state of ``cancelled`` which
+        # holds no slot, so it released nothing either and no later path could
+        # recover them.
+        previous_body_size_bytes = 0
         if fetched is not None and cursor.rowcount == 1:
             previous_state = fetched["state"]
+            previous_body_size_bytes = int(fetched["body_size_bytes"])
             if fetched["body_discarded_at"]:
                 previous_discarded_at = datetime.fromisoformat(fetched["body_discarded_at"])
         row = await self.get(chain_id)
@@ -2084,6 +2094,7 @@ class SqliteUploadStore:
             row=row,
             previous_state=previous_state,
             previous_body_discarded_at=previous_discarded_at,
+            body_size_bytes=previous_body_size_bytes,
         )
 
     async def bulk_delete(

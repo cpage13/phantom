@@ -238,6 +238,21 @@ class CancelOutcome:
     row: UploadRow
     previous_state: UploadState | None
     previous_body_discarded_at: datetime | None
+    body_size_bytes: int
+    """The release basis, read in the SAME pre-image as the predicate inputs.
+
+    Every other outcome in this module already carries an atomically captured
+    size; ``CancelOutcome`` alone did not, so the admin route took the basis
+    from a POST-COMMIT read of the row. The reaper's body-discard pass can zero
+    ``body_size_bytes`` in the window between the cancel's commit and that read,
+    and a cancelled row is in the reaper's retention table and immediately
+    eligible at the default ``cancelled_body_seconds``. The cancel then released
+    zero bytes: the row count came back and the bytes stayed charged for the
+    process lifetime. The reaper's own discard could not recover them either,
+    because its ``previous_state`` is ``cancelled``, which holds no slot, so it
+    released nothing. ADR-036's rule is that the basis rides the write that made
+    the crossing, and this is the field that lets this site honour it.
+    """
 
 
 class InsertClaimOutcome(enum.Enum):

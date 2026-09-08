@@ -1265,7 +1265,7 @@ async def cancel_upload(
         raise NotFoundError(f"chain {chain_id} not found")
     outcome = await ctx.store.cancel(chain_id)
     await ctx.saturation.settle(
-        SlotDelta.from_cancel(outcome, size_bytes=outcome.row.body_size_bytes)
+        SlotDelta.from_cancel(outcome, size_bytes=outcome.body_size_bytes)
     )
     return outcome.row
 

@@ -134,3 +134,51 @@ async def test_a_landed_replay_still_consumes_its_reservation(
     assert requeued.state == "queued"
     assert requeued.next_attempt_at is not None
     assert requeued.next_attempt_at <= datetime.now(tz=UTC)
+
+
+@pytest.mark.asyncio
+async def test_cancel_carries_its_release_basis_from_the_write(
+    store: SqliteUploadStore, make_upload_row: Callable[..., UploadRow]
+) -> None:
+    """Objective: the cancel's release basis survives a racing body discard.
+
+    Expected: the outcome carries the pre-cancel size, and settling on it
+    returns the full charge even after the reaper has zeroed the row.
+
+    The route used to take the basis from a POST-COMMIT read of the row. The
+    reaper's body-discard pass can zero body_size_bytes in the window between
+    the cancel's commit and that read, and a cancelled row is in the reaper's
+    retention table and immediately eligible at the default
+    cancelled_body_seconds. The cancel then released zero bytes: the row count
+    came back while the bytes stayed charged for the process lifetime, and the
+    reaper's own discard could not recover them either, because its
+    previous_state is cancelled, which holds no slot.
+    """
+    row = make_upload_row(state="stored", body_size_bytes=4_194_304, body_discarded_at=None)
+    await store.insert(row)
+    gate = _gate()
+    granted = await gate.admit(declared_bytes=4_194_304)
+    assert isinstance(granted, AdmissionGranted)
+    assert gate.in_flight_bytes == 4_194_304
+
+    outcome = await store.cancel(row.chain_id)
+    assert outcome.body_size_bytes == 4_194_304, (
+        "the release basis must come from the cancel's own pre-image"
+    )
+
+    # The reaper lands between the cancel's commit and the settlement, zeroing
+    # the row exactly as it does in production.
+    discard = await store.discard_body_and_zero_accounting(
+        row.chain_id, expected_state="cancelled"
+    )
+    assert discard.flipped is True
+    post_commit = await store.get(row.chain_id)
+    assert post_commit is not None
+    assert post_commit.body_size_bytes == 0, "the reaper zeroed the row, as it does"
+
+    await gate.settle(SlotDelta.from_cancel(outcome, size_bytes=outcome.body_size_bytes))
+
+    assert gate.in_flight_bytes == 0, (
+        "the cancel released the reaper-zeroed size instead of the size it "
+        "actually cancelled; those bytes can never be recovered"
+    )
