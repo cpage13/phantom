@@ -2196,7 +2196,7 @@ class SqliteUploadStore:
                     previous_state=None,
                     discarded_at=None,
                 )
-            await conn.execute(
+            cursor = await conn.execute(
                 """
                 UPDATE uploads
                    SET body_discarded_at = ?,
@@ -2205,9 +2205,37 @@ class SqliteUploadStore:
                 """,
                 (now_iso, str(chain_id), expected_state),
             )
+            flipped = cursor.rowcount == 1
             await conn.commit()
-        # The guard matched ``expected_state`` with the stamp NULL, so
-        # that IS the pre-image state and ``now`` IS the stamp written.
+        if not flipped:
+            # The pre-image SELECT matched and the UPDATE did not, so a writer
+            # OUTSIDE this store's asyncio write lock moved the row between the
+            # two statements. Python's sqlite3 opens the transaction at the
+            # first DML, so the SELECT above ran in autocommit and the
+            # "same transaction" the docstring claims holds only against
+            # Phantom's own writers: a second process on the same file (the
+            # case ``busy_timeout`` exists for) can interleave.
+            #
+            # Reporting the pre-image's optimism here was the defect. All three
+            # callers act on ``flipped``: the reaper settles a release AND
+            # deletes the body files, so an unstamped row lost its bytes while
+            # its ``body_size_bytes`` stayed non-zero, double-releasing the
+            # gate and leaving a live row with declared hashes and nothing on
+            # disk, which the sender later quarantines as corrupted.
+            logger.warning(
+                "body discard for chain_id=%s matched the pre-image but not the "
+                "UPDATE; a writer outside this store moved the row",
+                chain_id,
+            )
+            return DiscardOutcome(
+                flipped=False,
+                body_size_bytes=0,
+                previous_state=None,
+                discarded_at=None,
+            )
+        # The guard matched ``expected_state`` with the stamp NULL and the
+        # write landed, so that IS the pre-image state and ``now`` IS the
+        # stamp written.
         return DiscardOutcome(
             flipped=True,
             body_size_bytes=int(fetched["body_size_bytes"]),
