@@ -168,9 +168,7 @@ async def test_cancel_carries_its_release_basis_from_the_write(
 
     # The reaper lands between the cancel's commit and the settlement, zeroing
     # the row exactly as it does in production.
-    discard = await store.discard_body_and_zero_accounting(
-        row.chain_id, expected_state="cancelled"
-    )
+    discard = await store.discard_body_and_zero_accounting(row.chain_id, expected_state="cancelled")
     assert discard.flipped is True
     post_commit = await store.get(row.chain_id)
     assert post_commit is not None
