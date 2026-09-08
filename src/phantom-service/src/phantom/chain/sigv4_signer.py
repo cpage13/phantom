@@ -28,7 +28,12 @@ because that chain does blocking file/network I/O, it is resolved inside
 The body bytes are NOT mutated: botocore computes the payload hash internally for
 the signature, but the forwarded body stays byte-identical (the transparent-proxy
 invariant). The signed ``Authorization`` / ``x-amz-*`` headers REPLACE any the
-inbound request carried.
+inbound request carried. Two mechanisms together make that claim true rather
+than nearly true: the header map is REBUILT from botocore's signed view at the
+end of :func:`sign_sigv4`, and an inbound ``X-Amz-Security-Token`` is dropped
+BEFORE signing when Phantom's own credential supplies none, because that is the
+single header botocore's ``_modify_request_before_signing`` leaves alone in that
+case (see :data:`_SECURITY_TOKEN_HEADER`).
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from botocore.awsrequest import AWSRequest  # type: ignore[import-untyped]
 from botocore.credentials import Credentials  # type: ignore[import-untyped]
 from botocore.session import Session  # type: ignore[import-untyped]
 
+from phantom.chain.headers import pop_header
 from phantom.models.credential import (
     DestinationCredential,
     ProfileRefCred,
@@ -55,6 +61,18 @@ from phantom.models.credential import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The STS session-token header. botocore's ``_modify_request_before_signing``
+# deletes and re-adds ``Authorization``, ``X-Amz-Date`` and
+# ``x-amz-content-sha256`` unconditionally, but deletes this one ONLY when
+# ``self.credentials.token`` is truthy. With a credential that carries no
+# session token, an inbound client token is therefore left in place AND signed
+# into ``SignedHeaders``, so AWS receives Phantom's access key paired with an
+# unrelated STS token and answers 403. The executor reads that as a bad
+# credential and marks the slot bad, and the slot is keyed on the DESTINATION
+# HOST ALONE with no uid (ADR-033), so one producer's stale token parks every
+# row targeting that host from every producer.
+_SECURITY_TOKEN_HEADER = "X-Amz-Security-Token"
 
 # The enum -> botocore-signer-class dispatch, EXHAUSTIVE over
 # :class:`SigningService`. This is the ONLY module that may name a botocore
@@ -105,6 +123,11 @@ async def sign_sigv4(
     timestamp, the signed ``x-amz-content-sha256`` and (when the credential
     carries a session token) ``X-Amz-Security-Token`` arrive canonical-cased.
 
+    An inbound ``X-Amz-Security-Token`` is removed FIRST when this credential
+    carries no session token of its own, because that is the one header
+    botocore leaves in place and then signs (see
+    :data:`_SECURITY_TOKEN_HEADER`).
+
     The guarantee callers depend on is that NO header name appears twice
     case-insensitively afterwards. botocore's map is case-insensitive and the
     caller's dict is not, so merging the signed view back key by key would
@@ -131,6 +154,24 @@ async def sign_sigv4(
             or the credential's ``service`` has no ``_SERVICE_SIGNERS`` entry.
     """
     botocore_creds, region = await _resolve_credentials(credential)
+    if not botocore_creds.token:
+        # Make the module docstring's "the signed x-amz-* headers REPLACE any
+        # the inbound request carried" true for the ONE header botocore does
+        # not replace on its own. When Phantom's credential supplies a session
+        # token, botocore deletes and re-adds this header itself and the strip
+        # would be redundant; when it does not, an inbound client token is
+        # superseded material exactly as a presigned query credential is on
+        # this route (ADR-033), and leaving it would sign somebody else's STS
+        # token alongside Phantom's access key.
+        dropped = pop_header(headers, _SECURITY_TOKEN_HEADER)
+        if dropped is not None:
+            logger.info(
+                "dropped an inbound %s before re-signing: this route's credential "
+                "carries no session token, so the client's is superseded material "
+                "(ADR-033) and signing it would pair Phantom's access key with a "
+                "foreign STS token",
+                _SECURITY_TOKEN_HEADER,
+            )
     request = AWSRequest(method=method, url=url, data=body, headers=headers)
     # Service-dispatched signing: the credential's ``service`` selects the
     # botocore signer class. A map-miss raises ``SigV4SigningError`` (parkable by
