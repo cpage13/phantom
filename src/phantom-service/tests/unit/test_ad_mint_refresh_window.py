@@ -46,6 +46,13 @@ _DRAWS = 500
 # two together.
 _MIN_MINT_WAIT_SECONDS = 30.0
 
+# The last-resort positive wait, used when half the remaining lifetime is
+# tiny (an already-expired token is the worst input the loop can see). The
+# floor is PROPORTIONATE to the token's lifetime rather than flat, so a
+# legitimately short-lived token keeps its own correct schedule instead of
+# being pushed past its expiry by an unrelated constant.
+_ABSOLUTE_MIN_WAIT = 1.0
+
 
 def _config(**overrides: object) -> AdMintConfig:
     """A valid AD-mint block with the required identity fields filled in."""
@@ -81,7 +88,14 @@ def test_the_wait_is_always_positive_at_the_widest_legal_jitter() -> None:
 
     waits = [minter._next_mint_wait_seconds(already_expired) for _ in range(_DRAWS)]
 
-    assert min(waits) >= _MIN_MINT_WAIT_SECONDS, f"computed a {min(waits)}s wait"
+    # STRICTLY POSITIVE is the invariant that matters, and it is the whole
+    # mechanism: ``asyncio.wait_for`` treats a non-positive timeout as already
+    # expired and returns with zero delay, which is what turned this loop into
+    # a continuous mint against the authority. The floor is proportionate to the
+    # token's remaining lifetime rather than a flat constant, so an
+    # already-expired token floors at the absolute guard, not at 30 s.
+    assert min(waits) >= _ABSOLUTE_MIN_WAIT, f"computed a {min(waits)}s wait"
+    assert min(waits) > 0.0
 
 
 def test_a_margin_larger_than_the_token_lifetime_cannot_spin() -> None:
@@ -95,7 +109,19 @@ def test_a_margin_larger_than_the_token_lifetime_cannot_spin() -> None:
     minter = _minter(_config(refresh_seconds_before_expiry=600))
     expires_at = datetime.now(tz=UTC) + timedelta(seconds=60)
 
-    assert minter._next_mint_wait_seconds(expires_at) >= _MIN_MINT_WAIT_SECONDS
+    wait = minter._next_mint_wait_seconds(expires_at)
+
+    # Bounded and proportionate: never sooner than half the token's remaining
+    # lifetime, and never above the absolute rate guard. Asserting the flat
+    # constant here was both wrong and fragile, since the elapsed microseconds
+    # between building ``expires_at`` and reading the clock put the result a
+    # few microseconds under an exact-equality bound.
+    assert wait > 0.0
+    assert wait <= _MIN_MINT_WAIT_SECONDS
+    assert wait >= _MIN_MINT_WAIT_SECONDS - 1.0, (
+        f"a 60s token with a 600s margin waited {wait}s; the floor should be "
+        "half its lifetime, capped by the absolute guard"
+    )
 
 
 def test_the_collapsed_window_is_reported_not_silently_floored(
@@ -185,3 +211,4 @@ def test_the_floor_constant_is_what_the_tests_assert() -> None:
     from phantom.refresh import ad_client_credentials
 
     assert ad_client_credentials._MIN_MINT_WAIT_SECONDS == _MIN_MINT_WAIT_SECONDS
+    assert ad_client_credentials._ABSOLUTE_MIN_WAIT == _ABSOLUTE_MIN_WAIT

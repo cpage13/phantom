@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 # two mints a minute - a rate no authority treats as abuse.
 _MIN_MINT_WAIT_SECONDS: float = 30.0
 
+# The last-resort positive wait, used when even half the remaining lifetime is
+# tiny. Its only job is to keep the wait strictly positive so
+# ``asyncio.wait_for`` actually waits; the proportionate floor above does the
+# rate limiting.
+_ABSOLUTE_MIN_WAIT: float = 1.0
+
 
 class AuthUnavailableError(Exception):
     """Raised when neither primary nor secondary AD credentials succeed."""
@@ -143,13 +149,30 @@ class AdMinter:
                 own ``expires_on``.
 
         Returns:
-            The wait in seconds, never below :data:`_MIN_MINT_WAIT_SECONDS`.
+            The wait in seconds, always strictly positive and never later
+            than the token's own expiry.
         """
         refresh_before = self._config.refresh_seconds_before_expiry
         jitter = self._config.refresh_jitter_seconds
         lifetime_remaining = (expires_at - datetime.now(tz=UTC)).total_seconds()
         scheduled = lifetime_remaining - refresh_before - random.uniform(0.0, jitter)
-        if scheduled < _MIN_MINT_WAIT_SECONDS:
+        # The floor is PROPORTIONATE to the token's own lifetime, not a flat
+        # constant. A flat 30 s floor was wrong in a way the original comment
+        # asserted it was not ("well below any healthy refresh interval, so it
+        # never shapes a correct schedule"): a legitimately short-lived token,
+        # which the AD-mint e2e uses and which real app registrations can be
+        # configured for, has a whole lifetime under a minute, so a flat floor
+        # overrides its correct schedule and the token expires before the
+        # replacement is minted.
+        #
+        # Half the remaining lifetime is never sooner than the token needs and
+        # never later than its expiry, and the absolute guard still caps the
+        # rate for a long-lived token whose margin was misconfigured. Both
+        # goals hold: the wait is always strictly positive, so ``wait_for``
+        # cannot treat it as already-expired and spin, and the mint rate stays
+        # bounded by the lifetime rather than by an unrelated constant.
+        floor = min(_MIN_MINT_WAIT_SECONDS, max(lifetime_remaining / 2.0, _ABSOLUTE_MIN_WAIT))
+        if scheduled < floor:
             # Not a hypothetical: pinning refresh_seconds_before_expiry above
             # the token's actual lifetime lands here on EVERY cycle, so say so
             # rather than quietly minting at the floor rate forever.
@@ -165,9 +188,9 @@ class AdMinter:
                 refresh_before,
                 jitter,
                 scheduled,
-                _MIN_MINT_WAIT_SECONDS,
+                floor,
             )
-        return max(_MIN_MINT_WAIT_SECONDS, scheduled)
+        return max(floor, scheduled)
 
     async def _mint_and_store(self) -> datetime:
         """Mint a token via azure-identity and write it to the cache.
