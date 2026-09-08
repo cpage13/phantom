@@ -25,6 +25,7 @@ from phantom_client.models.admin import (
     KeyValueMatchFilter,
     ListUploadsResponse,
     ProfileRefCredBody,
+    ResolvedDefaultsSummary,
     SigningService,
     SigV4StaticCredBody,
     UploadBundle,
@@ -48,7 +49,6 @@ from phantom_client.models.status import (
     TERMINAL_STATES,
     HealthResponse,
     ReadyResponse,
-    SortKey,
     StatsResponse,
     TokenSlot,
     UploadRow,
@@ -87,11 +87,11 @@ __all__ = [
     "ListUploadsResponse",
     "ProfileRefCredBody",
     "ReadyResponse",
+    "ResolvedDefaultsSummary",
     # envelope.py
     "ResponseHeaders",
     "SigV4StaticCredBody",
     "SigningService",
-    "SortKey",
     # status.py
     "StatsResponse",
     "TokenSlot",

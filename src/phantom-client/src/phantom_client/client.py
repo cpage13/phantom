@@ -50,6 +50,7 @@ from phantom_client.models.admin import (
     IdentifierLookupResponse,
     InstanceStatusResponse,
     InstanceSummary,
+    KeyValueMatchFilter,
     ListUploadsResponse,
     ProfileRefCredBody,
     QuarantineInventoryResponse,
@@ -63,10 +64,10 @@ from phantom_client.models.status import (
     TERMINAL_STATES,
     HealthResponse,
     ReadyResponse,
-    SortKey,
     StatsResponse,
     TokenSlot,
     UploadRow,
+    UploadState,
 )
 from phantom_client.poller import (
     DEFAULT_INITIAL_POLL_DELAY_SECONDS,
@@ -77,7 +78,35 @@ from phantom_client.poller import (
 from phantom_client.poller import (
     poll_until as _poll_until,
 )
-from phantom_client.transport import QueryParamValue, Transport
+from phantom_client.transport import (
+    PATH_ADMIN_STATUS,
+    PATH_CHAIN,
+    PATH_CHAIN_BODY,
+    PATH_CHAIN_BUNDLE,
+    PATH_CHAIN_CANCEL,
+    PATH_CHAIN_REPLAY,
+    PATH_CHAINS,
+    PATH_CHAINS_EXTRACT,
+    PATH_CREDENTIAL_FOR,
+    PATH_EXPORT_TAR,
+    PATH_GROUP_STATUS,
+    PATH_HEALTH,
+    PATH_INSTANCE_STATUS,
+    PATH_INSTANCES,
+    PATH_LOOKUP_BY_CAPTURED_ID,
+    PATH_LOOKUP_BY_LOCAL_UUID,
+    PATH_OBSERVABILITY_COUNTERS,
+    PATH_OBSERVABILITY_GAUGES,
+    PATH_OBSERVABILITY_RAM_PRESSURE,
+    PATH_QUARANTINE,
+    PATH_QUARANTINE_RESTORE,
+    PATH_READY,
+    PATH_STATS,
+    PATH_TOKEN_FOR,
+    PATH_TOKENS,
+    QueryParamValue,
+    Transport,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -88,52 +117,11 @@ _LOG = logging.getLogger(__name__)
 # tuning knob, high enough that no realistic lookup truncates.
 _CAPTURED_VALUE_LOOKUP_LIMIT = 1000
 
-# Default read timeout used when the simple-constructor's ``timeout``
-# kwarg is set. The kwarg is ignored when a full ClientConfig is passed.
-_DEFAULT_READ_TIMEOUT_SECONDS = 30.0
-
-# Admin path constants - single source of truth for the v1 admin surface.
-_PATH_UPLOAD = "/v1/admin/chains/{chain_id}"
-_PATH_UPLOADS = "/v1/admin/chains"
-_PATH_UPLOAD_BODY = "/v1/admin/chains/{chain_id}/body"
-_PATH_UPLOAD_BUNDLE = "/v1/admin/chains/{chain_id}/bundle"
-_PATH_UPLOAD_REPLAY = "/v1/admin/chains/{chain_id}/replay"
-_PATH_UPLOAD_CANCEL = "/v1/admin/chains/{chain_id}/cancel"
-_PATH_UPLOADS_EXTRACT = "/v1/admin/chains/extract"
-_PATH_EXPORT_TAR = "/v1/admin/export.tar"
-
-# Cycle-7 group rollup + either-identifier lookups (plan § 6 task 5.1).
-_PATH_GROUP_STATUS = "/v1/admin/groups/{group_id}"
-_PATH_LOOKUP_BY_CAPTURED_ID = "/v1/admin/uploads/by-captured-id/{captured_id}"
-_PATH_LOOKUP_BY_LOCAL_UUID = "/v1/admin/uploads/by-local-uuid/{local_uuid}"
-
-_PATH_TOKENS = "/v1/admin/tokens"
-_PATH_TOKEN_FOR = "/v1/admin/tokens/{endpoint}/{uid}"
-
-# Destination SigV4 credential push - host-keyed, the analogue of the
-# per-(endpoint, uid) token slot above (the executor looks it up by host).
-_PATH_CREDENTIAL_FOR = "/v1/admin/credentials/{dest_host}"
-
-_PATH_STATS = "/v1/admin/stats"
-# Liveness + readiness are the public, unprefixed probe paths (GET
-# /v1/healthz, GET /v1/readyz). Phantom serves intake, admin, and health
-# on one listener (loopback by default per ADR-004), so every path here
-# rides the same base_url; these two just live outside the /v1/admin/
-# prefix.
-_PATH_HEALTH = "/v1/healthz"
-_PATH_READY = "/v1/readyz"
-_PATH_ADMIN_STATUS = "/v1/admin/status"
-_PATH_INSTANCE_STATUS = "/v1/admin/instances/{instance_id}/status"
-_PATH_INSTANCES = "/v1/admin/instances"
-
-# Plan § 4.2.5 observability endpoints.
-_PATH_OBSERVABILITY_COUNTERS = "/v1/admin/observability/counters"
-_PATH_OBSERVABILITY_GAUGES = "/v1/admin/observability/gauges"
-_PATH_OBSERVABILITY_RAM_PRESSURE = "/v1/admin/observability/ram_pressure"
-
-# Plan § 5.2.5 quarantine inventory + § 1.5 restore.
-_PATH_QUARANTINE = "/v1/admin/quarantine"
-_PATH_QUARANTINE_RESTORE = "/v1/admin/quarantine/restore"
+# The v1 path constants this module issues against live in
+# :mod:`phantom_client.transport`, the one module that owns the URL space, and
+# are imported above. They were declared here too until the duplicate pair
+# named ``_PATH_UPLOADS`` came to mean the chain COLLECTION in this module and
+# ONE chain's detail template in the poller.
 
 
 def _encode_key_value_match(key: str, value: str) -> str:
@@ -298,20 +286,19 @@ class PhantomClient:
         ``POST /v1/send`` (:class:`ChainResponse`) stays unchanged.
         """
         return await self._transport.get_json(
-            _PATH_UPLOAD.format(chain_id=chain_id), model=ChainAdminDetail
+            PATH_CHAIN.format(chain_id=chain_id), model=ChainAdminDetail
         )
 
     async def list_uploads(
         self,
         *,
-        state: str | None = None,
+        state: UploadState | None = None,
         route: str | None = None,
         multifile_id: UUID | None = None,
         group_id: UUID | None = None,
         since: datetime | None = None,
         limit: int = 100,
         cursor: str | None = None,
-        sort: SortKey = SortKey.NEXT_ATTEMPT_AT_ASC,
         instance: str | None = None,
         key_value_match: tuple[str, str] | None = None,
     ) -> tuple[list[UploadRow], str | None]:
@@ -323,11 +310,34 @@ class PhantomClient:
         filters by the query-grouping handle and paginates like every
         other filter.
 
+        There is NO sort parameter. ``GET /v1/admin/chains`` declares none, and
+        FastAPI drops undeclared query parameters silently, so the ``sort``
+        this method used to send unconditionally was discarded on arrival and
+        the caller got the service's own order while believing otherwise. That
+        order is fixed: ``received_at ASC, chain_id ASC``, which is also the
+        keyset the pagination cursor rides on (``send_order ASC`` under the
+        ``multifile_id`` filter). Re-ordering is not a knob the service can
+        honour, so the SDK no longer advertises one.
+
+        Args:
+            state: Match one upload state. Typed as
+                :data:`~phantom_client.models.status.UploadState`, so a typo
+                fails at type-check time rather than after a round-trip.
+            route: Match by resolved route name.
+            multifile_id: Return one multi-file set, ordered by send_order.
+            group_id: Match by the query-grouping handle.
+            since: Match rows with ``received_at >= since``.
+            limit: Page size.
+            cursor: Opaque continuation from a previous call's next_cursor.
+            instance: Scope to one instance id.
+            key_value_match: A ``(key, value)`` pair matched against the
+                metadata key-value store.
+
         Returns:
             ``(rows, next_cursor)``. ``next_cursor`` is ``None`` when
             the result is the final page.
         """
-        params: dict[str, QueryParamValue] = {"limit": limit, "sort": sort.value}
+        params: dict[str, QueryParamValue] = {"limit": limit}
         if state is not None:
             params["state"] = state
         if route is not None:
@@ -346,7 +356,7 @@ class PhantomClient:
             key, value = key_value_match
             params["key_value_match"] = _encode_key_value_match(key, value)
         envelope = await self._transport.get_json(
-            _PATH_UPLOADS, model=ListUploadsResponse, params=params
+            PATH_CHAINS, model=ListUploadsResponse, params=params
         )
         return envelope.uploads, envelope.next_cursor
 
@@ -364,9 +374,32 @@ class PhantomClient:
         (or beginning with a double quote) is encoded on the wire via
         the service's quoted-key form transparently, so the lookup
         never queries the wrong key (round 2 defender fix R2-3).
+
+        The pair is validated by constructing
+        :class:`~phantom_client.models.admin.KeyValueMatchFilter`, the exported
+        model whose own docstring names this method as its user. That is what
+        runs its ``min_length=1`` guard: an empty key or value is refused HERE
+        rather than costing a round-trip to come back as the service's
+        ``key_value_match_invalid`` envelope. It is the same pre-flight stance
+        :meth:`bulk_delete` takes for an empty filter.
+
+        Args:
+            key: Metadata KVS key to match. Must be non-empty.
+            value: Metadata KVS value to match. Must be non-empty.
+            instance: Narrow the search to one instance; omit to search
+                every configured instance.
+
+        Returns:
+            Every matching upload row, up to the lookup's one-shot ceiling.
+
+        Raises:
+            pydantic.ValidationError: When ``key`` or ``value`` is empty, per
+                :class:`KeyValueMatchFilter`'s own constraints. Raised before
+                any network call.
         """
+        match = KeyValueMatchFilter(key=key, value=value)
         rows, _ = await self.list_uploads(
-            key_value_match=(key, value),
+            key_value_match=(match.key, match.value),
             instance=instance,
             limit=_CAPTURED_VALUE_LOOKUP_LIMIT,
         )
@@ -426,7 +459,7 @@ class PhantomClient:
         if instance is not None:
             params["instance"] = instance
         return await self._transport.get_json(
-            _PATH_GROUP_STATUS.format(group_id=group_id),
+            PATH_GROUP_STATUS.format(group_id=group_id),
             model=GroupStatusResponse,
             params=params,
         )
@@ -458,7 +491,7 @@ class PhantomClient:
         if instance is not None:
             params["instance"] = instance
         return await self._transport.get_json(
-            _PATH_LOOKUP_BY_LOCAL_UUID.format(local_uuid=local_uuid),
+            PATH_LOOKUP_BY_LOCAL_UUID.format(local_uuid=local_uuid),
             model=IdentifierLookupResponse,
             params=params,
         )
@@ -496,7 +529,7 @@ class PhantomClient:
         if instance is not None:
             params["instance"] = instance
         return await self._transport.get_json(
-            _PATH_LOOKUP_BY_CAPTURED_ID.format(captured_id=quote(value, safe="")),
+            PATH_LOOKUP_BY_CAPTURED_ID.format(captured_id=quote(value, safe="")),
             model=IdentifierLookupResponse,
             params=params,
         )
@@ -523,12 +556,12 @@ class PhantomClient:
 
     async def fetch_body(self, chain_id: UUID) -> AsyncIterator[bytes]:
         """Stream the upload's body bytes as chunks."""
-        return self._transport.stream_request("GET", _PATH_UPLOAD_BODY.format(chain_id=chain_id))
+        return self._transport.stream_request("GET", PATH_CHAIN_BODY.format(chain_id=chain_id))
 
     async def fetch_bundle(self, chain_id: UUID) -> UploadBundle:
         """Return metadata + body as a single :class:`UploadBundle`."""
         return await self._transport.get_json(
-            _PATH_UPLOAD_BUNDLE.format(chain_id=chain_id), model=UploadBundle
+            PATH_CHAIN_BUNDLE.format(chain_id=chain_id), model=UploadBundle
         )
 
     async def extract(self, filter: ExtractFilter) -> AsyncIterator[bytes]:  # noqa: A002 - match plan signature
@@ -546,14 +579,14 @@ class PhantomClient:
         # back through the shared core.
         return self._transport.stream_request(
             "POST",
-            _PATH_UPLOADS_EXTRACT,
+            PATH_CHAINS_EXTRACT,
             content=filter.model_dump_json(by_alias=True),
             headers={"Content-Type": "application/json"},
         )
 
     async def export_tar(self) -> AsyncIterator[bytes]:
         """Stream the full ``/v1/admin/export.tar`` archive (ADR-005)."""
-        return self._transport.stream_request("GET", _PATH_EXPORT_TAR)
+        return self._transport.stream_request("GET", PATH_EXPORT_TAR)
 
     # -----------------------------------------------------------------
     # Lifecycle ops.
@@ -575,7 +608,7 @@ class PhantomClient:
                 ``cancel`` the chain first), then retry the replay.
         """
         return await self._transport.post_json(
-            _PATH_UPLOAD_REPLAY.format(chain_id=chain_id),
+            PATH_CHAIN_REPLAY.format(chain_id=chain_id),
             body=None,
             model=UploadRow,
         )
@@ -583,14 +616,14 @@ class PhantomClient:
     async def cancel(self, chain_id: UUID) -> UploadRow:
         """Cancel a non-terminal row (transitions it to ``cancelled``)."""
         return await self._transport.post_json(
-            _PATH_UPLOAD_CANCEL.format(chain_id=chain_id),
+            PATH_CHAIN_CANCEL.format(chain_id=chain_id),
             body=None,
             model=UploadRow,
         )
 
     async def delete_upload(self, chain_id: UUID) -> None:
         """Delete one upload row (and its body)."""
-        await self._transport.delete_no_body(_PATH_UPLOAD.format(chain_id=chain_id))
+        await self._transport.delete_no_body(PATH_CHAIN.format(chain_id=chain_id))
 
     async def bulk_delete(self, filter: DeleteFilter) -> int:  # noqa: A002 - match plan signature
         """Delete rows matching ``filter``.
@@ -602,7 +635,7 @@ class PhantomClient:
         if filter.is_empty():
             raise EmptyFilterError("bulk_delete refused: filter has no fields set")
         result = await self._transport.delete_json(
-            _PATH_UPLOADS, body=filter, model=BulkDeleteResponse
+            PATH_CHAINS, body=filter, model=BulkDeleteResponse
         )
         return result.deleted
 
@@ -610,37 +643,46 @@ class PhantomClient:
     # Token cache (ADR-002, ADR-003, ADR-004).
     # -----------------------------------------------------------------
 
-    async def list_tokens(
-        self,
-        *,
-        endpoint: str | None = None,
-        instance: str | None = None,
-    ) -> list[TokenSlot]:
-        """List token slots, optionally scoped to one endpoint/instance.
+    async def list_tokens(self, *, endpoint: str | None = None) -> list[TokenSlot]:
+        """List token slots, optionally scoped to one endpoint.
 
         Per ADR-004, bearer values are NEVER returned - each slot
         carries ``(endpoint, uid, last_updated, status)`` only.
+
+        There is NO instance scope. ``GET /v1/admin/tokens`` declares only
+        ``endpoint`` and always fans out across every configured instance;
+        FastAPI drops undeclared query parameters silently, so the ``instance``
+        this method used to send was discarded on arrival and the caller was
+        handed an UNSCOPED list while believing it was narrowed. Scoping is a
+        service-side capability that does not exist yet, so the SDK stops
+        advertising it. When the route grows the parameter (via the shared
+        ``_scope_instances`` helper every sibling list route already uses),
+        the keyword comes back here in the same change.
+
+        Args:
+            endpoint: Narrow to one upstream hostname; omit for every slot.
+
+        Returns:
+            One :class:`TokenSlot` per cached ``(endpoint, uid)`` entry.
         """
         params: dict[str, QueryParamValue] = {}
         if endpoint is not None:
             params["endpoint"] = endpoint
-        if instance is not None:
-            params["instance"] = instance
         envelope = await self._transport.get_json(
-            _PATH_TOKENS, model=_TokenListResponse, params=params
+            PATH_TOKENS, model=_TokenListResponse, params=params
         )
         return envelope.tokens
 
     async def push_token(self, *, endpoint: str, uid: str, token: str) -> None:
         """Push a bearer into the ``(endpoint, uid)`` slot."""
         await self._transport.put_json(
-            _PATH_TOKEN_FOR.format(endpoint=endpoint, uid=uid),
+            PATH_TOKEN_FOR.format(endpoint=endpoint, uid=uid),
             body={"token": token},
         )
 
     async def invalidate_token(self, *, endpoint: str, uid: str) -> None:
         """Mark the ``(endpoint, uid)`` slot as bad (status=bad)."""
-        await self._transport.delete_no_body(_PATH_TOKEN_FOR.format(endpoint=endpoint, uid=uid))
+        await self._transport.delete_no_body(PATH_TOKEN_FOR.format(endpoint=endpoint, uid=uid))
 
     # -----------------------------------------------------------------
     # Destination credentials (SigV4 re-sign surface).
@@ -679,7 +721,7 @@ class PhantomClient:
             ... )
         """
         await self._transport.put_json(
-            _PATH_CREDENTIAL_FOR.format(dest_host=quote(dest_host, safe="")),
+            PATH_CREDENTIAL_FOR.format(dest_host=quote(dest_host, safe="")),
             body=credential,
         )
 
@@ -692,30 +734,30 @@ class PhantomClient:
         params: dict[str, QueryParamValue] = {}
         if instance is not None:
             params["instance"] = instance
-        return await self._transport.get_json(_PATH_STATS, model=StatsResponse, params=params)
+        return await self._transport.get_json(PATH_STATS, model=StatsResponse, params=params)
 
     async def get_health(self) -> HealthResponse:
         """Return Phantom's health snapshot."""
-        return await self._transport.get_json(_PATH_HEALTH, model=HealthResponse)
+        return await self._transport.get_json(PATH_HEALTH, model=HealthResponse)
 
     async def get_ready(self) -> ReadyResponse:
         """Return Phantom's readiness snapshot."""
-        return await self._transport.get_json(_PATH_READY, model=ReadyResponse)
+        return await self._transport.get_json(PATH_READY, model=ReadyResponse)
 
     async def get_admin_status(self) -> AdminStatusResponse:
         """Return the aggregate admin-status view (ADR-007)."""
-        return await self._transport.get_json(_PATH_ADMIN_STATUS, model=AdminStatusResponse)
+        return await self._transport.get_json(PATH_ADMIN_STATUS, model=AdminStatusResponse)
 
     async def get_instance_status(self, instance_id: str) -> InstanceStatusResponse:
         """Return one instance's status (ADR-007)."""
         return await self._transport.get_json(
-            _PATH_INSTANCE_STATUS.format(instance_id=instance_id),
+            PATH_INSTANCE_STATUS.format(instance_id=instance_id),
             model=InstanceStatusResponse,
         )
 
     async def list_instances(self) -> list[InstanceSummary]:
         """List configured instances."""
-        envelope = await self._transport.get_json(_PATH_INSTANCES, model=_InstanceListResponse)
+        envelope = await self._transport.get_json(PATH_INSTANCES, model=_InstanceListResponse)
         return envelope.instances
 
     # -----------------------------------------------------------------
@@ -724,16 +766,16 @@ class PhantomClient:
 
     async def get_observability_counters(self) -> CountersResponse:
         """Return the process-wide MetricsRegistry counters snapshot."""
-        return await self._transport.get_json(_PATH_OBSERVABILITY_COUNTERS, model=CountersResponse)
+        return await self._transport.get_json(PATH_OBSERVABILITY_COUNTERS, model=CountersResponse)
 
     async def get_observability_gauges(self) -> GaugesResponse:
         """Return the process-wide MetricsRegistry gauges snapshot."""
-        return await self._transport.get_json(_PATH_OBSERVABILITY_GAUGES, model=GaugesResponse)
+        return await self._transport.get_json(PATH_OBSERVABILITY_GAUGES, model=GaugesResponse)
 
     async def get_observability_ram_pressure(self) -> RamPressureStatusResponse:
         """Return the RAM-pressure status aggregated across instances."""
         return await self._transport.get_json(
-            _PATH_OBSERVABILITY_RAM_PRESSURE, model=RamPressureStatusResponse
+            PATH_OBSERVABILITY_RAM_PRESSURE, model=RamPressureStatusResponse
         )
 
     # -----------------------------------------------------------------
@@ -758,7 +800,7 @@ class PhantomClient:
         if instance is not None:
             params["instance"] = instance
         return await self._transport.get_json(
-            _PATH_QUARANTINE, model=QuarantineInventoryResponse, params=params
+            PATH_QUARANTINE, model=QuarantineInventoryResponse, params=params
         )
 
     async def restore_quarantine_backup(
@@ -795,7 +837,7 @@ class PhantomClient:
         if instance is not None:
             params["instance"] = instance
         return await self._transport.post_json(
-            _PATH_QUARANTINE_RESTORE,
+            PATH_QUARANTINE_RESTORE,
             body=None,
             model=QuarantineRestoreResponse,
             params=params,

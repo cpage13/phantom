@@ -12,24 +12,36 @@ shape, descriptions excluded from comparison, drift surfaces as a
 test failure with a unified-diff report.
 
 The admin surface differs from the chain envelope in one important
-way: a subset of admin response models are deliberately
-**extras-tolerated** on the SDK side. ``UploadRow``,
-``AdminStatusResponse``, ``InstanceSummary``, ``HealthResponse``,
-``ReadyResponse``, and ``ListUploadsResponse`` use ``extra="ignore"``
-on the SDK so additional service-emitted fields surface as silent
-drops rather than parse failures. The service-side equivalents use
-``extra="forbid"``. This is a documented invariant, not drift.
+way: EVERY admin RESPONSE model is deliberately **extras-tolerated**
+on the SDK side, while its service-side equivalent forbids extras.
+That asymmetry is a contract decision, not drift. A published SDK
+release outlives the service version it was written against, so a
+caller pinned to an older client must not fault when a newer service
+adds a response field. The service stays strict because it deploys as
+one unit with its own models, where an unknown field is a real defect.
 
-Because of that, the test runs in two modes:
+REQUEST bodies are strict on BOTH sides, because they travel the other
+way: the SDK builds them and the service validates them, so tolerating
+an unknown field would silently swallow a caller's typo. The SDK
+declares which models those are in
+``phantom_client.models.admin.REQUEST_BODY_MODELS``.
 
-- **Strict-match models** (both sides ``extra="forbid"``): the
-  dereferenced, description-stripped JSON Schemas must match
-  byte-for-byte.
-- **Extras-tolerated models** (SDK ``extra="ignore"``, service
-  ``extra="forbid"``): only the fields the SDK declares are
+Because that one boolean is expected to differ, ``_wire_schema``
+strips ``additionalProperties`` before comparing, and
+``test_extras_policy_is_the_only_sanctioned_divergence`` asserts the
+policy directly for every strict model. Stripping a key from a drift
+test is only safe when something else pins it, and that test is what
+pins it. Everything that actually binds the wire (types, defaults,
+enums, required-ness) is still compared byte-for-byte.
+
+The test runs in two modes:
+
+- **Strict-match models**: the dereferenced, description-stripped,
+  extras-policy-stripped JSON Schemas must match byte-for-byte.
+- **Extras-tolerated models**: only the fields the SDK declares are
   compared. Service-emitted fields the SDK doesn't know about are
   allowed (the SDK drops them silently); SDK-declared fields the
-  service doesn't emit are not — that's broken-on-arrival.
+  service doesn't emit are not, that's broken-on-arrival.
 
 See:
 
@@ -158,7 +170,13 @@ _STRICT_MODELS: tuple[tuple[str, type[BaseModel], type[BaseModel]], ...] = (
         client_admin.KeyValueMatchFilter,
     ),
 )
-"""Models compared by full schema byte-equality (both sides forbid extras)."""
+"""Models compared by full schema byte-equality.
+
+The comparison excludes ``additionalProperties``, which is expected to differ:
+the service forbids extras and the SDK's RESPONSE models tolerate them. Request
+bodies in this tuple forbid on both sides. Both halves of that rule are asserted
+by :func:`test_extras_policy_is_the_only_sanctioned_divergence`.
+"""
 
 
 _EXTRAS_TOLERATED_MODELS: tuple[tuple[str, type[BaseModel], type[BaseModel]], ...] = (
@@ -212,6 +230,30 @@ def _strip_doc_keys(node: Any) -> Any:
     return node
 
 
+def _strip_extras_policy(node: Any) -> Any:
+    """Recursively remove ``additionalProperties``, the ONE sanctioned divergence.
+
+    The two packages deliberately disagree here, and only here. The service's
+    response models forbid unknown fields; the SDK's tolerate them, because a
+    published SDK release outlives the service version it was written against
+    and a pinned 0.1.0 client must not fault when a 0.2.0 service adds a field.
+    That asymmetry is a contract decision, not drift.
+
+    It is stripped rather than accepted quietly, because leaving it in would
+    force these models into the weaker names-and-required comparison, which
+    would stop detecting per-field TYPE, DEFAULT and ENUM drift on sixteen
+    models to express one boolean. Stripping keeps full byte-equality on
+    everything that binds the wire, and
+    :func:`test_extras_policy_is_the_only_sanctioned_divergence` asserts the
+    policy itself directly, so it stays checked rather than merely ignored.
+    """
+    if isinstance(node, dict):
+        return {k: _strip_extras_policy(v) for k, v in node.items() if k != "additionalProperties"}
+    if isinstance(node, list):
+        return [_strip_extras_policy(v) for v in node]
+    return node
+
+
 def _dereference(schema: dict[str, Any]) -> dict[str, Any]:
     """Inline every ``$ref`` against ``$defs`` so two schemas that differ
     only in inline-vs-ref'd subschema encoding compare equal.
@@ -248,8 +290,10 @@ def _dereference(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def _wire_schema(model: type[BaseModel]) -> dict[str, Any]:
-    """Pydantic JSON schema, $ref-dereferenced and doc-key-stripped."""
-    return _strip_doc_keys(_dereference(model.model_json_schema()))  # type: ignore[no-any-return]
+    """Pydantic JSON schema: dereferenced, doc-stripped, extras-policy-stripped."""
+    return _strip_extras_policy(  # type: ignore[no-any-return]
+        _strip_doc_keys(_dereference(model.model_json_schema()))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -361,3 +405,54 @@ def test_field_aliases_match(
             f"{model_name}.{name} alias mismatch: "
             f"service={s_fields[name].alias!r}, client={c_fields[name].alias!r}"
         )
+
+
+@pytest.mark.parametrize(
+    ("model_name", "service_model", "client_model"),
+    _STRICT_MODELS,
+    ids=[name for name, _, _ in _STRICT_MODELS],
+)
+def test_extras_policy_is_the_only_sanctioned_divergence(
+    model_name: str,
+    service_model: type[BaseModel],
+    client_model: type[BaseModel],
+) -> None:
+    """Objective: pin the ONE way the two packages are allowed to disagree.
+
+    Expected: the service response model forbids unknown fields and the SDK's
+    tolerates them.
+
+    ``_wire_schema`` strips ``additionalProperties`` so the byte-equality test
+    can keep checking everything that binds the wire (types, defaults, enums,
+    required-ness) without one deliberate boolean forcing sixteen models into a
+    weaker comparison. Stripping a key from a drift test is only safe if
+    something else asserts it, which is this test.
+
+    The asymmetry is a contract decision. A published SDK release outlives the
+    service version it was written against, so a caller pinned to an older
+    client must not fault when a newer service adds a response field. The
+    service stays strict because it is deployed as a unit with its own models
+    and an unknown field there is a real defect.
+    """
+    service_extras = service_model.model_config.get("extra")
+    client_extras = client_model.model_config.get("extra")
+
+    assert service_extras == "forbid", (
+        f"{model_name}: the service model should forbid unknown fields, got {service_extras!r}"
+    )
+
+    if model_name in client_admin.REQUEST_BODY_MODELS:
+        # A request body travels the other way. The SDK builds it and the
+        # service validates it, so tolerating an unknown field there would
+        # silently drop a caller's typo instead of surfacing it. Strict on
+        # both sides is correct and is asserted rather than assumed.
+        assert client_extras == "forbid", (
+            f"{model_name} is a request body, so the SDK must forbid unknown "
+            f"fields and surface a caller typo, got {client_extras!r}"
+        )
+        return
+
+    assert client_extras == "ignore", (
+        f"{model_name}: the SDK response model must tolerate unknown fields so "
+        f"a pinned client survives a newer service, got {client_extras!r}"
+    )

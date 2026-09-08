@@ -5,6 +5,37 @@ accepts on bulk and filtered admin endpoints and the responses it
 returns. Each request-body model uses ``extra="forbid"`` to surface
 typos early; response models use ``extra="ignore"`` so future Phantom
 additions don't fault the SDK.
+
+That second half is the SDK's forward-compatibility contract, and it is
+load-bearing for a package published to PyPI and pinned by its callers. A
+release of this SDK outlives the service version it was written against: an
+operator upgrades phantom-service on its own cadence, and the first response
+carrying one new field would otherwise raise ``ValidationError``, which
+:meth:`Transport._parse_json` surfaces as
+:class:`~phantom_client.errors.PhantomEnvelopeError`. Every already-shipped
+client would break on a purely additive service change. The in-repo contract
+test cannot protect against this - it compares the two packages as they sit in
+one checkout, not the released pair a user actually runs.
+
+Eleven response models had drifted to ``extra="forbid"``, including the two
+the pollers read on every iteration (:class:`ChainAdminDetail` and
+:class:`GroupStatusResponse`), so ``get_group_status`` and
+``poll_group_until_finished`` were exactly the calls a service field addition
+would have broken first. The rule now holds for every response model in this
+module, NESTED components included: tolerance at the top level buys nothing if
+a new field inside :class:`GroupMember` still faults the parse.
+
+:data:`REQUEST_BODY_MODELS` names the request half; everything else here is a
+response and is checked mechanically by
+``tests/unit/test_admin_models.py::test_extras_policy_holds_for_every_model``,
+so the twelfth model cannot drift either way without the suite saying so.
+
+Residue worth knowing: response models still reach nested components defined in
+:mod:`phantom_client.models.status` (``TierBreakdown``, ``StateBreakdown``,
+``AuthStatus``, ``CapturedValues``) and :mod:`phantom_client.models.chain`
+(``CapturedStep``), which remain ``extra="forbid"``. A new field on one of
+THOSE still faults. Extending the rule to them is a wider change to the shared
+contract test's model registry and is not made here.
 """
 
 from __future__ import annotations
@@ -25,6 +56,28 @@ from phantom_client.models.status import (
     UploadRow,
     UploadState,
 )
+
+REQUEST_BODY_MODELS: frozenset[str] = frozenset(
+    {
+        "ExtractFilter",
+        "DeleteFilter",
+        "KeyValueMatchFilter",
+        "SigV4StaticCredBody",
+        "ProfileRefCredBody",
+    }
+)
+"""Names of the models in this module the SDK SENDS rather than receives.
+
+The declared half of the extras rule: a name listed here must use
+``extra="forbid"`` (the SDK is the author of the payload, so an unknown key is
+the caller's typo and should fault loudly); every other ``BaseModel`` defined
+in this module is a response and must use ``extra="ignore"``. The unit test
+walks the module and enforces both directions, so adding a model without
+placing it on the correct side of this line fails the suite.
+
+Not part of the package's public surface; it is a contract marker for the test.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Filter bodies: request payloads.
@@ -76,8 +129,18 @@ class DeleteFilter(BaseModel):
     instance: str | None = Field(None, description="Scope to one instance id.")
 
     def is_empty(self) -> bool:
-        """True iff no filter field is set (the unsafe 'delete-all' shape)."""
-        return not any([self.state, self.route, self.since, self.instance])
+        """True iff no filter field is SET (the unsafe 'delete-all' shape).
+
+        Set means ``is not None``, not truthy. The service's own guard on
+        ``DELETE /v1/admin/chains`` refuses exactly the all-None body, so this
+        pre-flight has to draw the line in the same place. Testing truthiness
+        instead read a filter with an empty-string field as empty and raised
+        :class:`~phantom_client.errors.EmptyFilterError` locally for
+        ``DeleteFilter(route="")`` - a filter the service would have accepted
+        and evaluated as "rows whose route is the empty string", matching
+        nothing. Refusing it turned an empty result into an exception.
+        """
+        return all(value is None for value in (self.state, self.route, self.since, self.instance))
 
 
 class KeyValueMatchFilter(BaseModel):
@@ -201,7 +264,7 @@ class ChainAdminStepDetail(BaseModel):
     response.
     """
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     name: str = Field(..., description="Step name (envelope-defined, snake_case).")
     method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = Field(
@@ -266,7 +329,7 @@ class ChainAdminDetail(BaseModel):
     without a second lookup.
     """
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     chain_id: UUID = Field(..., description="The chain's id.")
     state: ChainState = Field(..., description="Current chain state.")
@@ -365,12 +428,14 @@ class ChainAdminDetail(BaseModel):
 class GroupMember(BaseModel):
     """One upload that belongs to a query group.
 
-    Mirrors :class:`phantom.models.admin.GroupMember` byte-for-byte
+    Mirrors :class:`phantom.models.admin.GroupMember` field-for-field
     (ADR-012); drift is caught by
-    ``tests/contract/test_admin_models_alignment.py``.
+    ``tests/contract/test_admin_models_alignment.py``. The one deliberate
+    difference is the extras policy: the service forbids, this model ignores,
+    per this module's forward-compatibility rule.
     """
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     chain_id: UUID = Field(..., description="The member upload's chain_id (primary key).")
     state: ChainState = Field(..., description="The member's current chain state.")
@@ -409,11 +474,14 @@ class GroupStatusResponse(BaseModel):
     """Synthesized rollup for one query group.
 
     Mirrors :class:`phantom.models.admin.GroupStatusResponse`
-    byte-for-byte (ADR-012); drift is caught by
-    ``tests/contract/test_admin_models_alignment.py``.
+    field-for-field (ADR-012); drift is caught by
+    ``tests/contract/test_admin_models_alignment.py``. The one deliberate
+    difference is the extras policy: the service forbids, this model ignores,
+    per this module's forward-compatibility rule. It matters most here - this
+    is the model ``poll_group_until_finished`` re-parses on every iteration.
     """
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     group_id: UUID = Field(
         ..., description="The query group this rollup describes (the path parameter)."
@@ -452,11 +520,13 @@ class UploadStatusSummary(BaseModel):
     """The 'did my upload land' status projection for one upload.
 
     Mirrors :class:`phantom.models.admin.UploadStatusSummary`
-    byte-for-byte (ADR-012); drift is caught by
-    ``tests/contract/test_admin_models_alignment.py``.
+    field-for-field (ADR-012); drift is caught by
+    ``tests/contract/test_admin_models_alignment.py``. The one deliberate
+    difference is the extras policy: the service forbids, this model ignores,
+    per this module's forward-compatibility rule.
     """
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     chain_id: UUID = Field(..., description="The upload's chain_id (primary key).")
     state: ChainState = Field(..., description="Current chain state.")
@@ -507,11 +577,13 @@ class IdentifierLookupResponse(BaseModel):
     """Result of an either-identifier lookup.
 
     Mirrors :class:`phantom.models.admin.IdentifierLookupResponse`
-    byte-for-byte (ADR-012); drift is caught by
-    ``tests/contract/test_admin_models_alignment.py``.
+    field-for-field (ADR-012); drift is caught by
+    ``tests/contract/test_admin_models_alignment.py``. The one deliberate
+    difference is the extras policy: the service forbids, this model ignores,
+    per this module's forward-compatibility rule.
     """
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     kind: Literal["captured_file_id", "local_uuid"] = Field(
         ..., description="Which identifier axis was queried."
@@ -530,7 +602,7 @@ class IdentifierLookupResponse(BaseModel):
 class BulkDeleteResponse(BaseModel):
     """Response payload for ``DELETE /v1/admin/chains``."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     deleted: int = Field(..., ge=0, description="Number of rows deleted.")
 
@@ -538,12 +610,15 @@ class BulkDeleteResponse(BaseModel):
 class ListUploadsResponse(BaseModel):
     """Response payload for ``GET /v1/admin/chains``.
 
-    Mirrors :class:`phantom.models.admin.ListUploadsResponse` byte-for-byte;
+    Mirrors :class:`phantom.models.admin.ListUploadsResponse` field-for-field;
     the field is ``uploads`` (not ``rows``). The duplication is enforced by
-    ``tests/contract/test_admin_models_alignment.py``.
+    ``tests/contract/test_admin_models_alignment.py``. The one deliberate
+    difference is the extras policy: the service forbids, this model ignores,
+    per this module's forward-compatibility rule - which is what that contract
+    test's own header docstring already said this model did.
     """
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     uploads: list[UploadRow] = Field(
         default_factory=list,
@@ -610,6 +685,54 @@ class InstanceSummary(BaseModel):
     in_flight: int = Field(..., ge=0, description="In-flight upload count.")
 
 
+class ResolvedDefaultsSummary(BaseModel):
+    """Resolved-default values an operator can read back via admin.
+
+    Mirrors :class:`phantom.models.admin.ResolvedDefaultsSummary`. Echoes the
+    saturation / storage / worker numbers Phantom derived from its host probe
+    at startup, plus the three machine facts it observed, so
+    ``GET /v1/admin/status`` answers "what cap am I actually running under?"
+    without parsing logs. CONTEXT.md pins this echo as pilot admin surface.
+
+    The SDK omitted it entirely, and :class:`AdminStatusResponse` tolerates
+    extras, so the whole block was dropped on arrival with no warning: an
+    operator reading it through this SDK saw nothing and had no way to tell
+    that from an unpopulated field.
+    """
+
+    model_config = ConfigDict(strict=True, extra="ignore")
+
+    max_in_flight: int = Field(..., ge=0, description="Resolved saturation row-count cap.")
+    max_in_flight_bytes: int = Field(..., ge=0, description="Resolved saturation byte cap.")
+    max_disk_bytes: int = Field(
+        ..., ge=0, description="Resolved persisted-tier disk-usage ceiling."
+    )
+    ram_ceiling_bytes: int = Field(
+        ...,
+        ge=0,
+        description="Resolved RAM-tier body-store ceiling (the RamBodyStore bytes cap).",
+    )
+    large_body_threshold_bytes: int = Field(
+        ..., ge=0, description="Resolved large-body class size boundary."
+    )
+    max_large_in_flight: int = Field(
+        ..., ge=0, description="Resolved max concurrent in-flight large bodies."
+    )
+    persist_body_size_threshold_bytes: int = Field(
+        ..., ge=0, description="Resolved size-aware persist threshold."
+    )
+    worker_count: int = Field(..., ge=1, description="Resolved sender worker-pool size.")
+    observed_total_ram_bytes: int = Field(
+        ..., ge=0, description="``psutil.virtual_memory().total`` observed at probe time."
+    )
+    observed_free_disk_bytes: int = Field(
+        ..., ge=0, description="``shutil.disk_usage(data_dir).free`` observed at probe time."
+    )
+    observed_cpu_count: int = Field(
+        ..., ge=1, description="``os.cpu_count() or 1`` observed at probe time."
+    )
+
+
 class AdminStatusResponse(BaseModel):
     """Response for ``GET /v1/admin/status``."""
 
@@ -630,6 +753,15 @@ class AdminStatusResponse(BaseModel):
             "'not_configured' when no instance runs ad_client_credentials."
         ),
     )
+    resolved_defaults: ResolvedDefaultsSummary | None = Field(
+        None,
+        description=(
+            "Resolved saturation/storage/worker defaults filled by the host "
+            "probe at startup. Always populated by the live admin route; None "
+            "is permitted because the service's own field is optional, so a "
+            "response constructed without a probe still parses."
+        ),
+    )
     implementation: str = Field(
         "phantom-python",
         description=(
@@ -647,10 +779,12 @@ class InstanceStatusResponse(BaseModel):
     """Response for ``GET /v1/admin/instances/{id}/status``.
 
     Mirrors :class:`phantom.models.admin.InstanceStatusResponse`
-    byte-for-byte; enforced by the admin contract test.
+    field-for-field; enforced by the admin contract test. The one deliberate
+    difference is the extras policy: the service forbids, this model ignores,
+    per this module's forward-compatibility rule.
     """
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     id: str = Field(..., description="InstanceCfg.id.")
     ready: bool = Field(
@@ -682,15 +816,17 @@ class InstanceStatusResponse(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Plan § 4.2.5: Observability admin response shapes (SDK mirror).
-# Mirrors phantom.models.admin byte-for-byte; enforced by the admin
-# contract test.
+# Mirrors phantom.models.admin field-for-field; enforced by the admin
+# contract test. Extras policy is the one deliberate difference: the
+# service forbids, these ignore, per this module's forward-compatibility
+# rule.
 # ---------------------------------------------------------------------------
 
 
 class CounterValue(BaseModel):
     """One counter entry from the observability surface."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     name: str = Field(..., description="Canonical metric name.")
     description: str = Field(..., description="One-line human-readable description.")
@@ -703,7 +839,7 @@ class CounterValue(BaseModel):
 class CountersResponse(BaseModel):
     """``GET /v1/admin/observability/counters`` response."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     counters: list[CounterValue] = Field(
         ...,
@@ -714,7 +850,7 @@ class CountersResponse(BaseModel):
 class GaugeValue(BaseModel):
     """One gauge entry from the observability surface."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     name: str = Field(..., description="Canonical metric name.")
     description: str = Field(..., description="One-line human-readable description.")
@@ -727,7 +863,7 @@ class GaugeValue(BaseModel):
 class GaugesResponse(BaseModel):
     """``GET /v1/admin/observability/gauges`` response."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     gauges: list[GaugeValue] = Field(
         ...,
@@ -738,7 +874,7 @@ class GaugesResponse(BaseModel):
 class RamPressureStatusResponse(BaseModel):
     """``GET /v1/admin/observability/ram_pressure`` response."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     ram_body_store_bytes: int = Field(
         ...,
@@ -775,7 +911,7 @@ class QuarantineEntry(BaseModel):
     (``anomaly`` true, ``backup_id`` null) and is not restorable.
     """
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     backup_id: UUID | None = Field(
         ...,
@@ -831,7 +967,7 @@ class QuarantineEntry(BaseModel):
 class QuarantineInventoryResponse(BaseModel):
     """``GET /v1/admin/quarantine`` response."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     quarantines: list[QuarantineEntry] = Field(
         ...,
@@ -845,7 +981,7 @@ class QuarantineInventoryResponse(BaseModel):
 class QuarantineRestoreResponse(BaseModel):
     """``POST /v1/admin/quarantine/restore`` response (SDK mirror)."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     restored_db: str = Field(
         ...,
@@ -892,6 +1028,7 @@ __all__ = [
     "QuarantineInventoryResponse",
     "QuarantineRestoreResponse",
     "RamPressureStatusResponse",
+    "ResolvedDefaultsSummary",
     "SigV4StaticCredBody",
     "SigningService",
     "UploadBundle",

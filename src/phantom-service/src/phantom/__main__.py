@@ -154,7 +154,11 @@ def main() -> int:
         # a password there would make uvicorn try to decrypt an unencrypted key
         # and fail at bind. So gate the password on operator-supplied only.
         if tls.cert_path is not None and tls.key_password is not None:
-            ssl_kwargs["ssl_keyfile_password"] = tls.key_password
+            # `key_password` is a SecretStr so that `--validate`, which this
+            # module advertises as safe to run at deploy time, cannot print the
+            # passphrase into a CI log via `model_dump_json`. uvicorn needs the
+            # real characters, and this is the single place that unwraps it.
+            ssl_kwargs["ssl_keyfile_password"] = tls.key_password.get_secret_value()
 
     if settings.server.bind_uds is not None:
         uvicorn.run(app, uds=settings.server.bind_uds, **ssl_kwargs)

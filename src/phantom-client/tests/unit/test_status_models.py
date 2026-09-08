@@ -6,12 +6,12 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+from phantom_client.models import status as status_models
 from phantom_client.models.chain import ChainState
 from phantom_client.models.status import (
     TERMINAL_STATES,
     HealthResponse,
     ReadyResponse,
-    SortKey,
     StatsResponse,
     TokenSlot,
     UploadRow,
@@ -45,11 +45,17 @@ def test_terminal_states_set() -> None:
     )
 
 
-def test_sort_key_values() -> None:
-    """SortKey values match the documented wire strings."""
-    assert SortKey.NEXT_ATTEMPT_AT_ASC.value == "next_attempt_at_asc"
-    assert SortKey.NEXT_ATTEMPT_AT_DESC.value == "next_attempt_at_desc"
-    assert SortKey.RECEIVED_AT_DESC.value == "received_at_desc"
+def test_no_sort_key_is_advertised() -> None:
+    """Objective: the module exports no SortKey. Expected: the name is gone.
+
+    ``GET /v1/admin/chains`` declares no ``sort`` query parameter, so every
+    value the enum advertised was dropped silently by FastAPI; two of its
+    three members named ``next_attempt_at``, which is nullable and cannot be
+    the store's keyset-pagination axis at all. The SDK does not advertise
+    capabilities the service cannot honour.
+    """
+    assert not hasattr(status_models, "SortKey")
+    assert "SortKey" not in status_models.__all__
 
 
 def test_upload_row_ignores_unknown_fields() -> None:

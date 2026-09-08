@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -19,6 +19,7 @@ from phantom_client.config import ClientConfig, RetryPolicy
 from phantom_client.errors import (
     PhantomConnectError,
     PhantomEnvelopeError,
+    PhantomNetworkError,
     PhantomServerError,
     PhantomTimeoutError,
     PhantomUnavailableError,
@@ -684,5 +685,245 @@ async def test_uds_missing_socket_maps_to_connect_error(tmp_path: Path) -> None:
     try:
         with pytest.raises(PhantomConnectError):
             await transport.get_json("/v1/healthz", model=HealthResponse)
+    finally:
+        await transport.aclose()
+
+
+async def test_uds_missing_socket_maps_to_connect_error_on_stream(tmp_path: Path) -> None:
+    """Objective: the STREAMING methods translate httpx errors too.
+
+    Expected: ``PhantomConnectError`` from ``stream_request``, the same typed
+    error the buffered read above raises against the same absent socket.
+
+    This is the regression pin for the transport's documented promise that a
+    missing socket surfaces as ``PhantomConnectError`` "like any refused TCP
+    connect". ``stream_request`` never translated at all: it opened the stream
+    on the raw httpx client, so ``fetch_body``, ``export_tar`` and ``extract``
+    leaked ``httpx.ConnectError`` while ``get_health`` on the same address
+    raised the SDK error, and a caller wrapping every SDK call in
+    ``except PhantomTransportError`` crashed on exactly three of them.
+    """
+    config = ClientConfig(
+        phantom_url=f"unix:{tmp_path / 'absent-phantom.sock'}",
+        retry_policy=RetryPolicy(enabled=False),
+    )
+    transport = Transport(config)
+    await transport.start()
+    try:
+        with pytest.raises(PhantomConnectError):
+            async for _ in transport.stream_request("GET", "/v1/admin/export.tar"):
+                pass
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [
+        (httpx.ConnectError("refused"), PhantomConnectError),
+        (httpx.ConnectTimeout("connect timed out"), PhantomTimeoutError),
+        (httpx.PoolTimeout("pool exhausted"), PhantomTimeoutError),
+        (httpx.ReadTimeout("read timed out"), PhantomTimeoutError),
+        (httpx.ReadError("reset"), PhantomNetworkError),
+        (httpx.RemoteProtocolError("server disconnected"), PhantomNetworkError),
+        (httpx.UnsupportedProtocol("bad scheme"), PhantomNetworkError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stream_request_translates_every_httpx_class(
+    transport_factory: Callable[..., Transport],
+    raised: httpx.HTTPError,
+    expected: type[Exception],
+) -> None:
+    """Objective: every httpx failure class reaches the caller as its SDK twin.
+
+    Expected: the mapped ``PhantomTransportError`` subclass, never a raw
+    ``httpx`` exception. The pairs are the same ones ``_send_with_retry``
+    produces, because both paths now share ``_translate_httpx_error``; drift
+    between the buffered and streaming mappings is what this pins against.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise raised
+
+    transport = transport_factory(handler, retry_policy=RetryPolicy(enabled=False))
+    await transport.start()
+    try:
+        with pytest.raises(expected) as caught:
+            async for _ in transport.stream_request("GET", "/v1/admin/export.tar"):
+                pass
+    finally:
+        await transport.aclose()
+    assert not isinstance(caught.value, httpx.HTTPError)
+
+
+@pytest.mark.asyncio
+async def test_stream_request_retries_never_landed_connect(
+    transport_factory: Callable[..., Transport],
+) -> None:
+    """Objective: a refused connect before the first chunk is retried.
+
+    Expected: two attempts, the second succeeding, and the caller sees the
+    body. A connect that was refused never landed and no chunk has reached the
+    caller, so re-opening the stream cannot duplicate or interleave bytes -
+    the deliberate reading of the module's no-retry-on-partial-stream rule,
+    which is about a stream that already started.
+    """
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("refused")
+        return httpx.Response(200, content=b"tar-bytes")
+
+    transport = transport_factory(
+        handler,
+        retry_policy=RetryPolicy(
+            max_attempts=3, backoff_initial_seconds=0.001, backoff_jitter=False
+        ),
+    )
+    await transport.start()
+    try:
+        chunks = [c async for c in transport.stream_request("GET", "/v1/admin/export.tar")]
+    finally:
+        await transport.aclose()
+    assert calls == 2
+    assert b"".join(chunks) == b"tar-bytes"
+
+
+@pytest.mark.asyncio
+async def test_stream_request_does_not_retry_may_have_landed(
+    transport_factory: Callable[..., Transport],
+) -> None:
+    """Objective: a may-have-landed failure is never re-sent by the stream path.
+
+    Expected: exactly one attempt and a ``PhantomTimeoutError``. A read timeout
+    can strike after the server executed the request, and a streamed extract or
+    export is not something the SDK may quietly repeat.
+    """
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("read timed out")
+
+    transport = transport_factory(
+        handler,
+        retry_policy=RetryPolicy(
+            max_attempts=3, backoff_initial_seconds=0.001, backoff_jitter=False
+        ),
+    )
+    await transport.start()
+    try:
+        with pytest.raises(PhantomTimeoutError):
+            async for _ in transport.stream_request("GET", "/v1/admin/export.tar"):
+                pass
+    finally:
+        await transport.aclose()
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_request_no_retry_once_a_chunk_was_yielded() -> None:
+    """Objective: a failure MID-stream is never retried, whatever its class.
+
+    Expected: the caller receives the first chunk, then a
+    ``PhantomConnectError``, and the stream is opened exactly once. Connect
+    refusal is the always-retried never-landed class, so this proves the gate
+    is "has the caller seen bytes", not the failure class alone: the SDK
+    cannot rewind chunks the caller already holds.
+    """
+    opens = 0
+
+    async def failing_body() -> AsyncIterator[bytes]:
+        yield b"first"
+        raise httpx.ConnectError("dropped mid-stream")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal opens
+        opens += 1
+        return httpx.Response(200, content=failing_body())
+
+    cfg = ClientConfig(
+        phantom_url="http://test",
+        retry_policy=RetryPolicy(
+            max_attempts=3, backoff_initial_seconds=0.001, backoff_jitter=False
+        ),
+    )
+    transport = Transport(cfg, transport=httpx.MockTransport(handler))
+    await transport.start()
+    seen: list[bytes] = []
+    try:
+        with pytest.raises(PhantomConnectError):
+            async for chunk in transport.stream_request("GET", "/v1/admin/export.tar"):
+                seen.append(chunk)
+    finally:
+        await transport.aclose()
+    assert seen == [b"first"]
+    assert opens == 1
+
+
+@pytest.mark.asyncio
+async def test_get_json_with_poll_hint_returns_body_and_hint(
+    transport_factory: Callable[..., Transport],
+) -> None:
+    """Objective: the public poll-hinted read parses body and header together.
+
+    Expected: the model instance plus the header value as float seconds, and
+    ``None`` when the response carries no hint. This is the method the pollers
+    now call instead of reaching through ``_require_client`` and
+    ``_raise_for_status``.
+    """
+    hints = iter(["7", None])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        headers = {"Content-Type": "application/json"}
+        hint = next(hints)
+        if hint is not None:
+            headers["X-Phantom-Suggested-Poll-After"] = hint
+        return httpx.Response(
+            200, content=json.dumps({"status": "ok", "version": "1.2.3"}), headers=headers
+        )
+
+    transport = transport_factory(handler)
+    await transport.start()
+    try:
+        with_hint = await transport.get_json_with_poll_hint("/v1/healthz", model=HealthResponse)
+        without_hint = await transport.get_json_with_poll_hint("/v1/healthz", model=HealthResponse)
+    finally:
+        await transport.aclose()
+    assert with_hint.body.version == "1.2.3"
+    assert with_hint.suggested_poll_after_seconds == 7.0
+    assert without_hint.suggested_poll_after_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_get_json_with_poll_hint_rejects_non_integer_hint(
+    transport_factory: Callable[..., Transport],
+) -> None:
+    """Objective: a non-integer poll hint is a contract violation, not a shrug.
+
+    Expected: ``PhantomEnvelopeError``. The header is documented as integer
+    seconds; silently ignoring a malformed value would hide a service bug.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=json.dumps({"status": "ok", "version": "1"}),
+            headers={
+                "Content-Type": "application/json",
+                "X-Phantom-Suggested-Poll-After": "soon",
+            },
+        )
+
+    transport = transport_factory(handler)
+    await transport.start()
+    try:
+        with pytest.raises(PhantomEnvelopeError):
+            await transport.get_json_with_poll_hint("/v1/healthz", model=HealthResponse)
     finally:
         await transport.aclose()
