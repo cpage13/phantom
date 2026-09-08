@@ -1744,18 +1744,43 @@ class SqliteUploadStore:
         )
 
     async def list_oldest_ram_bodies(self, limit: int) -> list[UUID]:
-        """Return the oldest ``body_location='ram'`` chain_ids.
+        """Return the oldest chain_ids that still hold a RAM body.
 
-        Used by the RAM-pressure watcher (plan § 2.3.12)
-        to pick migration candidates when RAM pressure breaches the
-        ceiling. Ordered by ``received_at`` ASC; capped at ``limit``.
-        Returns an empty list when no RAM-tier rows remain.
+        Used by the RAM-pressure watcher (plan § 2.3.12) to pick migration
+        candidates when RAM pressure breaches the ceiling. Ordered by
+        ``received_at`` ASC; capped at ``limit``. Returns an empty list when no
+        RAM-tier rows remain.
+
+        The ``body_discarded_at IS NULL`` filter is load-bearing, not defensive.
+        ``body_location`` is written by exactly ONE statement after INSERT,
+        :meth:`mark_persisted`'s flip to ``'file'``, and NOTHING ever moves it
+        back or clears it when a body is discarded. So a row whose body was
+        discarded while RAM-resident stayed a permanent ``'ram'`` candidate for
+        as long as the row existed, and because it is OLDER by ``received_at``
+        than anything still holding memory, it crowded the front of this query.
+
+        The dominant source is the default success path, not slow accretion:
+        ``succeeded_body_seconds`` defaults to 0, so the sender discards every
+        delivered upload's bytes immediately while leaving ``body_location``
+        at ``'ram'``, and ``succeeded_metadata_seconds`` is 180. At a modest
+        upload rate the whole candidate window filled with rows that had no
+        body left. The watcher enqueued them, ``PersistController._migrate_one``
+        rejected every one at its deliverability pre-check, nothing migrated,
+        and the watcher logged unresolved pressure at 1 Hz forever. With the
+        ceiling lowered, which is the documented reason the knob exists, RAM
+        then grew to the in-flight byte cap and the process was OOM-killed,
+        after which recovery quarantined every RAM-resident row and the
+        buffered uploads were lost.
+
+        A reproduction with 70 discarded rows and 5 live ones observed all 64
+        candidate slots occupied by discarded rows and 64 of 64 rejected.
         """
         conn = self._read_connection()
         async with conn.execute(
             """
             SELECT chain_id FROM uploads
              WHERE body_location = 'ram'
+               AND body_discarded_at IS NULL
              ORDER BY received_at ASC
              LIMIT ?
             """,
