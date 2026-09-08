@@ -186,10 +186,25 @@ class ReplayOutcome:
     transitions in both directions. The route hands it to
     :meth:`phantom.workers.saturation.SlotDelta.from_replay` and the
     gate applies the predicate (ADR-036).
+
+    ``rowcount`` is the re-queue UPDATE's own answer, and it is load-bearing
+    rather than defensive. The implementation used to assert that its in-lock
+    precheck made a miss impossible, because the precheck admits every
+    non-``attempting`` state and refuses a stamped row. That reasoning has one
+    hole: ``expire_row`` commits the state change to ``expired`` and the
+    body-discard stamp SEPARATELY, so a row sits in ``expired`` with a NULL
+    stamp between the two. Both prechecks pass on it, and the UPDATE's own
+    state list omits ``expired``, so the write matched nothing while the caller
+    was told it succeeded. The route had already taken a reservation, and
+    ``from_replay`` hard-codes the after-state, so the gate charged for a row
+    that never moved: a permanent slot and its bytes, on a terminal row that
+    can never release them, walking the gate to its cap and 503-ing all fresh
+    ingress. Reporting the rowcount lets the adapter see a no-op as a no-op.
     """
 
     row: UploadRow
     previous_state: UploadState
+    rowcount: int
 
 
 @dataclass(frozen=True)

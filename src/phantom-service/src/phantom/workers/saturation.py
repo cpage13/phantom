@@ -286,14 +286,29 @@ class SlotDelta:
         stamp here would re-open the stale-read race the in-transaction
         outcome exists to close (C5).
 
+        That literal after-state is conditioned on the write having LANDED.
+        Hard-coding it unconditionally was a real leak: ``expire_row`` commits
+        its state change to ``expired`` and its body-discard stamp separately,
+        so a row sits in ``expired`` with a NULL stamp between the two, passes
+        both of replay's prechecks, and misses the UPDATE's state list. The
+        delta then read as a charge for a row that had not moved, and because
+        the route reserves before the write, the gate consumed that reservation
+        against a terminal row that can never release it: a permanent slot and
+        its bytes, repeated occurrences walking the gate to its cap.
+
+        On a non-landed write the after-state is the before-state, which makes
+        the crossing a no-op, which is exactly the arm that unwinds the
+        reservation. That is the same rule ``from_attempt`` already applies to
+        its own rowcount, so the two adapters now agree.
+
         Args:
-            outcome: The replay's in-transaction pre-image.
+            outcome: The replay's in-transaction pre-image and rowcount.
             size_bytes: This site's release basis.
         """
         return cls._crossing(
             before_state=outcome.previous_state,
             before_discarded_at=None,
-            after_state="queued",
+            after_state="queued" if outcome.rowcount else outcome.previous_state,
             after_discarded_at=None,
             size_bytes=size_bytes,
         )

@@ -1985,7 +1985,7 @@ class SqliteUploadStore:
                     chain_id=chain_id,
                     instance_id=str(accounting["instance_id"]),
                 )
-            await conn.execute(
+            cursor = await conn.execute(
                 """
                 UPDATE uploads
                    SET state = 'queued',
@@ -2006,12 +2006,24 @@ class SqliteUploadStore:
                 """,
                 (now_iso, now_iso, CapturedValues().model_dump_json(), str(chain_id)),
             )
+            rowcount = cursor.rowcount
             await conn.commit()
-        # The in-lock precheck guarantees the row exists and is in one of
-        # the seven replay-eligible states the UPDATE's IN-predicate covers
-        # (every non-attempting state EXCEPT the body-released ``expired``,
-        # ADR-032, which the body-discard precheck already refuses), so the
-        # write cannot have missed.
+        # The precheck admits every non-``attempting`` state and refuses a
+        # stamped row, which USED to be argued as proof the write could not
+        # miss. It is not: ``expire_row`` commits its state change to
+        # ``expired`` and its body-discard stamp SEPARATELY, so a row sits in
+        # ``expired`` with a NULL stamp between the two commits. Both prechecks
+        # pass on it and the UPDATE's own state list omits ``expired``, so the
+        # write matches nothing. Report what the write actually did rather than
+        # what the precheck implies, so the gate can settle a no-op as a no-op
+        # instead of charging a permanent slot to a terminal row.
+        if rowcount == 0:
+            logger.warning(
+                "replay matched no row for chain_id=%s (precheck saw state=%s); "
+                "the row was not re-queued",
+                chain_id,
+                accounting["state"],
+            )
         row = await self.get(chain_id)
         if row is None:
             raise KeyError(f"No upload row for chain_id={chain_id}")
@@ -2022,7 +2034,7 @@ class SqliteUploadStore:
         # ``SlotDelta.from_replay`` and the gate applies the predicate
         # (ADR-036); the row below is a post-commit read and is never a
         # predicate input.
-        return ReplayOutcome(row=row, previous_state=accounting["state"])
+        return ReplayOutcome(row=row, previous_state=accounting["state"], rowcount=rowcount)
 
     async def cancel(self, chain_id: UUID) -> CancelOutcome:
         """Transition to ``cancelled`` if non-terminal.
