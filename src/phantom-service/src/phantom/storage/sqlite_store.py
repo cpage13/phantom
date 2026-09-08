@@ -301,6 +301,40 @@ def _accounting_from_sql_row(row: aiosqlite.Row) -> DeletedRowAccounting:
     )
 
 
+def _bind_instant(value: datetime) -> str:
+    """Render a caller-supplied instant the way the column stores instants.
+
+    Every timestamp column is written from ``datetime.now(tz=UTC).isoformat()``,
+    so every stored value carries a ``+00:00`` offset, and SQLite compares these
+    columns as TEXT. A caller-supplied bound must therefore be normalised to UTC
+    before it is bound, or the comparison is lexicographic against a DIFFERENT
+    offset and silently selects the wrong rows.
+
+    Concretely, before this helper existed: ``{"since": "2026-09-07T13:00:00-07:00"}``
+    on ``DELETE /v1/admin/chains`` means 20:00Z, but the raw text sorts as
+    13:00Z, so the HARD DELETE took seven extra hours of rows. ``bulk_delete``
+    places no state restriction, so those extra rows included ``queued`` and
+    ``attempting`` uploads that had never been delivered. An east-of-UTC offset
+    fails the other way, silently skipping rows the operator did ask to remove.
+
+    A naive value is treated as UTC rather than rejected, because that is what
+    every writer of these columns means and because the admin models accept a
+    naive datetime off the wire. This is the same class of defect
+    :mod:`phantom.storage.timestamps` was written to close for filesystem
+    artifact names, one column family over.
+
+    Args:
+        value: The caller's bound. Aware values are converted; naive values are
+            interpreted as UTC.
+
+    Returns:
+        An ISO-8601 string in UTC, directly comparable with the stored text.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC).isoformat()
+    return value.astimezone(UTC).isoformat()
+
+
 def _row_to_upload(row: aiosqlite.Row) -> UploadRow:
     """Decode one SQLite row into an :class:`UploadRow`."""
     return UploadRow(
@@ -1192,7 +1226,7 @@ class SqliteUploadStore:
             params.append(str(group_id))
         if since is not None:
             wheres.append("received_at >= ?")
-            params.append(since.isoformat())
+            params.append(_bind_instant(since))
         if instance is not None:
             wheres.append("instance_id = ?")
             params.append(instance)
@@ -2050,7 +2084,7 @@ class SqliteUploadStore:
             params.append(route)
         if since is not None:
             wheres.append("received_at >= ?")
-            params.append(since.isoformat())
+            params.append(_bind_instant(since))
         if instance is not None:
             wheres.append("instance_id = ?")
             params.append(instance)
