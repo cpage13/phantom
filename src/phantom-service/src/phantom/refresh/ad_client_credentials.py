@@ -25,6 +25,16 @@ from phantom.storage.interface import TokenCache
 
 logger = logging.getLogger(__name__)
 
+# Hard floor on the wait between two mints, applied AFTER the jitter
+# subtraction. Without it the arithmetic could produce a non-positive wait
+# (``asyncio.wait_for`` with a negative timeout raises TimeoutError with zero
+# delay), and the loop would mint against the authority's token endpoint as
+# fast as the event loop allows until Entra ID throttled the app registration
+# or locked it. Thirty seconds is well below any healthy refresh interval, so
+# it never shapes a correct schedule, and it bounds the pathological case to
+# two mints a minute - a rate no authority treats as abuse.
+_MIN_MINT_WAIT_SECONDS: float = 30.0
+
 
 class AuthUnavailableError(Exception):
     """Raised when neither primary nor secondary AD credentials succeed."""
@@ -100,13 +110,7 @@ class AdMinter:
                 expires_at = await self._mint_and_store()
                 outage_index = 0
                 # Sleep until refresh-before-expiry minus jitter, or wake on 401.
-                refresh_before = self._config.refresh_seconds_before_expiry
-                jitter = self._config.refresh_jitter_seconds
-                wait = max(
-                    1.0,
-                    (expires_at - datetime.now(tz=UTC)).total_seconds() - refresh_before,
-                )
-                wait -= random.uniform(0, jitter)
+                wait = self._next_mint_wait_seconds(expires_at)
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(
                         self._immediate_mint.wait(),
@@ -123,6 +127,47 @@ class AdMinter:
                 logger.warning("AD mint failed (%s); retry in %ds", exc, delay)
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+
+    def _next_mint_wait_seconds(self, expires_at: datetime) -> float:
+        """Seconds to wait before minting a replacement for a token.
+
+        The schedule is "the token's remaining lifetime, less the pre-expiry
+        refresh margin, less a jitter draw", floored so it is always strictly
+        positive. The floor is applied LAST, after the jitter subtraction:
+        applied before it (as it once was) the subtraction could take the
+        floored value negative, and ``asyncio.wait_for`` treats a negative
+        timeout as already-expired, so the loop minted continuously.
+
+        Args:
+            expires_at: Expiry of the token just minted, from the authority's
+                own ``expires_on``.
+
+        Returns:
+            The wait in seconds, never below :data:`_MIN_MINT_WAIT_SECONDS`.
+        """
+        refresh_before = self._config.refresh_seconds_before_expiry
+        jitter = self._config.refresh_jitter_seconds
+        lifetime_remaining = (expires_at - datetime.now(tz=UTC)).total_seconds()
+        scheduled = lifetime_remaining - refresh_before - random.uniform(0.0, jitter)
+        if scheduled < _MIN_MINT_WAIT_SECONDS:
+            # Not a hypothetical: pinning refresh_seconds_before_expiry above
+            # the token's actual lifetime lands here on EVERY cycle, so say so
+            # rather than quietly minting at the floor rate forever.
+            logger.warning(
+                "AD mint refresh window collapsed for endpoint=%s uid=%s: token "
+                "lifetime %.1fs vs refresh_seconds_before_expiry=%d (+ up to "
+                "%.1fs jitter) computes a %.1fs wait; using the %.1fs floor. "
+                "Lower refresh_seconds_before_expiry or check the app "
+                "registration's token lifetime",
+                self._config.endpoint,
+                self._config.uid,
+                lifetime_remaining,
+                refresh_before,
+                jitter,
+                scheduled,
+                _MIN_MINT_WAIT_SECONDS,
+            )
+        return max(_MIN_MINT_WAIT_SECONDS, scheduled)
 
     async def _mint_and_store(self) -> datetime:
         """Mint a token via azure-identity and write it to the cache.

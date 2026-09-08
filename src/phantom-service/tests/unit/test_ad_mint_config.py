@@ -55,7 +55,10 @@ def test_ad_mint_config_defaults() -> None:
     cfg = AdMintConfig.model_validate(_kwargs())
     assert cfg.secondary_client_secret_env is None
     assert cfg.authority_url == "https://login.microsoftonline.com"
-    assert cfg.refresh_seconds_before_expiry == 12
+    # 300 s (5 min), the Azure Identity / MSAL refresh window. The former 12 s
+    # left no allowance for clock skew between the container and Entra ID's
+    # ``expires_on`` plus the mint's own round trip to the authority.
+    assert cfg.refresh_seconds_before_expiry == 300
     assert cfg.refresh_jitter_seconds == 0.5
     assert cfg.ad_outage_retry_seconds == [1, 2, 4, 8, 30]
 

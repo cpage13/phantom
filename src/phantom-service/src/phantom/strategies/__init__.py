@@ -2,18 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Final
-
 from phantom.config.settings import RetryStrategyCfg
 from phantom.strategies.exponential_backoff import ExponentialBackoffStrategy
 from phantom.strategies.fixed_intervals import FixedIntervalsStrategy
 from phantom.strategies.interface import UploadStrategy
-
-# Fallback schedule when ``type == "fixed_intervals"`` but the YAML
-# leaves ``intervals_seconds`` empty: quick first retries, then back
-# off to five minutes (the long-standing composition-root default the
-# builder carried in app.py before R5-2 moved it here).
-_DEFAULT_FIXED_INTERVALS_SECONDS: Final[list[int]] = [1, 5, 20, 60, 300]
 
 
 def build_retry_strategy(cfg: RetryStrategyCfg) -> UploadStrategy:
@@ -24,6 +16,14 @@ def build_retry_strategy(cfg: RetryStrategyCfg) -> UploadStrategy:
     so reloaded retry parameters apply to subsequent scheduling
     decisions, per ADR-013).
 
+    The builder substitutes nothing. It used to swap a five-step fallback
+    schedule in for an empty ``intervals_seconds``, which the exported
+    contract did not carry, so an implementation built from
+    ``contracts/settings.schema.json`` (the ADR-035 acceptance basis) built an
+    empty schedule and sent every row to ``stored`` after ONE failure. The
+    default now lives on :class:`RetryStrategyCfg`, where it exports, and an
+    explicitly empty list means what it says: no retries.
+
     Args:
         cfg: The ``retry.default_strategy`` block.
 
@@ -32,10 +32,7 @@ def build_retry_strategy(cfg: RetryStrategyCfg) -> UploadStrategy:
         :class:`ExponentialBackoffStrategy` per ``cfg.type``.
     """
     if cfg.type == "fixed_intervals":
-        return FixedIntervalsStrategy(
-            cfg.intervals_seconds or _DEFAULT_FIXED_INTERVALS_SECONDS,
-            jitter=cfg.jitter,
-        )
+        return FixedIntervalsStrategy(cfg.intervals_seconds, jitter=cfg.jitter)
     return ExponentialBackoffStrategy(
         base_seconds=cfg.base_seconds,
         factor=cfg.factor,

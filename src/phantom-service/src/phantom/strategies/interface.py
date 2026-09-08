@@ -5,6 +5,16 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Protocol
 
+# Floor on any scheduled delay, shared by every strategy. A delay of zero
+# means the row's ``next_attempt_at`` is already in the past, so the sender
+# re-claims it on its very next poll (``retry.poll_interval_ms``, 250 ms by
+# default) and a failing upstream is hammered in a tight loop for the whole
+# retry budget. Jitter is what drives a computed delay to zero, so the floor
+# is applied AFTER jitter, last of all. One second is long enough to break
+# the loop and short enough to be invisible against the smallest schedule a
+# strategy can be configured with.
+MIN_RETRY_DELAY_SECONDS: float = 1.0
+
 
 class UploadStrategy(Protocol):
     """Schedule the next retry delay.

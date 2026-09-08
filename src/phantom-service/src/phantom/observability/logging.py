@@ -29,7 +29,9 @@ Configures stdlib logging with two filters:
 
 String-level filters cannot reach values that dependencies interpolate
 through non-string args at format time, so :func:`configure_logging` also
-caps the known secret-bearing dependency loggers (``_DEPENDENCY_LOG_CAPS``).
+holds every logger OUTSIDE Phantom's own tree at
+:data:`_DEPENDENCY_LOG_FLOOR` (see that constant for why the boundary is a
+default rather than a list of named dependencies).
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+from collections.abc import Mapping
 from typing import Final
 
 from phantom.config.settings import ObservabilityCfg
@@ -47,22 +50,35 @@ _BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._\-]+")
 _REDACTED = "Bearer <redacted>"
 _SENSITIVE_REDACTED = "<redacted>"
 
-# Dependency loggers whose records interpolate secret-bearing values by
-# design and therefore bypass string-level redaction. aiosqlite's DEBUG
-# statement log formats the bound-parameter tuple through a non-string
-# functools.partial arg (bearer tokens on the token-cache INSERT, credential
-# JSON on the store write), so BearerRedactionFilter never sees the token as
-# a string. httpx's INFO request line and httpcore's DEBUG wire chatter
-# carry full request URLs, and a presigned upload URL is a sensitive
-# capture. Capping these loggers is the leak boundary for dependency-
-# authored records; Phantom's own records stay at the operator-configured
-# level and pass through the redaction filters. The production no-leak
-# guard (tests/e2e/test_production_log_no_leak.py) enforces this boundary.
-_DEPENDENCY_LOG_CAPS: Final[dict[str, int]] = {
-    "aiosqlite": logging.INFO,
-    "httpx": logging.WARNING,
-    "httpcore": logging.WARNING,
-}
+# The level every logger that is NOT Phantom's own is held at, whatever the
+# operator sets ``observability.log_level`` to.
+#
+# This used to be an ALLOWLIST of three named dependency loggers (aiosqlite,
+# httpx, httpcore) chosen because each was known to interpolate a secret or a
+# sensitive URL through a non-string arg that string-level redaction cannot
+# reach. An allowlist is the wrong shape for a leak boundary: it is only as
+# complete as the last audit. botocore was the proof - its signer writes the
+# live STS session token, the derived signature and the full canonical
+# request into a DEBUG record, and because ``botocore.auth`` is NOTSET it
+# inherited the root level and reached EVERY sink, the persistent file sink
+# included, on any deployment running at DEBUG.
+#
+# So the boundary is inverted: third-party loggers are capped by DEFAULT and
+# Phantom's own tree (:data:`_PHANTOM_LOGGER_NAMES`) is the explicit
+# exception that runs at the operator's level. A dependency added tomorrow is
+# inside the boundary without anyone remembering to add it. WARNING is the
+# floor because it is what the previous allowlist already held its two
+# noisiest members at, and because a dependency's WARNING and ERROR records
+# are the ones an operator actually needs. The production no-leak guard
+# (tests/e2e/test_production_log_no_leak.py) enforces the boundary end to end.
+_DEPENDENCY_LOG_FLOOR: Final[int] = logging.WARNING
+
+# The loggers carrying PHANTOM'S OWN records, which run at the
+# operator-configured level. ``phantom`` is the package tree (every module
+# uses ``logging.getLogger(__name__)``). ``__main__`` is the launcher:
+# ``python -m phantom`` executes ``phantom/__main__.py`` with ``__name__``
+# set to ``"__main__"``, so its logger sits outside the package tree.
+_PHANTOM_LOGGER_NAMES: Final[tuple[str, ...]] = ("phantom", "__main__")
 
 
 class BearerRedactionFilter(logging.Filter):
@@ -72,15 +88,34 @@ class BearerRedactionFilter(logging.Filter):
         """Redact in-place and pass the record through."""
         if isinstance(record.msg, str):
             record.msg = _BEARER_RE.sub(_REDACTED, record.msg)
-        if record.args:
-            redacted_args: list[object] = []
-            for arg in record.args if isinstance(record.args, tuple) else (record.args,):
-                if isinstance(arg, str):
-                    redacted_args.append(_BEARER_RE.sub(_REDACTED, arg))
-                else:
-                    redacted_args.append(arg)
-            record.args = tuple(redacted_args)
+        args = record.args
+        if isinstance(args, Mapping):
+            # ``%(name)s``-style formatting. ``LogRecord.__init__`` stores a
+            # single non-empty Mapping arg AS THE MAPPING, not wrapped in a
+            # tuple, and ``getMessage`` then evaluates ``msg % mapping``.
+            # Coercing it to a tuple made that ``msg % (mapping,)``, which
+            # raises "format requires a mapping": the handler emitted nothing,
+            # printed "--- Logging error ---" to stderr, and THE RECORD WAS
+            # LOST. This filter is attached to every root handler, so that was
+            # every mapping-style record from every dependency.
+            record.args = {key: _redact_arg(value) for key, value in args.items()}
+        elif args:
+            record.args = tuple(_redact_arg(arg) for arg in args)
         return True
+
+
+def _redact_arg(arg: object) -> object:
+    """Scrub ``Bearer <token>`` from one interpolation argument.
+
+    Args:
+        arg: One positional or mapping value from ``LogRecord.args``.
+
+    Returns:
+        The argument with bearer substrings replaced when it is a string,
+        otherwise the argument unchanged (its ``__str__`` runs at format time,
+        past every filter, which is what the dependency-logger floor covers).
+    """
+    return _BEARER_RE.sub(_REDACTED, arg) if isinstance(arg, str) else arg
 
 
 class SensitiveCaptureRedactor(logging.Filter):
@@ -139,6 +174,12 @@ def configure_logging(observability: ObservabilityCfg) -> None:
     value still gets scrubbed before the capture-redactor inspects the
     record.
 
+    ``log_level`` applies to Phantom's own loggers. Every other logger is
+    held at :data:`_DEPENDENCY_LOG_FLOOR`, so an operator DEBUG turns up
+    Phantom's own detail without opening a dependency's secret-bearing
+    records; see that constant for why the boundary is a default rather than
+    a list of names.
+
     The knobs are restart-required (ADR-013): this is called once in
     ``create_app`` and the reload path does not re-run it, because
     reloadable sinks would mean tearing down and rebuilding handlers
@@ -189,12 +230,17 @@ def configure_logging(observability: ObservabilityCfg) -> None:
     root.handlers.clear()
     for handler in handlers:
         root.addHandler(handler)
-    root.setLevel(observability.log_level)
-    # Bound the dependency loggers that embed secrets or sensitive URLs in
-    # their own records (see _DEPENDENCY_LOG_CAPS). Applied after the root
-    # level so an operator DEBUG never re-opens the dependency leak surface.
-    for name, cap in _DEPENDENCY_LOG_CAPS.items():
-        logging.getLogger(name).setLevel(cap)
+    # Default-deny for third-party records, explicit-allow for Phantom's own.
+    # The ROOT level is the effective level of every logger that sets none of
+    # its own (which is every dependency), so holding root at the floor caps
+    # them all; naming Phantom's own loggers then lifts exactly those back to
+    # what the operator asked for. ``max`` rather than a plain assignment so
+    # an operator who asks for ERROR gets ERROR everywhere rather than having
+    # the floor loosen their choice.
+    operator_level = logging.getLevelNamesMapping()[observability.log_level]
+    root.setLevel(max(operator_level, _DEPENDENCY_LOG_FLOOR))
+    for name in _PHANTOM_LOGGER_NAMES:
+        logging.getLogger(name).setLevel(operator_level)
     if file_error is not None:
         # Emitted AFTER installation so it lands in whichever sink did
         # install. With no sink it goes nowhere, which is self-consistent
