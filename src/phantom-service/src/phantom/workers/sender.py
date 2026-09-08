@@ -850,8 +850,19 @@ class Sender:
         else:
             last_error = f"network:{result.error}"
             upstream_status = None
+        # The strategy indexes the ladder by PRIOR attempts, so the first retry
+        # must ask for rung 0. ``attempts`` above is the post-increment count
+        # persisted on the row, and passing it here shifted every schedule by
+        # one: with ``intervals_seconds: [1, 5, 20]`` the first retry waited 5 s
+        # rather than 1 s, ``intervals_seconds[0]`` was dead config that never
+        # produced a delay, and the third failure ran off the end so an operator
+        # who configured three intervals got two. Exponential shifted the same
+        # way, making the documented 5, 20, 80 ladder actually run 20, 80, 320
+        # and ``base_seconds`` never the delay. FixedIntervalsStrategy's own
+        # unit test pins ``attempts=0 -> intervals[0]``, which is the contract
+        # this call site was not meeting.
         delay = self._instance.retry_strategy.schedule_next_attempt(
-            attempts=attempts,
+            attempts=row.attempts,
             since_received=since_received,
             last_error=last_error,
             route_name=row.route_name,
