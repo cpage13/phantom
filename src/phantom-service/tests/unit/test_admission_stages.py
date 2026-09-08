@@ -42,6 +42,7 @@ from phantom.models.chain import ChainEnvelope, ChainStep
 from phantom.routes.admission import (
     AdmissionInputs,
     ChainAdmissionError,
+    admit_chain,
     _admit_saturation_slot,
     _AdmittedSlot,
     _build_row,
@@ -404,15 +405,51 @@ async def test_build_row_blank_header_minted(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_build_row_caches_authorization(tmp_path: Path) -> None:
-    """An inbound Authorization header is written to the token cache."""
+async def test_build_row_defers_the_authorization_cache_write(tmp_path: Path) -> None:
+    """Objective: preparing a row must not touch the token cache.
+
+    Expected: the write is CARRIED on the prepared row and the cache is still
+    empty. Four rejection arms lie between preparation and a committed row, and
+    ``TokenCache.set`` resets the slot to fresh and wakes every parked row for
+    it, so performing it here let a request Phantom answered with 409 overwrite
+    a cached bearer, flip a bad slot healthy in the operator's own token view,
+    and re-admit every parked row through the saturation gate. The write is
+    durable SQLite, so it also survived the restart that would clear a memory
+    cache.
+    """
     instance = await _build_instance(tmp_path)
     envelope = _envelope()
     encoded = await _encode_and_hash_bodies(instance, {})
-    await _build_row(_inputs(envelope, authorization="Bearer xyz"), instance, encoded)
-    slot = await instance.token_cache.get("files.example.com", "user-1")
-    assert slot is not None
-    assert slot.status == "fresh"
+
+    prepared = await _build_row(
+        _inputs(envelope, authorization="Bearer xyz"), instance, encoded
+    )
+
+    assert prepared.bearer_cache_write is not None, "the intent must be carried"
+    assert prepared.bearer_cache_write.endpoint == "files.example.com"
+    assert prepared.bearer_cache_write.uid == "user-1"
+    assert prepared.bearer_cache_write.bearer == "Bearer xyz"
+    assert await instance.token_cache.get("files.example.com", "user-1") is None, (
+        "row preparation wrote to the token cache before the row was committed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_row_carries_no_cache_write_without_authorization(
+    tmp_path: Path,
+) -> None:
+    """Objective: no inbound credential means no deferred write.
+
+    Expected: ``bearer_cache_write`` is None, so the committed path has nothing
+    to perform and the D3 mode gate is unchanged by the deferral.
+    """
+    instance = await _build_instance(tmp_path)
+    envelope = _envelope()
+    encoded = await _encode_and_hash_bodies(instance, {})
+
+    prepared = await _build_row(_inputs(envelope), instance, encoded)
+
+    assert prepared.bearer_cache_write is None
 
 
 @pytest.mark.asyncio
@@ -678,3 +715,60 @@ async def test_admitted_slot_direct_lifecycle() -> None:
     async with slot:
         await slot.release_on_rejection()
     assert gate.in_flight == 0 and gate.in_flight_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_admission_does_not_touch_the_token_cache(tmp_path: Path) -> None:
+    """Objective: a refused request must leave the cached credential alone.
+
+    Expected: after a 409 on a chain_id already in use, the token cache still
+    holds the ORIGINAL bearer, still marked bad, and no wake handler fired.
+
+    This is the whole point of deferring the write. ``TokenCache.set`` upserts
+    the bearer, resets the slot to ``fresh`` and awaits every registered wake
+    handler, so performing it during row preparation meant a request Phantom
+    ADMITTED NOTHING FOR still replaced the operator's credential, flipped a
+    bad slot healthy in their own token view, and re-admitted every parked row
+    for that slot through the saturation gate. The kicker's handler discards
+    the pair it is given and rescans everything, so a client retry-looping into
+    409s became a repeated kicker storm.
+    """
+    instance = await _build_instance(tmp_path)
+    envelope = _envelope()
+
+    # Seed the operator's real credential and mark it bad, which is the state
+    # a parked row leaves behind.
+    await instance.token_cache.set(
+        endpoint="files.example.com",
+        uid="user-1",
+        bearer="Bearer operator-real",
+        source="admin_push",
+    )
+    await instance.token_cache.mark_bad("files.example.com", "user-1")
+
+    wakes: list[tuple[str, str]] = []
+
+    async def _record(endpoint: str, uid: str) -> None:
+        wakes.append((endpoint, uid))
+
+    instance.token_cache.register_wake_handler(_record)
+
+    # Admit once so the chain_id is live, then collide on it.
+    first = await admit_chain(_inputs(envelope), instance)
+    assert first.status_code == 202
+
+    with pytest.raises(ChainAdmissionError) as refused:
+        await admit_chain(
+            _inputs(envelope, authorization="Bearer attacker-garbage"), instance
+        )
+    assert refused.value.code == "chain_id_in_use"
+
+    slot = await instance.token_cache.get("files.example.com", "user-1")
+    assert slot is not None
+    assert slot.bearer == "Bearer operator-real", (
+        "a refused request overwrote the operator's cached credential"
+    )
+    assert slot.status == "bad", (
+        "a refused request flipped a bad slot back to fresh in the operator's view"
+    )
+    assert wakes == [], "a refused request woke every parked row for the slot"

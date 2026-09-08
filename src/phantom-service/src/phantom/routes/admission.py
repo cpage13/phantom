@@ -620,6 +620,40 @@ async def _admit_saturation_slot(
 
 
 @dataclass(frozen=True)
+class _PendingBearerCacheWrite:
+    """A token-cache write that must not happen until the row lands.
+
+    D3 caches a producer's inbound ``Authorization`` so the sender can re-send
+    with it. That write used to happen during row PREPARATION, which is before
+    the primary-key pre-check, the body-store failure arm, the locked-database
+    arm and the whole collision resolver, every one of which can still reject
+    the request. ``TokenCache.set`` upserts the bearer, resets the slot status
+    to ``fresh`` and then awaits every registered wake handler, so a request
+    Phantom ANSWERED WITH 409 still replaced the cached credential, flipped a
+    bad slot healthy in the operator's own token view, and re-admitted every
+    parked row for that slot through the saturation gate. The kicker's handler
+    discards the ``(endpoint, uid)`` it is given and rescans everything, so a
+    client retry-looping into 409s became a repeated kicker storm, and the
+    write is durable SQLite so it survived the restart that would have cleared
+    a memory cache.
+
+    ``_build_row``'s own docstring already reasoned carefully about which auth
+    MODES must not cache and named these three harms. The mode gate was built;
+    the OUTCOME gate was never considered. Carrying the intent here and
+    performing it only on a committed row closes that.
+
+    Attributes:
+        endpoint: Canonical host key the slot is filed under.
+        uid: The uid the slot is keyed by.
+        bearer: The producer's inbound credential.
+    """
+
+    endpoint: str
+    uid: str
+    bearer: str
+
+
+@dataclass(frozen=True)
 class _PreparedRow:
     """Typed output of the row-preparation stage.
 
@@ -629,12 +663,16 @@ class _PreparedRow:
     ``idempotency_index`` claim so the two can never diverge; ``snapshot``
     is the settings snapshot read ONCE during preparation, so the
     persist-trigger stage decides against the same configuration the row
-    was built under (a concurrent hot-reload cannot split the two).
+    was built under (a concurrent hot-reload cannot split the two);
+    ``bearer_cache_write`` is the D3 token-cache write this row EARNS if and
+    only if it commits, deferred here rather than performed during preparation
+    (see :class:`_PendingBearerCacheWrite`).
     """
 
     row: UploadRow
     ingress_dedup_key: str
     snapshot: InstanceSettingsSnapshot
+    bearer_cache_write: _PendingBearerCacheWrite | None
 
 
 async def _build_row(
@@ -688,12 +726,17 @@ async def _build_row(
     first_step_url = resolve_first_step_url(inputs.envelope)
     endpoint = host_key_for(first_step_url)
     resolved = _resolved_route_or_none(first_step_url, instance_ctx)
+    # DEFERRED, not performed. Four rejection arms still lie ahead of this
+    # point, and this write resets a slot to fresh and wakes every parked row
+    # for it, so a refused request used to inflict all three harms this
+    # function's own docstring warns about. The caller performs it only after
+    # the row is durably committed.
+    bearer_cache_write: _PendingBearerCacheWrite | None = None
     if inputs.authorization and resolved is not None and resolved.auth_mode == "phantom_bearer":
-        await instance_ctx.token_cache.set(
+        bearer_cache_write = _PendingBearerCacheWrite(
             endpoint=endpoint,
             uid=inputs.uid_header,
             bearer=inputs.authorization,
-            source="inbound_request",
         )
 
     chain_id = inputs.envelope.chain_id
@@ -774,7 +817,12 @@ async def _build_row(
         storage_encoding=encoded.storage_encoding,
         body_hashes=encoded.body_hashes_map,
     )
-    return _PreparedRow(row=row, ingress_dedup_key=ingress_dedup_key, snapshot=snapshot)
+    return _PreparedRow(
+        row=row,
+        ingress_dedup_key=ingress_dedup_key,
+        snapshot=snapshot,
+        bearer_cache_write=bearer_cache_write,
+    )
 
 
 async def _persist_row_and_claim(
@@ -1260,10 +1308,35 @@ async def admit_chain(
                 slot=slot,
             )
 
-        # Stage 6: respond. The persist-trigger enqueue runs before the
-        # slot commit, exactly as the monolithic flow ordered it: an
-        # enqueue failure unwinds into the slot's release (no committed
-        # slot is left behind by a failed respond stage).
+        # Stage 6: respond.
+        #
+        # The slot commits FIRST, immediately after the row is durable. ADR-036
+        # says a reservation is consumed by the CREATION of the row it was
+        # taken for, and the row now exists. The previous ordering ran the
+        # persist enqueue first so that "an enqueue failure unwinds into the
+        # slot's release", but that reasoning inverts once the insert has
+        # committed: unwinding then returns a charge a LIVE row still holds.
+        # PersistController.enqueue suspends on a lock, a queue put and a gauge
+        # write, so a producer disconnect at any of those raised CancelledError,
+        # the slot scope unwound, and the durably committed queued row was in
+        # flight with nothing behind it. The sender later settled a real
+        # crossing and released a second time against one charge, and because
+        # release floors at zero the decrement came out of another row's
+        # accounting, leaving in_flight permanently short and admitting past
+        # max_in_flight for the process lifetime.
+        slot.commit()
+
+        # The D3 token-cache write, performed HERE rather than during row
+        # preparation, so a request Phantom rejects cannot overwrite a cached
+        # bearer, flip a bad slot to fresh, or wake every parked row for it.
+        if prepared.bearer_cache_write is not None:
+            await instance_ctx.token_cache.set(
+                endpoint=prepared.bearer_cache_write.endpoint,
+                uid=prepared.bearer_cache_write.uid,
+                bearer=prepared.bearer_cache_write.bearer,
+                source="inbound_request",
+            )
+
         await _maybe_enqueue_immediate_persist(
             instance_ctx,
             chain_id=prepared.row.chain_id,
@@ -1271,10 +1344,6 @@ async def admit_chain(
             snapshot=prepared.snapshot,
         )
 
-        # Happy path: a new in-flight row landed. The saturation slot
-        # stays held; the sender releases it when the row reaches a
-        # terminal state.
-        slot.commit()
         return AdmissionOutcome(row=prepared.row, status_code=202)
 
 
