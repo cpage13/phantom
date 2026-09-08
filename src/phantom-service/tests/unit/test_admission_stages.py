@@ -42,7 +42,6 @@ from phantom.models.chain import ChainEnvelope, ChainStep
 from phantom.routes.admission import (
     AdmissionInputs,
     ChainAdmissionError,
-    admit_chain,
     _admit_saturation_slot,
     _AdmittedSlot,
     _build_row,
@@ -50,6 +49,7 @@ from phantom.routes.admission import (
     _maybe_enqueue_immediate_persist,
     _persist_row_and_claim,
     _resolve_collision,
+    admit_chain,
 )
 from phantom.routing import resolve_route
 from phantom.storage import (
@@ -421,9 +421,7 @@ async def test_build_row_defers_the_authorization_cache_write(tmp_path: Path) ->
     envelope = _envelope()
     encoded = await _encode_and_hash_bodies(instance, {})
 
-    prepared = await _build_row(
-        _inputs(envelope, authorization="Bearer xyz"), instance, encoded
-    )
+    prepared = await _build_row(_inputs(envelope, authorization="Bearer xyz"), instance, encoded)
 
     assert prepared.bearer_cache_write is not None, "the intent must be carried"
     assert prepared.bearer_cache_write.endpoint == "files.example.com"
@@ -758,9 +756,7 @@ async def test_a_rejected_admission_does_not_touch_the_token_cache(tmp_path: Pat
     assert first.status_code == 202
 
     with pytest.raises(ChainAdmissionError) as refused:
-        await admit_chain(
-            _inputs(envelope, authorization="Bearer attacker-garbage"), instance
-        )
+        await admit_chain(_inputs(envelope, authorization="Bearer attacker-garbage"), instance)
     assert refused.value.code == "chain_id_in_use"
 
     slot = await instance.token_cache.get("files.example.com", "user-1")
