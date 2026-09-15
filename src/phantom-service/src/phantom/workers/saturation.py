@@ -64,6 +64,16 @@ logger = logging.getLogger(__name__)
 # re-derives the crossing.
 #
 # This set answers OCCUPANCY, never ACTIVITY. See ACTIVE_WORK_STATES.
+# Gauge label for a gate that belongs to no named instance: a single-instance
+# deployment or a unit-test construction. The metrics registry is PROCESS-WIDE
+# and gauges are registered by bare name, so every instance's gate writes into
+# the same gauge; an unlabelled write from instance B therefore overwrites
+# instance A's value outright. Passing the instance id as the label keeps one
+# bucket per instance. The empty default is correct where there is only one
+# writer, which is exactly the single-gate case, and it cannot silently mask a
+# multi-instance collision because the composition root always passes the id.
+NO_INSTANCE_LABEL: Final[str] = ""
+
 SLOT_HOLDING_STATES: Final[frozenset[str]] = frozenset({"queued", "attempting", "stored"})
 
 # States whose row is WORK IN PROGRESS: the sender is about to claim it,
@@ -438,6 +448,7 @@ class SaturationGate:
         large_body_threshold_bytes: int = 0,
         max_large_in_flight: int = 0,
         metrics_registry: MetricsRegistry | None = None,
+        instance_label: str = NO_INSTANCE_LABEL,
     ) -> None:
         """Construct the gate.
 
@@ -480,6 +491,7 @@ class SaturationGate:
         # plan-canonical Gauge name for current in-flight declared
         # bytes; admin endpoints serialize it via the registry.
         self._metrics = metrics_registry if metrics_registry is not None else MetricsRegistry()
+        self._instance_label = instance_label
         self._saturation_balance = self._metrics.register_gauge(
             "saturation_balance",
             "Current in-flight declared bytes admitted by the gate.",
@@ -616,7 +628,7 @@ class SaturationGate:
         # Emit gauge after releasing the lock - Gauge.set acquires its
         # own asyncio.Lock and we forbid await inside async with lock
         # (plan § 0.3).
-        await self._saturation_balance.set(self._in_flight_bytes)
+        await self._saturation_balance.set(self._in_flight_bytes, label_value=self._instance_label)
         # The ONE place a SlotReservation is minted (ADR-036): the
         # granted charge travels as a token its holder must consume or
         # unwind, so the release basis is structurally the admit basis.
@@ -663,7 +675,7 @@ class SaturationGate:
                 )
         # Emit after releasing the lock (plan § 0.3 forbids await
         # inside async with lock).
-        await self._saturation_balance.set(self._in_flight_bytes)
+        await self._saturation_balance.set(self._in_flight_bytes, label_value=self._instance_label)
 
     async def settle(self, delta: SlotDelta, *, consumes: SlotReservation | None = None) -> None:
         """Apply one write's effect on the ledger, and dispose of any reservation.
@@ -754,7 +766,7 @@ class SaturationGate:
                 self._large_in_flight = max(0, self._large_in_flight - 1)
         # Emit after releasing the lock (plan § 0.3 forbids await
         # inside async with lock).
-        await self._saturation_balance.set(self._in_flight_bytes)
+        await self._saturation_balance.set(self._in_flight_bytes, label_value=self._instance_label)
 
     async def update_caps(self, snapshot_saturation: SaturationCfg) -> None:
         """Update the gate's caps from a fresh :class:`SaturationCfg`.

@@ -1087,6 +1087,7 @@ async def _build_instance_context(
             file_body_store=file_body_store,
             store=store,
             metrics_registry=metrics_registry,
+            instance_label=cfg.id,
         )
     except OSError as exc:
         # Close in reverse construction order. Each stop is best-effort and
@@ -1133,6 +1134,7 @@ async def _build_instance_context(
         large_body_threshold_bytes=sat_cfg.large_body_threshold_bytes,
         max_large_in_flight=sat_cfg.max_large_in_flight,
         metrics_registry=metrics_registry,
+        instance_label=cfg.id,
     )
 
     executor = ChainExecutor(
@@ -1658,6 +1660,7 @@ def create_app(
                                 instance=ctx,
                                 persist_controller=ctx.persist_controller,
                                 metrics_registry=metrics_registry,
+                                instance_label=ctx.cfg.id,
                             )
                             tg.create_task(
                                 ctx.persist_controller.run(stop_event),

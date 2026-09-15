@@ -1166,6 +1166,7 @@ async def build_body_store(
     file_body_store: FileBodyStore,
     store: SqliteUploadStore,
     metrics_registry: MetricsRegistry,
+    instance_label: str,
 ) -> tuple[BodyStore, PersistController | None]:
     """Compose the mode-selected body store + optional PersistController.
 
@@ -1214,6 +1215,7 @@ async def build_body_store(
             ram_body_store=ram_body_store,
             file_body_store=file_body_store,
             metrics_registry=metrics_registry,
+            instance_label=instance_label,
         )
         return body_store, persist_controller
     if mode == "all_ram":

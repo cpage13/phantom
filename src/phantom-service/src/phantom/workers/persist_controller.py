@@ -43,7 +43,7 @@ from phantom.observability.metrics import MetricsRegistry
 from phantom.storage.file_body_store import FileBodyStore
 from phantom.storage.ram_body_store import RamBodyStore
 from phantom.storage.sqlite_store import SqliteUploadStore
-from phantom.workers.saturation import is_deliverable
+from phantom.workers.saturation import NO_INSTANCE_LABEL, is_deliverable
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,7 @@ class PersistController:
         ram_body_store: RamBodyStore,
         file_body_store: FileBodyStore,
         metrics_registry: MetricsRegistry | None = None,
+        instance_label: str = NO_INSTANCE_LABEL,
     ) -> None:
         """Construct the controller.
 
@@ -121,6 +122,7 @@ class PersistController:
             "persist_total",
             "PersistController migration outcomes (labels: success, failure).",
         )
+        self._instance_label = instance_label
         self._queue_depth = self._metrics.register_gauge(
             "persist_controller_queue_depth",
             "Current enqueued RAM→disk migrations.",
@@ -167,7 +169,7 @@ class PersistController:
         # second lock while holding this one widens the critical section and
         # creates a lock-ordering hazard. ``SaturationGate`` emits its gauges
         # the same way for the same reason.
-        await self._queue_depth.set(depth)
+        await self._queue_depth.set(depth, label_value=self._instance_label)
         return handle
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -249,7 +251,7 @@ class PersistController:
         finally:
             # Whether success, failure or cancellation, the queue depth
             # dropped.
-            await self._queue_depth.set(self._queue.qsize())
+            await self._queue_depth.set(self._queue.qsize(), label_value=self._instance_label)
 
     async def _migrate_one(self, chain_id: UUID) -> None:
         """Run the RAM → disk migration for one chain_id.

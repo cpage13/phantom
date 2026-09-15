@@ -59,6 +59,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from phantom.observability.metrics import MetricsRegistry
+from phantom.workers.saturation import NO_INSTANCE_LABEL
 
 if TYPE_CHECKING:
     from phantom.instances.context import InstanceContext
@@ -136,6 +137,7 @@ class RamPressureWatcher:
         instance: InstanceContext,
         persist_controller: PersistController,
         metrics_registry: MetricsRegistry | None = None,
+        instance_label: str = NO_INSTANCE_LABEL,
     ) -> None:
         """Construct the watcher.
 
@@ -162,6 +164,7 @@ class RamPressureWatcher:
         self._persist_controller = persist_controller
         # Metrics surface (plan § 4.2.2).
         self._metrics = metrics_registry if metrics_registry is not None else MetricsRegistry()
+        self._instance_label = instance_label
         self._ram_bytes_gauge = self._metrics.register_gauge(
             "ram_body_store_bytes",
             "Current RamBodyStore.total_bytes() observation.",
@@ -206,8 +209,8 @@ class RamPressureWatcher:
         # Observe live bytes AND the live ceiling on every tick so the
         # gauge surface carries both numerator and denominator, and the
         # gauges agree with /observability/ram_pressure after a reload.
-        await self._ram_bytes_gauge.set(current)
-        await self._ram_ceiling_gauge.set(max_bytes)
+        await self._ram_bytes_gauge.set(current, label_value=self._instance_label)
+        await self._ram_ceiling_gauge.set(max_bytes, label_value=self._instance_label)
         if current < max_bytes:
             return
 
