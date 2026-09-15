@@ -314,7 +314,11 @@ class PersistController:
         # store's WHERE guards (body_location='ram' AND
         # body_discarded_at IS NULL) refuse the flip when the reaper's
         # discard raced the disk write above; rowcount 0 reports it.
-        flipped = await self._store.mark_persisted(chain_id)
+        # Fenced on the row read at step 0 (SW-6): a deletion plus a
+        # same-chain_id re-admission inside this window would otherwise
+        # satisfy the key-and-state guards and flip the NEW row to 'file'
+        # while its bytes were still only in RAM.
+        flipped = await self._store.mark_persisted(chain_id, received_at=row.received_at)
         if flipped == 0:
             # The discard (or a row deletion) landed mid-migration. The
             # disk write above resurrected policy-discarded bytes; undo

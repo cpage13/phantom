@@ -1,8 +1,10 @@
 """Upload-row, state-alias, and admin-status response models.
 
 These mirror the shapes Phantom emits on the admin API:
-- ``UploadRow`` - the row as returned by ``GET /v1/admin/chains/{chain_id}``
-  and ``GET /v1/admin/chains``. ``extra="ignore"`` so unknown fields
+- ``UploadRow`` - the row as returned by ``GET /v1/admin/chains``, and by
+  ``POST /v1/admin/chains/{chain_id}/replay`` and ``.../cancel``. NOT the
+  single-chain detail route (S10-3): ``GET /v1/admin/chains/{chain_id}``
+  returns ``ChainAdminDetail``. ``extra="ignore"`` so unknown fields
   on the wire round-trip silently rather than failing the SDK; integration
   tests pin the documented field set.
 - ``UploadState`` - alias for ``ChainState`` from

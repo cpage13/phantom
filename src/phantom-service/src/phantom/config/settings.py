@@ -52,7 +52,7 @@ from __future__ import annotations
 import logging
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Final, Literal, get_args
 
 import yaml  # type: ignore[import-untyped]  # types-PyYAML not in workspace dev deps
 from pydantic import (
@@ -79,6 +79,13 @@ from phantom.config.probe import probe_machine
 from phantom.models.credential import SigningService, _coerce_signing_service
 
 logger = logging.getLogger(__name__)
+
+# Characters that cannot appear in a BARE SQLite json-path label, so their
+# presence would force the quoted-label form. Quotes and backslashes are the
+# escape hazard itself; brackets are the array-index syntax; whitespace and
+# the dollar sign break the bare-label grammar. Dots are legal here because
+# they are the segment separator this field is documented to use.
+_JSON_PATH_FORBIDDEN_CHARS: Final[frozenset[str]] = frozenset("\"'\\[]$ \t\n\r")
 
 # The environment namespace Phantom reads, and the nesting delimiter inside
 # it. Named here rather than inline because BOTH the model config and
@@ -1188,9 +1195,50 @@ class AdminLookupCfg(BaseModel):
         description=(
             "Dotted path under that step's 'values' map down to the "
             "upstream identifier field (capture name first, then keys "
-            "inside the captured object)."
+            "inside the captured object). Plain dotted segments only: "
+            "this value is spliced into a SQLite json_extract path, so a "
+            "character needing a quoted label is refused at boot."
         ),
     )
+
+    @field_validator("json_path")
+    @classmethod
+    def _reject_characters_needing_a_quoted_label(cls, value: str) -> str:
+        """Refuse a path that would need a quoted JSON-path label.
+
+        This value is spliced into the ``$.values.<json_path>`` argument of a
+        SQLite ``json_extract`` call. A segment carrying a quote, a bracket or
+        whitespace cannot be written as a bare label, so it would have to be
+        emitted as a quoted one, and an escaped quoted label is exactly the
+        construction that older SQLite builds cannot parse: ``json_extract``
+        then yields NULL rather than raising, and the by-captured-id route maps
+        the miss to ``found=false``. The deployment would look configured and
+        the lookup would report every chain absent, silently, for as long as
+        the config stood.
+
+        The store's own query sites were moved off quoted labels for the same
+        reason, and a pre-commit gate keeps them off. This closes the operator
+        -supplied second-order route into the same failure, at the boot
+        boundary where it can still be refused loudly.
+
+        Args:
+            value: The configured dotted path.
+
+        Returns:
+            The value unchanged when every segment is a bare label.
+
+        Raises:
+            ValueError: When a character requiring a quoted label is present.
+        """
+        offenders = sorted({c for c in value if c in _JSON_PATH_FORBIDDEN_CHARS})
+        if offenders:
+            raise ValueError(
+                f"admin_lookup.json_path may only contain plain dotted segments; "
+                f"{offenders!r} would require a quoted json_extract label, which "
+                f"older SQLite builds parse as NULL rather than rejecting, making "
+                f"every by-captured-id lookup silently report the chain absent"
+            )
+        return value
 
 
 class InstanceCfg(BaseModel):

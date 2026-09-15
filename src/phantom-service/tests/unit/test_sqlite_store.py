@@ -431,7 +431,7 @@ async def test_mark_persisted_flips_body_location(
     """
     row = make_upload_row(body_location="ram")
     await store.insert(row)
-    await store.mark_persisted(row.chain_id)
+    await store.mark_persisted(row.chain_id, received_at=row.received_at)
     fetched = await store.get(row.chain_id)
     assert fetched is not None
     assert fetched.body_location == "file"
@@ -453,7 +453,7 @@ async def test_mark_persisted_is_noop_when_already_file(
     pre = await store.get(row.chain_id)
     assert pre is not None
     pre_updated_at = pre.updated_at
-    await store.mark_persisted(row.chain_id)
+    await store.mark_persisted(row.chain_id, received_at=row.received_at)
     post = await store.get(row.chain_id)
     assert post is not None
     assert post.body_location == "file"

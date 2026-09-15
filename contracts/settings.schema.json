@@ -100,7 +100,7 @@
           "type": "string"
         },
         "json_path": {
-          "description": "Dotted path under that step's 'values' map down to the upstream identifier field (capture name first, then keys inside the captured object).",
+          "description": "Dotted path under that step's 'values' map down to the upstream identifier field (capture name first, then keys inside the captured object). Plain dotted segments only: this value is spliced into a SQLite json_extract path, so a character needing a quoted label is refused at boot.",
           "minLength": 1,
           "title": "Json Path",
           "type": "string"

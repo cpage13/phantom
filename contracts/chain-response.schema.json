@@ -25,7 +25,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "Phantom's reply to submit_chain and the shape of GET /v1/admin/chains/{chain_id}.",
+  "description": "Phantom's INGRESS acknowledgement: the 202 body for a submitted chain.\n\nNOT the shape of ``GET /v1/admin/chains/{chain_id}``, which this docstring\nclaimed (S10-3). That route returns :class:`ChainAdminDetail`, which\ncarries thirteen fields this model does not declare, and this model is\nstrict with ``extra=\"forbid\"``, so validating a real admin response\nagainst it RAISES. The SDK's own admin call already returns the right\ntype, so nothing was broken at runtime; what was broken is that the\ncontract artifact generated from this docstring told an integrator, and a\nGo port author, to expect the wrong shape on that route.",
   "properties": {
     "captured": {
       "description": "Per-step captured values. Populated as steps complete; persists per the row's succeeded_metadata_seconds retention window.",

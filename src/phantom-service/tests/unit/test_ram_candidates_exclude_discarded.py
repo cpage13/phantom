@@ -139,7 +139,7 @@ async def test_a_row_already_moved_to_disk_is_not_a_candidate(
     """
     migrated = make_upload_row(state="queued", body_location="ram", received_at=_BASE)
     await store.insert(migrated)
-    await store.mark_persisted(migrated.chain_id)
+    await store.mark_persisted(migrated.chain_id, received_at=migrated.received_at)
 
     assert await store.list_oldest_ram_bodies(limit=64) == []
 

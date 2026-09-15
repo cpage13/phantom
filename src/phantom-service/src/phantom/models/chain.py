@@ -338,7 +338,17 @@ class CapturedStep(BaseModel):
 
 
 class ChainResponse(BaseModel):
-    """Phantom's reply to submit_chain and the shape of GET /v1/admin/chains/{chain_id}."""
+    """Phantom's INGRESS acknowledgement: the 202 body for a submitted chain.
+
+    NOT the shape of ``GET /v1/admin/chains/{chain_id}``, which this docstring
+    claimed (S10-3). That route returns :class:`ChainAdminDetail`, which
+    carries thirteen fields this model does not declare, and this model is
+    strict with ``extra="forbid"``, so validating a real admin response
+    against it RAISES. The SDK's own admin call already returns the right
+    type, so nothing was broken at runtime; what was broken is that the
+    contract artifact generated from this docstring told an integrator, and a
+    Go port author, to expect the wrong shape on that route.
+    """
 
     model_config = ConfigDict(strict=True, extra="forbid")
 

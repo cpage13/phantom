@@ -733,8 +733,12 @@ class UploadStore(Protocol):
         """Init-recovery sweep. Returns the count of rows reset."""
         ...
 
-    async def mark_persisted(self, chain_id: UUID) -> int:
+    async def mark_persisted(self, chain_id: UUID, *, received_at: datetime) -> int:
         """Flip body_location from 'ram' to 'file'; return the rowcount.
+
+        ``received_at`` fences the write to the row the caller actually read
+        (SW-6): a chain_id is reusable the moment its row is deleted, so the
+        key alone can match a DIFFERENT, newly admitted row.
 
         SOLE writer of this transition per the single-writer manifest
         (plan § 0.5 invariant #6). Called by the PersistController

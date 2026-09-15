@@ -39,6 +39,7 @@ import json
 
 import pytest
 from phantom.config.settings import (
+    AdminLookupCfg,
     BodyStoreCfg,
     CompressionCfg,
     RetryStrategyCfg,
@@ -248,3 +249,53 @@ def test_the_exported_contract_marks_the_passphrase_as_a_secret() -> None:
 
     assert string_arm.get("format") == "password", json.dumps(string_arm)
     assert string_arm.get("writeOnly") is True, json.dumps(string_arm)
+
+
+# ---------------------------------------------------------------------
+# admin_lookup.json_path is SPLICED into a SQLite json_extract path, so it
+# is a config value with a query-shape consequence. The store's own query
+# sites were moved off quoted JSON-path labels because older SQLite builds
+# cannot parse an escaped one: json_extract yields NULL rather than raising,
+# and the by-captured-id route maps that miss to found=false. A pre-commit
+# gate keeps the store's sites off quoted labels. This is the operator-
+# supplied route into the same failure, refused at boot instead.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("json_path", "why"),
+    [
+        ('file"information.id', "a double quote is the escape hazard itself"),
+        ("file'information.id", "a single quote closes a quoted label"),
+        ("a[0].b", "brackets are the array-index syntax, not a bare label"),
+        ("a b.c", "whitespace cannot appear in a bare label"),
+        ("$.a.b", "a dollar sign restarts the path expression"),
+    ],
+)
+def test_a_json_path_needing_a_quoted_label_is_refused_at_boot(json_path: str, why: str) -> None:
+    """Objective: a config value that would force a quoted label fails loudly.
+
+    Expected: a ValidationError naming the offending characters. Accepted, the
+    deployment looks configured and every by-captured-id lookup reports the
+    chain absent, silently, for as long as the config stands, because
+    json_extract answers NULL instead of raising on a path it cannot parse.
+    """
+    with pytest.raises(ValidationError) as caught:
+        AdminLookupCfg(capture_name="create", json_path=json_path)
+
+    assert "quoted json_extract label" in str(caught.value), (
+        f"the refusal does not explain the consequence ({why}), so an operator "
+        f"cannot tell why a path that looks reasonable was rejected"
+    )
+
+
+def test_an_ordinary_dotted_json_path_is_still_accepted() -> None:
+    """Objective: the guard does not refuse the documented shape.
+
+    Expected: the value survives unchanged. The field is documented as dotted
+    segments, capture name first, so dots and underscores must stay legal or
+    the guard would break every real deployment.
+    """
+    cfg = AdminLookupCfg(capture_name="create", json_path="file_information.id")
+
+    assert cfg.json_path == "file_information.id"

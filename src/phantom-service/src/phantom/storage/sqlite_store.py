@@ -1897,7 +1897,7 @@ class SqliteUploadStore:
             await conn.commit()
         return cursor.rowcount
 
-    async def mark_persisted(self, chain_id: UUID) -> int:
+    async def mark_persisted(self, chain_id: UUID, *, received_at: datetime) -> int:
         """Flip body_location from 'ram' to 'file'.
 
         SOLE writer of this transition (plan § 0.5 single-writer
@@ -1913,11 +1913,26 @@ class SqliteUploadStore:
           the row to ``'file'`` and resurrect policy-discarded bytes
           (every other H4 consumer - recovery, the InvariantAuditor,
           replay, the kicker wake path - already guards the stamp).
+        * ``received_at = ?`` is the FENCING TOKEN (SW-6). The caller
+          passes the ``received_at`` of the row it read before writing the
+          body to disk, so the flip applies only to THAT row. A chain_id is
+          reusable the instant its row is deleted, and admission can legally
+          re-admit one inside the migration's await window; without the
+          token ``chain_id`` plus ``body_location='ram'`` matched the NEW
+          row just as well, so the migration flipped a row whose bytes it
+          had never written to ``'file'`` while those bytes were still only
+          in RAM. Every other guard here is about the row's STATE; this one
+          is about its IDENTITY, which is why none of the others caught it.
+
+        Args:
+            chain_id: The chain whose body moved to disk.
+            received_at: The ``received_at`` of the row the caller read
+                before writing. Identifies the row, not just the key.
 
         Returns:
             The UPDATE rowcount: 1 when the flip committed, 0 when a
             guard refused it. The PersistController uses 0 to undo a
-            disk write that raced the discard.
+            disk write that raced the discard or a re-admission.
         """
         conn = self._require_conn()
         now_iso = datetime.now(tz=UTC).isoformat()
@@ -1925,8 +1940,8 @@ class SqliteUploadStore:
             cursor = await conn.execute(
                 "UPDATE uploads SET body_location = 'file', updated_at = ? "
                 "WHERE chain_id = ? AND body_location = 'ram' "
-                "AND body_discarded_at IS NULL",
-                (now_iso, str(chain_id)),
+                "AND body_discarded_at IS NULL AND received_at = ?",
+                (now_iso, str(chain_id), _bind_instant(received_at)),
             )
             await conn.commit()
         return cursor.rowcount
