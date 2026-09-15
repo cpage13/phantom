@@ -2,9 +2,20 @@
 
 Round 4 adversary hardening (iteration loop, task 7.3). The sender's
 ``_on_rewind`` handler (ADR-011 reexecute=True) re-queues a claimed row
-at the capture-producing step with ``attempts=0`` (the rewind erases
-burned budget BY DESIGN: the chain never reached the upstream). The
-cycle-7 contract under attack:
+at the capture-producing step, SCHEDULED behind the retry strategy's
+delay and with the attempt burned.
+
+The budget half of that sentence was the opposite until finding S7-1: the
+rewind wrote ``attempts=0`` and ``next_attempt_at=now`` and never consulted
+the strategy, on the reasoning that the chain had not reached the upstream.
+It reaches the upstream on the NEXT pass, because the rewind's whole purpose
+is to re-execute the producing step, so the cycle cost one real upstream
+write per turn with no attempt budget, no backoff and no wall-clock bound.
+The assertions below moved with the behaviour; see
+``tests/unit/test_rewind_runs_on_the_retry_budget.py`` for the witness that
+pins the new contract directly.
+
+The cycle-7 contract under attack:
 
 * The rewind UPDATE must not touch ``group_id`` / ``multifile_id`` /
   ``send_order`` (recorded at admission, moved by nobody) and must
@@ -40,6 +51,10 @@ _MID_CHAIN_STEP = 2
 # handlers are invoked directly, matching test_sent_at_stamp's idiom).
 _WORKER_COUNT = 1
 _POLL_INTERVAL_MS = 250
+# Attempts already burned on the claimed row. The shared fixture wires
+# ``FixedIntervalsStrategy([1, 5])``, so one is inside the ladder and the
+# rewind schedules a delay instead of parking the row in ``stored``.
+_ATTEMPTS_WITHIN_BUDGET = 1
 # Body retention for the replay leg: the suite default
 # (succeeded_body_seconds=0) discards the body at delivery and the
 # subsequent replay then refuses replay_body_discarded BY DESIGN
@@ -72,7 +87,10 @@ async def test_rewind_preserves_grouping_and_leaves_sent_at_null(
         state="attempting",
         route_name="files",
         current_step_index=_MID_CHAIN_STEP,
-        attempts=3,
+        # Within the fixture's two-rung ladder, so the rewind re-queues
+        # rather than parking; the exhausted arm has its own witness in
+        # ``test_rewind_runs_on_the_retry_budget.py``.
+        attempts=_ATTEMPTS_WITHIN_BUDGET,
     )
     await instance.store.insert(row)
     sender = Sender(
@@ -86,9 +104,12 @@ async def test_rewind_preserves_grouping_and_leaves_sent_at_null(
     assert fresh.state == "queued"
     assert fresh.current_step_index == _REWIND_TARGET_STEP
     assert fresh.last_error == "rewind:mint-token"
-    # ADR-011: the rewound chain never reached the upstream; the
-    # attempt budget resets by design.
-    assert fresh.attempts == 0
+    # S7-1: the rewind re-executes the producing step on the next pass, so
+    # it burns an attempt and is scheduled behind the strategy's delay
+    # rather than made due at once.
+    assert fresh.attempts == row.attempts + 1
+    assert fresh.next_attempt_at is not None
+    assert fresh.next_attempt_at > fresh.updated_at
     # The cycle-7 columns are untouched by the rewind UPDATE.
     assert fresh.group_id == row.group_id
     assert fresh.multifile_id == row.multifile_id
@@ -113,7 +134,12 @@ async def test_rewound_row_delivery_stamps_sent_at_once(
     )
     await sender._on_rewind(instance.store, row, _rewind())
 
-    claimed = await instance.store.claim_due(datetime.now(tz=UTC), 1)
+    # S7-1: the rewind schedules the re-queue behind the strategy's backoff,
+    # so the row becomes claimable AT its ``next_attempt_at``, not at once.
+    rewound = await instance.store.get(row.chain_id)
+    assert rewound is not None
+    assert rewound.next_attempt_at is not None
+    claimed = await instance.store.claim_due(rewound.next_attempt_at, 1)
     assert [c.chain_id for c in claimed] == [row.chain_id]
     assert claimed[0].sent_at is None
 

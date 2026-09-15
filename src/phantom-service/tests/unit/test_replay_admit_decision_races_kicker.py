@@ -62,7 +62,7 @@ from phantom.storage import (
     SqliteUploadStore,
 )
 from phantom.storage.hybrid_body_store import HybridBodyStore
-from phantom.storage.interface import AttemptWriteOutcome, ParkedCandidate
+from phantom.storage.interface import AttemptWriteOutcome, ParkedCandidate, ParkedCursor
 from phantom.strategies import FixedIntervalsStrategy
 from phantom.workers.kicker import PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
@@ -113,9 +113,11 @@ class _KickerWakesBeforeReplayStore:
         """Delegate the route's pre-fetch lookup to the real store."""
         return await self._real.get(chain_id)
 
-    async def list_parked_candidates(self) -> list[ParkedCandidate]:
-        """Delegate the kicker's scan snapshot to the real store."""
-        return await self._real.list_parked_candidates()
+    async def list_parked_candidates(
+        self, *, limit: int, after: ParkedCursor | None = None
+    ) -> list[ParkedCandidate]:
+        """Delegate the kicker's paged scan snapshot to the real store."""
+        return await self._real.list_parked_candidates(limit=limit, after=after)
 
     async def record_attempt_result(self, *args: object, **kwargs: object) -> AttemptWriteOutcome:
         """Delegate the kicker's guarded re-queue write to the real store."""

@@ -63,7 +63,7 @@ from phantom.storage import (
     SqliteUploadStore,
 )
 from phantom.storage.hybrid_body_store import HybridBodyStore
-from phantom.storage.interface import AttemptWriteOutcome, ParkedCandidate
+from phantom.storage.interface import AttemptWriteOutcome, ParkedCandidate, ParkedCursor
 from phantom.strategies import FixedIntervalsStrategy
 from phantom.workers.kicker import PHANTOM_BEARER_FLAVOUR, Kicker
 from phantom.workers.saturation import SaturationGate
@@ -101,9 +101,11 @@ class _RaiseOnRequeueStore:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._real, name)
 
-    async def list_parked_candidates(self) -> list[ParkedCandidate]:
-        """Delegate the kicker's scan snapshot to the real store."""
-        return await self._real.list_parked_candidates()
+    async def list_parked_candidates(
+        self, *, limit: int, after: ParkedCursor | None = None
+    ) -> list[ParkedCandidate]:
+        """Delegate the kicker's paged scan snapshot to the real store."""
+        return await self._real.list_parked_candidates(limit=limit, after=after)
 
     async def record_attempt_result(self, *args: Any, **kwargs: Any) -> AttemptWriteOutcome:
         """Raise a transient storage fault on the kicker's first write."""

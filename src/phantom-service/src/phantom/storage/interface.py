@@ -96,6 +96,57 @@ class ParkedCandidate:
     body_size_bytes: int
     attempts: int
 
+    @property
+    def cursor(self) -> ParkedCursor:
+        """This candidate's position in the oldest-first parked walk."""
+        return ParkedCursor(received_at=self.received_at, chain_id=self.chain_id)
+
+
+@dataclass(frozen=True)
+class ParkedCursor:
+    """A keyset position in :meth:`UploadStore.list_parked_candidates`.
+
+    The kicker's rescan is a PAGED walk rather than a full fetch, so a pass
+    has to say where the previous one stopped. An offset would not do it: rows
+    leave the parked set as they wake, which shifts every later offset and
+    silently skips rows. A keyset carries the sort key itself, so a page that
+    resumes from it is exact whatever happened to the rows before it.
+
+    ``received_at`` alone is not a total order (the single writer of
+    ``auth_expired`` leaves ``next_attempt_at`` NULL and two rows can share an
+    ingress timestamp), so ``chain_id`` is the tiebreak, and the statement's
+    ``ORDER BY`` carries both in the same order.
+    """
+
+    received_at: datetime
+    chain_id: UUID
+
+
+@dataclass(frozen=True)
+class SlotChargeCandidate:
+    """The three columns boot reconstruction reads off a persisted row.
+
+    :func:`phantom.workers.recovery.reconcile_saturation` asks one question per
+    row, ``row_holds_slot(state, body_discarded_at)``, and charges
+    ``body_size_bytes`` when the answer is yes. It used to ask it over
+    :meth:`UploadStore.iter_rows`, which decodes a complete strict
+    :class:`~phantom.models.upload.UploadRow` per row: at the default
+    ``retention.max_rows`` ceiling of 100 000 that is a second 100 000-row
+    pydantic walk immediately after recovery's own, both of them before the
+    first worker starts and before uvicorn accepts a request, on the restart
+    path whose whole purpose is to get the backlog moving again.
+
+    The PREDICATE deliberately stays in Python rather than moving into the
+    statement. ADR-036 keeps ``row_holds_slot`` in exactly two places outside
+    the gate and boot reconstruction is one of them; a SQL copy of the rule
+    would be a third derivation of the one decision the ADR exists to
+    centralise.
+    """
+
+    state: UploadState
+    body_discarded_at: datetime | None
+    body_size_bytes: int
+
 
 @dataclass(frozen=True)
 class AttemptWriteOutcome:
@@ -558,8 +609,10 @@ class UploadStore(Protocol):
         """Every row whose state is not in the terminal set."""
         ...
 
-    async def list_parked_candidates(self) -> list[ParkedCandidate]:
-        """Parked, still-deliverable rows, projected to the kicker's columns.
+    async def list_parked_candidates(
+        self, *, limit: int, after: ParkedCursor | None = None
+    ) -> list[ParkedCandidate]:
+        """One PAGE of parked, still-deliverable rows, projected to the kicker's columns.
 
         ``WHERE state = 'auth_expired' AND body_discarded_at IS NULL``,
         ordered oldest first. Both predicates were Python filters over
@@ -574,17 +627,56 @@ class UploadStore(Protocol):
         the sender's next claim and burn a saturation slot on a row that can
         never succeed. The predicate lives in SQL now; the reason lives here.
 
-        The order is DECLARED rather than incidental. Today's scan and the
-        index seek return the same sequence, because the single writer of
-        ``auth_expired`` stores a NULL ``next_attempt_at`` and equal index
-        keys fall back to rowid order, but nothing pins that invariant. Under
-        a saturated gate the rescan skips refused rows and retries next tick,
-        so WHICH rows wake in a tick is order dependent, and oldest-parked
-        first is the fairness property an operator expects of a backlog.
+        The order is DECLARED rather than incidental. Under a saturated gate
+        the rescan skips refused rows and retries next tick, so WHICH rows wake
+        in a tick is order dependent, and oldest-parked first is the fairness
+        property an operator expects of a backlog. Since the walk became paged
+        the order also has to be TOTAL, or a page boundary could repeat or skip
+        a row, so ``chain_id`` is the declared tiebreak on equal
+        ``received_at``.
+
+        THE PAGE IS MANDATORY, and that is the point. The parked population is
+        bounded by nothing: ``auth_expired`` is not in
+        :data:`TERMINAL_STATES`, ``retention.auth_expired_metadata_seconds``
+        defaults to never, and the count-cap eviction only touches terminal
+        states. An unpaged fetch made each rescan tick O(backlog): a credential
+        outage parking 100 000 rows had both kicker flavours fetch all 100 000
+        projections every second and walk them with a synchronous
+        ``resolve_route`` per row, stalling the event loop, ingress admission
+        and every other worker in the precise failure mode where buffering
+        matters most.
+
+        Args:
+            limit: Maximum rows to return. Required, so no caller can fetch
+                the backlog by omission.
+            after: Resume strictly after this keyset position, or ``None`` to
+                start at the oldest parked row.
 
         Returns:
-            One :class:`ParkedCandidate` per parked row, oldest
-            ``received_at`` first.
+            At most ``limit`` :class:`ParkedCandidate` rows, oldest
+            ``received_at`` first, ``chain_id`` breaking ties. A short page
+            means the walk reached the end of the parked set.
+        """
+        ...
+
+    def iter_slot_charge_candidates(self) -> AsyncIterator[SlotChargeCandidate]:
+        """Stream the three columns boot reconstruction needs, for every row.
+
+        The same walk shape and the same cursor-drain obligation as
+        :meth:`iter_rows` (a caller MUST consume promptly, and MUST NOT write
+        while the cursor is open), over a THREE-COLUMN projection instead of a
+        strict :class:`~phantom.models.upload.UploadRow` build per row. Every
+        row is yielded, with no state filter: the caller applies
+        :func:`phantom.workers.saturation.row_holds_slot` itself, because that
+        predicate has exactly two homes outside the gate (ADR-036) and this is
+        one of them.
+
+        Same non-``async def`` shape as :meth:`iter_rows`, and for the same
+        reason: implementations are ``async def`` + ``yield``.
+
+        Returns:
+            An async iterator over one :class:`SlotChargeCandidate` per row in
+            the table.
         """
         ...
 

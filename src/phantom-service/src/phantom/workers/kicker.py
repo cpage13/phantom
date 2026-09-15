@@ -3,7 +3,7 @@
 ONE loop, two flavours. Until CL2 this file was two: ``auth_kicker.py`` and
 ``credential_kicker.py``, the second of which declared itself "A COPY of
 :class:`AuthKicker`" in its own module docstring and then enumerated the
-differences it meant to keep. Those differences were four axes in disguise,
+differences it meant to keep. Those differences were axes in disguise,
 and they are now the fields of :class:`KickerFlavour`:
 
 1. **the name**, used in every log line and nothing else;
@@ -14,7 +14,9 @@ and they are now the fields of :class:`KickerFlavour`:
    signal (the ``(endpoint, uid)`` token cache, or the host-keyed credential
    store);
 4. **the key's arity**, which is the only thing the two stores disagree about
-   at lookup time and the only reason the wake log lines differ.
+   at lookup time and the only reason the wake log lines differ;
+5. **who reports an un-routable row**, which belongs to neither flavour by the
+   ordinary partition and so needs one named owner.
 
 Everything else was already line-for-line identical: the rescan cadence, the
 H4 skip, the auth_mode partition, the send-deadline sweep, the re-admit, the
@@ -27,7 +29,15 @@ so the partition and the wake key can never sit on different host axes.
 
 The rescan reads a PROJECTION, not whole rows (CL5): the state filter and the
 H4 deliverability filter live in the store's statement, and the seven columns
-this loop actually touches come back undecoded by pydantic.
+this loop actually touches come back undecoded by pydantic. It reads ONE PAGE
+of that projection per pass and resumes where the last pass stopped, because
+the parked population is bounded by nothing and a full walk per tick per
+flavour stalled the event loop (finding S7-6).
+
+A flavour is INERT unless this instance declares a route of its ``auth_mode``.
+That test used to be "is a store of this kind wired", which the composition
+root makes true for every instance, so neither flavour was ever inert and the
+documented cost-nothing wiring cost a full backlog walk per second (E6).
 """
 
 from __future__ import annotations
@@ -35,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -45,7 +56,13 @@ from phantom.instances.context import InstanceContext
 from phantom.models.credential import CredentialStatus, HostCredKey
 from phantom.models.token import TokenStatus
 from phantom.routing import AuthMode
-from phantom.storage.interface import CredentialStore, TokenCache
+from phantom.storage.interface import (
+    CredentialStore,
+    ParkedCandidate,
+    ParkedCursor,
+    TokenCache,
+)
+from phantom.storage.sqlite_store import is_transient_lock_error
 from phantom.workers._expire import expire_row
 from phantom.workers._kicker_auth_mode import resolved_route_for_host
 from phantom.workers.saturation import AdmissionGranted, SlotDelta
@@ -61,6 +78,23 @@ logger = logging.getLogger(__name__)
 # steady-state idle work stays negligible.
 _RESCAN_INTERVAL_SECONDS = 1.0
 
+# Parked rows one rescan pass may fetch and walk. The parked population is
+# bounded by NOTHING (``auth_expired`` is not terminal, its metadata retention
+# defaults to never, and the count-cap eviction only reaches terminal states),
+# so an unpaged pass was O(backlog) per flavour per second and the whole walk
+# ran as one uninterruptible synchronous block on the non-matching path. This
+# caps a pass at a few hundred cheap in-memory tests plus one fnmatch route
+# resolve each, which is microseconds of blocking work, while still sweeping a
+# 100 000-row backlog end to end in about three minutes of ticks. Smaller would
+# lengthen that sweep; larger buys nothing, because a woken row leaves the
+# parked set and the next page moves on regardless.
+_RESCAN_PAGE_SIZE = 512
+
+# Un-routable parked rows named individually in the one aggregated warning per
+# pass. A count plus a couple of concrete chain_ids is what an operator needs
+# to start looking; the rest are reachable from the admin listing.
+_UNROUTABLE_LOG_SAMPLE = 2
+
 # The status of one auth slot. The two stores declare the SAME closed member
 # set under two names (``TokenStatus``, ``CredentialStatus``); the union names
 # the shared type once so the loop's ``!= "fresh"`` test reads against one
@@ -74,6 +108,25 @@ type SlotStatus = TokenStatus | CredentialStatus
 type WakeCallback = Callable[[], Awaitable[None]]
 
 
+def _declares_auth_mode(instance: InstanceContext, auth_mode: AuthMode) -> bool:
+    """Whether any of this instance's routes declares ``auth_mode``.
+
+    Read ONCE, at oracle construction, because ``InstanceContext.cfg`` is the
+    immutable boot snapshot (D1/F5): ``apply_reload`` warns on route drift and
+    applies none of it, and the model is frozen, so nothing can add a route to
+    a running instance.
+
+    This is the predicate the two oracles' ``configured`` actually wants.
+    Gating on "is a store wired" was the wrong question: the composition root
+    constructs a token cache AND a credential store for EVERY instance
+    unconditionally, so both stores are always present and neither kicker was
+    ever inert (finding E6). On a bearer-only deployment the sigv4 flavour
+    therefore ran a full parked-row scan plus a route resolve per row every
+    second purely to discard every one of them on the auth_mode guard.
+    """
+    return any(route.auth_mode == auth_mode for route in instance.cfg.routes)
+
+
 class FreshnessOracle(Protocol):
     """The store whose slot going ``fresh`` wakes a parked row.
 
@@ -84,7 +137,15 @@ class FreshnessOracle(Protocol):
 
     @property
     def configured(self) -> bool:
-        """False when this deployment wired no such store, making the kicker inert."""
+        """False when nothing in this deployment can wake a row of this kind.
+
+        Two independent reasons, and an implementation answers for both: this
+        instance declares no route of the flavour's ``auth_mode``, so every
+        candidate would be discarded on the auth_mode guard anyway; or the
+        deployment wired no store of this kind, so no freshness question can
+        be asked at all. False makes the whole flavour inert: no wake handler
+        is registered and the rescan returns before it reads anything.
+        """
         ...
 
     def register_wake(self, on_write: WakeCallback) -> None:
@@ -104,17 +165,35 @@ class FreshnessOracle(Protocol):
 
 @dataclass(frozen=True)
 class TokenCacheOracle:
-    """``phantom_bearer`` freshness: the ``(endpoint, uid)`` token cache."""
+    """``phantom_bearer`` freshness: the ``(endpoint, uid)`` token cache.
+
+    Attributes:
+        cache: The instance's token cache. Never ``None``: the composition
+            root wires one for every instance, which is precisely why it
+            cannot be the inertness test.
+        route_declared: Whether this instance declares a ``phantom_bearer``
+            route. Computed by the flavour's factory from the frozen boot
+            config; see :func:`_declares_auth_mode`.
+    """
 
     cache: TokenCache
+    route_declared: bool
 
     @property
     def configured(self) -> bool:
-        """Always True: every instance wires a token cache."""
-        return True
+        """False when this instance declares no ``phantom_bearer`` route.
+
+        The store half of the question is vacuous here (every instance wires a
+        token cache), so the route half is the whole answer. It used to return
+        a bare ``True``, which made this flavour walk the parked backlog every
+        second on a deployment that routes nothing through bearer auth.
+        """
+        return self.route_declared
 
     def register_wake(self, on_write: WakeCallback) -> None:
-        """Register on the cache's wake hook, discarding the written slot's identity."""
+        """Register on the cache's wake hook when a bearer route exists; else stay inert."""
+        if not self.route_declared:
+            return
 
         async def _handler(endpoint: str, uid: str) -> None:
             """Wake the kicker on any cache write, ignoring which slot moved."""
@@ -133,22 +212,37 @@ class TokenCacheOracle:
 class CredentialStoreOracle:
     """``aws_sigv4`` freshness: the host-keyed destination-credential store.
 
-    OPTIONAL by construction: ``InstanceContext.signer_creds`` is ``None`` for
-    any deployment with no ``aws_sigv4`` route (the default). ``configured`` is
-    then False, no wake handler is registered and the rescan returns early, so
-    wiring this flavour on every instance's TaskGroup costs nothing.
+    INERT unless this instance declares an ``aws_sigv4`` route: no wake handler
+    is registered and the rescan returns early, so wiring this flavour on every
+    instance's TaskGroup costs nothing on the common bearer-only deployment.
+
+    That inertness used to be claimed off ``store is not None`` alone, and it
+    never held: the composition root constructs a ``SqliteCredentialStore`` for
+    EVERY instance unconditionally and passes it here, so the store is never
+    ``None`` in a production boot and this flavour rescanned the whole parked
+    backlog every second purely to discard every row on the auth_mode guard
+    (finding E6). The type stays optional because a direct construction (a
+    unit test, a future composition root) may still leave it out, and
+    :meth:`lookup` has to answer for that case.
+
+    Attributes:
+        store: The instance's destination-credential store, or ``None`` when
+            none was wired.
+        route_declared: Whether this instance declares an ``aws_sigv4`` route.
+            Computed by the flavour's factory; see :func:`_declares_auth_mode`.
     """
 
     store: CredentialStore | None
+    route_declared: bool
 
     @property
     def configured(self) -> bool:
-        """False when no ``aws_sigv4`` route is configured for this instance."""
-        return self.store is not None
+        """False when no ``aws_sigv4`` route is declared, or no store was wired."""
+        return self.route_declared and self.store is not None
 
     def register_wake(self, on_write: WakeCallback) -> None:
-        """Register on the store's wake hook when one exists; otherwise stay inert."""
-        if self.store is None:
+        """Register on the store's wake hook when this flavour is live; else stay inert."""
+        if not self.configured or self.store is None:
             return
 
         async def _handler(dest_host: HostCredKey) -> None:
@@ -175,7 +269,7 @@ class CredentialStoreOracle:
 
 @dataclass(frozen=True)
 class KickerFlavour:
-    """The four axes on which the two kickers actually differ.
+    """The five axes on which the two kickers actually differ.
 
     Attributes:
         name: The kicker's operator-visible name, used in every log line.
@@ -188,26 +282,45 @@ class KickerFlavour:
         log_key_fields: The slot key's shape as the wake log renders it.
             ``("blocked_host", "uid")`` for the bearer cache, and
             ``("blocked_host",)`` for the host-keyed credential store.
+        reports_unroutable: Whether this flavour reports parked rows whose
+            blocked host matches NO route. Such a row has no ``auth_mode``, so
+            neither flavour owns it by the ordinary partition, and both used to
+            warn about it on every tick: two WARNING lines per second per row,
+            roughly 63 million lines per row per year (finding S7-4). Exactly
+            one flavour carries True so the report has a single owner.
     """
 
     name: str
     auth_mode: AuthMode
     oracle_for: Callable[[InstanceContext], FreshnessOracle]
     log_key_fields: tuple[str, ...]
+    reports_unroutable: bool
 
 
 PHANTOM_BEARER_FLAVOUR = KickerFlavour(
     name="AuthKicker",
     auth_mode="phantom_bearer",
-    oracle_for=lambda instance: TokenCacheOracle(cache=instance.token_cache),
+    oracle_for=lambda instance: TokenCacheOracle(
+        cache=instance.token_cache,
+        route_declared=_declares_auth_mode(instance, "phantom_bearer"),
+    ),
     log_key_fields=("blocked_host", "uid"),
+    # The bearer flavour, arbitrarily but deterministically: a route-less row
+    # belongs to no auth mode, so the choice only has to be STABLE and made in
+    # one place. It is also the flavour live on every deployment that kicks at
+    # all, so the report is not lost on a bearer-only instance.
+    reports_unroutable=True,
 )
 
 AWS_SIGV4_FLAVOUR = KickerFlavour(
     name="CredentialKicker",
     auth_mode="aws_sigv4",
-    oracle_for=lambda instance: CredentialStoreOracle(store=instance.signer_creds),
+    oracle_for=lambda instance: CredentialStoreOracle(
+        store=instance.signer_creds,
+        route_declared=_declares_auth_mode(instance, "aws_sigv4"),
+    ),
     log_key_fields=("blocked_host",),
+    reports_unroutable=False,
 )
 
 
@@ -247,6 +360,13 @@ class Kicker:
         # happened since the last scan. The periodic rescan covers the gap
         # between an early wake and a later park.
         self._wake_event = asyncio.Event()
+        # Where the NEXT page of the paged parked walk resumes, or ``None`` to
+        # start at the oldest parked row. Carried across ticks rather than
+        # reset per pass: a page bounds the work, and the cursor is what turns
+        # a sequence of bounded pages into a complete sweep. Resetting it on
+        # every tick would pin the kicker to the oldest page and starve every
+        # row behind it whenever the backlog exceeds one page.
+        self._scan_cursor: ParkedCursor | None = None
         self._oracle.register_wake(self._on_slot_write)
 
     async def _on_slot_write(self) -> None:
@@ -254,7 +374,24 @@ class Kicker:
         self._wake_event.set()
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        """Main loop: rescan on every wake or every interval until stopped."""
+        """Main loop: rescan on every wake or every interval until stopped.
+
+        FAULT POSTURE, identical to the sender's worker loop
+        (:meth:`phantom.workers.sender.Sender._worker_loop`): a CLASSIFIED
+        transient SQLite lock is ridden out on the next tick, and everything
+        else propagates to the TaskGroup and the CLI's fatal-worker bridge.
+
+        The loop used to wrap the whole rescan in a bare ``except Exception``
+        that logged a traceback and never re-raised, so a PERMANENT fault was
+        retried at 1 Hz forever: a schema-class ``OperationalError`` after a
+        partial schema change, an ``OSError`` from failing storage, or any bug
+        raising out of :meth:`_rescan`. The service stayed up in a state where
+        no parked row could ever wake, the operator got one traceback per
+        second instead of a restart, and no supervisor-visible signal was
+        produced at all. The wake-write leg inside ``_rescan`` unwinds its
+        admitted slot and then deliberately re-raises (R10-2); that re-raise
+        only reaches supervision now.
+        """
         while not stop_event.is_set():
             # Wait for either a store write or the rescan interval: whichever
             # fires first triggers the next rescan.
@@ -266,11 +403,19 @@ class Kicker:
             self._wake_event.clear()
             try:
                 await self._rescan()
-            except Exception:
-                logger.exception("%s rescan failed", self._flavour.name)
+            except sqlite3.OperationalError as exc:
+                if not is_transient_lock_error(exc):
+                    raise
+                # Contention, not a fault (ADR-023). The next tick is one
+                # ``_RESCAN_INTERVAL_SECONDS`` away and the rescan is a pure
+                # re-read, so nothing is lost by letting this pass go.
+                logger.warning(
+                    "%s rescan hit transient SQLite contention; retrying on the next tick",
+                    self._flavour.name,
+                )
 
     async def _rescan(self) -> None:
-        """Re-queue every ``auth_expired`` row of this flavour whose slot is fresh.
+        """Re-queue the ``auth_expired`` rows of this flavour, ONE PAGE per pass.
 
         Single persistent store (plan § 2.3.6): one store holds every row
         regardless of body_location. The flavour's oracle is the freshness
@@ -283,6 +428,27 @@ class Kicker:
         which is a DECLARED order rather than the physical row order the
         unfiltered scan happened to return.
 
+        THE PASS IS BOUNDED AT ``_RESCAN_PAGE_SIZE`` ROWS and resumes where the
+        last one stopped (finding S7-6). It used to fetch the ENTIRE parked
+        backlog, which nothing bounds, and walk it with a synchronous
+        ``resolve_route`` per row and no await anywhere on the non-matching
+        path. A credential outage parking 100 000 rows therefore had each of
+        the two kicker flavours run a 100 000-iteration uninterruptible
+        synchronous block once per second, stalling ingress admission and every
+        other worker in the precise failure mode where buffering matters most.
+        A short page means the walk reached the end of the parked set, so the
+        cursor resets and the next pass starts at the oldest row again; on any
+        backlog smaller than one page that is every pass, which is exactly the
+        old behaviour.
+
+        ONE LIVENESS CONSEQUENCE, stated rather than left to be discovered: on
+        a backlog larger than one page a newly-wakeable row waits up to
+        ``ceil(backlog / _RESCAN_PAGE_SIZE)`` ticks for the cursor to reach it,
+        instead of at most one. The wake EVENT does not shortcut that, and
+        deliberately: resetting the cursor on every wake would pin the sweep to
+        the oldest page under a wake storm and starve the rest of the backlog
+        outright, which is the failure the page exists to prevent.
+
         One freshness lookup is issued per distinct ``(probe_host, uid)`` slot
         per pass, memoised in a dict that lives and dies inside this call. That
         bound is deliberate: freshness is asked at SCAN time (see the class
@@ -290,13 +456,26 @@ class Kicker:
         candidate list the pass is judging.
         """
         if not self._oracle.configured:
-            # No store of this kind for this instance, so there is nothing
-            # this flavour can wake. Keeps the per-instance TaskGroup wiring
-            # uniform while staying inert in the common deployment.
+            # Nothing in this deployment can wake a row of this kind: no route
+            # declares this flavour's auth_mode, or no store of this kind was
+            # wired. Keeps the per-instance TaskGroup wiring uniform while
+            # staying inert in the common deployment.
             return
         now = datetime.now(tz=UTC)
         store = self._instance.store
-        candidates = await store.list_parked_candidates()
+        candidates = await store.list_parked_candidates(
+            limit=_RESCAN_PAGE_SIZE, after=self._scan_cursor
+        )
+        # Advance the cursor BEFORE the walk, so a row that raises out of the
+        # loop cannot wedge the sweep on its own page for the process lifetime.
+        # The rows behind it are picked up on the next full lap.
+        self._scan_cursor = candidates[-1].cursor if len(candidates) == _RESCAN_PAGE_SIZE else None
+        # Parked rows whose blocked host matches NO route, collected for ONE
+        # aggregated warning at the end of the pass. Per-row WARNINGs here cost
+        # two lines per second per row across the two flavours, roughly 63
+        # million lines per row per year, which fills an operator's log sink
+        # with a message that never changes (finding S7-4).
+        unroutable: list[ParkedCandidate] = []
         # ONE freshness lookup per distinct slot key per tick. Parked rows
         # cluster on few slots by construction: a row parks because ITS
         # ``(endpoint, uid)`` slot went bad, and one bad credential parks every
@@ -345,16 +524,17 @@ class Kicker:
             # every row ordered behind it forever under the 1 s rescan). One
             # resolve feeds BOTH the auth_mode partition and the deadline
             # sweep.
+            #
+            # A row that resolves to NO route has no auth_mode, so the ordinary
+            # partition below cannot assign it and BOTH flavours reached this
+            # arm for the same row. It is collected here and reported ONCE per
+            # pass, by the one flavour that carries ``reports_unroutable``
+            # (finding S7-4).
             try:
                 resolved = resolved_route_for_host(probe_host, self._instance)
             except ValueError:
-                logger.warning(
-                    "%s: no route matches blocked_host=%s for chain_id=%s; "
-                    "skipping this row (left in auth_expired for the next rescan)",
-                    self._flavour.name,
-                    probe_host,
-                    candidate.chain_id,
-                )
+                if self._flavour.reports_unroutable:
+                    unroutable.append(candidate)
                 continue
             if resolved.auth_mode != self._flavour.auth_mode:
                 # NOT my kind: the other flavour, or no kicker at all
@@ -514,6 +694,46 @@ class Kicker:
                     self._flavour.name,
                     candidate.chain_id,
                 )
+        self._log_unroutable(unroutable)
+
+    def _log_unroutable(self, unroutable: list[ParkedCandidate]) -> None:
+        """Report this pass's un-routable parked rows in ONE line, or say nothing.
+
+        A parked row whose blocked host matches no route can never wake: with
+        no route there is no auth slot to go fresh and no flavour owns it. It
+        also never leaves the table on its own, because ``auth_expired`` is not
+        in ``TERMINAL_STATES``, ``retention.auth_expired_metadata_seconds``
+        defaults to never, and the count-cap eviction only reaches terminal
+        states. So the condition is PERMANENT and its report repeats on every
+        tick; what this method bounds is the VOLUME. Per row per flavour it was
+        two WARNING lines per second, and it is now one line per pass, emitted
+        only on the passes whose page actually contains such a row and only by
+        the flavour carrying ``reports_unroutable`` (finding S7-4).
+
+        ADR-032's send-deadline sweep still cannot reach these rows, and this
+        method does not pretend otherwise: the deadline is a per-ROUTE field
+        and these rows have no route, so giving them a backstop needs an
+        instance-level deadline that does not exist in the config model today.
+
+        Args:
+            unroutable: The candidates this pass could not resolve a route
+                for, in page order. Empty on the overwhelming majority of
+                passes, and nothing is logged then.
+        """
+        if not unroutable:
+            return
+        sample = ", ".join(
+            f"chain_id={c.chain_id} blocked_host={c.auth_blocked_host or c.endpoint}"
+            for c in unroutable[:_UNROUTABLE_LOG_SAMPLE]
+        )
+        logger.warning(
+            "%s: %d parked row(s) in this rescan page match no configured route "
+            "and can never wake; left in auth_expired (repair the instance's "
+            "routes, then replay). Sample: %s",
+            self._flavour.name,
+            len(unroutable),
+            sample,
+        )
 
     def _log_wake(self, chain_id: UUID, probe_host: str, uid: str) -> None:
         """Log the confirmed wake with the flavour's slot-key shape.

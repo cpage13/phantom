@@ -69,8 +69,10 @@ from phantom.storage.interface import (
     DiscardOutcome,
     InsertClaimOutcome,
     ParkedCandidate,
+    ParkedCursor,
     PersistCandidateState,
     ReplayOutcome,
+    SlotChargeCandidate,
     StateTally,
 )
 
@@ -1675,8 +1677,10 @@ class SqliteUploadStore:
             fetched = await cur.fetchall()
         return [_row_to_upload(r) for r in fetched]
 
-    async def list_parked_candidates(self) -> list[ParkedCandidate]:
-        """Parked, still-deliverable rows, projected to the kicker's columns.
+    async def list_parked_candidates(
+        self, *, limit: int, after: ParkedCursor | None = None
+    ) -> list[ParkedCandidate]:
+        """One PAGE of parked, still-deliverable rows, projected to the kicker's columns.
 
         Seven columns and a hand decode, in the shape
         :func:`_accounting_from_sql_row` and :meth:`list_oldest_ram_bodies`
@@ -1689,20 +1693,46 @@ class SqliteUploadStore:
         ``body_discarded_at`` means the reaper aged this row's body out, so
         waking it would land it in ``corrupted`` and burn a saturation slot.
 
+        The ``LIMIT`` and the keyset resume are finding S7-6: the parked
+        population is bounded by nothing, so the unpaged form made each of the
+        two kicker flavours fetch and walk the WHOLE backlog once per second.
+        The resume clause is the same ``(received_at, chain_id) > (?, ?)`` row
+        comparison :meth:`list_uploads` uses, against the same
+        ``idx_uploads_received_at`` pair, so a resumed page SEEKS to its start
+        rather than scanning to it, and the ``ORDER BY`` now carries
+        ``chain_id`` as the tiebreak that makes the page boundary exact.
+
         ``state = ?`` seeks ``idx_uploads_state_next_attempt``'s leading
-        column, where ``list_non_terminal``'s ``NOT IN`` cannot; the
-        ``ORDER BY`` costs one temp B-tree, which is the price of a declared
-        oldest-first wake order (see the Protocol docstring).
+        column, where ``list_non_terminal``'s ``NOT IN`` cannot; SQLite picks
+        between that seek plus a sort of the (now capped) match set and an
+        ordered walk of ``idx_uploads_received_at``, and either plan satisfies
+        the declared oldest-first wake order (see the Protocol docstring).
+
+        Args:
+            limit: Maximum rows this page may return.
+            after: Resume strictly after this keyset position, or ``None`` for
+                the oldest parked row.
+
+        Returns:
+            At most ``limit`` :class:`ParkedCandidate` rows, oldest first.
         """
         conn = self._read_connection()
+        params: list[str | int] = [_PARKED_STATE]
+        resume = ""
+        if after is not None:
+            resume = "AND (received_at, chain_id) > (?, ?) "
+            params.extend([_bind_instant(after.received_at), str(after.chain_id)])
+        params.append(limit)
         sql = (
             "SELECT chain_id, endpoint, uid, auth_blocked_host, received_at, "
             "body_size_bytes, attempts "
             "FROM uploads "
             "WHERE state = ? AND body_discarded_at IS NULL "
-            "ORDER BY received_at ASC"
+            f"{resume}"
+            "ORDER BY received_at ASC, chain_id ASC "
+            "LIMIT ?"
         )
-        async with conn.execute(sql, (_PARKED_STATE,)) as cur:
+        async with conn.execute(sql, params) as cur:
             fetched = await cur.fetchall()
         return [
             ParkedCandidate(
@@ -1716,6 +1746,48 @@ class SqliteUploadStore:
             )
             for r in fetched
         ]
+
+    async def iter_slot_charge_candidates(self) -> AsyncIterator[SlotChargeCandidate]:
+        """Stream the three columns boot reconstruction needs, on a walk-private connection.
+
+        Same cursor and same connection discipline as :meth:`iter_rows` (see
+        that method for why a walk takes a connection of its own), over a
+        three-column projection. :func:`_row_to_upload` is deliberately not
+        called: finding S7-8 is that
+        :func:`phantom.workers.recovery.reconcile_saturation` built a complete
+        strict :class:`UploadRow` per row to read ``state``,
+        ``body_discarded_at`` and ``body_size_bytes``, which at the default
+        ``retention.max_rows`` ceiling of 100 000 is a second 100 000-row
+        pydantic walk before uvicorn accepts its first request.
+
+        No state filter, deliberately: the caller owns the
+        :func:`phantom.workers.saturation.row_holds_slot` decision (ADR-036),
+        so putting a copy of it in this statement would create a second
+        derivation of the rule the ADR exists to centralise.
+
+        A state value outside the known :data:`UploadState` vocabulary would
+        mean a corrupt or foreign row; it is logged at WARNING and skipped, the
+        same posture :meth:`counts_by_state` takes, rather than crashing a boot
+        whose whole purpose is to get a stranded backlog moving again.
+        """
+        sql = "SELECT state, body_discarded_at, body_size_bytes FROM uploads"
+        async with self._walk_connection() as conn, conn.execute(sql) as cursor:
+            async for row in cursor:
+                state = row["state"]
+                if state not in _VALID_UPLOAD_STATES:
+                    logger.warning(
+                        "iter_slot_charge_candidates: skipping unrecognized state %r",
+                        state,
+                    )
+                    continue
+                discarded_at = _optional_row_value(row, "body_discarded_at")
+                yield SlotChargeCandidate(
+                    state=state,
+                    body_discarded_at=(
+                        datetime.fromisoformat(discarded_at) if discarded_at is not None else None
+                    ),
+                    body_size_bytes=int(row["body_size_bytes"]),
+                )
 
     async def counts_by_state(self) -> dict[UploadState, StateTally]:
         """Row count and summed body bytes per state, in one read.
