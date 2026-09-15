@@ -140,10 +140,13 @@ class PersistController:
 
         Returns:
             An :class:`asyncio.Future[None]` that resolves to ``None``
-            on successful migration or carries an exception if the
-            migration fails. Callers may ``await`` the future to block
-            on completion or fire-and-forget (the controller's
-            :meth:`run` loop drains the queue regardless).
+            on successful migration, carries an exception if the
+            migration fails, or is CANCELLED if the controller was
+            cancelled while running it. Callers may ``await`` the future
+            to block on completion or fire-and-forget (the controller's
+            :meth:`run` loop drains the queue regardless). Every one of
+            those three settlements also removes the chain from
+            ``_in_flight``, so a later ``enqueue`` re-queues it.
         """
         async with self._handles_lock:
             existing = self._in_flight.get(chain_id)
@@ -172,10 +175,12 @@ class PersistController:
 
         Supervised by the composition root - :func:`phantom.app.create_app`'s
         lifespan :class:`asyncio.TaskGroup` (plan § 2.3.10). The loop never
-        re-raises an exception - unrelated chain_ids must continue migrating
-        even when one fails. Failures on a single chain are logged with full
-        context AND the failing chain's handle gets the exception set, so any
-        awaiting caller sees it.
+        re-raises a migration FAILURE - unrelated chain_ids must continue
+        migrating even when one fails. Failures on a single chain are logged
+        with full context AND the failing chain's handle gets the exception
+        set, so any awaiting caller sees it. Cancellation is the one thing that
+        does propagate: it is the shutdown signal, not a chain's failure, and
+        the sibling workers re-raise it for the same reason.
 
         On failure the row's ``body_location`` stays at ``'ram'``. The
         leftover disk file (if (2) succeeded but (3) did not) is the
@@ -202,11 +207,33 @@ class PersistController:
             await self._handle_one(chain_id)
 
     async def _handle_one(self, chain_id: UUID) -> None:
-        """Migrate one chain_id, resolve its handle, never re-raise."""
+        """Migrate one chain_id and settle its handle on EVERY exit path.
+
+        Three exits, and the dedupe map is emptied on all three. That
+        totality is the contract, not a nicety: ``_in_flight`` is the one
+        piece of controller state that is supposed to be self-clearing, and
+        an entry that survives its migration is permanent. :meth:`enqueue`
+        takes the ``existing is not None`` branch forever after, handing every
+        later caller a future that will never resolve WITHOUT re-queueing the
+        chain, so the chain is excluded from migration for the process
+        lifetime and the admin surface reads the dead entry as pending work.
+
+        Cancellation is the exit that used to escape. ``except Exception``
+        does not catch :class:`asyncio.CancelledError` (a ``BaseException``
+        since 3.8) and the ``finally`` only touched the gauge, so a cancel
+        landing on any of ``_migrate_one``'s awaits - the store read, the RAM
+        read, the disk write, the flip - left the handle pending and the entry
+        poisoned. It is caught by name here, settled by CANCELLING the handle
+        (the honest signal: this migration did not happen) and then RE-RAISED,
+        because cancellation is the shutdown path and swallowing it would
+        strand the lifespan TaskGroup. The handle is settled before the
+        ``finally`` runs its await, so the pop cannot itself be cancelled.
+        """
         try:
             await self._migrate_one(chain_id)
-            self._resolve_handle(chain_id, exception=None)
-            await self._persist_total.inc(label_value=_PERSIST_OUTCOME_SUCCESS)
+        except asyncio.CancelledError:
+            self._cancel_handle(chain_id)
+            raise
         except Exception as exc:
             logger.exception(
                 "PersistController migration failed: chain_id=%s",
@@ -216,8 +243,12 @@ class PersistController:
             await self._persist_total.inc(label_value=_PERSIST_OUTCOME_FAILURE)
             # Do NOT re-raise - TaskGroup would cancel the entire
             # runtime. Errors on one chain don't kill the service.
+        else:
+            self._resolve_handle(chain_id, exception=None)
+            await self._persist_total.inc(label_value=_PERSIST_OUTCOME_SUCCESS)
         finally:
-            # Whether success or failure, the queue depth dropped.
+            # Whether success, failure or cancellation, the queue depth
+            # dropped.
             await self._queue_depth.set(self._queue.qsize())
 
     async def _migrate_one(self, chain_id: UUID) -> None:
@@ -225,8 +256,9 @@ class PersistController:
 
         Order matters (plan § 0.5 commit-last-column):
 
-        0. live-row pre-check - skip rows already body-discarded or
-           gone (R7-2; narrows the race window before any work).
+        0. live-row pre-check - skip rows that are gone, already
+           body-discarded, or already off RAM (R7-2 / SW-4; narrows the
+           race window before any work).
         1. ``ram.get_all`` - pull body bytes.
         2. ``file.put`` - write + fsync (fsync inside FileBodyStore).
         3. ``store.mark_persisted`` - flip ``body_location`` (the
@@ -237,16 +269,37 @@ class PersistController:
         4. ``ram.delete`` - release RAM bytes.
         """
         row = await self._store.get(chain_id)
-        if row is None or not is_deliverable(row):
+        # Three DIFFERENT questions, so three branches rather than one
+        # predicate. This caller does its own fresh ``get``, so the row can
+        # simply have vanished; a live row can have been body-discarded; and a
+        # live, undiscarded row can already be off RAM.
+        if row is None:
+            logger.info("PersistController skipping chain_id=%s: the row is gone", chain_id)
+            return
+        if not is_deliverable(row):
             # H4 carve-out (R7-2): migrating a discarded body would
-            # resurrect bytes the operator's window dropped. The ``row is
-            # None`` disjunct is a DIFFERENT question (this caller does its
-            # own fresh ``get``, so the row can have vanished) and stays
-            # visibly separate from the predicate.
+            # resurrect bytes the operator's window dropped.
             logger.info(
-                "PersistController skipping chain_id=%s: row %s",
+                "PersistController skipping chain_id=%s: the row is body-discarded",
                 chain_id,
-                "body-discarded" if row is not None else "gone",
+            )
+            return
+        if row.body_location != "ram":
+            # SW-4: the migration this enqueue asks for ALREADY HAPPENED, so
+            # its postcondition holds and there is nothing to do. Without this
+            # branch the run below read RAM for a chain whose RAM entry step 4
+            # of the previous migration deleted, ``RamBodyStore.get_all``
+            # raised ``KeyError``, and a SUCCEEDED migration was logged at
+            # ERROR and counted as ``persist_total{failure}``. Two paths reach
+            # here on healthy traffic, both through a CLAIM-TIME row snapshot
+            # that still says 'ram' while the live row says 'file': the
+            # sender's retry-linger enqueue after :class:`RamPressureWatcher`
+            # migrated the row mid-attempt, and admission's size-threshold
+            # enqueue when the attempt outlives ``linger_seconds``.
+            logger.info(
+                "PersistController skipping chain_id=%s: the body is already at body_location=%s",
+                chain_id,
+                row.body_location,
             )
             return
         body_refs = await self._ram.get_all(chain_id)
@@ -268,9 +321,18 @@ class PersistController:
             # same-chain_id upload can be legally re-admitted at ANY
             # instant after a mid-migration row deletion, so no check
             # can make a RAM delete here safe (R8-3; wiping it would
-            # destroy the accepted new upload). RAM needs no cleanup
-            # from us anyway: both discard owners delete the body store
-            # before stamping, so the original bytes are already gone.
+            # destroy the accepted new upload).
+            #
+            # Do NOT read that as "the RAM bytes are already gone". All
+            # THREE discard owners (reaper R9-5, sender R10-1,
+            # ``_expire.expire_row``) STAMP FIRST and delete the body store
+            # only after a confirmed flip, each documenting exactly that
+            # ordering, so at the instant we observe rowcount 0 the original
+            # bytes may still be resident and are the stamping owner's to
+            # remove. That distinction is load-bearing in the one interleaving
+            # that matters, a cancel landing between a racing stamper's flip
+            # and its delete, where the delete never runs at all.
+            #
             # The chain's migrations are serialized by the in-flight
             # dedupe, so the disk entry is exclusively ours to remove.
             await self._file.delete(chain_id)
@@ -289,21 +351,56 @@ class PersistController:
             len(body_refs),
         )
 
-    def _resolve_handle(self, chain_id: UUID, *, exception: BaseException | None) -> None:
-        """Pop ``chain_id`` from ``_in_flight`` and signal its future.
+    def _take_handle(self, chain_id: UUID) -> asyncio.Future[None] | None:
+        """Pop ``chain_id`` from ``_in_flight``; return its future if settleable.
 
-        Called from :meth:`run`'s success and failure paths. The
-        ``_handles_lock`` is NOT held - popping from the dict is fast
+        The single exit from the dedupe map, so every settlement path empties
+        it by construction. Returns ``None`` when there was no entry or its
+        future is already done (nothing left to signal).
+
+        The ``_handles_lock`` is NOT held - popping from the dict is fast
         and not racing with a concurrent ``enqueue`` (queue ordering
         guarantees enqueue happens-before run-dequeue for the same
         chain_id within one event loop).
         """
         handle = self._in_flight.pop(chain_id, None)
+        if handle is None or handle.done():
+            return None
+        return handle
+
+    def _resolve_handle(self, chain_id: UUID, *, exception: BaseException | None) -> None:
+        """Settle ``chain_id``'s future with a migration result.
+
+        Called from :meth:`_handle_one`'s success and failure paths.
+        """
+        handle = self._take_handle(chain_id)
         if handle is None:
-            return
-        if handle.done():
             return
         if exception is None:
             handle.set_result(None)
-        else:
-            handle.set_exception(exception)
+            return
+        handle.set_exception(exception)
+        # Mark the exception RETRIEVED. Every production caller of
+        # :meth:`enqueue` discards the handle (the contract sanctions
+        # fire-and-forget), so the future is garbage-collected un-awaited and
+        # ``Future.__del__`` logged "Future exception was never retrieved" at
+        # ERROR on top of the ``logger.exception`` above. A disk-full episode
+        # therefore emitted TWO error records per chain, the second carrying no
+        # chain_id and timed to a GC pass rather than to the failure. Reading
+        # the exception here clears that flag without changing what an actual
+        # awaiter sees: ``await handle`` still raises it.
+        handle.exception()
+
+    def _cancel_handle(self, chain_id: UUID) -> None:
+        """Settle ``chain_id``'s future as CANCELLED.
+
+        The cancellation counterpart of :meth:`_resolve_handle`. Cancelling
+        rather than setting :class:`asyncio.CancelledError` as an exception is
+        deliberate: an awaiter sees the same raise either way, and a cancelled
+        future is never reported by ``Future.__del__``, so the fire-and-forget
+        callers stay quiet for the same reason they do above.
+        """
+        handle = self._take_handle(chain_id)
+        if handle is None:
+            return
+        handle.cancel()

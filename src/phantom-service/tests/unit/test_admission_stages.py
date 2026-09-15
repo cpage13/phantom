@@ -423,10 +423,10 @@ async def test_build_row_defers_the_authorization_cache_write(tmp_path: Path) ->
 
     prepared = await _build_row(_inputs(envelope, authorization="Bearer xyz"), instance, encoded)
 
-    assert prepared.bearer_cache_write is not None, "the intent must be carried"
-    assert prepared.bearer_cache_write.endpoint == "files.example.com"
-    assert prepared.bearer_cache_write.uid == "user-1"
-    assert prepared.bearer_cache_write.bearer == "Bearer xyz"
+    assert len(prepared.bearer_cache_writes) == 1, "the intent must be carried"
+    assert prepared.bearer_cache_writes[0].endpoint == "files.example.com"
+    assert prepared.bearer_cache_writes[0].uid == "user-1"
+    assert prepared.bearer_cache_writes[0].bearer == "Bearer xyz"
     assert await instance.token_cache.get("files.example.com", "user-1") is None, (
         "row preparation wrote to the token cache before the row was committed"
     )
@@ -438,8 +438,8 @@ async def test_build_row_carries_no_cache_write_without_authorization(
 ) -> None:
     """Objective: no inbound credential means no deferred write.
 
-    Expected: ``bearer_cache_write`` is None, so the committed path has nothing
-    to perform and the D3 mode gate is unchanged by the deferral.
+    Expected: ``bearer_cache_writes`` is empty, so the committed path has
+    nothing to perform and the D3 mode gate is unchanged by the deferral.
     """
     instance = await _build_instance(tmp_path)
     envelope = _envelope()
@@ -447,7 +447,7 @@ async def test_build_row_carries_no_cache_write_without_authorization(
 
     prepared = await _build_row(_inputs(envelope), instance, encoded)
 
-    assert prepared.bearer_cache_write is None
+    assert prepared.bearer_cache_writes == ()
 
 
 @pytest.mark.asyncio
@@ -589,6 +589,67 @@ async def test_resolve_collision_chain_id_arm_preserves_shared_body(
     assert instance.saturation.in_flight == 0
     assert instance.saturation.in_flight_bytes == 0
     assert await instance.body_store.get_all(envelope.chain_id) == {"body": b"winning-bytes"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_collision_rollback_fault_maps_to_storage_unavailable(
+    tmp_path: Path,
+) -> None:
+    """Objective: the collision rollback's delete must not escape as an OSError.
+
+    ``FileBodyStore.delete`` reaches ``_rm_rf``, whose exists/iterdir/unlink/
+    rmdir each raise ``OSError`` on EIO, EACCES or a directory that will not
+    empty. This was the ONE body-store call in the whole admission flow outside
+    the ``storage_unavailable`` mapping that ``_persist_row_and_claim`` applies
+    to its own delete and put.
+
+    Expected: a typed ``storage_unavailable`` (503) carrying ``Retry-After``,
+    and the slot released exactly once, back to the live baseline and not below
+    it. Before the fix two POSTs sharing an idempotency key while the data
+    volume returned I/O errors sent the raw ``OSError`` past
+    ``resolve_and_admit``'s ``except ChainAdmissionError`` and out of the
+    ``/send`` handler, where no global handler exists: a bare 500 with no
+    ErrorEnvelope, no ``error.code`` and no ``Retry-After``, tripping the
+    producer's 5xx fallback instead of preserving its buffered retry.
+    """
+
+    class _FailingDeleteBodyStore:
+        async def delete(self, _chain_id: object) -> None:
+            raise OSError("simulated I/O error on rollback")
+
+        async def put(self, _chain_id: object, _refs: object) -> int:
+            return 0
+
+    instance = await _build_instance(tmp_path)
+    envelope = _envelope()
+    encoded = await _encode_and_hash_bodies(instance, {"body": b"duplicate-bytes"})
+    prepared = await _build_row(_inputs(envelope), instance, encoded)
+
+    # A different, LIVE row's slot, owned by the sender: the baseline the
+    # rejection must restore the counters to, never below.
+    live = await _admit_saturation_slot(instance, _SLOT_BYTES)
+    live.commit()
+    baseline_rows = instance.saturation.in_flight
+    baseline_bytes = instance.saturation.in_flight_bytes
+
+    instance.body_store = _FailingDeleteBodyStore()  # type: ignore[assignment]
+    slot = await _admit_saturation_slot(instance, encoded.admit_bytes)
+    with pytest.raises(ChainAdmissionError) as exc_info:
+        async with slot:
+            await _resolve_collision(
+                _inputs(envelope),
+                instance,
+                outcome=InsertClaimOutcome.IDEMPOTENCY_COLLISION,
+                prepared=prepared,
+                encoded=encoded,
+                slot=slot,
+            )
+    assert exc_info.value.code == "storage_unavailable"
+    assert exc_info.value.details == {"reason": "body_store_rollback_failed"}
+    assert exc_info.value.headers is not None
+    assert exc_info.value.headers.get("Retry-After")
+    assert instance.saturation.in_flight == baseline_rows
+    assert instance.saturation.in_flight_bytes == baseline_bytes
 
 
 # ---------------------------------------------------------------------------

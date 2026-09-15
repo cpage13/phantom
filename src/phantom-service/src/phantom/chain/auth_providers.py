@@ -179,6 +179,18 @@ class BearerAuthProvider:
     ) -> AuthOutcome:
         """Inject the cached bearer, or park when the slot is absent or bad.
 
+        **The lookup is keyed on THIS step's URL**, because the executor picks a
+        provider per step and a chain can cross hosts. Admission is the writer
+        that has to agree: it earmarks the producer's inbound ``Authorization``
+        for one ``(host_key_for(step url), uid)`` key per step whose route is
+        ``phantom_bearer``, not for the first step alone. When it wrote only the
+        first key, a chain whose bearer-protected step came later parked here
+        against a key no writer ever filled, and no kicker could wake it.
+
+        Parking happens BEFORE any forwarding, so a producer cannot work around
+        a missing slot by putting the credential in that step's own headers: a
+        miss never reaches the send, and a hit overwrites the header anyway.
+
         The write goes through :func:`~phantom.chain.headers.set_header`, which
         DROPS every other casing of ``Authorization`` before inserting Phantom's
         own. Both halves of that matter and neither is cosmetic.
