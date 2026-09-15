@@ -39,8 +39,18 @@ concrete proof that two hand-maintained roots cannot stay honest.
 A separate latent risk: there was no validation that configured
 instances were mutually isolated. A duplicate instance `id` silently
 collapses in the dispatcher's `_by_id` map (an instance becomes
-unreachable); a shared `data_dir` puts two stores on one `uploads.db`
-(a single-writer violation that corrupts the DB).
+unreachable); a shared `data_dir` puts two stores on one `uploads.db`.
+
+> **Correction (2026-09-15).** The parenthetical here originally read
+> "a single-writer violation that corrupts the DB". An adversarial
+> verification of that claim found it overstated: SQLite serialises two
+> connections to one file, so the database itself is not corrupted. The
+> real damage is application-level and arguably worse for being less
+> obvious, which is two full `InstanceContext` bundles with independent
+> saturation gates, senders, kickers and reapers all driving the same
+> `uploads` rows and the same `bodies/` tree. There is no flock or
+> lockfile anywhere in `src/`. The decision below is unaffected; only
+> the stated consequence was wrong.
 
 ## Decision
 
@@ -61,7 +71,12 @@ documented root it already was in practice.
    scope:**
    - **Process-wide, once at the top** (settings + perms are process
      global): `apply_umask()`, `check_retention_floor(settings)`, and
-     `check_instance_isolation(settings.instances)`.
+     `check_instance_isolation(settings.instances,
+     data_dir_root=...)`. The `data_dir_root` argument was added on
+     2026-09-15: the guard previously resolved each per-instance
+     `data_dir` against the process working directory rather than
+     composing it with `storage.data_dir`, so a mixed
+     relative-and-absolute pair naming one real directory was admitted.
    - **Per instance** (after that instance's `data_root.mkdir`, before
      its `SqliteUploadStore` opens and before body-store construction):
      `check_body_store_mode(mode, bodies_root)` and the
