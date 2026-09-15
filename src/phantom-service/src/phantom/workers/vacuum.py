@@ -1,4 +1,15 @@
-"""VacuumScheduler - cron-style SQLite VACUUM, only when in-flight=0."""
+"""VacuumScheduler - cron-style SQLite VACUUM, only when nothing is moving.
+
+The flash-wear invariant is "never VACUUM under load", and the load question
+is answered by counting the rows in :data:`ACTIVE_WORK_STATES` on this
+instance's own store. It used to be answered by reading the saturation gate's
+``in_flight``, which is a BUFFER-OCCUPANCY ledger and not an activity signal:
+``stored`` holds a slot on purpose, ``stored_metadata_seconds`` defaults to
+never, and boot recovery re-seeds the charge from the persisted row. So one
+row parked by an exhausted retry budget or a mistyped route host pinned
+``in_flight`` at one from that moment on, and the weekly VACUUM was skipped
+every week, for good, across restarts, with no signal anywhere (SW-3).
+"""
 
 from __future__ import annotations
 
@@ -8,6 +19,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from phantom.instances.context import InstanceContext
+from phantom.workers.saturation import ACTIVE_WORK_STATES
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +140,7 @@ def _matches_cron(spec: str, now: datetime) -> bool:
 
 
 class VacuumScheduler:
-    """Periodic VACUUM scheduler, gated on in-flight=0."""
+    """Periodic VACUUM scheduler, gated on this instance having no active work."""
 
     def __init__(
         self,
@@ -177,7 +189,7 @@ class VacuumScheduler:
     async def run(self, stop_event: asyncio.Event) -> None:
         """Tick every ``_POLL_INTERVAL_SECONDS``; fire VACUUM when the cron matches.
 
-        The VACUUM fires only on a matching cron minute with saturation=0. A
+        The VACUUM fires only on a matching cron minute with no active work. A
         scheduler whose expression did not parse is inert: it waits for the
         stop event and schedules nothing, so a config typo costs the VACUUM and
         nothing else.
@@ -196,22 +208,47 @@ class VacuumScheduler:
         """One scheduling decision at ``now``; fires at most one VACUUM.
 
         The complete gate in one place: a minute-slot not already fired
-        (same-minute dedup), a cron match, and ``saturation.in_flight == 0``
+        (same-minute dedup), a cron match, and :meth:`_active_rows` at zero
         (the flash-wear invariant: never VACUUM under load). :meth:`run` is
         loop coordination around this method and nothing else, so a test can
         drive real ticks at injected times without copying any decision
         logic.
+
+        The activity read is LAST because it is the only leg that touches the
+        database: a non-matching minute costs nothing. The minute slot is
+        stamped only when the VACUUM actually fires, so a minute skipped for
+        active work is retried on the next poll within the same minute.
         """
         if self._parsed is None:
             return
         slot = (now.year, now.month, now.day, now.hour, now.minute)
-        if (
-            slot != self._last_run_minute
-            and _matches_parsed(self._parsed, now)
-            and self._instance.saturation.in_flight == 0
-        ):
-            self._last_run_minute = slot
-            await self._vacuum()
+        if slot == self._last_run_minute or not _matches_parsed(self._parsed, now):
+            return
+        active = await self._active_rows()
+        if active:
+            logger.debug(
+                "Skipping scheduled VACUUM on instance %s: %d row(s) in %s",
+                self._instance.cfg.id,
+                active,
+                sorted(ACTIVE_WORK_STATES),
+            )
+            return
+        self._last_run_minute = slot
+        await self._vacuum()
+
+    async def _active_rows(self) -> int:
+        """Count this instance's rows that are still moving.
+
+        One ``GROUP BY state`` aggregate, read at most once per matching cron
+        minute. States absent from the mapping have no rows, which is the
+        Protocol's documented shape.
+
+        Returns:
+            Rows in :data:`ACTIVE_WORK_STATES`; zero means the store is
+            quiescent as far as delivery work is concerned.
+        """
+        tallies = await self._instance.store.counts_by_state()
+        return sum(tallies[state].count for state in ACTIVE_WORK_STATES if state in tallies)
 
     async def _vacuum(self) -> None:
         """Run VACUUM on the persistent store via the Protocol method."""

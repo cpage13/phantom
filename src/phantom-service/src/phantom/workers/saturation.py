@@ -20,6 +20,12 @@ by every worker that walks rows. :func:`row_holds_slot` answers "does this row
 currently charge the gate", and :func:`is_deliverable` answers "does this row
 still have bytes to send" (the H4 carve-out). Both live here so no caller
 re-derives them by hand.
+
+:data:`ACTIVE_WORK_STATES` is the third, and it is here for the opposite
+reason: to be read NEXT TO the first and not confused with it. "Does this row
+charge the gate" and "is this row still moving" are different questions with
+different answers for ``stored``, and a caller that wants the second one and
+reads the first gets a number that can never return to zero.
 """
 
 from __future__ import annotations
@@ -56,7 +62,30 @@ logger = logging.getLogger(__name__)
 # INSIDE the gate, from the store outcome's in-transaction pre-image,
 # so the ledger cannot drift in either direction and no caller
 # re-derives the crossing.
+#
+# This set answers OCCUPANCY, never ACTIVITY. See ACTIVE_WORK_STATES.
 SLOT_HOLDING_STATES: Final[frozenset[str]] = frozenset({"queued", "attempting", "stored"})
+
+# States whose row is WORK IN PROGRESS: the sender is about to claim it,
+# or has claimed it and is mid-attempt. Everything else is either
+# finished, parked awaiting an external event, or buffered.
+#
+# Deliberately NOT ``SLOT_HOLDING_STATES``, and the difference is the
+# whole reason this constant exists. That set is a buffer-occupancy
+# ledger and it includes the TERMINAL state ``stored``, whose body still
+# occupies space long after the row stopped moving. A row reaches
+# ``stored`` from an exhausted retry budget or from a step whose host
+# matches no configured route, and ``stored_metadata_seconds`` defaults
+# to never, so the occupancy answer for one such row is "charged, from
+# now on, forever". A caller asking "is this instance doing anything" and
+# reading the occupancy number instead gets "yes" for the life of the
+# deployment: exactly the reading that silently disabled the scheduled
+# VACUUM every week (SW-3).
+#
+# ``auth_expired`` is absent for the same reason ``stored`` is: a parked
+# row is waiting on a token push that may never come, it holds no slot,
+# and nothing is writing to it until a kicker wakes it back to ``queued``.
+ACTIVE_WORK_STATES: Final[frozenset[UploadState]] = frozenset({"queued", "attempting"})
 
 
 def row_holds_slot(state: str, body_discarded_at: datetime | None) -> bool:
