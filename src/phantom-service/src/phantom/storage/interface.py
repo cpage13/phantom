@@ -336,7 +336,24 @@ class UploadStore(Protocol):
         ...
 
     async def insert(self, row: UploadRow) -> None:
-        """Insert a new row. Caller supplies a fully populated row."""
+        """Insert a new row WITHOUT an idempotency claim.
+
+        Caller supplies a fully populated row. NOT an admission path:
+        ADR-019 makes :meth:`insert_with_idempotency_claim` the single
+        method that admits an upload, and this one has no production
+        caller. It exists for seeding a store directly into a chosen
+        state, which is what the test suites do, without also minting an
+        ``idempotency_index`` claim.
+
+        An implementation MUST write the same column set as
+        :meth:`insert_with_idempotency_claim` (finding S2-8). A column
+        present in one and absent from the other is invisible in
+        production and silently dropped for everything seeded through
+        here, so the suite exercises a row shape production never writes.
+        The SQLite implementation carries two hand-maintained copies of
+        that column list today; see its ``insert`` docstring for why the
+        obvious deduplication is blocked and what must be done instead.
+        """
         ...
 
     async def get(self, chain_id: UUID) -> UploadRow | None:
@@ -457,6 +474,13 @@ class UploadStore(Protocol):
         (``ValueError``), and ``next_cursor`` is always ``None``; every
         other filter combination (``group_id`` included) paginates in
         receipt-time order exactly as before.
+
+        Raises:
+            ValueError: When ``cursor`` is combined with the
+                ``multifile_id`` filter, or when ``limit`` is below 1.
+                A page of zero rows has no last row for the keyset
+                cursor to resume from, so it is a caller error rather
+                than an empty result (finding S2-9).
         """
         ...
 
@@ -468,7 +492,15 @@ class UploadStore(Protocol):
         instance: str | None = None,
         limit: int = 100,
     ) -> list[UploadRow]:
-        """Find rows whose chain envelope's metadata key-value-store contains key=value."""
+        """Find rows whose chain envelope's metadata key-value-store contains key=value.
+
+        The key-value store is unconstrained producer JSON, so ``value``
+        is matched against the TEXT RENDERING of the stored leaf, not
+        against its JSON type: a leaf stored as the number ``7`` matches
+        ``value="7"`` (finding D4). An implementation comparing the raw
+        leaf to a text parameter never matches a numeric leaf and reports
+        the chain absent with no error.
+        """
         ...
 
     async def list_by_group_id(
@@ -495,19 +527,28 @@ class UploadStore(Protocol):
     ) -> list[UploadRow]:
         """Find rows carrying ``value`` inside their captured values (cycle-7 task 4.2).
 
-        JSON1 extract over ``captured_values_json`` at
-        ``$.steps.<capture_name>.values.<subpath>``. The binding values
-        are deployment-supplied per-instance configuration
+        Locates ``$.steps.<capture_name>.values.<subpath>`` within
+        ``captured_values_json``. The binding values are
+        deployment-supplied per-instance configuration
         (``InstanceCfg.admin_lookup``), keeping the service
         upstream-ignorant. A miss returns an empty list, never raises.
+
+        ``capture_name`` is an operator-authored LABEL and may contain
+        quotes, dots or backslashes, so an implementation MUST match it
+        by key equality rather than by interpolating it into a quoted
+        JSON-path label (finding D6): SQLite below ~3.50 cannot parse an
+        escaped quote inside such a label and answers NULL, which is
+        indistinguishable from a genuine miss. ``value`` is matched
+        against the TEXT RENDERING of the stored leaf, for the same
+        reason :meth:`list_by_key_value` states (finding D4).
         """
         ...
 
     async def find_by_local_uuid(self, local_uuid: UUID) -> list[UploadRow]:
         """Find rows stamped with ``local_uuid`` in their metadata KVS (cycle-7 task 4.2).
 
-        The extract path is PINNED to the ``phantom_local_uuid`` metadata
-        key (the exact path the generic key-value match builds for that
+        The lookup is PINNED to the ``phantom_local_uuid`` metadata key
+        (the exact match the generic key-value lookup makes for that
         key); callers never spell a JSON path. A list because Phantom
         enforces no global uniqueness on the key.
         """
@@ -632,6 +673,17 @@ class UploadStore(Protocol):
         (Phase 3) for row-walk passes. Implementations may iterate the
         underlying connection's cursor; callers MUST consume promptly
         because the cursor is held for the duration of iteration.
+
+        The walk yields ONE consistent snapshot, and an implementation
+        that splits reads across connections MUST give the walk a
+        connection of its own (finding S2-1). A walk sharing the
+        point-read connection pins that connection's snapshot for the
+        whole walk, so every :meth:`get` issued DURING the walk answers
+        from the walk's snapshot instead of the live row. A caller that
+        re-reads a row mid-walk to ask whether it changed since the
+        snapshot, which is precisely what the invariant auditor does,
+        then gets its own snapshot back and can never observe the
+        change.
 
         Note the non-``async def`` shape: an async generator's
         ``__call__`` synchronously returns the generator object, then
@@ -792,18 +844,58 @@ class UploadStore(Protocol):
         instead and leaves the row untouched (caller responds 409
         ``replay_body_discarded``). Checked before the state guard: a
         stamped row refuses in every state, including ``attempting``.
+
+        The returned ``row`` is read back after the commit and MUST be
+        read on the connection that made the write, while the write lock
+        is still held (finding S2-3). Read afterwards on a separate
+        point-read connection it can come back missing for a row that is
+        present, and the implementation is then left with a committed
+        re-queue and no outcome to hand the caller, so the caller's gate
+        settlement never runs.
+
+        Raises:
+            KeyError: When the read-back finds no row despite the
+                re-queue having committed. Unreachable while the
+                read-back is in-lock on the writer; it stays declared
+                because it is what an implementation that gets this wrong
+                will raise.
         """
         ...
 
     async def cancel(self, chain_id: UUID) -> CancelOutcome:
-        """Transition to ``cancelled`` if non-terminal; no-op otherwise.
+        """Transition to ``cancelled`` from a cancellable state; no-op otherwise.
+
+        The cancellable set is ``queued``, ``attempting``,
+        ``auth_expired`` and ``stored``. That is deliberately NOT "every
+        non-terminal state" (finding SPr-2): ``stored`` IS in
+        :data:`TERMINAL_STATES` and cancels anyway, because a ``stored``
+        row is retained bytes an operator may legitimately want to stop
+        holding. The summary used to say "if non-terminal", which told a
+        reader of this method alone that cancel on a ``stored`` row was
+        inert, while :class:`CancelOutcome`'s own docstring described the
+        admission correctly. Every OTHER terminal state
+        (``succeeded``, ``failed``, ``cancelled``, ``corrupted``) is the
+        no-op the summary always meant.
 
         Returns a :class:`CancelOutcome` whose ``previous_state`` is the
         cancellable state the in-transaction precheck saw immediately
-        before the UPDATE, or ``None`` when the row was already terminal
-        (no transition). The caller releases the saturation gate iff the
+        before the UPDATE, or ``None`` when the UPDATE did not land (no
+        transition). The caller releases the saturation gate iff the
         previous state held a slot (R8-4); a route-side pre-fetch cannot
         serve because the row may transition between fetch and UPDATE.
+
+        The returned ``row`` is read back after the commit and MUST be
+        read on the connection that made the write, while the write lock
+        is still held (finding S2-3). Read afterwards on a separate
+        point-read connection it can come back missing for a row that is
+        present, and the implementation then has no outcome to return for
+        a cancel that already committed.
+
+        Raises:
+            KeyError: When no row with ``chain_id`` exists. Cancel has no
+                row-missing return value (unlike :meth:`replay`'s
+                ``None``), so absence surfaces as this exception. Callers
+                that cannot tolerate it pre-check existence.
         """
         ...
 
@@ -857,6 +949,13 @@ class UploadStore(Protocol):
         Holds the store's write lock so concurrent writes wait until
         the VACUUM completes (SQLite VACUUM itself requires exclusive
         access; the lock just keeps Phantom's own writers honest).
+
+        VACUUM needs free space of roughly the database's own size, so on
+        a nearly-full disk it is the writer MOST likely to fail. An
+        implementation sharing one connection across writers must
+        therefore give it the same rollback-on-failure treatment as every
+        other write (finding SP-6), or a failed vacuum leaves a
+        transaction open and wedges every writer behind it.
         """
         ...
 
@@ -886,15 +985,29 @@ class UploadStore(Protocol):
         state: UploadState,
         cutoff: datetime,
     ) -> list[DeletedRowAccounting]:
-        """Hard-delete terminal rows in ``state`` whose ``updated_at`` < ``cutoff``.
+        """Hard-delete metadata-reapable rows in ``state`` older than ``cutoff``.
 
         Reaper helper (plan § 2.3.16) - the metadata-retention pass.
         Returns one :class:`DeletedRowAccounting` per deleted row,
         captured in the same write transaction, so the reaper can
         release the gate for ``stored`` rows whose body was never
-        separately discarded (R8-4). Raises ``ValueError`` if ``state``
-        is non-terminal (single-purpose surface - the reaper should
-        never call this with a queued/attempting state).
+        separately discarded (R8-4).
+
+        The accepted set is :data:`TERMINAL_STATES` PLUS ``auth_expired``
+        (finding S2-7). ``auth_expired`` is NOT terminal: the auth kicker
+        re-queues such a row when its credential slot refreshes, so this
+        is the one call that can hard-delete an upload that was still
+        going to be delivered. That is deliberate, because it is what
+        gives ``RetentionCfg.auth_expired_metadata_seconds`` an effect,
+        and the default of -1 (forever) keeps it dormant unless an
+        operator sets a finite window. This contract used to say only
+        "raises ValueError if state is non-terminal", which told an
+        operator that exact deletion could not happen.
+
+        Raises:
+            ValueError: When ``state`` is neither terminal nor
+                ``auth_expired`` (single-purpose surface - the reaper
+                should never call this with a queued/attempting state).
         """
         ...
 
@@ -912,6 +1025,13 @@ class UploadStore(Protocol):
         rows are never dropped, so the backstop cannot lose an
         undelivered upload. ``max_rows < 0`` is unbounded (no-op →
         ``[]``), preserving time-only retention.
+
+        Called on every reaper sweep, and ``retention.max_rows`` defaults
+        to a finite cap, so the UNDER-CAP answer is the hot path. An
+        implementation MUST be able to give it without blocking writers
+        (finding S2-5): deciding there is nothing to evict is a read, and
+        pricing it as a write serializes admission behind a full-table
+        count once per sweep forever.
         """
         ...
 

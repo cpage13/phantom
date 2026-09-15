@@ -104,6 +104,27 @@ CREATE INDEX IF NOT EXISTS idx_uploads_state_updated_at
 CREATE INDEX IF NOT EXISTS idx_uploads_body_location
     ON uploads(body_location);
 
+-- Serves the paginated listing, which sorted on a column carrying no index
+-- at all (finding SP-7). The column pair matches
+-- `ORDER BY received_at ASC, chain_id ASC` exactly, so EXPLAIN QUERY PLAN
+-- goes from `SCAN uploads` + `USE TEMP B-TREE FOR ORDER BY` to
+-- `SCAN uploads USING INDEX idx_uploads_received_at`, and the keyset resume
+-- clause `(received_at, chain_id) > (?, ?)` goes from that same scan-plus-sort
+-- to `SEARCH ... ((received_at,chain_id)>(?,?))`: a seek straight to the
+-- resume point. Without the seek, paging N pages costs O(N x rows), and this
+-- listing is both the admin UI's default view and the export tar's row
+-- source. Same reasoning the `idx_uploads_state_updated_at` comment above
+-- records for the reaper.
+--
+-- It does NOT change the other two receipt-time-ordered reads, measured
+-- rather than assumed: the RAM-pressure candidate query and the kickers'
+-- parked-row rescan both filter on a selective equality first, so SQLite
+-- keeps seeking `idx_uploads_body_location` / `idx_uploads_state_updated_at`
+-- and sorting the (small) match set. Their temp B-trees are the declared
+-- price of an oldest-first order, as `list_parked_candidates` already says.
+CREATE INDEX IF NOT EXISTS idx_uploads_received_at
+    ON uploads(received_at, chain_id);
+
 -- Deliberate duplicate of SqliteTokenCache's DDL (storage/token_cache.py).
 -- Production tokens live in the separate token_cache.db; this copy sits
 -- empty in uploads.db. A change to either definition must land in both.

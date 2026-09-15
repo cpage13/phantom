@@ -106,52 +106,83 @@ _SYNCHRONOUS_TO_PRAGMA_INT: dict[str, int] = {
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
+# The journal mode a FILE-backed store requires, as SQLite reports it back
+# (lower case). Verified after the pragma is set, because
+# ``PRAGMA journal_mode=WAL`` does NOT raise when the switch cannot happen:
+# it returns the RESULTING mode as a row, so a data_dir whose VFS lacks the
+# shared-memory support WAL needs (NFS, a 9p container volume) leaves the DB
+# in ``delete`` and the store used to boot reporting healthy (finding S2-4).
+# Two of the store's guarantees invert under a rollback journal:
+# ``synchronous=NORMAL``, the default, is corruption-safe under WAL but a
+# power cut can corrupt under a rollback journal; and the read/write
+# connection split assumes WAL readers never block the writer, so without WAL
+# every admin read becomes writer contention absorbed only by busy_timeout
+# and then a 503.
+_REQUIRED_JOURNAL_MODE: Final[str] = "wal"
+
+# The smallest page :meth:`SqliteUploadStore.list_uploads` can return. A
+# smaller limit cannot express a page at all: the keyset resume cursor is
+# built from the LAST row of the page, and a zero-row page has no last row.
+# The method used to index it anyway and raise IndexError on limit=0
+# (finding S2-9), which reads as a store bug rather than as the caller
+# precondition it is.
+_MIN_LIST_LIMIT: Final[int] = 1
+
+# What SQLite reports for an in-memory database, which has no journal file
+# for WAL to mean anything about. ``:memory:`` is a unit-test-only shape
+# (production is always file-backed), so it is exempt from the WAL assertion
+# rather than being a failure.
+_IN_MEMORY_JOURNAL_MODE: Final[str] = "memory"
+
 # The one park state. Named rather than inlined because
 # :meth:`SqliteUploadStore.list_parked_candidates` binds it as a query
 # parameter and a bare literal there reads as an arbitrary string.
 _PARKED_STATE: Final[UploadState] = "auth_expired"
 
+# Every state :meth:`SqliteUploadStore.delete_terminal_older_than` accepts.
+# It is the terminal set PLUS ``auth_expired``, which is NOT terminal and is
+# still deliverable: the auth kicker re-queues an ``auth_expired`` row when
+# its credential slot refreshes. The admission is deliberate and load-bearing
+# (the reaper's retention table drives ``auth_expired`` through this call, and
+# ``RetentionCfg.auth_expired_metadata_seconds`` is the operator knob for it),
+# but the method's name and its Protocol contract said "terminal" without
+# qualification, so an operator setting that knob to any finite value
+# hard-deletes parked, undelivered uploads through a method whose contract
+# said that could not happen (finding S2-7). Naming the set here makes the one
+# non-terminal admission visible at the guard instead of reading as a typo.
+# Only the -1 "forever" default keeps the path dormant today.
+_METADATA_REAPABLE_STATES: Final[frozenset[UploadState]] = TERMINAL_STATES | {_PARKED_STATE}
+
 # The metadata key the producer-side adapter stamps into every submission's
 # metadata key-value store. The by-local-uuid admin lookup is PINNED to this
-# key (cycle-7 task 4.2): :meth:`SqliteUploadStore.find_by_local_uuid` builds
-# its JSON1 extract path from it via :func:`_metadata_kvs_json_path`, so
+# key (cycle-7 task 4.2): :meth:`SqliteUploadStore.find_by_local_uuid` binds
+# it as the ``json_each`` key over :data:`_METADATA_KVS_PARENT_PATH`, so
 # callers never spell a JSON path. Route code that surfaces the value reads
 # THIS constant rather than re-spelling the key.
 PHANTOM_LOCAL_UUID_METADATA_KEY: Final[str] = "phantom_local_uuid"
 
 
-def _quote_json_path_label(label: str) -> str:
-    """Quote one object label for a SQLite JSON1 path.
+# The FIXED, quote-free JSON1 path to the metadata key-value store. The
+# metadata is carried in step 1's JSON body and serialized in camelCase (the
+# upstream convention: the producing client's camelCase alias generator emits
+# ``keyValueStore`` for the snake-cased Python attribute ``key_value_store``).
+# Both KVS lookups, :meth:`SqliteUploadStore.list_by_key_value` (caller-supplied
+# key) and :meth:`SqliteUploadStore.find_by_local_uuid` (pinned key), select
+# over this PARENT path with ``json_each`` and bind the key as an ordinary
+# parameter, so a key never enters a JSON-path expression at all. That is what
+# retires the previous per-key quoted-label builder: on the CI/deploy SQLite
+# (< ~3.50) an escaped ``\"`` inside a quoted label fails to parse, and
+# ``json_extract`` then yields NULL and the lookup silently reports the chain
+# absent (memory ``sqlite-jsonpath-quote-escape-version-skew``).
+_METADATA_KVS_PARENT_PATH: Final[str] = "$.steps[0].body.value.metadata.keyValueStore"
 
-    SQLite's JSON path grammar accepts double-quoted object labels with
-    backslash escapes for the quote and the backslash itself, so every
-    label is emitted quoted with ``\\`` and ``"`` escaped. This makes
-    labels containing ``.``, ``:``, ``"``, ``[``, or ``\\`` addressable
-    exactly; the pre-fix unquoted interpolation silently re-segmented
-    the path at a ``.`` and could not address such keys at all (round 2
-    defender fix R2-3). The path string itself is always BOUND as an
-    SQL parameter by the callers, never interpolated into SQL text.
-    """
-    escaped = label.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
-
-
-def _metadata_kvs_json_path(key: str) -> str:
-    """Build the JSON1 path to a metadata key-value-store entry.
-
-    The metadata is carried in step 1's JSON body and serialized in
-    camelCase (the upstream convention: the producing client's camelCase
-    alias generator emits ``keyValueStore`` for the snake-cased Python
-    attribute ``key_value_store``). The ONE place the extract path is
-    spelled; :meth:`SqliteUploadStore.list_by_key_value` (caller-supplied
-    key) and :meth:`SqliteUploadStore.find_by_local_uuid` (pinned key)
-    both build their paths here so they can never drift. The key segment
-    is quoted via :func:`_quote_json_path_label`, so KVS keys are
-    user-defined dynamic keys in the fullest sense: dots, colons,
-    quotes, and backslashes are all addressable (round 2 defender fix
-    R2-3).
-    """
-    return f"$.steps[0].body.value.metadata.keyValueStore.{_quote_json_path_label(key)}"
+# The FIXED, quote-free JSON1 path to the captured-values step map, and the
+# path INSIDE one step's entry down to its values map. Same shape and same
+# reason as the KVS pair above (finding D6): the capturing step's name is an
+# operator-supplied label, so it is matched by ``json_each`` key equality
+# rather than interpolated into a quoted path label.
+_CAPTURED_STEPS_PARENT_PATH: Final[str] = "$.steps"
+_CAPTURED_STEP_VALUES_PREFIX: Final[str] = "$.values."
 
 
 # The on-disk schema contract version for the ``uploads`` /
@@ -576,10 +607,34 @@ class SqliteUploadStore:
         transient lock on either open rides the same boot-open retry
         (``retry_on_transient_lock``, judged by the one shared
         :func:`is_transient_lock_error` classifier per ADR-023).
+
+        Raises:
+            RuntimeError: When any pragma did not take effect, journal
+                mode included (finding S2-4). Each message is unique per
+                pragma so an operator log search lands on the right line.
         """
         self._conn = await aiosqlite.connect(self._db_path)
         self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode=WAL;")
+        # journal_mode is the one pragma whose ANSWER is the assertion: it
+        # reports the resulting mode instead of raising when the switch
+        # cannot happen (finding S2-4). Read it here rather than in the
+        # verification block below, because the statement's own row is the
+        # authoritative result and a non-WAL store must not go on to apply a
+        # schema and declare itself healthy. See _REQUIRED_JOURNAL_MODE.
+        async with self._conn.execute("PRAGMA journal_mode=WAL;") as journal_cursor:
+            journal_row = await journal_cursor.fetchone()
+        observed_journal_mode = str(journal_row[0]).lower() if journal_row is not None else ""
+        if (
+            observed_journal_mode != _REQUIRED_JOURNAL_MODE
+            and observed_journal_mode != _IN_MEMORY_JOURNAL_MODE
+        ):
+            raise RuntimeError(
+                f"journal_mode pragma did not stick: expected "
+                f"{_REQUIRED_JOURNAL_MODE!r}, got {observed_journal_mode!r}; "
+                f"the data_dir filesystem at {self._db_path!r} cannot support "
+                f"WAL, and both synchronous={self._synchronous()} durability "
+                f"and the reader/writer split depend on it"
+            )
         synchronous = self._synchronous()
         await self._conn.execute(f"PRAGMA synchronous={synchronous};")
         journal_limit = self._journal_size_limit_bytes()
@@ -710,7 +765,7 @@ class SqliteUploadStore:
         return self._conn
 
     def _read_connection(self) -> aiosqlite.Connection:
-        """Return the connection every read-only method executes on.
+        """Return the connection every POINT read executes on.
 
         File-backed stores get the dedicated ``mode=ro`` reader opened by
         :meth:`start`, so reads never queue behind in-flight writes at the
@@ -725,6 +780,17 @@ class SqliteUploadStore:
         connection: a second connection to ``:memory:`` would be a
         different, empty database.
 
+        THAT STALENESS BOUND IS WHY :meth:`iter_rows` IS NOT HERE
+        (finding S2-1). A row walk holds its ``SELECT`` cursor open for
+        the whole walk, which is unbounded in duration, so a walk on this
+        connection pinned the read transaction of EVERY point read that
+        overlapped it: the invariant auditor's live re-read handed back
+        exactly the snapshot row the walk had just yielded, and cancel's
+        and replay's post-commit reads could not see their own committed
+        write. Walks take their own connection via
+        :meth:`_walk_connection`; this one stays short-statement only, so
+        its snapshot is never held past a single point read.
+
         Lifecycle posture (cycle-7 task 4.1): during a staged quarantine
         restore the reader, exactly like the writer, keeps its old file
         descriptor until the required process restart; there is NO
@@ -735,6 +801,43 @@ class SqliteUploadStore:
         if self._read_conn is not None:
             return self._read_conn
         return self._require_conn()
+
+    @asynccontextmanager
+    async def _walk_connection(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Yield the connection ONE row walk owns for its whole duration.
+
+        Finding S2-1. A walk's cursor stays open for as long as the caller
+        takes to consume it, and SQLite pins a connection's read snapshot
+        while any statement on it is active. Sharing the point-read
+        connection therefore froze every overlapping point read to the
+        walk's snapshot, which is what made the invariant auditor's
+        mid-sweep re-read echo the walk instead of the live row. A walk
+        gets a FRESH ``mode=ro`` connection, opened here and closed when
+        the walk ends, so the snapshot it pins is its own and nothing
+        else reads through it.
+
+        Opening per walk rather than holding a third long-lived
+        connection is deliberate: walks are rare (boot recovery, plus the
+        invariant auditor at its 300 s default cadence), so the open costs
+        one short-lived aiosqlite worker thread per walk and holds nothing
+        at all in between. ``:memory:`` stores keep the writer connection,
+        for the same reason :meth:`_read_connection` does: a second
+        connection to ``:memory:`` is a different, empty database. Those
+        stores are unit-test only, and on them a walk and a point read do
+        share the writer's snapshot.
+        """
+        if self._read_conn is None:
+            yield self._require_conn()
+            return
+        conn = await aiosqlite.connect(self._read_only_uri(), uri=True)
+        try:
+            conn.row_factory = aiosqlite.Row
+            # Same busy_timeout posture as the other two connections; see
+            # _DEFAULT_BUSY_TIMEOUT_MS for the value rationale (R9-V6-1).
+            await conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms()};")
+            yield conn
+        finally:
+            await conn.close()
 
     @asynccontextmanager
     async def _write_txn(self, conn: aiosqlite.Connection) -> AsyncIterator[None]:
@@ -793,7 +896,32 @@ class SqliteUploadStore:
                 raise
 
     async def insert(self, row: UploadRow) -> None:
-        """Insert a new row."""
+        """Insert a new row WITHOUT an idempotency claim.
+
+        NOT an admission path. ADR-019 makes
+        :meth:`insert_with_idempotency_claim` the one method production uses
+        to admit an upload, and this method has zero production callers; it
+        exists for seeding a row directly, which is what the unit and e2e
+        suites do several hundred times to put the store into a chosen state
+        without also minting an ``idempotency_index`` claim they did not ask
+        for.
+
+        KNOWN HAZARD, NOT YET CLOSED (finding S2-8). The 30-column INSERT
+        below is a verbatim copy of the one in
+        :meth:`insert_with_idempotency_claim`, so a new column has to be
+        added to BOTH name lists. Forgetting this one is invisible in
+        production, because nothing in production calls it, while silently
+        dropping the column for every row the suites seed: the suite would
+        then exercise a row shape production never writes. The finding's own
+        remedy is to delete this method and migrate the seeds, which is a
+        change to roughly 300 call sites across 60-odd test files. Hoisting
+        the statement into one shared constant is NOT an alternative:
+        ``scripts/check_atomic_admission.py`` asserts the H7 closure by
+        looking for the literal ``INSERT INTO uploads`` inside
+        :meth:`insert_with_idempotency_claim`'s own body, and moving the text
+        out would make that gate blind. Until one of those lands, a column
+        addition MUST touch both lists.
+        """
         conn = self._require_conn()
         async with self._write_txn(conn):
             await conn.execute(
@@ -956,17 +1084,41 @@ class SqliteUploadStore:
                     )
                 raise
 
-    async def get(self, chain_id: UUID) -> UploadRow | None:
-        """Fetch one row by chain_id (read-only connection)."""
-        conn = self._read_connection()
+    async def _total_row_count(self, conn: aiosqlite.Connection) -> int:
+        """Return the ``uploads`` row count as ``conn`` sees it.
+
+        Parameterised on the connection for the same reason
+        :meth:`_fetch_row` is: :meth:`evict_terminal_over_limit` asks the
+        point-read connection off the write lock to decide whether there
+        is any work, and the writer connection inside the lock for the
+        number its DELETE is actually sized from (finding S2-5).
+        """
+        async with conn.execute("SELECT COUNT(*) FROM uploads") as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row is not None else 0
+
+    async def _fetch_row(self, conn: aiosqlite.Connection, chain_id: UUID) -> UploadRow | None:
+        """Read one row by chain_id on ``conn``; ``None`` when absent.
+
+        Parameterised on the connection because the answer's authority
+        depends on which one asks (finding S2-3). :meth:`get` asks the
+        point-read connection, which is the right one for a caller with
+        no write of its own in flight. A writer reading back the row it
+        just committed MUST ask the WRITER connection, still inside the
+        write lock, or it can be told the row is missing.
+        """
         async with conn.execute(
             "SELECT * FROM uploads WHERE chain_id = ?",
             (str(chain_id),),
         ) as cursor:
             row = await cursor.fetchone()
-            if row is None:
-                return None
-            return _row_to_upload(row)
+        if row is None:
+            return None
+        return _row_to_upload(row)
+
+    async def get(self, chain_id: UUID) -> UploadRow | None:
+        """Fetch one row by chain_id (point-read connection)."""
+        return await self._fetch_row(self._read_connection(), chain_id)
 
     async def update_state(
         self,
@@ -1201,7 +1353,8 @@ class SqliteUploadStore:
 
         Raises:
             ValueError: When ``cursor`` is combined with the
-                ``multifile_id`` filter.
+                ``multifile_id`` filter, or when ``limit`` is below
+                :data:`_MIN_LIST_LIMIT`.
         """
         conn = self._read_connection()
         wheres: list[str] = []
@@ -1212,6 +1365,12 @@ class SqliteUploadStore:
                 "filter (results are ordered by send_order, not the "
                 "cursor's receipt-time keyset)"
             )
+        if limit < _MIN_LIST_LIMIT:
+            # Finding S2-9. The admin route declares ge=1 so this never
+            # fires from HTTP, but the Protocol offers ``limit`` with no
+            # stated precondition, and any other caller passing 0 used to
+            # get an IndexError off the cursor build below.
+            raise ValueError(f"limit must be at least {_MIN_LIST_LIMIT}, got {limit}")
         if state is not None:
             wheres.append("state = ?")
             params.append(state)
@@ -1330,30 +1489,31 @@ class SqliteUploadStore:
 
         The dynamic, caller-supplied ``key`` is matched via a table-valued
         ``json_each`` over the FIXED, quote-free parent path
-        ``$.steps[0].body.value.metadata.keyValueStore``, binding the key
-        and value as ordinary parameters (``je.key = ?`` and
-        ``je.value = ?``). The user key therefore NEVER enters a JSON-path
+        :data:`_METADATA_KVS_PARENT_PATH`, binding the key and value as
+        ordinary parameters. The user key therefore NEVER enters a JSON-path
         expression. This deliberately avoids interpolating the key into a
         quoted JSON-path label: older SQLite (the CI/deploy version, < ~3.50)
         cannot parse an escaped ``\\"`` inside a quoted label, so a
         quote-bearing KVS key (e.g. ``q"uote``) would otherwise silently miss
         the lookup (memory ``sqlite-jsonpath-quote-escape-version-skew``;
-        proven on SQLite 3.43.2 and 3.50.4). ``json_each.value`` returns the
-        JSON leaf as a SQL TEXT value for string leaves, so ``je.value = ?``
-        is the same TEXT equality the prior ``json_extract(...) = ?`` ran; a
-        missing parent path yields zero rows (a clean empty result).
+        proven on SQLite 3.43.2 and 3.50.4). A missing parent path yields
+        zero rows (a clean empty result).
 
-        :meth:`find_by_local_uuid` still uses the quoted-label
-        :func:`_metadata_kvs_json_path` form, but with a fixed, quote-free
-        pinned key, so it is unaffected by the version skew.
+        The value comparison is ``CAST(je.value AS TEXT) = ?`` rather than a
+        bare ``je.value = ?`` (finding D4). ``keyValueStore`` is unconstrained
+        producer JSON, so a key whose leaf is a JSON NUMBER arrives as SQLite
+        storage class INTEGER or REAL, and SQLite compares INTEGER to a bound
+        TEXT parameter WITHOUT conversion: the row never matched and the
+        lookup reported the chain absent, permanently and silently, for the
+        whole deployment. The CAST is a no-op on the string leaves that
+        already worked.
         """
         conn = self._read_connection()
         params: list[Any] = [key, value]
         sql = (
             "SELECT u.* FROM uploads u, "
-            "json_each(u.chain_envelope_json, "
-            "'$.steps[0].body.value.metadata.keyValueStore') je "
-            "WHERE je.key = ? AND je.value = ? "
+            f"json_each(u.chain_envelope_json, '{_METADATA_KVS_PARENT_PATH}') je "
+            "WHERE je.key = ? AND CAST(je.value AS TEXT) = ? "
         )
         if instance is not None:
             sql += "AND u.instance_id = ? "
@@ -1409,16 +1569,31 @@ class SqliteUploadStore:
     ) -> list[UploadRow]:
         """Find rows whose captured values carry ``value`` at a bound path.
 
-        The by-captured-id admin lookup (cycle-7 task 4.2): a JSON1
-        ``json_extract`` over ``captured_values_json`` following the
-        :meth:`list_by_key_value` pattern. The extract path is
-        ``$.steps.<capture_name>.values.<subpath>``: ``capture_name`` is
-        the capturing step's key under the row's captured-values ``steps``
-        map, and ``subpath`` is the dotted path within that step's
-        ``values`` map down to the identifier. Both binding values come
-        from per-instance deployment configuration
-        (``InstanceCfg.admin_lookup``), never from query params and never
-        from code, so the service stays upstream-ignorant.
+        The by-captured-id admin lookup (cycle-7 task 4.2), built on the
+        SAME ``json_each`` shape :meth:`list_by_key_value` uses. The row's
+        captured-values ``steps`` map is selected over as a table with
+        ``json_each`` at the FIXED, quote-free parent path
+        :data:`_CAPTURED_STEPS_PARENT_PATH`; ``capture_name`` is bound as an
+        ordinary parameter matched against ``je.key``, and the identifier is
+        extracted from the matched step's own JSON at
+        ``$.values.<subpath>``. Both binding values come from per-instance
+        deployment configuration (``InstanceCfg.admin_lookup``), never from
+        query params and never from code, so the service stays
+        upstream-ignorant.
+
+        WHY ``json_each`` AND NOT A QUOTED PATH LABEL (finding D6). This used
+        to interpolate ``capture_name`` into the path as a quoted label with
+        ``\\`` and ``"`` escaped. SQLite below ~3.50, which is the CI and
+        deploy version, cannot PARSE an escaped ``\\"`` inside a quoted label:
+        ``json_extract`` yields NULL, no row matches, and the route maps the
+        miss to ``found=false`` with no error anywhere. ``list_by_key_value``
+        was moved off that form for exactly this reason and this sibling was
+        left behind, uncovered by both the old-SQLite lane and the static
+        shape gate. The comparison is also CAST to TEXT (finding D4): an
+        upstream that returns ``{"fileId": 918273}`` stores a JSON number, and
+        SQLite compares INTEGER storage to a bound TEXT parameter without
+        conversion, so the lookup reported the chain absent for the entire
+        deployment.
 
         Un-indexed by design: O(rows-per-instance) at producer scale,
         exactly how :meth:`list_by_key_value` already runs. The named
@@ -1427,9 +1602,9 @@ class SqliteUploadStore:
 
         Args:
             capture_name: Key under ``$.steps`` in the captured-values
-                JSON (the capturing step's name). A SINGLE label, quoted
-                via :func:`_quote_json_path_label` so step names with
-                path-special characters cannot corrupt the path.
+                JSON (the capturing step's name). A SINGLE label, BOUND as
+                a parameter, so a step name carrying quotes, dots or
+                backslashes is matched exactly on every SQLite version.
             subpath: Dotted path under that step's ``values`` map to the
                 identifier field. A multi-segment PATH by contract
                 (``AdminLookupCfg.json_path``), interpolated as-is.
@@ -1437,24 +1612,36 @@ class SqliteUploadStore:
 
         Returns:
             All matching rows; empty list on a miss (the route maps a
-            miss to ``found=false``, not 404).
+            miss to ``found=false``, not 404). A row whose captured values
+            carry no ``steps`` map contributes no rows.
         """
         conn = self._read_connection()
-        json_path = f"$.steps.{_quote_json_path_label(capture_name)}.values.{subpath}"
-        sql = "SELECT * FROM uploads WHERE json_extract(captured_values_json, ?) = ?"
-        async with conn.execute(sql, [json_path, value]) as cur:
+        step_values_path = f"{_CAPTURED_STEP_VALUES_PREFIX}{subpath}"
+        sql = (
+            "SELECT u.* FROM uploads u, "
+            f"json_each(u.captured_values_json, '{_CAPTURED_STEPS_PARENT_PATH}') je "
+            "WHERE je.key = ? AND CAST(json_extract(je.value, ?) AS TEXT) = ?"
+        )
+        async with conn.execute(sql, [capture_name, step_values_path, value]) as cur:
             fetched = await cur.fetchall()
         return [_row_to_upload(r) for r in fetched]
 
     async def find_by_local_uuid(self, local_uuid: UUID) -> list[UploadRow]:
         """Find rows stamped with ``local_uuid`` in their metadata KVS.
 
-        The by-local-uuid admin lookup (cycle-7 task 4.2): the SAME JSON1
-        extract :meth:`list_by_key_value` runs, with the key PINNED to
+        The by-local-uuid admin lookup (cycle-7 task 4.2): the SAME
+        ``json_each`` query :meth:`list_by_key_value` runs, over the same
+        :data:`_METADATA_KVS_PARENT_PATH`, with the key PINNED to
         :data:`PHANTOM_LOCAL_UUID_METADATA_KEY` (the key the producer-side
-        adapter writes). Callers never spell a path; the path is built by
-        the shared :func:`_metadata_kvs_json_path` so this lookup and the
-        generic key-value match can never drift.
+        adapter writes). Callers never spell a path, and the two lookups now
+        share one query shape as well as one parent path, so they cannot
+        drift.
+
+        This was the third and last JSON-path site still building a quoted
+        label (finding D6). Its key is pinned and quote-free, so unlike
+        :meth:`find_by_captured_value` it was not silently missing on old
+        SQLite; it moves for the structural reason, which is that the
+        quoted-label builder should not exist for any caller to reach for.
 
         Un-indexed by design, same posture and escalation path as
         :meth:`find_by_captured_value`; this pinned key is the
@@ -1470,9 +1657,12 @@ class SqliteUploadStore:
             Phantom enforces no global uniqueness on the key.
         """
         conn = self._read_connection()
-        json_path = _metadata_kvs_json_path(PHANTOM_LOCAL_UUID_METADATA_KEY)
-        sql = "SELECT * FROM uploads WHERE json_extract(chain_envelope_json, ?) = ?"
-        async with conn.execute(sql, [json_path, str(local_uuid)]) as cur:
+        sql = (
+            "SELECT u.* FROM uploads u, "
+            f"json_each(u.chain_envelope_json, '{_METADATA_KVS_PARENT_PATH}') je "
+            "WHERE je.key = ? AND CAST(je.value AS TEXT) = ?"
+        )
+        async with conn.execute(sql, [PHANTOM_LOCAL_UUID_METADATA_KEY, str(local_uuid)]) as cur:
             fetched = await cur.fetchall()
         return [_row_to_upload(r) for r in fetched]
 
@@ -1711,7 +1901,7 @@ class SqliteUploadStore:
             await conn.commit()
 
     async def iter_rows(self, *, deliverable_only: bool = False) -> AsyncIterator[UploadRow]:
-        """Stream every row via a cursor on the read-only connection.
+        """Stream every row via a cursor on a walk-private read-only connection.
 
         Used by recovery and the invariant-audit
         coroutine (Phase 3). The cursor stays open for the duration of
@@ -1728,27 +1918,39 @@ class SqliteUploadStore:
         ``NOT IN`` is not a seek, so the plan stays a SCAN by design.
 
         WRITE-DURING-WALK posture (V1/V2 history, revised by cycle-7
-        task 4.1): the walk used to hold its ``SELECT`` cursor on the
-        single shared connection, where a concurrent write over a
-        SIGKILL-hot WAL could trigger an in-line checkpoint that
-        collided with the open cursor (``SQLITE_LOCKED``). The walk now
-        runs on the DEDICATED read-only connection, so a concurrent
-        write cannot collide with the cursor; the open read snapshot
-        merely pins the WAL from being checkpointed past it until the
-        walk finishes (benign). The collect-targets-then-write
-        discipline in :func:`phantom.workers.recovery.run_recovery` is
-        retained as good hygiene: the walk sees ONE consistent snapshot
-        and the writes land after it, which keeps recovery's sweep
-        semantics easy to reason about.
+        task 4.1 and again by finding S2-1): the walk used to hold its
+        ``SELECT`` cursor on the single shared connection, where a
+        concurrent write over a SIGKILL-hot WAL could trigger an in-line
+        checkpoint that collided with the open cursor
+        (``SQLITE_LOCKED``). Cycle-7 moved it to the dedicated read-only
+        connection, which removed the collision but introduced a worse
+        one: that connection also serves every POINT read, and an open
+        walk cursor pins its read snapshot, so for the whole walk
+        ``get()`` answered from the walk's snapshot rather than from the
+        live row. The auditor's mid-sweep re-read is exactly such a
+        ``get()``, and because ``deliverable_only=True`` had already
+        excluded terminal and stamped rows from that snapshot, all three
+        of the re-read's disjuncts were unsatisfiable by construction:
+        every delivery that finished inside the walk was reported as a
+        ``missing_body_file`` invariant violation. The same pin made
+        cancel's and replay's post-commit reads return the PRE-write row.
+        A walk now takes its own connection (:meth:`_walk_connection`),
+        so the snapshot it pins is its own; a concurrent write still
+        cannot collide with the cursor, and the open snapshot still
+        merely holds the WAL back from checkpointing past it (benign).
+        The collect-targets-then-write discipline in
+        :func:`phantom.workers.recovery.run_recovery` is retained as good
+        hygiene: the walk sees ONE consistent snapshot and the writes
+        land after it, which keeps recovery's sweep semantics easy to
+        reason about.
         """
-        conn = self._read_connection()
         sql = "SELECT * FROM uploads"
         params: tuple[str, ...] = ()
         if deliverable_only:
             placeholders = ",".join("?" * len(TERMINAL_STATES))
             sql += f" WHERE state NOT IN ({placeholders}) AND body_discarded_at IS NULL"
             params = tuple(TERMINAL_STATES)
-        async with conn.execute(sql, params) as cursor:
+        async with self._walk_connection() as conn, conn.execute(sql, params) as cursor:
             async for row in cursor:
                 yield _row_to_upload(row)
 
@@ -2045,6 +2247,19 @@ class SqliteUploadStore:
             )
             rowcount = cursor.rowcount
             await conn.commit()
+            # Read the row back on the WRITER connection while the lock is
+            # still held (finding S2-3). Taken outside the lock off the
+            # point-read connection, this read could miss the row two ways:
+            # an overlapping walk pinned that connection's snapshot behind
+            # the commit (S2-1), and any writer holding the lock next could
+            # delete the row before the read ran. Either way ``None`` came
+            # back, the KeyError below escaped as a naked 500, and the route
+            # never reached ``saturation.settle`` even though the re-queue
+            # HAD committed, so the gate under-counted a row back in flight
+            # and over-admitted past ``max_in_flight``. Inside the lock on
+            # the writer, the read always sees this transaction's own commit
+            # and no other Phantom writer can intervene.
+            row = await self._fetch_row(conn, chain_id)
         # The precheck admits every non-``attempting`` state and refuses a
         # stamped row, which USED to be argued as proof the write could not
         # miss. It is not: ``expire_row`` commits its state change to
@@ -2061,8 +2276,12 @@ class SqliteUploadStore:
                 chain_id,
                 accounting["state"],
             )
-        row = await self.get(chain_id)
         if row is None:
+            # Unreachable by construction now that the read-back runs on the
+            # writer inside the lock: the precheck above already returned for
+            # a missing row, and nothing else can delete it while we hold the
+            # lock. Kept as the narrowing that proves it to the type checker,
+            # and as the loud failure if that invariant is ever broken.
             raise KeyError(f"No upload row for chain_id={chain_id}")
         # R9-4: the in-transaction pre-state is the gate's settlement
         # input for the re-queue; a route-side pre-fetch races the
@@ -2074,7 +2293,12 @@ class SqliteUploadStore:
         return ReplayOutcome(row=row, previous_state=accounting["state"], rowcount=rowcount)
 
     async def cancel(self, chain_id: UUID) -> CancelOutcome:
-        """Transition to ``cancelled`` if non-terminal.
+        """Transition to ``cancelled`` from any cancellable state.
+
+        The guard is ``state IN ('queued','attempting','auth_expired',
+        'stored')``, which is NOT the same as "non-terminal": ``stored``
+        is in :data:`TERMINAL_STATES` and is deliberately admitted, so a
+        ``stored`` row cancels. Every other terminal state is a no-op.
 
         The pre-UPDATE state AND the pre-UPDATE H4 stamp are captured
         inside the same write transaction (R8-4): they are what the row
@@ -2089,6 +2313,13 @@ class SqliteUploadStore:
         stamp for. Unlike :meth:`replay`, cancel has no stamped-row
         refusal, so a stamped ``stored`` row reaches the UPDATE and the
         stamp decides whether it was still holding a slot.
+
+        Raises:
+            KeyError: When no row with ``chain_id`` exists. Cancel has no
+                row-missing return value, so this is how the absence
+                surfaces; the admin route pre-checks existence, leaving
+                only the window where the row is deleted between that
+                check and this write lock.
         """
         conn = self._require_conn()
         now_iso = datetime.now(tz=UTC).isoformat()
@@ -2108,6 +2339,17 @@ class SqliteUploadStore:
                 (now_iso, str(chain_id)),
             )
             await conn.commit()
+            # Read the row back on the WRITER connection while the lock is
+            # still held (finding S2-3). Taken outside the lock off the
+            # point-read connection, this read could miss a row that was
+            # very much there: an overlapping walk pinned that connection's
+            # snapshot behind the commit (S2-1), and any writer holding the
+            # lock next could delete the row first. ``None`` then raised the
+            # KeyError below as a naked 500 for a cancel that had ALREADY
+            # committed, and because the route never reached
+            # ``saturation.settle``, the cancelled row's slot and bytes
+            # stayed charged until restart.
+            row = await self._fetch_row(conn, chain_id)
         previous_state: UploadState | None = None
         previous_discarded_at: datetime | None = None
         # The release BASIS, read in the same pre-image as the predicate inputs.
@@ -2124,8 +2366,12 @@ class SqliteUploadStore:
             previous_body_size_bytes = int(fetched["body_size_bytes"])
             if fetched["body_discarded_at"]:
                 previous_discarded_at = datetime.fromisoformat(fetched["body_discarded_at"])
-        row = await self.get(chain_id)
         if row is None:
+            # The one remaining way here: no row with this chain_id existed
+            # when the lock was taken, so there was nothing to cancel. The
+            # route pre-checks existence, so this is the narrow window where
+            # the row was deleted between that check and this lock. Documented
+            # on the Protocol as cancel's one raising arm.
             raise KeyError(f"No upload row for chain_id={chain_id}")
         return CancelOutcome(
             row=row,
@@ -2294,10 +2540,22 @@ class SqliteUploadStore:
     async def vacuum(self) -> None:
         """Run ``VACUUM`` on the store.
 
-        Reclaims free pages and rebuilds the database file. Acquired
-        under the write lock so concurrent writes wait until the
-        VACUUM completes (SQLite VACUUM itself requires exclusive
-        access; the lock just keeps Phantom's own writers honest).
+        Reclaims free pages and rebuilds the database file. Runs under
+        :meth:`_write_txn` so concurrent writes wait until the VACUUM
+        completes (SQLite VACUUM itself requires exclusive access; the
+        lock just keeps Phantom's own writers honest).
+
+        WHY ``_write_txn`` AND NOT THE RAW LOCK (finding SP-6). This was
+        the one writer that took ``_write_lock`` directly, and it is the
+        writer most likely to fail on a full disk: VACUUM needs free
+        space of roughly the database's own size, so on the nearly-full
+        SD card that motivated ``auto_vacuum=NONE`` it raises "database
+        or disk is full". Under the raw lock nothing rolled back, so a
+        transaction left open on the single shared writer connection
+        stayed open and the next writer's implicit ``BEGIN`` raised
+        "cannot start a transaction within a transaction", wedging every
+        writer until restart. That is the exact cascade ``_write_txn``
+        exists to prevent, described in its own docstring.
 
         ``:memory:`` stores are exempt - VACUUM on an in-memory
         database is a no-op in SQLite but holding the write lock
@@ -2307,7 +2565,7 @@ class SqliteUploadStore:
         if self._db_path == ":memory:":
             return
         conn = self._require_conn()
-        async with self._write_lock:
+        async with self._write_txn(conn):
             await conn.execute("VACUUM;")
             await conn.commit()
 
@@ -2316,14 +2574,36 @@ class SqliteUploadStore:
         state: UploadState,
         cutoff: datetime,
     ) -> list[DeletedRowAccounting]:
-        """Reaper helper - delete terminal rows older than ``cutoff``.
+        """Reaper helper - delete metadata-reapable rows older than ``cutoff``.
 
         Returns per-row accounting captured in the same transaction so
         the reaper can release the gate for ``stored`` rows whose body
         was never separately discarded (R8-4).
+
+        ACCEPTS :data:`_METADATA_REAPABLE_STATES`, which is the terminal
+        set PLUS the non-terminal ``auth_expired`` (finding S2-7). The
+        name says "terminal" and the contract used to say only
+        "non-terminal raises", so the one admitted exception was invisible
+        to a reader of either. It is deliberate: the reaper's retention
+        table drives ``auth_expired`` through this call so that
+        ``RetentionCfg.auth_expired_metadata_seconds`` has something to
+        act on. It is also the only way a still-DELIVERABLE upload can be
+        hard-deleted, which is why it is spelled out here and in the
+        Protocol rather than left as an inline ``!=`` beside the terminal
+        test. The sibling :meth:`evict_terminal_over_limit` has no such
+        admission and must not grow one.
+
+        Raises:
+            ValueError: When ``state`` is not in
+                :data:`_METADATA_REAPABLE_STATES`, which for the
+                still-deliverable states means every one of them except
+                ``auth_expired``.
         """
-        if state not in TERMINAL_STATES and state != "auth_expired":
-            raise ValueError(f"Cannot bulk-delete non-terminal state {state!r}")
+        if state not in _METADATA_REAPABLE_STATES:
+            raise ValueError(
+                f"Cannot bulk-delete state {state!r}: only "
+                f"{sorted(_METADATA_REAPABLE_STATES)} are metadata-reapable"
+            )
         conn = self._require_conn()
         async with self._write_txn(conn):
             async with conn.execute(
@@ -2392,16 +2672,35 @@ class SqliteUploadStore:
         ``_write_lock`` hold so it is atomic against concurrent admission (a row
         admitted between the count and the delete cannot be mis-evicted, and the
         eligible-set membership is consistent).
+
+        LOCK COST (finding S2-5). The whole sequence, the ``COUNT(*)``
+        included, used to run inside that hold, and it ran on EVERY reaper
+        sweep because ``retention.max_rows`` defaults to 100_000 rather than
+        unbounded. ``COUNT(*)`` is a full covering-index scan, and ``_write_lock``
+        is the single asyncio lock admission, the sender pool, the persist
+        controller and the reaper all funnel through, so at a six-figure row
+        count every writer including admission stalled behind a scan once a
+        minute. ``busy_timeout`` cannot absorb that: the contention is
+        Phantom's own lock, not SQLITE_BUSY. The count that decides whether
+        there is any work now runs on the POINT-READ connection, off the lock;
+        the lock is taken only when the table is genuinely over cap, and the
+        authoritative count is then re-taken inside it so the delete's overage
+        and eligible set stay mutually consistent. Under cap, which is the
+        steady state the cap exists to maintain, the sweep touches the write
+        lock not at all.
         """
         if max_rows < 0:
+            return []
+        if await self._total_row_count(self._read_connection()) <= max_rows:
             return []
         conn = self._require_conn()
         placeholders = ",".join("?" * len(TERMINAL_STATES))
         async with self._write_txn(conn):
-            async with conn.execute("SELECT COUNT(*) FROM uploads") as cur:
-                count_row = await cur.fetchone()
-            total = int(count_row[0]) if count_row is not None else 0
-            overage = total - max_rows
+            # Authoritative re-count. The off-lock gate above only decides
+            # whether to get here; it is stale by construction, so the number
+            # the DELETE is sized from is read in the same transaction as the
+            # eligible-set SELECT.
+            overage = await self._total_row_count(conn) - max_rows
             if overage <= 0:
                 return []
             # Oldest-DONE-first among the terminal (evictable) states only.

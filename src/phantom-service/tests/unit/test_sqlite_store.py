@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from phantom.models.upload import UploadRow
+from phantom.models.upload import CapturedStepValues, CapturedValues, UploadRow
 from phantom.storage.interface import InsertClaimOutcome, StateTally
 from phantom.storage.sqlite_store import SqliteUploadStore
 
@@ -299,6 +299,58 @@ async def test_kv_query_addresses_special_character_keys(
     matches = await store.list_by_key_value(key, "wanted")
     assert [m.chain_id for m in matches] == [row.chain_id]
     assert await store.list_by_key_value(key, "decoy") == []
+
+
+# Capture names are operator-authored labels (the capturing step's key under
+# the captured-values ``steps`` map), so the same addressability requirement
+# applies to them as to KVS keys (finding D6). Same shapes as
+# _SPECIAL_KVS_KEYS: a colon, a dot, a quote and a backslash.
+_SPECIAL_CAPTURE_NAMES: tuple[str, ...] = (
+    "step:one",
+    "step.two",
+    'q"uote',
+    "back\\slash",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture_name", _SPECIAL_CAPTURE_NAMES)
+async def test_captured_value_query_addresses_special_character_capture_names(
+    store: SqliteUploadStore,
+    make_upload_row: Callable[..., UploadRow],
+    capture_name: str,
+) -> None:
+    """Objective: ``find_by_captured_value`` addresses a capture name exactly (D6).
+
+    Seeds a row whose captured values hang off a colon/dot/quote/backslash
+    capture name, plus a decoy step keyed by the truncation an unquoted path
+    would have read, and looks the identifier up by that capture name.
+
+    Expected outcome: exactly the seeded row, and no match for the decoy
+    value. This sits beside the KVS case deliberately: this method built the
+    capture name into an escaped quoted JSON-path label, and SQLite below
+    ~3.50 (the CI and deploy version) cannot parse the escaped quote, so the
+    lookup silently returned "chain not found". The test is GREEN either way
+    on a modern SQLite, which is exactly why it is named to run in the
+    ``unit-phantom-old-sqlite`` lane's ``special_character`` selection.
+    """
+    now = datetime.now(tz=UTC)
+
+    def step(file_id: str) -> CapturedStepValues:
+        return CapturedStepValues(
+            values={"resp": {"fileId": file_id}},
+            captured_at=now,
+            expires_at={"resp": None},
+        )
+
+    row = make_upload_row(
+        captured_values=CapturedValues(steps={capture_name: step("wanted"), "step": step("decoy")})
+    )
+    await store.insert(row)
+
+    matches = await store.find_by_captured_value(capture_name, "resp.fileId", "wanted")
+    assert [m.chain_id for m in matches] == [row.chain_id]
+    assert await store.find_by_captured_value(capture_name, "resp.fileId", "decoy") == []
 
 
 @pytest.mark.asyncio
