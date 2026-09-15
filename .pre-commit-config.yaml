@@ -25,10 +25,13 @@
 # `async with asyncio.TaskGroup()` block IS supervision (the sender's
 # nested per-instance worker pool is a legitimate structured-concurrency
 # pattern). Sanctioned unsupervised-primitive sites:
-#   - src/phantom-service/src/phantom/app.py — the SIGHUP handler's single
-#     `loop.create_task(_sighup_reload(...))` (the signal callback runs
-#     sync on the loop thread and cannot await, so it must schedule the
-#     reload as a loop task; a strong ref + done-callback prevent GC).
+#   - src/phantom-service/src/phantom/runtime/reload.py:182 — the SIGHUP
+#     handler's single `loop.create_task(_sighup_reload(...))` (the signal
+#     callback runs sync on the loop thread and cannot await, so it must
+#     schedule the reload as a loop task; a strong ref + done-callback
+#     prevent GC). app.py's lifespan INSTALLS that handler and remains the
+#     one composition root, but it does not spawn the task; naming app.py
+#     here contradicted both the real site and the script's own allowlist.
 #   - src/phantom-emulator/src/phantom_emulator/server.py — emulator's
 #     internal task spawn (test-only server). Permanent allowlist.
 #   - All tests/ paths (and src/<pkg>/tests/*).

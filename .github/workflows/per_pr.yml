@@ -111,6 +111,50 @@ jobs:
           export UV_NO_SYNC=1
           cd src/phantom-client && uv run pytest tests/unit/ -q
 
+  # Declared-floor lane for the PyPI-publishable SDK (finding S13-9).
+  # phantom-client declares requires-python = ">=3.12", but every other lane
+  # runs 3.14 and the workspace uv.lock is pinned >=3.14, because the root and
+  # the two service-side members force that intersection. So the declared floor
+  # was never RESOLVED and never EXECUTED, and a 3.13-only typing import could
+  # ship to PyPI and fail on a consumer's 3.12 interpreter with every lane
+  # green. CONTEXT.md:157 states the rule; this lane is what enforces it.
+  #
+  # Deliberately NOT `uv sync --all-packages`: that resolves the WORKSPACE
+  # lock, which cannot go below 3.14, so it would either fail or quietly hand
+  # this lane a 3.14 interpreter. The client is installed on its own, from its
+  # own pyproject.toml, against public PyPI — the same `uv pip install
+  # --python` pattern unit-phantom-old-sqlite uses to escape the workspace venv.
+  # phantom-client depends only on httpx and pydantic, no workspace member.
+  #
+  # check_client_python_floor.py hard-asserts that the interpreter IS the
+  # floor the package declares (not merely >= it) before importing every
+  # module in the package, so a workflow edit cannot silently degrade this
+  # lane to a 3.14 false-green, and a 3.13-only import in a module no unit
+  # test touches is still caught.
+  unit-phantom-client-floor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v3
+      - name: Resolve phantom-client on its declared floor
+        run: |
+          set -euo pipefail
+          PYBIN="$(which python)"
+          echo "PYBIN=$PYBIN" >> "$GITHUB_ENV"
+          uv pip install --python "$PYBIN" pytest pytest-asyncio -e src/phantom-client
+      - name: Assert the floor interpreter and import every module
+        run: |
+          set -euo pipefail
+          "$PYBIN" scripts/check_client_python_floor.py
+      - name: Run the client unit suite on the floor interpreter
+        run: |
+          set -euo pipefail
+          cd src/phantom-client
+          "$PYBIN" -m pytest tests/unit/ -q
+
   unit-phantom-emulator:
     runs-on: ubuntu-latest
     steps:
@@ -182,6 +226,13 @@ jobs:
   # E2E docker tier (audit T7): builds both images from the repo
   # Dockerfiles and drives the compose named-volume replacement matrix.
   # Separate from e2e-core so image builds never slow the core battery.
+  #
+  # THIS LANE USED TO EXIT 0 WITH EVERYTHING SKIPPED. The docker-tier module
+  # carries a module-level `skipif(not _daemon_reachable(...))`, so an
+  # unreachable daemon turned the whole tier into skips and pytest returned 0:
+  # a green badge on a lane that ran nothing. Two steps close that, a
+  # precondition and a post-condition, because the precondition alone would
+  # stop covering the lane the day a second skip reason is added.
   e2e-docker:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -191,13 +242,55 @@ jobs:
         with:
           python-version: "3.14"
       - uses: astral-sh/setup-uv@v3
+      # PRECONDITION: the daemon must be reachable. Failing here names the
+      # real cause instead of letting the tier evaporate into skips.
+      - name: Assert the Docker daemon is reachable
+        run: |
+          set -euo pipefail
+          docker info > /dev/null
       - run: |
           uv sync --all-packages
           export UV_NO_SYNC=1
-          uv run pytest tests/e2e/ -q -m docker
+          uv run pytest tests/e2e/ -q -m docker --junit-xml=docker-tier.xml
+      # POST-CONDITION: the tier must have actually executed. Any skip, any
+      # error, or an empty run fails the lane, whatever the reason.
+      - name: Assert the docker tier actually ran
+        if: always()
+        run: |
+          set -euo pipefail
+          uv run python - docker-tier.xml <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
 
-  # E2E load tier (tests/e2e/test_e2e_2[1234]_*; ~15 min via test_e2e_23).
-  # Isolated so it does not slow e2e-core; runs on every push, as before.
+          report = Path(sys.argv[1])
+          if not report.is_file():
+              raise SystemExit(f"{report}: no junit report; the docker tier did not run")
+          root = ET.parse(report).getroot()
+          suites = root.iter("testsuite")
+          total = skipped = errors = failures = 0
+          for suite in suites:
+              total += int(suite.get("tests", "0"))
+              skipped += int(suite.get("skipped", "0"))
+              errors += int(suite.get("errors", "0"))
+              failures += int(suite.get("failures", "0"))
+          executed = total - skipped - errors
+          print(f"docker tier: {total} collected, {skipped} skipped, {errors} errors, {failures} failures")
+          if total == 0:
+              raise SystemExit("the docker tier collected NO tests; this lane proves nothing")
+          if skipped or errors:
+              raise SystemExit(
+                  f"the docker tier did not fully run ({skipped} skipped, {errors} errors); "
+                  "a green badge on a lane that ran nothing is worse than no lane"
+              )
+          print(f"docker tier executed {executed} test(s)")
+          PY
+
+  # E2E load tier (the `load`-marked files: test_e2e_23_sustained_15min.py and
+  # test_e2e_24_sigkill_idempotency.py; ~15 min via test_e2e_23). The tier is
+  # selected by the MARKER, not by a filename glob; the old
+  # `test_e2e_2[1234]_*` shorthand named two files, 21 and 22, that do not
+  # exist. Isolated so it does not slow e2e-core; runs on every push, as before.
   e2e-load:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -239,11 +332,17 @@ jobs:
           uv run python scripts/check_descriptions.py
 
   # Static-shape gate for the json_each prerequisite (§0.1 / TASK 0.1b,
-  # acceptance criterion 3). Asserts list_by_key_value keys on the
-  # bound-parameter json_each form (no _metadata_kvs_json_path interpolated
-  # quoted-JSON-path), so a revert toward the version-skew bug fails on
-  # EVERY runner; ADDITIONAL to, never a substitute for, the behavioral
+  # acceptance criterion 3). Asserts all THREE JSON-path lookups
+  # (list_by_key_value, find_by_captured_value, find_by_local_uuid) key on the
+  # bound-parameter json_each form and that no quoted-JSON-path label builder
+  # exists in the storage module, so a revert toward the version-skew bug fails
+  # on EVERY runner; ADDITIONAL to, never a substitute for, the behavioral
   # unit-phantom-old-sqlite gate (which is blind on a modern 3.50.4 runner).
+  #
+  # Runs --selftest FIRST, for the same reason falsifiability-await-in-lock
+  # does: the previous version of this gate was scoped to one method and keyed
+  # on one helper's NAME, so a rename disarmed it silently and nothing in CI
+  # had ever watched it reject anything (finding S13-4).
   falsifiability-kv-json-each:
     runs-on: ubuntu-latest
     steps:
@@ -255,6 +354,7 @@ jobs:
       - run: |
           uv sync --all-packages
           export UV_NO_SYNC=1
+          uv run python scripts/check_kv_query_uses_json_each.py --selftest
           uv run python scripts/check_kv_query_uses_json_each.py
 
   # Await-inside-a-state-lock gate. Runs --selftest FIRST, because the shell
@@ -309,6 +409,28 @@ jobs:
           uv sync --all-packages
           export UV_NO_SYNC=1
           uv run python scripts/export_contracts.py --check
+
+  # Consumer-side contracts gate (finding S13-2). contracts-drift above is
+  # CIRCULAR on its own: it compares the generator's output to the generator's
+  # own committed output, and the fixtures round-trip through the same pydantic
+  # model that emitted them. This lane reads contracts/ the way a Go port does,
+  # through a third-party JSON Schema implementation with no pydantic and no
+  # phantom in the process: every schema must compile, and every committed
+  # fixture must validate against its committed schema. --selftest runs first
+  # and proves the committed schemas reject a nonconforming document.
+  contracts-consumer-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v3
+      - run: |
+          uv sync --all-packages
+          export UV_NO_SYNC=1
+          uv run python scripts/check_contract_schemas.py --selftest
+          uv run python scripts/check_contract_schemas.py
 
   # Old-SQLite gate (the json_each prerequisite, §1.4a / TASK 0.1). The per-PR
   # unit lane runs uv-managed CPython 3.14 => SQLite 3.50.4, which MASKS the

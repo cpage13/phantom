@@ -44,8 +44,8 @@ or `PHANTOM_*` env vars.
 
 ```bash
 docker run \
-  -v /var/lib/phantom:/var/lib/phantom \
-  -v /etc/phantom/phantom.yaml:/etc/phantom/phantom.yaml \
+  -v phantom-data:/var/lib/phantom \
+  -v /etc/phantom/phantom.yaml:/etc/phantom/phantom.yaml:ro \
   -e PHANTOM_SERVER__BIND_TCP=0.0.0.0:8080 \
   -p 127.0.0.1:8080:8080 \
   phantom-service:dev -c /etc/phantom/phantom.yaml
@@ -55,6 +55,49 @@ docker run \
 reaches it; the host side maps to `127.0.0.1` only, keeping the port
 loopback-only on the machine. A bare-metal run uses the config's loopback
 default with no override.)
+
+The data volume is a **named volume**, not a host path. A fresh named
+volume inherits the image's `nonroot` (UID/GID 65532) ownership from the
+data directory baked into the image, so the container can write it.
+
+#### Using a host path instead
+
+A bind mount does **not** inherit the image's ownership: the host
+directory keeps whatever ownership it has on the host, which for a
+root-created `/var/lib/phantom` means the `nonroot` runtime user cannot
+write it. Chown it on the host first:
+
+```bash
+sudo mkdir -p /var/lib/phantom
+sudo chown -R 65532:65532 /var/lib/phantom
+
+docker run \
+  -v /var/lib/phantom:/var/lib/phantom \
+  -v /etc/phantom/phantom.yaml:/etc/phantom/phantom.yaml:ro \
+  -e PHANTOM_SERVER__BIND_TCP=0.0.0.0:8080 \
+  -p 127.0.0.1:8080:8080 \
+  phantom-service:dev -c /etc/phantom/phantom.yaml
+```
+
+Skipping the `chown` does not crash the container. An unwritable data
+directory is `DegradeReason.SUBSTRATE_UNWRITABLE`
+([ADR-025](../../docs/adr/025-never-refuse-to-boot-on-recoverable-config.md) /
+[ADR-027](../../docs/adr/027-typed-boot-outcome.md)), which **degrades** the
+instance: the process stays up, `GET /v1/healthz` still answers `200` with
+`status: "ok"` because liveness is about the process, every `POST /v1/send`
+is rejected, and nothing is buffered. `GET /v1/readyz` is the signal that
+says so, with `ready: false` and a `detail` naming the fault. Confirm a
+run with:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/readyz
+# {"ready":true,"detail":null}
+```
+
+The shipped Dockerfile and compose healthchecks probe `/v1/readyz` and
+parse that body for exactly this reason. Note that `/v1/readyz` answers
+HTTP `200` even when `ready` is `false`, so any probe you write yourself
+must read the body, not just the status code.
 
 ### Compose
 
@@ -105,10 +148,17 @@ reloadable vs. restart-required knobs.
 
 - `/var/lib/phantom`: the persistent data directory. Holds the
   SQLite DB(s), body files, optional cold-backup snapshots, and any
-  flat timestamped quarantine backups. Mount a named volume or a host
-  path; the container runs as the Wolfi `nonroot` user (UID/GID
-  65532), and the data directory is created with that ownership
-  at build time so a fresh named volume inherits it.
+  flat timestamped quarantine backups. The container runs as the Wolfi
+  `nonroot` user (UID/GID 65532), and the data directory is created with
+  that ownership at build time.
+  - A **named volume** is the default in both the compose file and the
+    documented `docker run`: a fresh one inherits that nonroot ownership,
+    so it is writable with no extra step.
+  - A **host path** does not inherit it. Bind mounts keep the host's own
+    ownership, so `chown -R 65532:65532 <path>` on the host is required
+    before the run. Without it the instance boots degraded rather than
+    crashing, and only `GET /v1/readyz` reports it. See
+    [Using a host path instead](#using-a-host-path-instead).
 
 ## Port
 
@@ -119,7 +169,9 @@ bind IS the admin access control (ADR-004).
 
 - `8080` - the one listener: ingress (POST `/v1/send`), the admin surface
   (`/v1/admin/*`), and the liveness + readiness probes (`GET /v1/healthz`,
-  `GET /v1/readyz`). The Dockerfile HEALTHCHECK probes `/v1/healthz` here.
+  `GET /v1/readyz`). The Dockerfile HEALTHCHECK probes `/v1/readyz` here and
+  requires `ready: true` in the body; `/v1/healthz` is liveness only and
+  answers `200 ok` for a degraded instance that accepts no sends.
   In a container the listener binds `0.0.0.0` (via
   `PHANTOM_SERVER__BIND_TCP`) so docker's port-forward reaches it, and the
   host-side mapping (`127.0.0.1:8080:8080`) keeps it loopback-only on the

@@ -40,12 +40,18 @@ services:
       - ../../config/phantom.yaml.example:/etc/phantom/phantom.yaml:ro        # mounted config
     command: ["-c", "/etc/phantom/phantom.yaml"]
     restart: unless-stopped
-    # Liveness on the single listener (GET /v1/healthz). The check runs
-    # inside the container against 127.0.0.1, so it reaches the listener.
-    # The runtime image is shell-less, so the check uses Python's stdlib
-    # urllib (the same probe the Dockerfile HEALTHCHECK runs).
+    # Health on the single listener. The check runs inside the container
+    # against 127.0.0.1, so it reaches the listener. The runtime image is
+    # shell-less, so the check uses Python's stdlib urllib (the same probe the
+    # Dockerfile HEALTHCHECK runs).
+    #
+    # It probes /v1/readyz and READS THE BODY (finding S13-5). /v1/healthz is
+    # liveness and answers 200 "ok" even for an instance whose data directory
+    # is unwritable, which rejects every POST /v1/send and buffers nothing;
+    # /v1/readyz answers 200 with ready=false in that state, so the status
+    # code alone is not a readiness signal either.
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/v1/healthz', timeout=3).status == 200 else 1)"]
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request; r = urllib.request.urlopen('http://127.0.0.1:8080/v1/readyz', timeout=3); sys.exit(0 if r.status == 200 and json.load(r).get('ready') is True else 1)"]
       interval: 30s
       timeout: 5s
       start_period: 10s

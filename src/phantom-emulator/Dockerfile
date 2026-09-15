@@ -27,8 +27,27 @@
 # HS256 signing secret via the EMULATOR_SIGNING_KEY environment variable.
 
 
+# ---------- Base images: pinned by digest (finding S13-10) ------------------
+#
+# Same pins, same reasons, same refresh procedure as
+# src/phantom-deploy/Dockerfile, whose header documents both at length: a
+# floating `latest` is not reproducible, and the build and runtime stages
+# resolve two INDEPENDENT tags whose Python ABI must match or the copied C
+# extensions cannot be imported at container start. These are OCI image INDEX
+# digests, so multi-arch builds still resolve per platform. The ABI assertion
+# in the runtime stage turns a mismatched repin into a build failure.
+#
+# Keep these two digests equal to the service image's. They are the same two
+# upstream references, and letting the images drift apart would mean the
+# Docker-lane E2E exercises a pair the shipped service image never uses.
+#
+# Pinned 2026-09-15.
+ARG PYTHON_BUILD_IMAGE=cgr.dev/chainguard/python:latest-dev@sha256:666971ccbb01312b3e12799879a76e8b8cb574c6ed8218d6a8faa4d7ac2e493e
+ARG PYTHON_RUNTIME_IMAGE=cgr.dev/chainguard/python:latest@sha256:cbe0e6d0e3abdfc5b54938b140be046e345ef765f8658e2a165b5417cb2bb6a9
+
+
 # ---------- Stage 1: build the phantom-emulator wheel with uv, then prune ---
-FROM cgr.dev/chainguard/python:latest-dev AS build
+FROM ${PYTHON_BUILD_IMAGE} AS build
 
 WORKDIR /work
 
@@ -53,7 +72,7 @@ RUN cd emulator \
 
 
 # ---------- Stage 2: minimal runtime ----------------------------------------
-FROM cgr.dev/chainguard/python:latest AS runtime
+FROM ${PYTHON_RUNTIME_IMAGE} AS runtime
 
 # Drop /install on PYTHONPATH so the runtime Python finds the installed
 # packages without a venv.
@@ -61,6 +80,13 @@ ENV PYTHONPATH=/install \
     PYTHONUNBUFFERED=1
 
 COPY --from=build /work/install /install
+
+# ABI GATE (finding S13-10), identical to the service image's. A version-locked
+# C extension built under the build stage's interpreter carries that
+# interpreter's ABI tag in its filename, so a build/runtime pair that straddles
+# a Python minor bump cannot import it. Fail here, at build, rather than at
+# container start inside a Docker-lane E2E where it reads as a flaky test.
+RUN ["python", "-c", "import pathlib, sys, sysconfig; suffix = sysconfig.get_config_var('EXT_SUFFIX'); shared = sorted(p.name for p in pathlib.Path('/install').rglob('*.so')); locked = [n for n in shared if '.cpython-' in n]; bad = [n for n in locked if not n.endswith(suffix)]; sys.exit('ABI GATE INCONCLUSIVE: no shared objects under /install; the wheel install or the prune step changed shape, so this check proves nothing') if not shared else None; sys.exit('ABI MISMATCH between the pinned build and runtime base images: this interpreter loads ' + suffix + ' but /install carries version-locked extensions ' + repr(bad) + '. Repin PYTHON_BUILD_IMAGE and PYTHON_RUNTIME_IMAGE to one Python minor.') if bad else None; print('ABI OK: ' + repr(len(locked)) + ' version-locked and ' + repr(len(shared) - len(locked)) + ' stable-ABI extensions match ' + suffix)"]
 
 # The emulator serves the upstream-shaped API + /control surface on one
 # port (8000 by convention in the E2E compose topology; the mounted
