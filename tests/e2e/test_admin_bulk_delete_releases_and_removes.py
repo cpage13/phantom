@@ -75,13 +75,21 @@ FORCE_5XX_RATE: float = 1.0
 
 
 async def _saturation_balance(stack: E2EStack) -> float:
-    """Read the live ``saturation_balance`` no-label total off the wire."""
+    """Read the live ``saturation_balance`` across every instance, off the wire.
+
+    SUMS every label bucket. Each instance's gate writes its own bucket keyed
+    by instance id, because the metrics registry is process-wide and gauges are
+    registered by bare name, so unlabelled writes let the last instance to tick
+    overwrite every other instance's value. The deployment-wide balance is the
+    sum, and summing is correct for one instance or many; reading the
+    empty-string bucket alone now reads a bucket nothing writes.
+    """
     async with httpx.AsyncClient() as http:
         response = await http.get(f"{stack.phantom_admin_url}/v1/admin/observability/gauges")
     response.raise_for_status()
     for entry in response.json()["gauges"]:
         if entry["name"] == "saturation_balance":
-            return float(entry["values"][""])
+            return float(sum(entry["values"].values()))
     raise AssertionError("saturation_balance gauge missing from the gauges response")
 
 
