@@ -193,3 +193,40 @@ async def test_no_shadow_both_directions(
     assert state.raw_bodies["mybucket/mykey"].body == b"forward-as-is"
     # And it did NOT leak into the s3 store under {bucket: "raw", ...}.
     assert ("raw", "mybucket/mykey") not in state.s3_objects
+
+
+# One field name sent TWICE, the second occurrence under a different casing.
+# Field names are case-insensitive, so this is one field carrying two values.
+_DUPLICATE_TRACE_LINES: list[tuple[str, str]] = [("X-Trace", "one"), ("x-trace", "two")]
+
+# Every occurrence in arrival order, joined by the bare comma the service side
+# combines with.
+_COMBINED_TRACE_VALUE = "one,two"
+
+
+async def test_raw_store_keeps_both_values_of_a_duplicate_header(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """Objective: the forward-as-is sink records BOTH values of a header sent twice.
+
+    This sink is the Phase-1 oracle for forward-as-is, which is exactly where
+    "did the proxy pass the envelope through untouched?" is judged. The
+    capture was last-value-wins, so a forwarder that dropped one of two
+    identical field names produced the same record as one that forwarded both
+    and no assertion could tell them apart.
+
+    Expected outcome: ``RawBody.all_headers["x-trace"]`` is ``one,two``, the
+    case variant having combined into the same entry rather than overwritten
+    it. Against the unfixed capture this fails with the last value alone,
+    ``two``.
+    """
+    client, state = client_and_state
+
+    r = await client.put(
+        "/raw/bucket/dupheader",
+        content=b"forward-as-is",
+        headers=_DUPLICATE_TRACE_LINES,
+    )
+
+    assert r.status_code == 200
+    assert state.raw_bodies["bucket/dupheader"].all_headers["x-trace"] == _COMBINED_TRACE_VALUE

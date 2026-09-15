@@ -15,6 +15,12 @@ under ``/control/*`` and the in-process :class:`phantom_emulator.server.Server`
 oracle. That is what keeps the e2e tier (which reads the HTTP surface) and
 the conformance tier (which reads the oracle) looking at ONE implementation
 rather than at two copies that can drift apart.
+
+For the same reason the inbound-header capture (:func:`capture_headers`)
+lives here rather than in a router: it is the ground truth behind the
+``all_headers`` field of all three body stores, and every capture site must
+apply ONE rule for repeated field lines or the stores disagree about what
+arrived.
 """
 
 from __future__ import annotations
@@ -34,6 +40,8 @@ from phantom_emulator.config import AppConfig
 from phantom_emulator.control_models import ReceivedEntry
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports
+    from starlette.datastructures import Headers
+
     from phantom_emulator.auth.jwks import RsaKeyPair
     from phantom_emulator.auth.jwt_minter import JwtMinter
     from phantom_emulator.failure.injection import FailureInjectionState
@@ -47,6 +55,61 @@ UploadToken = str
 
 # Type alias for the Idempotency-Key header value.
 IdempotencyKey = str
+
+# Type alias for an inbound HTTP field name AS CAPTURED: always lower-cased,
+# because field names are case-insensitive and one field must produce exactly
+# one captured entry however the client cased its occurrences.
+HeaderName = str
+
+# Separator used when the repeated occurrences of one inbound field name are
+# combined into the single value a captured entry holds. RFC 7230 section
+# 3.2.2 permits combining repeated field lines into one, values in order,
+# separated by a comma. It carries NO trailing space because the service side
+# of this boundary combines with a bare comma too
+# (``phantom.routes.catch_all._REPEATED_HEADER_JOINER``, bare so a combined
+# line re-canonicalises under SigV4 to what the client signed over the split
+# ones). The two halves MUST agree: this emulator is the oracle that compares
+# what it received against what the service forwarded, so a joiner of its own
+# would report a value the wire never carried and would make a faithful
+# forward look like a regression.
+REPEATED_HEADER_JOINER = ","
+
+
+def capture_headers(headers: Headers) -> dict[HeaderName, str]:
+    """Capture every inbound field line, keyed by lower-cased field name.
+
+    The ground truth behind ``all_headers`` on :class:`AcceptedBody`,
+    :class:`S3Object` and :class:`RawBody`, and so behind
+    :attr:`phantom_emulator.control_models.ReceivedEntry.headers`.
+
+    REPEATED field lines are COMBINED, not overwritten. ``Headers.items()``
+    yields one entry per raw occurrence with NO merging, so capturing into a
+    dict comprehension was last-value-wins: the first value vanished before
+    any test could see it. That blinded the oracle to precisely the class of
+    regression a transparent proxy must not have - a duplicate inbound header
+    dropped, reordered or merged wrongly on the way through - because the
+    surviving value looked like a correct single-valued forward and the suite
+    certified it.
+
+    Field names are case-insensitive, so a duplicate arriving as a case
+    variant (``X-Trace`` then ``x-trace``) is the SAME field and combines into
+    one entry. ASGI lower-cases field names in the scope, so both occurrences
+    reach this function under one name already.
+
+    Args:
+        headers: The inbound request headers.
+
+    Returns:
+        One entry per distinct field name, lower-cased, whose value is every
+        occurrence of that name in arrival order joined by
+        :data:`REPEATED_HEADER_JOINER`.
+    """
+    captured: dict[HeaderName, str] = {}
+    for name, value in headers.items():
+        lowered = name.lower()
+        seen = captured.get(lowered)
+        captured[lowered] = value if seen is None else f"{seen}{REPEATED_HEADER_JOINER}{value}"
+    return captured
 
 
 class UpstreamEventKind(StrEnum):
@@ -152,20 +215,23 @@ class AcceptedBody:
             ``None`` if unset). Captured so transparent-proxy tests can
             assert byte-identity plus header preservation.
         all_headers: Every inbound HTTP header on the PUT, lowercased
-            keys with original values. Captured so transparent-proxy
-            tests can audit the full request envelope (e.g., that
-            ``X-Phantom-*`` headers were stripped, that ``Authorization``
-            carries the cached bearer byte-equal, that ``User-Agent``
-            is preserved). Multi-value headers are joined with ``", "``
-            per Starlette's header-dict semantics.
+            keys with original values, per :func:`capture_headers`.
+            Captured so transparent-proxy tests can audit the full
+            request envelope (e.g., that ``X-Phantom-*`` headers were
+            stripped, that ``Authorization`` carries the cached bearer
+            byte-equal, that ``User-Agent`` is preserved). A field name
+            that arrived more than once, under any casing, keeps ALL of
+            its values: they are joined in arrival order by
+            :data:`REPEATED_HEADER_JOINER`, the bare comma the service
+            side combines with.
         accepted_at: Server-side timestamp at acceptance.
     """
 
     upload_token: UploadToken
     body: bytes
-    headers: dict[str, str]
+    headers: dict[HeaderName, str]
     content_encoding: str | None
-    all_headers: dict[str, str]
+    all_headers: dict[HeaderName, str]
     accepted_at: datetime
 
 
@@ -194,7 +260,8 @@ class S3Object:
         all_headers: Every inbound header (lowercased keys, original
             values), captured so round-trip / transparent-proxy
             assertions can audit the envelope - mirrors
-            :attr:`AcceptedBody.all_headers`.
+            :attr:`AcceptedBody.all_headers`, repeated field lines
+            combined and all.
         stored_at: Server-side acceptance timestamp.
     """
 
@@ -203,7 +270,7 @@ class S3Object:
     method: str
     body: bytes
     content_type: str | None
-    all_headers: dict[str, str]
+    all_headers: dict[HeaderName, str]
     stored_at: datetime
 
 
@@ -214,9 +281,10 @@ class RawBody:
     The forward-as-is Phase-1 analogue of :class:`AcceptedBody`: no token,
     no auth - the full forwarded path itself is the key. Accepts any forwarded
     upload verb (PUT/POST/PATCH), recording it in :attr:`method`.
-    ``all_headers`` is captured (lowercased keys, original values) so the e2e
-    can assert that ``X-Phantom-*`` headers were stripped and a benign upstream
-    header survived.
+    ``all_headers`` is captured by :func:`capture_headers` (lowercased keys,
+    original values, repeated field lines combined) so the e2e can assert that
+    ``X-Phantom-*`` headers were stripped and a benign upstream header
+    survived.
 
     Attributes:
         path: The full forwarded path (no leading slash) used as the store
@@ -233,7 +301,8 @@ class RawBody:
         body: Raw bytes the unsigned, tokenless upload stored (byte-identical).
         content_type: The request ``Content-Type``, or ``None``.
         all_headers: Every inbound header (lowercased keys, original
-            values) - mirrors :attr:`AcceptedBody.all_headers`.
+            values) - mirrors :attr:`AcceptedBody.all_headers`, repeated
+            field lines combined and all.
         stored_at: Server-side acceptance timestamp.
     """
 
@@ -242,7 +311,7 @@ class RawBody:
     query: str
     body: bytes
     content_type: str | None
-    all_headers: dict[str, str]
+    all_headers: dict[HeaderName, str]
     stored_at: datetime
 
 

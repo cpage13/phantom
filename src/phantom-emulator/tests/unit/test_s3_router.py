@@ -34,7 +34,7 @@ from phantom.routes import catch_all
 from phantom_emulator.app import create_app
 from phantom_emulator.config import AppConfig, S3Cfg
 from phantom_emulator.routers._deps import UPLOAD_METHODS
-from phantom_emulator.state import EmulatorState
+from phantom_emulator.state import REPEATED_HEADER_JOINER, EmulatorState
 
 # The AWS-doc example pair the emulator's S3Cfg defaults to. The client
 # signs with the SAME pair so the server recompute matches.
@@ -677,3 +677,62 @@ async def test_truncated_body_after_signing_is_refused(
     assert response.status_code == 400
     assert response.json()["detail"] == "XAmzContentSHA256Mismatch"
     assert ("mybucket", "truncated") not in state.s3_objects
+
+
+# One field name sent TWICE, the second occurrence under a different casing.
+# Field names are case-insensitive, so this is one field carrying two values.
+# It is deliberately OUTSIDE the signed set, so the recompute is untouched and
+# the test is about the capture and nothing else.
+_DUPLICATE_TRACE_LINES: list[tuple[str, str]] = [("X-Trace", "one"), ("x-trace", "two")]
+
+# Every occurrence in arrival order, joined by the bare comma the service side
+# combines with.
+_COMBINED_TRACE_VALUE = "one,two"
+
+
+async def test_stored_object_keeps_both_values_of_a_duplicate_header(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """Objective: the SigV4 sink records BOTH values of a header sent twice.
+
+    This store backs the Phase-4 re-signed-upload assertions, so a duplicate
+    inbound header it flattens is a regression the transparent-proxy matrix
+    cannot see. The capture was last-value-wins, which made a dropped
+    duplicate indistinguishable from a faithful forward.
+
+    Expected outcome: ``S3Object.all_headers["x-trace"]`` is ``one,two``, the
+    case variant having combined into the same entry rather than overwritten
+    it. Against the unfixed capture this fails with the last value alone,
+    ``two``.
+    """
+    client, state = client_and_state
+    body = b"duplicate-header-payload"
+    signed = _sign("PUT", "/mybucket/dupheader", body, extra_headers=_TEXT)
+
+    r = await client.put(
+        "/mybucket/dupheader",
+        content=body,
+        headers=[*signed.items(), *_DUPLICATE_TRACE_LINES],
+    )
+
+    assert r.status_code == 200
+    assert state.s3_objects[("mybucket", "dupheader")].all_headers["x-trace"] == (
+        _COMBINED_TRACE_VALUE
+    )
+
+
+def test_repeated_header_joiner_matches_the_service_side() -> None:
+    """Objective: both halves of the boundary combine repeated headers identically.
+
+    A drift guard, NOT the behavioural witness above. The emulator is the
+    oracle that compares what it received against what the service forwarded,
+    so if the two sides ever joined repeated field lines differently a
+    faithful forward would read as a regression, and the reported value would
+    be one the wire never carried. The service's joiner is bare on purpose:
+    SigV4's canonical request joins a repeated header's values with exactly
+    that.
+
+    Expected outcome: the emulator's joiner is the same string as
+    ``catch_all._REPEATED_HEADER_JOINER``.
+    """
+    assert REPEATED_HEADER_JOINER == catch_all._REPEATED_HEADER_JOINER

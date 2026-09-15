@@ -48,6 +48,7 @@ from phantom_emulator.state import (
     MetadataCreateEvent,
     PendingUpload,
     UpstreamEventKind,
+    capture_headers,
 )
 from phantom_emulator.upload.correlation import echo_metadata_kvs, extract_metadata_kvs
 from phantom_emulator.upload.presigned import PresignedTokenStore
@@ -60,6 +61,10 @@ StateDep = Annotated[EmulatorState, Depends(get_state)]
 
 # Idempotency-Key request header name (canonical per RFC 9110-style).
 IDEMPOTENCY_HEADER: str = "idempotency-key"
+
+# Prefix of the S3 user-metadata headers the PUT path records separately on
+# :attr:`AcceptedBody.headers` (the narrower view of the same capture).
+_X_AMZ_META_PREFIX: str = "x-amz-meta-"
 
 # Query parameters the synthetic presigned URL carries. The PUT handler
 # checks BOTH against the record minted for the token, so a forwarded PUT
@@ -97,11 +102,17 @@ def _enforce_auth(request: Request, state: EmulatorState) -> None:
     An accepted bearer is recorded on the credential ledger, which is what
     later makes ``revoke_tokens`` / ``expire_all_now`` bite on a credential
     the emulator never minted itself.
+
+    The header view comes from :func:`phantom_emulator.state.capture_headers`,
+    so a request that presents ``Authorization`` TWICE is judged on both
+    values combined, the way a real upstream judges it. Flattening to the last
+    value would have authenticated a request no real upstream accepts and hid
+    the duplicate from the test that should have caught it.
     """
     if state.jwt_minter is None:
         raise HTTPException(status_code=500, detail="jwt_minter not initialized")
     policy = _resolve_auth_policy(state, request.url.path)
-    headers = dict(request.headers.items())
+    headers = capture_headers(request.headers)
     if not authenticate(headers, policy, state.jwt_minter):
         raise HTTPException(status_code=401, detail="invalid_token")
     presented = bearer_credential(headers)
@@ -337,6 +348,14 @@ async def put_upload(
     elapsed; ``413`` if the body exceeds
     :attr:`UpstreamCfg.body_max_bytes`. Stores the bytes plus any
     ``x-amz-meta-*`` headers on :class:`EmulatorState`.
+
+    Both header views come from ONE
+    :func:`phantom_emulator.state.capture_headers` pass, the ``x-amz-meta-*``
+    view being a filter of it, so a field name the forwarder sent twice
+    carries BOTH values into :attr:`AcceptedBody.all_headers` and, when it is
+    a metadata header, into :attr:`AcceptedBody.headers` as well. This is the
+    record ``/control/received`` publishes, so a duplicate header is
+    observable by a test instead of being flattened to its last value here.
     """
     pending = state.pending_uploads.get(token)
     if pending is None:
@@ -360,13 +379,10 @@ async def put_upload(
     if len(body) > state.cfg.upstream.body_max_bytes:
         raise HTTPException(status_code=413, detail="body exceeds upstream cap")
 
-    x_amz_meta: dict[str, str] = {}
-    all_headers: dict[str, str] = {}
-    for key, value in request.headers.items():
-        lower = key.lower()
-        all_headers[lower] = value
-        if lower.startswith("x-amz-meta-"):
-            x_amz_meta[lower] = value
+    all_headers = capture_headers(request.headers)
+    x_amz_meta = {
+        name: value for name, value in all_headers.items() if name.startswith(_X_AMZ_META_PREFIX)
+    }
 
     state.accepted_bodies[token] = AcceptedBody(
         upload_token=token,

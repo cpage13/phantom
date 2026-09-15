@@ -71,7 +71,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from phantom_emulator.config import S3Cfg
 from phantom_emulator.routers._deps import UPLOAD_METHODS, get_state
-from phantom_emulator.state import EmulatorState, S3Object
+from phantom_emulator.state import EmulatorState, S3Object, capture_headers
 
 logger = logging.getLogger(__name__)
 
@@ -326,13 +326,17 @@ async def put_object(bucket: str, key: str, request: Request, state: StateDep) -
     ``403 SignatureDoesNotMatch`` on any mismatch; ``413`` when the body
     exceeds the configured cap (checked before the recompute so an oversized
     body is rejected without hashing); ``404`` for a reserved bucket.
+
+    The header capture goes through :func:`phantom_emulator.state.capture_headers`,
+    so a field name the forwarder sent twice reaches
+    :attr:`S3Object.all_headers` carrying BOTH values rather than only the last.
     """
     _guard_reserved_bucket(bucket)
     body = await request.body()
     if len(body) > state.cfg.s3.body_max_bytes:
         raise HTTPException(status_code=413, detail="body exceeds upstream cap")
     _verify_sigv4(request, body, state.cfg.s3, expected_session_token=state.expected_session_token)
-    all_headers = {k.lower(): v for k, v in request.headers.items()}
+    all_headers = capture_headers(request.headers)
     state.s3_objects[(bucket, key)] = S3Object(
         bucket=bucket,
         key=key,

@@ -46,10 +46,13 @@ class ReceivedEntry(BaseModel):
             "original values. Captures the full request envelope so "
             "transparent-proxy tests can audit byte-equality of "
             "``Authorization``, absence of ``X-Phantom-*``, preservation "
-            "of ``User-Agent`` and custom producer headers. Multi-value "
-            'headers join on ``", "`` per Starlette\'s header-dict '
-            "semantics. Authorization values are recorded verbatim - "
-            "tests opt-in to assert against them."
+            "of ``User-Agent`` and custom producer headers. A field name "
+            "that arrived more than once, under any casing, keeps ALL of "
+            "its values: they are combined in arrival order separated by "
+            "a bare comma, the same joiner the service side uses, so a "
+            "duplicate header is VISIBLE here instead of being silently "
+            "reduced to its last value. Authorization values are recorded "
+            "verbatim - tests opt-in to assert against them."
         ),
     )
     body_size: int = Field(..., ge=0, description="Bytes accepted on the PUT.")
