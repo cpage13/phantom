@@ -94,7 +94,7 @@ from phantom.storage.errors import (
     ReplayRefusedAttemptingError,
 )
 from phantom.storage.integrity import (
-    list_quarantines,
+    list_quarantines_off_loop,
     load_backup_manifest,
     quarantine,
     restore_mode_switch_backup,
@@ -2153,6 +2153,12 @@ async def get_quarantine_inventory(
     entries: list[QuarantineEntry] = []
     for ctx in targets:
         paths = instance_storage_paths(data_root, ctx.cfg)
+        # The walk is hoisted and awaited OFF the event loop (SP-4). It is a
+        # recursive rglob plus a stat per file, and run inline nothing else on
+        # the loop progressed for its whole duration: no admission, no sender
+        # attempt, no heartbeat, no kicker tick. The await cannot live inside
+        # the comprehension below, which is why this is a separate statement.
+        found = await list_quarantines_off_loop(paths.data_root)
         entries.extend(
             QuarantineEntry(
                 backup_id=e.backup_id,
@@ -2165,7 +2171,7 @@ async def get_quarantine_inventory(
                 bytes=e.bytes,
                 anomaly=e.anomaly,
             )
-            for e in list_quarantines(paths.data_root)
+            for e in found
         )
     return QuarantineInventoryResponse(quarantines=entries)
 

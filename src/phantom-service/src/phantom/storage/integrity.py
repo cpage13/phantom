@@ -57,7 +57,8 @@ Public surface (plan § 5.2.1, § 1.1, cycle-7 § 4):
   reconciliation for an interrupted backup OR restore move, keyed on
   ``backup_id``.
 * :func:`list_quarantines` - manifest-driven inventory (one entry per
-  backup plus anomaly entries).
+  backup plus anomaly entries). It WALKS THE FILESYSTEM, so every async
+  caller must reach it through :func:`list_quarantines_off_loop`.
 * :func:`load_backup_manifest` / :func:`backup_manifest_path` - manifest
   addressing for the admin restore route.
 * :class:`IntegrityChecker` - thin orchestrator that bundles the
@@ -69,6 +70,7 @@ Public surface (plan § 5.2.1, § 1.1, cycle-7 § 4):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -1229,6 +1231,31 @@ def list_quarantines(data_root: Path) -> list[QuarantineInventoryEntry]:
     return backups + anomalies
 
 
+async def list_quarantines_off_loop(data_root: Path) -> list[QuarantineInventoryEntry]:
+    """Run :func:`list_quarantines` in a worker thread.
+
+    The entry point every ASYNC caller must use. :func:`list_quarantines`
+    is a synchronous ``rglob("*")`` plus a ``stat`` per file over every
+    quarantined body tree, and a quarantined tree holds the backlog for
+    ``retention.stored_body_seconds`` (six months by default), so it can
+    be hundreds of thousands of files. Called inline from a coroutine,
+    NOTHING else runs on the event loop for the whole walk: no admission,
+    no sender attempt, no heartbeat, no kicker tick. One operator opening
+    the quarantine inventory would stall the whole service.
+
+    :class:`phantom.storage.file_body_store.FileBodyStore` already moved
+    the identical walk off the loop with ``asyncio.to_thread``; this is
+    the same treatment for its sibling.
+
+    Args:
+        data_root: The per-instance ``data_root`` to inventory.
+
+    Returns:
+        The same list :func:`list_quarantines` returns.
+    """
+    return await asyncio.to_thread(list_quarantines, data_root)
+
+
 # ---------------------------------------------------------------------
 # Class facade (plan § 5.2.2 - composition-root injection point).
 # ---------------------------------------------------------------------
@@ -1247,32 +1274,17 @@ class IntegrityChecker:
     Attributes:
         db_path: Persistent SQLite path.
         body_store_root: Body-store root directory.
-        data_root: The Phantom ``storage.data_dir`` directory, supplied by
-            the composition root. No method on this class reads it: the
-            inventory is served by the free function
-            :func:`list_quarantines`, which the admin route calls with the
-            per-instance data root it already resolves. The parameter is
-            retained only because its one construction site lives in
-            ``runtime/startup_checks.py``.
     """
 
-    def __init__(
-        self,
-        *,
-        db_path: Path,
-        body_store_root: Path,
-        data_root: Path,
-    ) -> None:
+    def __init__(self, *, db_path: Path, body_store_root: Path) -> None:
         """Store paths; no side effects at construction.
 
         Args:
             db_path: Persistent SQLite path.
             body_store_root: Body-store root directory.
-            data_root: The Phantom ``storage.data_dir`` directory.
         """
         self._db_path = db_path
         self._body_store_root = body_store_root
-        self._data_root = data_root
 
     async def check(self) -> IntegrityCheckResult:
         """Run :func:`check_integrity` against the configured DB path."""
@@ -1304,6 +1316,7 @@ __all__ = [
     "check_integrity",
     "isolate_db_file",
     "list_quarantines",
+    "list_quarantines_off_loop",
     "load_backup_manifest",
     "quarantine",
     "quarantine_paths",

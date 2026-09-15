@@ -29,17 +29,10 @@ from typing import TypedDict
 
 logger = logging.getLogger(__name__)
 
-# Default TCP port when ``bind_tcp`` carries no explicit ``:port`` suffix.
-# Mirrors the ``ServerCfg.bind_tcp`` default ("127.0.0.1:8080").
 # Indent for the ``--validate`` settings dump. Two spaces, matching
 # ``scripts/export_contracts.py``'s ``_JSON_INDENT``, so every JSON this repo
 # writes for a human to read is shaped the same way.
 _SETTINGS_DUMP_INDENT: int = 2
-
-_DEFAULT_TCP_PORT: int = 8080
-# Default bind host when ``bind_tcp`` is an empty string (no host segment).
-# Loopback, matching the same-machine-only deployment default.
-_DEFAULT_TCP_HOST: str = "127.0.0.1"
 
 
 class _SslKwargs(TypedDict, total=False):
@@ -80,6 +73,7 @@ def main() -> int:
     # Imports kept inside `main` so `python -m phantom --help` doesn't load
     # the full FastAPI dep tree just to print usage.
     from phantom.config.settings import SettingsError, load_settings
+    from phantom.runtime.startup_checks import BindAddress, ConfigInvariantError, parse_bind_tcp
 
     try:
         settings = load_settings(args.config)
@@ -88,6 +82,20 @@ def main() -> int:
         # `--validate` in CI gets a non-zero exit they can branch on.
         sys.stderr.write(f"config validation failed: {exc}\n")
         return 1
+
+    # Resolve the listen address BEFORE the `--validate` branch, so a
+    # malformed `bind_tcp` is caught at deploy time by the check that
+    # advertises itself as safe to run there. `bind_tcp` is a free-form
+    # string on ServerCfg, so Pydantic cannot reject "[::1:8080" for us;
+    # without this the fault surfaced only at launch, as a raw traceback out
+    # of `int(...)`, on a config `--validate` had already passed.
+    bind: BindAddress | None = None
+    if settings.server.bind_uds is None:
+        try:
+            bind = parse_bind_tcp(settings.server.bind_tcp)
+        except ConfigInvariantError as exc:
+            sys.stderr.write(f"config validation failed: {exc}\n")
+            return 1
 
     if args.validate:
         # `model_dump_json(indent=2)` is a load-bearing print: the operator
@@ -127,10 +135,13 @@ def main() -> int:
     )
     # One uvicorn server bound to the single listener. UDS takes precedence
     # over TCP (the documented connections-table posture): when
-    # ``server.bind_uds`` is set, bind the Unix-domain socket; otherwise
-    # partition ``server.bind_tcp`` into host / port. ``uvicorn.run`` owns
-    # the process signals (clean SIGINT/SIGTERM drain); the lifespan installs
-    # SIGHUP for hot reload (a distinct signal uvicorn does not touch).
+    # ``server.bind_uds`` is set, bind the Unix-domain socket; otherwise use
+    # the host / port resolved above by the shared ``parse_bind_tcp`` - the
+    # same parse ``create_app``'s loopback warning reads, so the address that
+    # gets bound and the address the ADR-004 warning judges are one value.
+    # ``uvicorn.run`` owns the process signals (clean SIGINT/SIGTERM drain);
+    # the lifespan installs SIGHUP for hot reload (a distinct signal uvicorn
+    # does not touch).
     #
     # When ``server.tls.enabled``, ``ssl_kwargs`` (built below) is splatted
     # into the SAME call so the one socket serves HTTPS; empty otherwise
@@ -163,13 +174,10 @@ def main() -> int:
     if settings.server.bind_uds is not None:
         uvicorn.run(app, uds=settings.server.bind_uds, **ssl_kwargs)
     else:
-        host, _, port = settings.server.bind_tcp.partition(":")
-        uvicorn.run(
-            app,
-            host=host or _DEFAULT_TCP_HOST,
-            port=int(port or _DEFAULT_TCP_PORT),
-            **ssl_kwargs,
-        )
+        # Resolved above (the UDS arm is the only one that leaves it None),
+        # so the launch cannot fail on a parse the deploy-time check passed.
+        assert bind is not None
+        uvicorn.run(app, host=bind.host, port=bind.port, **ssl_kwargs)
     return 0
 
 

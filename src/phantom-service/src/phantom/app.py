@@ -26,6 +26,7 @@ import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Protocol, assert_never
 
@@ -74,6 +75,7 @@ from phantom.runtime.startup_checks import (
     MODE_SWITCH_BACKUP_COUNTER_NAME,
     SCHEMA_DISCARD_COUNTER_DESCRIPTION,
     SCHEMA_DISCARD_COUNTER_NAME,
+    ConfigInvariantError,
     DegradedInstance,
     DegradeReason,
     apply_umask,
@@ -82,6 +84,7 @@ from phantom.runtime.startup_checks import (
     check_instance_isolation,
     check_retention_floor,
     degrade_action_hint,
+    parse_bind_tcp,
     run_integrity_gate,
     run_schema_gate,
 )
@@ -725,8 +728,8 @@ async def _build_instance_context(
     :class:`DegradedInstance` when a CLASSIFIED per-instance fault means the
     instance cannot serve (§ 4D.2 / finding M4-A): each boot stage
     (directory prep, integrity gate, backup reconcile, mode guard, schema
-    gate, the two DB opens) maps its fault classes to a
-    :class:`DegradeReason` member, so a per-instance storage fault degrades
+    gate, the three DB opens, the body substrate) maps its fault classes to
+    a :class:`DegradeReason` member, so a per-instance storage fault degrades
     ONLY that instance instead of crash-looping the process. There is no
     side-channel map; the boot loop folds the returned union exhaustively
     and the ready/status surfaces read the typed results.
@@ -787,7 +790,6 @@ async def _build_instance_context(
         await run_integrity_gate(
             db_path=db_path,
             bodies_root=bodies_root,
-            data_root=data_root,
             fail_open=settings.storage.db_integrity.fail_open,
             metrics_registry=metrics_registry,
         )
@@ -904,8 +906,9 @@ async def _build_instance_context(
         )
         await schema_discard_total.inc()
 
-    # Stages 6 + 7 - the two SQLite opens. One persistent SQLite, one
-    # mode-selected BodyStore binding. The :memory: store is gone - there is
+    # Stages 6 + 7 - the SQLite opens (upload store, token cache, then the
+    # signer's credential store). The body substrate follows in stage 8.
+    # The :memory: store is gone - there is
     # no scratch tier anymore; RAM buffering lives entirely in
     # :class:`RamBodyStore` (the body half) while metadata always lands in
     # the single persistent SQLite.
@@ -1041,17 +1044,21 @@ async def _build_instance_context(
         await _stop_quietly(store, description="upload store", instance_id=cfg.id)
         raise
 
-    ram_body_store = RamBodyStore()
-    file_body_store = FileBodyStore(
-        bodies_root,
-        shard_prefix_chars=settings.storage.shard_prefix_chars,
-    )
-    upstream_client = HttpxUpstreamClient(timeout_seconds=settings.upstream.timeout_seconds)
-
-    await ram_body_store.start()
-    await file_body_store.start()
-    await upstream_client.start()
-
+    # Stage 8 - the body substrate + the upstream client, the LAST stage
+    # that can fail. Its fault classification carries more weight than the
+    # stages above it because it is the only one that runs with three
+    # SQLite connections already open: an escaping exception here abandons
+    # the upload store, the token cache and the credential store. The
+    # concrete fault is a stray FILE at ``<data_root>/bodies`` - it passes
+    # every earlier guard (the integrity, reconcile, mode and schema gates
+    # all key off the DB) and then makes ``FileBodyStore.start()`` raise
+    # OSError. Unclassified, that escapes the lifespan, uvicorn aborts, the
+    # orchestrator restarts, and each cycle leaks three connections, which
+    # is exactly the crash loop ADR-025's "always boot, degrade loudly"
+    # posture and the seam-3 typed fold exist to prevent. So the whole
+    # stage is classified: OSError degrades the ONE instance with
+    # BODY_STORE_UNAVAILABLE after closing everything this build opened.
+    #
     # Mode-selected body store + optional PersistController, composed via
     # the single shared decision table (plan § 2.3.10):
     #     hybrid  → HybridBodyStore + PersistController
@@ -1062,15 +1069,41 @@ async def _build_instance_context(
     # size-aware immediate-persist hook; each call site invokes
     # ``await controller.enqueue(chain_id)`` (idempotent, fire-and-forget).
     # The two halves are kept on the InstanceContext regardless of mode.
+    ram_body_store = RamBodyStore()
+    file_body_store = FileBodyStore(
+        bodies_root,
+        shard_prefix_chars=settings.storage.shard_prefix_chars,
+    )
+    upstream_client = HttpxUpstreamClient(timeout_seconds=settings.upstream.timeout_seconds)
     body_store: BodyStore
     persist_controller: PersistController | None
-    body_store, persist_controller = await build_body_store(
-        mode=settings.storage.body_store.mode,
-        ram_body_store=ram_body_store,
-        file_body_store=file_body_store,
-        store=store,
-        metrics_registry=metrics_registry,
-    )
+    try:
+        await ram_body_store.start()
+        await file_body_store.start()
+        await upstream_client.start()
+        body_store, persist_controller = await build_body_store(
+            mode=settings.storage.body_store.mode,
+            ram_body_store=ram_body_store,
+            file_body_store=file_body_store,
+            store=store,
+            metrics_registry=metrics_registry,
+        )
+    except OSError as exc:
+        # Close in reverse construction order. Each stop is best-effort and
+        # never masks the degrade decision (_stop_quietly logs + swallows);
+        # stopping a store that never started is a no-op on every one of
+        # these types.
+        await _stop_quietly(upstream_client, description="upstream client", instance_id=cfg.id)
+        await _stop_quietly(file_body_store, description="file body store", instance_id=cfg.id)
+        await _stop_quietly(ram_body_store, description="ram body store", instance_id=cfg.id)
+        await _stop_quietly(credential_store, description="credential store", instance_id=cfg.id)
+        await _stop_quietly(token_cache, description="token cache", instance_id=cfg.id)
+        await _stop_quietly(store, description="upload store", instance_id=cfg.id)
+        return _degraded(
+            cfg.id,
+            DegradeReason.BODY_STORE_UNAVAILABLE,
+            f"the body store at {bodies_root} could not be opened: {exc!r}",
+        )
 
     # Per-instance AD-mint construction. When ``cfg.ad_mint`` is set,
     # construct an :class:`AdMinter` that mints AD tokens proactively
@@ -1146,17 +1179,46 @@ async def _build_instance_context(
     )
 
 
-def _build_resolved_defaults_summary(settings: Settings) -> ResolvedDefaultsSummary:
-    """Project resolved-settings values into the admin-surface shape.
+def _build_resolved_defaults_summary(
+    settings: Settings, live: InstanceSettingsSnapshot | None
+) -> ResolvedDefaultsSummary:
+    """Project the CURRENTLY EFFECTIVE settings into the admin-surface shape.
 
     Probes the host once more so the admin response can echo the same
     fact set ``compute_defaults`` saw (total RAM, free disk, CPU count).
     The cost is two syscalls per ``/v1/admin/status`` request; cheap
     relative to the response build itself.
+
+    The hot-reloadable knobs are read from the LIVE snapshot, not from the
+    boot :class:`Settings`. The summary was previously built once in the
+    lifespan and bound to the route by value, so an operator who raised
+    ``saturation.max_in_flight`` and reloaded was told the boot number for
+    the rest of the process lifetime while admission enforced the new one -
+    the status surface disagreeing with the behaviour it describes, on the
+    endpoint an operator consults precisely to confirm a reload landed.
+    The blocks the snapshot carries (``saturation``, ``body_store``,
+    ``persist_trigger``) are exactly the reloadable ones. The worker count
+    sizes the worker pool at boot and is restart-required, so the boot
+    value IS its truth.
+
+    Args:
+        settings: The boot settings (the source for restart-required
+            values and the probe root).
+        live: Any instance's live snapshot - the deployment-wide blocks are
+            projected identically into every instance's snapshot. ``None``
+            before the lifespan has installed any (a non-lifespan app), in
+            which case the boot settings answer for everything.
+
+    Returns:
+        The :class:`ResolvedDefaultsSummary` for this instant.
     """
-    sat = settings.saturation
+    sat = settings.saturation if live is None else live.saturation
     storage = settings.storage
     retry = settings.retry
+    if live is not None:
+        storage = storage.model_copy(
+            update={"body_store": live.body_store, "persist_trigger": live.persist_trigger}
+        )
     assert sat.max_in_flight is not None
     assert sat.max_in_flight_bytes is not None
     assert sat.max_disk_bytes is not None
@@ -1179,6 +1241,28 @@ def _build_resolved_defaults_summary(settings: Settings) -> ResolvedDefaultsSumm
         observed_free_disk_bytes=facts.free_disk_bytes,
         observed_cpu_count=facts.cpu_count,
     )
+
+
+@dataclass
+class _DispatcherSlot:
+    """The one mutable seam in the dependency-override table.
+
+    The override table is bound once, at app construction, and every route
+    resolves its dispatcher through :meth:`get`. The lifespan publishes the
+    dispatcher it builds by assigning :attr:`dispatcher`, so there is no
+    second copy of the table to keep in step with the first. Until then the
+    slot holds an empty dispatcher, which is the truth for an app whose
+    lifespan has not run: no instance exists yet.
+
+    Attributes:
+        dispatcher: The dispatcher every route currently resolves.
+    """
+
+    dispatcher: InstanceDispatcher
+
+    def get(self) -> InstanceDispatcher:
+        """Return the currently published dispatcher (the DI provider)."""
+        return self.dispatcher
 
 
 async def _stop_instance(ctx: InstanceContext) -> None:
@@ -1214,12 +1298,30 @@ def _warn_if_bound_non_loopback(settings: Settings) -> None:
     authenticating reverse proxy. The check skips the UDS case (a UDS is a
     filesystem-permissioned local socket, not a network exposure).
 
+    The host is taken from the shared :func:`parse_bind_tcp`, so this
+    warning and the launcher's actual bind can never disagree about which
+    host is being exposed. An UNPARSEABLE ``bind_tcp`` cannot be judged
+    either way, so it warns on its own terms rather than silently passing
+    (the launcher refuses the config outright; ``create_app`` is also
+    reachable from embedders that never go through it).
+
     Args:
         settings: The resolved top-level settings.
     """
     if settings.server.bind_uds is not None:
         return
-    host, _, _ = settings.server.bind_tcp.partition(":")
+    try:
+        host = parse_bind_tcp(settings.server.bind_tcp).host
+    except ConfigInvariantError as exc:
+        logger.warning(
+            "server.bind_tcp %r could not be parsed (%s), so the loopback trust "
+            "boundary could NOT be confirmed. The admin API rides this listener "
+            "and is UNAUTHENTICATED by design (ADR-004). Fix the bind address "
+            "before serving.",
+            settings.server.bind_tcp,
+            exc,
+        )
+        return
     if host_is_loopback(host):
         return
     logger.warning(
@@ -1265,8 +1367,12 @@ def create_app(
             ``settings`` was loaded from. Required for hot reload - both
             SIGHUP and ``POST /v1/admin/reload`` re-read this file. When
             ``None`` (e.g., tests that synthesize a Settings instance),
-            hot reload is disabled (the SIGHUP handler is not installed
-            and the admin endpoint returns 422).
+            hot reload is disabled: the SIGHUP handler is not installed
+            and the admin endpoint answers 404 ``not_found`` ("hot reload
+            not configured for this process"). That is a DIFFERENT outcome
+            from the 422 ``envelope_invalid`` the same endpoint returns for
+            a YAML that fails to parse or validate: no config path at all
+            versus a bad config.
         worker_failure_callback: Production-server hook invoked when a
             supervised long-lived worker raises an ordinary exception. The
             CLI uses it to stop uvicorn, whose lifespan protocol logs
@@ -1300,6 +1406,35 @@ def create_app(
         inst_cfg.id: _build_snapshot(settings, inst_cfg) for inst_cfg in settings.instances
     }
 
+    # The dependency-override table's one mutable seam. Empty until the
+    # lifespan publishes the dispatcher it builds, which is the truth for an
+    # app whose lifespan has not run.
+    dispatcher_slot = _DispatcherSlot(InstanceDispatcher(instances))
+
+    def _phantom_default_target() -> str | None:
+        """Resolve the catch-all's default upstream to the str DI expects."""
+        if settings.phantom_default_target is None:
+            return None
+        return str(settings.phantom_default_target)
+
+    def _live_resolved_defaults() -> ResolvedDefaultsSummary:
+        """Build the admin status summary from the CURRENT settings.
+
+        Reads the live snapshot of the first configured instance: the
+        deployment-wide blocks are projected identically into every
+        instance's snapshot, and an instance that booted degraded still has
+        one (the holder is populated before any context is built). Before
+        the lifespan installs them the holder is empty, and the boot
+        settings answer instead.
+        """
+        live: InstanceSettingsSnapshot | None = None
+        if settings.instances:
+            try:
+                live = settings_holder.snapshot_for(settings.instances[0].id)
+            except KeyError:
+                live = None
+        return _build_resolved_defaults_summary(settings, live)
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         """Run the boot guards, build every instance context, serve, then shut down."""
@@ -1314,12 +1449,15 @@ def create_app(
         #   * apply_umask: bare-metal owner-only file perms (WS-4 F6).
         #   * check_retention_floor: bodies must not outlive their row.
         #   * check_instance_isolation: unique id / non-nested data_dir /
-        #     unique host_prefix so every instance is fully isolated.
+        #     unique host_prefix so every instance is fully isolated. It
+        #     takes the storage root because an instance data_dir only
+        #     means anything composed against it (the mixed relative +
+        #     absolute spelling is the collision an operator writes).
         # Each raises before any store/worker exists, so a misconfig
         # crashes startup cleanly.
         apply_umask()
         check_retention_floor(settings)
-        check_instance_isolation(settings.instances)
+        check_instance_isolation(settings.instances, data_dir_root=Path(settings.storage.data_dir))
         # Register db_quarantine_total on the process-wide registry so the
         # per-instance integrity gate's bump lands on the same surface the
         # admin observability endpoints expose (the gate also registers
@@ -1362,258 +1500,225 @@ def create_app(
         # of the in-flight cap, capped at 64 to stay below the OS
         # thread limit.
         _resize_default_executor(settings)
-        # Build instances by folding each typed BootOutcome exhaustively
-        # (cycle-7 seam 3). A healthy context joins ``instances`` and runs
-        # recovery; a DegradedInstance joins the typed degraded set - no
-        # store, no recovery, no dispatcher entry, no workers - so the rest
-        # of the process boots normally and the fault surfaces on /ready,
-        # /health, and the POST /send guard. ``assert_never`` closes the
-        # union: a future third outcome variant fails mypy strict here
-        # rather than being silently dropped. Two deliberate refusals
-        # PROPAGATE out of _build_instance_context by design (they are not
-        # outcomes): IntegrityFailClosedError (the operator's fail-closed
-        # corruption abort, ADR-025) and an unclassified fault over a
-        # writable substrate (a real bug must crash loudly).
-        for inst_cfg in settings.instances:
-            outcome: BootOutcome = await _build_instance_context(
-                settings, inst_cfg, settings_holder, metrics_registry
-            )
-            match outcome:
-                case InstanceContext():
-                    instances.append(outcome)
-                    # Recovery operates on the single persistent store + the
-                    # mode-selected body store (plan § 2.3.15).
-                    await run_recovery(outcome.store, outcome.body_store)
-                    await reconcile_saturation(outcome.store, outcome.saturation)
-                case DegradedInstance():
-                    degraded_boot.append(outcome)
-                case _:
-                    assert_never(outcome)
-            # AdMinter is no longer self-spawning. Its run-loop is
-            # spawned on the lifespan TaskGroup below (H6 closure -
-            # the unsupervised ``minter.start()`` create_task call
-            # site is gone).
-
-        dispatcher = InstanceDispatcher(instances)
-
-        # Dependency injection: bind the live dispatcher + the typed
-        # degraded set on the single app. Intake, admin, and health all
-        # resolve their dependencies from this one app's overrides.
-        resolved_defaults_summary = _build_resolved_defaults_summary(settings)
-        # Intake (POST /v1/send) + the public health/readiness probes
-        # (GET /v1/healthz, /v1/readyz).
-        app.dependency_overrides[send_routes.get_dispatcher] = lambda: dispatcher
-        app.dependency_overrides[send_routes.get_max_buffered_bytes] = lambda: (
-            settings.storage.max_buffered_bytes
-        )
-        # Seam 3 - the POST /v1/send degraded-boot guard resolves the
-        # CONFIGURED target instance over settings.instances (a degraded
-        # instance is absent from the dispatcher) and 500s if that id is in
-        # the typed degraded set. Both exist regardless of boot outcome.
-        app.dependency_overrides[send_routes.get_instance_cfgs] = lambda: settings.instances
-        app.dependency_overrides[send_routes.get_degraded_instances] = lambda: tuple(degraded_boot)
-        # The raw-intake catch-all's second destination carrier (Phase 1
-        # TASK 1.3). Stringified to the str the DI surface expects (or None
-        # when no default upstream is configured).
-        app.dependency_overrides[send_routes.get_phantom_default_target] = lambda: (
-            str(settings.phantom_default_target)
-            if settings.phantom_default_target is not None
-            else None
-        )
-        app.dependency_overrides[health_routes.get_version] = lambda: __version__
-        app.dependency_overrides[health_routes.get_dispatcher] = lambda: dispatcher
-        # Seam 3 - bind the typed degraded set so /v1/readyz + /v1/healthz
-        # report a degraded boot. The lambda snapshots the SAME list the
-        # build loop above folded into (app.state.degraded_boot mirrors it),
-        # so a probe served after the lifespan ran sees the populated set.
-        app.dependency_overrides[health_routes.get_degraded_instances] = lambda: tuple(
-            degraded_boot
-        )
-        # Admin surface (/v1/admin/*) rides the SAME app.
-        app.dependency_overrides[admin_routes.get_dispatcher] = lambda: dispatcher
-        app.dependency_overrides[admin_routes.get_version] = lambda: __version__
-        app.dependency_overrides[admin_routes.get_resolved_defaults_summary] = lambda: (
-            resolved_defaults_summary
-        )
-        # Plan § 4.2.5 - observability admin endpoints depend on the
-        # process-wide MetricsRegistry.
-        app.dependency_overrides[admin_routes.get_metrics_registry] = lambda: metrics_registry
-        # Plan § 5.2.5 - quarantine-inventory endpoint depends on the
-        # resolved storage data_dir for the filesystem walk.
-        app.dependency_overrides[admin_routes.get_data_root] = lambda: Path(
-            settings.storage.data_dir
-        )
-
-        # Spawn workers per instance under one TaskGroup. An unhandled
-        # worker exception cancels every sibling and bubbles out as an
-        # ExceptionGroup. The production CLI callback below the group then
-        # requests uvicorn shutdown; pinned uvicorn drains and then re-raises
-        # SIGTERM so the orchestrator restarts. No silent worker death.
-        assert settings.retry.worker_count is not None
-        stop_event = asyncio.Event()
-
-        # Install the SIGHUP handler before yielding control. The handler
-        # (from phantom.runtime.reload) schedules ``apply_reload`` on the
-        # running loop; the file lock inside ``SettingsHolder.replace``
-        # guarantees concurrent reloads do not interleave.
+        # The teardown try/finally opens HERE, before the first instance is
+        # built, so every context that reaches ``instances`` is torn down on
+        # any exit. Three per-instance boot faults deliberately PROPAGATE
+        # rather than degrade (IntegrityFailClosedError, ConfigCredentialError,
+        # and RecoveryLockError from the recovery sweep); with the loop outside
+        # the guard they abandoned every already-built instance's SQLite
+        # connections, httpx client and started body store, which a supervisor
+        # restart loop then leaked once per cycle.
         sighup_installed = False
-        if settings_path is not None:
-            loop = asyncio.get_running_loop()
-            try:
-                loop.add_signal_handler(
-                    signal.SIGHUP,
-                    make_sighup_handler(settings_holder, settings_path, instances),
-                )
-                sighup_installed = True
-            except _SIGHUP_INSTALL_ERRORS:
-                # add_signal_handler is unsupported on Windows event loops
-                # and may fail when running outside the main thread (e.g.,
-                # in some test harnesses). Hot reload via POST is still
-                # available - log and continue.
-                logger.warning("SIGHUP handler not installed; admin reload endpoint only")
-
         try:
-            async with asyncio.TaskGroup() as tg:
-                for ctx in instances:
-                    sender = Sender(
-                        instance=ctx,
-                        worker_count=settings.retry.worker_count,
-                        poll_interval_ms=settings.retry.poll_interval_ms,
-                        metrics_registry=metrics_registry,
+            # Build instances by folding each typed BootOutcome exhaustively
+            # (cycle-7 seam 3). A healthy context joins ``instances`` and runs
+            # recovery; a DegradedInstance joins the typed degraded set - no
+            # store, no recovery, no dispatcher entry, no workers - so the rest
+            # of the process boots normally and the fault surfaces on /ready,
+            # /health, and the POST /send guard. ``assert_never`` closes the
+            # union: a future third outcome variant fails mypy strict here
+            # rather than being silently dropped. Two deliberate refusals
+            # PROPAGATE out of _build_instance_context by design (they are not
+            # outcomes): IntegrityFailClosedError (the operator's fail-closed
+            # corruption abort, ADR-025) and an unclassified fault over a
+            # writable substrate (a real bug must crash loudly).
+            for inst_cfg in settings.instances:
+                outcome: BootOutcome = await _build_instance_context(
+                    settings, inst_cfg, settings_holder, metrics_registry
+                )
+                match outcome:
+                    case InstanceContext():
+                        instances.append(outcome)
+                        # Recovery operates on the single persistent store + the
+                        # mode-selected body store (plan § 2.3.15).
+                        await run_recovery(outcome.store, outcome.body_store)
+                        await reconcile_saturation(outcome.store, outcome.saturation)
+                    case DegradedInstance():
+                        degraded_boot.append(outcome)
+                    case _:
+                        assert_never(outcome)
+                # AdMinter is no longer self-spawning. Its run-loop is
+                # spawned on the lifespan TaskGroup below (H6 closure -
+                # the unsupervised ``minter.start()`` create_task call
+                # site is gone).
+
+            # Publish the live dispatcher. The dependency-override TABLE is
+            # bound once, at app construction (see ``_bind_dependencies``);
+            # this slot is the one mutable seam in it, so the lifespan
+            # publishes the built instances instead of re-binding every
+            # override a second time.
+            dispatcher_slot.dispatcher = InstanceDispatcher(instances)
+
+            # Spawn workers per instance under one TaskGroup. An unhandled
+            # worker exception cancels every sibling and bubbles out as an
+            # ExceptionGroup. The production CLI callback below the group then
+            # requests uvicorn shutdown; pinned uvicorn drains and then re-raises
+            # SIGTERM so the orchestrator restarts. No silent worker death.
+            assert settings.retry.worker_count is not None
+            stop_event = asyncio.Event()
+
+            # Install the SIGHUP handler before yielding control. The handler
+            # (from phantom.runtime.reload) schedules ``apply_reload`` on the
+            # running loop. There is no file lock anywhere in Phantom: what
+            # keeps two concurrent reloads (a second SIGHUP, or a SIGHUP
+            # racing POST /v1/admin/reload) from interleaving is the in-process
+            # mutex ``apply_reload`` takes across its whole load-swap-push
+            # span. ``SettingsHolder.replace`` locks only its own dict swap.
+            if settings_path is not None:
+                loop = asyncio.get_running_loop()
+                try:
+                    loop.add_signal_handler(
+                        signal.SIGHUP,
+                        make_sighup_handler(settings_holder, settings_path, instances),
                     )
-                    kicker = Kicker(instance=ctx, flavour=PHANTOM_BEARER_FLAVOUR)
-                    # The SAME class in its other flavour (CL2). It reads the
-                    # SAME ctx (which carries ``signer_creds``); its oracle
-                    # reports itself unconfigured when ``ctx.signer_creds is
-                    # None`` (the bearer-only deployment), so it registers no
-                    # wake-handler and its rescan returns early. Spawning it on
-                    # every instance's TaskGroup is uniform and inert by
-                    # default.
-                    cred_kicker = Kicker(instance=ctx, flavour=AWS_SIGV4_FLAVOUR)
-                    vacuum = VacuumScheduler(
-                        instance=ctx, cron_spec=settings.storage.sqlite.vacuum_cron
-                    )
-                    tg.create_task(sender.run(stop_event), name=f"sender-{ctx.cfg.id}")
-                    tg.create_task(kicker.run(stop_event), name=f"auth-kicker-{ctx.cfg.id}")
-                    tg.create_task(
-                        cred_kicker.run(stop_event), name=f"credential-kicker-{ctx.cfg.id}"
-                    )
-                    tg.create_task(vacuum.run(stop_event), name=f"vacuum-{ctx.cfg.id}")
-                    # Plan § 5.2.6 - optional per-instance cold backup.
-                    # Each instance has its own data_root/uploads.db, so
-                    # one scheduler per instance when the operator opts in
-                    # via db_integrity.backup_enabled. Writes only to
-                    # <data_root>/backups/ - the live DB stays single-writer
-                    # (plan § 0.5). Driven by stop_event like every other
-                    # lifespan worker so the TaskGroup drains cleanly on
-                    # shutdown (an unstoppable loop would block teardown).
-                    if settings.storage.db_integrity.backup_enabled:
-                        backup_paths = instance_storage_paths(
-                            Path(settings.storage.data_dir), ctx.cfg
-                        )
-                        cold_backup = ColdBackupScheduler(
-                            db_path=backup_paths.db_path,
-                            backup_root=backup_paths.data_root / "backups",
-                            settings=settings,
-                        )
-                        tg.create_task(
-                            cold_backup.run(stop_event),
-                            name=f"cold-backup-{ctx.cfg.id}",
-                        )
-                    # H6 audit closure - AdMinter run-loop is now
-                    # supervised by the lifespan TaskGroup. An unhandled
-                    # exception (AuthUnavailableError with empty backoff,
-                    # azure-identity import failure, etc.) propagates as
-                    # an ExceptionGroup out of this ``async with`` and
-                    # crashes the process visibly; the orchestrator
-                    # restarts it. Pre-Phase-2 the minter spawned its
-                    # own asyncio.create_task - that task was
-                    # unsupervised and a silent exception left the
-                    # runtime believing the minter was healthy.
-                    if ctx.minter is not None:
-                        tg.create_task(
-                            ctx.minter.run(stop_event),
-                            name=f"ad-minter-{ctx.cfg.id}",
-                        )
-                    # Mode-gated workers (plan § 2.3.10 + § 2.3.12 / § 2.3.13 /
-                    # § 2.3.14). The PersistController only makes sense in
-                    # ``hybrid`` mode (RAM source + disk target); the
-                    # RamPressureWatcher relies on it. DiskPressureProbe
-                    # samples the file body store, so it is meaningful in
-                    # ``hybrid`` and ``all_disk``. BodyOrphanJanitor sweeps
-                    # disk orphans only - same two modes. ``all_ram`` spawns
-                    # none of these.
-                    if ctx.persist_controller is not None:
-                        # The watcher reads ceiling and cadence from the
-                        # instance's live snapshot per tick (R6-2), so it
-                        # takes no config values here.
-                        ram_watcher = RamPressureWatcher(
+                    sighup_installed = True
+                except _SIGHUP_INSTALL_ERRORS:
+                    # add_signal_handler is unsupported on Windows event loops
+                    # and may fail when running outside the main thread (e.g.,
+                    # in some test harnesses). Hot reload via POST is still
+                    # available - log and continue.
+                    logger.warning("SIGHUP handler not installed; admin reload endpoint only")
+
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    for ctx in instances:
+                        sender = Sender(
                             instance=ctx,
-                            persist_controller=ctx.persist_controller,
+                            worker_count=settings.retry.worker_count,
+                            poll_interval_ms=settings.retry.poll_interval_ms,
                             metrics_registry=metrics_registry,
                         )
-                        tg.create_task(
-                            ctx.persist_controller.run(stop_event),
-                            name=f"persist-controller-{ctx.cfg.id}",
+                        kicker = Kicker(instance=ctx, flavour=PHANTOM_BEARER_FLAVOUR)
+                        # The SAME class in its other flavour (CL2). It reads the
+                        # SAME ctx (which carries ``signer_creds``); its oracle
+                        # reports itself unconfigured when ``ctx.signer_creds is
+                        # None`` (the bearer-only deployment), so it registers no
+                        # wake-handler and its rescan returns early. Spawning it on
+                        # every instance's TaskGroup is uniform and inert by
+                        # default.
+                        cred_kicker = Kicker(instance=ctx, flavour=AWS_SIGV4_FLAVOUR)
+                        vacuum = VacuumScheduler(
+                            instance=ctx, cron_spec=settings.storage.sqlite.vacuum_cron
                         )
+                        tg.create_task(sender.run(stop_event), name=f"sender-{ctx.cfg.id}")
+                        tg.create_task(kicker.run(stop_event), name=f"auth-kicker-{ctx.cfg.id}")
                         tg.create_task(
-                            ram_watcher.run(stop_event),
-                            name=f"ram-pressure-{ctx.cfg.id}",
+                            cred_kicker.run(stop_event), name=f"credential-kicker-{ctx.cfg.id}"
                         )
-                    mode = settings.storage.body_store.mode
-                    if mode in ("hybrid", "all_disk"):
-                        disk_probe = DiskPressureProbe(instance=ctx)
-                        tg.create_task(
-                            disk_probe.run(stop_event),
-                            name=f"disk-probe-{ctx.cfg.id}",
-                        )
-                        janitor = BodyOrphanJanitor(
-                            store=ctx.store,
+                        tg.create_task(vacuum.run(stop_event), name=f"vacuum-{ctx.cfg.id}")
+                        # Plan § 5.2.6 - optional per-instance cold backup.
+                        # Each instance has its own data_root/uploads.db, so
+                        # one scheduler per instance when the operator opts in
+                        # via db_integrity.backup_enabled. Writes only to
+                        # <data_root>/backups/ - the live DB stays single-writer
+                        # (plan § 0.5). Driven by stop_event like every other
+                        # lifespan worker so the TaskGroup drains cleanly on
+                        # shutdown (an unstoppable loop would block teardown).
+                        if settings.storage.db_integrity.backup_enabled:
+                            backup_paths = instance_storage_paths(
+                                Path(settings.storage.data_dir), ctx.cfg
+                            )
+                            cold_backup = ColdBackupScheduler(
+                                db_path=backup_paths.db_path,
+                                backup_root=backup_paths.data_root / "backups",
+                                settings=settings,
+                            )
+                            tg.create_task(
+                                cold_backup.run(stop_event),
+                                name=f"cold-backup-{ctx.cfg.id}",
+                            )
+                        # H6 audit closure - AdMinter run-loop is now
+                        # supervised by the lifespan TaskGroup. An unhandled
+                        # exception (AuthUnavailableError with empty backoff,
+                        # azure-identity import failure, etc.) propagates as
+                        # an ExceptionGroup out of this ``async with`` and
+                        # crashes the process visibly; the orchestrator
+                        # restarts it. Pre-Phase-2 the minter spawned its
+                        # own asyncio.create_task - that task was
+                        # unsupervised and a silent exception left the
+                        # runtime believing the minter was healthy.
+                        if ctx.minter is not None:
+                            tg.create_task(
+                                ctx.minter.run(stop_event),
+                                name=f"ad-minter-{ctx.cfg.id}",
+                            )
+                        # Mode-gated workers (plan § 2.3.10 + § 2.3.12 / § 2.3.13 /
+                        # § 2.3.14). The PersistController only makes sense in
+                        # ``hybrid`` mode (RAM source + disk target); the
+                        # RamPressureWatcher relies on it. DiskPressureProbe
+                        # samples the file body store, so it is meaningful in
+                        # ``hybrid`` and ``all_disk``. BodyOrphanJanitor sweeps
+                        # disk orphans only - same two modes. ``all_ram`` spawns
+                        # none of these.
+                        if ctx.persist_controller is not None:
+                            # The watcher reads ceiling and cadence from the
+                            # instance's live snapshot per tick (R6-2), so it
+                            # takes no config values here.
+                            ram_watcher = RamPressureWatcher(
+                                instance=ctx,
+                                persist_controller=ctx.persist_controller,
+                                metrics_registry=metrics_registry,
+                            )
+                            tg.create_task(
+                                ctx.persist_controller.run(stop_event),
+                                name=f"persist-controller-{ctx.cfg.id}",
+                            )
+                            tg.create_task(
+                                ram_watcher.run(stop_event),
+                                name=f"ram-pressure-{ctx.cfg.id}",
+                            )
+                        mode = settings.storage.body_store.mode
+                        if mode in ("hybrid", "all_disk"):
+                            disk_probe = DiskPressureProbe(instance=ctx)
+                            tg.create_task(
+                                disk_probe.run(stop_event),
+                                name=f"disk-probe-{ctx.cfg.id}",
+                            )
+                            janitor = BodyOrphanJanitor(
+                                store=ctx.store,
+                                body_store=ctx.body_store,
+                                # Cadence reads the live snapshot per loop
+                                # iteration (T1 / ADR-031).
+                                current_settings=ctx.current_settings,
+                                metrics_registry=metrics_registry,
+                            )
+                            tg.create_task(
+                                janitor.run(stop_event),
+                                name=f"body-orphan-janitor-{ctx.cfg.id}",
+                            )
+
+                    reaper = Reaper(instances=instances, metrics_registry=metrics_registry)
+                    tg.create_task(reaper.run(stop_event), name="reaper")
+                    # Plan § 4.2.3 - InvariantAuditor runs in every mode.
+                    # One audit coroutine per instance - each instance has its
+                    # own store/body_store pair so the audit is scoped per
+                    # instance.
+                    for ctx in instances:
+                        auditor = InvariantAuditor(
+                            store=ctx.store,  # type: ignore[arg-type]
                             body_store=ctx.body_store,
                             # Cadence reads the live snapshot per loop
-                            # iteration (T1 / ADR-031).
+                            # iteration (R9-1 / ADR-031).
                             current_settings=ctx.current_settings,
                             metrics_registry=metrics_registry,
                         )
                         tg.create_task(
-                            janitor.run(stop_event),
-                            name=f"body-orphan-janitor-{ctx.cfg.id}",
+                            auditor.run(stop_event),
+                            name=f"invariant-audit-{ctx.cfg.id}",
                         )
 
-                tg.create_task(
-                    Reaper(instances=instances, metrics_registry=metrics_registry).run(stop_event),
-                    name="reaper",
-                )
-                # Plan § 4.2.3 - InvariantAuditor runs in every mode.
-                # One audit coroutine per instance - each instance has its
-                # own store/body_store pair so the audit is scoped per
-                # instance.
-                for ctx in instances:
-                    auditor = InvariantAuditor(
-                        store=ctx.store,  # type: ignore[arg-type]
-                        body_store=ctx.body_store,
-                        # Cadence reads the live snapshot per loop
-                        # iteration (R9-1 / ADR-031).
-                        current_settings=ctx.current_settings,
-                        metrics_registry=metrics_registry,
-                    )
-                    tg.create_task(
-                        auditor.run(stop_event),
-                        name=f"invariant-audit-{ctx.cfg.id}",
-                    )
-
-                try:
-                    yield
-                finally:
-                    stop_event.set()
-        except BaseExceptionGroup:
-            # TaskGroup wraps ordinary child exceptions in a group. Python
-            # deliberately re-raises child SystemExit/KeyboardInterrupt
-            # directly; do not broaden this to BaseException because normal
-            # ASGI lifespan cancellation must not masquerade as a worker crash.
-            if worker_failure_callback is not None:
-                worker_failure_callback()
-            raise
+                    try:
+                        yield
+                    finally:
+                        stop_event.set()
+            except BaseExceptionGroup:
+                # TaskGroup wraps ordinary child exceptions in a group. Python
+                # deliberately re-raises child SystemExit/KeyboardInterrupt
+                # directly; do not broaden this to BaseException because normal
+                # ASGI lifespan cancellation must not masquerade as a worker crash.
+                if worker_failure_callback is not None:
+                    worker_failure_callback()
+                raise
         finally:
             if sighup_installed:
                 with suppress_signal_handler_errors():
@@ -1675,64 +1780,48 @@ def create_app(
     # carries the rationale for its envelope code and status.
     admin_routes.register_admin_error_handlers(app)
 
-    # Pre-register dependency overrides so tests can boot the app without
-    # the lifespan (FastAPI dependency_overrides survives outside the
-    # lifespan). The lifespan rebinds them with the live dispatcher.
-    app.dependency_overrides.setdefault(
-        send_routes.get_dispatcher,
-        lambda: InstanceDispatcher(instances),
-    )
-    app.dependency_overrides.setdefault(
-        send_routes.get_max_buffered_bytes,
-        lambda: settings.storage.max_buffered_bytes,
-    )
-    # Seam 3 - the POST /v1/send degraded-boot guard deps. Bound to the live
-    # config + the same typed degraded list the lifespan folds into, so a
-    # non-lifespan boot resolves real config (the set is empty until the
-    # lifespan runs).
-    app.dependency_overrides.setdefault(
-        send_routes.get_instance_cfgs,
-        lambda: settings.instances,
-    )
-    app.dependency_overrides.setdefault(
-        send_routes.get_degraded_instances,
-        lambda: tuple(degraded_boot),
-    )
-    # The raw-intake catch-all's second destination carrier (Phase 1 TASK
-    # 1.3), bound here so a non-lifespan TestClient sees the same wiring.
-    app.dependency_overrides.setdefault(
-        send_routes.get_phantom_default_target,
-        lambda: (
-            str(settings.phantom_default_target)
-            if settings.phantom_default_target is not None
-            else None
-        ),
-    )
-    # The /v1/healthz + /v1/readyz probes resolve their own placeholders
-    # (distinct from the admin router's), bound here so a non-lifespan
-    # TestClient sees the same wiring.
-    app.dependency_overrides.setdefault(
-        health_routes.get_version,
-        lambda: __version__,
-    )
-    app.dependency_overrides.setdefault(
-        health_routes.get_dispatcher,
-        lambda: InstanceDispatcher(instances),
-    )
-    # Seam 3 - the /v1/readyz + /v1/healthz degraded-boot signal reads the
-    # same typed set.
-    app.dependency_overrides.setdefault(
-        health_routes.get_degraded_instances,
-        lambda: tuple(degraded_boot),
-    )
-    # Admin dep fallbacks for a non-lifespan TestClient (the lifespan
-    # rebinds them with the live dispatcher).
-    app.dependency_overrides.setdefault(
-        admin_routes.get_dispatcher,
-        lambda: InstanceDispatcher(instances),
-    )
-    app.dependency_overrides.setdefault(
-        admin_routes.get_version,
-        lambda: __version__,
+    # ONE dependency-override table, applied ONCE. Intake, admin and health
+    # all resolve from this single mapping, so a route whose dependency is
+    # added here cannot be reachable-but-unbound on one boot path and bound
+    # on the other. It was previously written twice - once in the lifespan
+    # and once here as a ``setdefault`` fallback - and had already drifted:
+    # ``get_resolved_defaults_summary``, ``get_metrics_registry`` and
+    # ``get_data_root`` existed only in the lifespan copy, so a TestClient
+    # that never enters the lifespan turned every observability and
+    # quarantine request into a NotImplementedError 500.
+    #
+    # Every entry resolves per request through a closure over live state, so
+    # binding before the lifespan runs costs nothing: the degraded set and
+    # the dispatcher slot are read at call time, not at bind time.
+    app.dependency_overrides.update(
+        {
+            # Intake (POST /v1/send) + the raw-intake catch-all.
+            send_routes.get_dispatcher: dispatcher_slot.get,
+            send_routes.get_max_buffered_bytes: lambda: settings.storage.max_buffered_bytes,
+            # Seam 3 - the POST /v1/send degraded-boot guard resolves the
+            # CONFIGURED target instance over settings.instances (a degraded
+            # instance is absent from the dispatcher) and 500s if that id is
+            # in the typed degraded set. Both exist regardless of outcome.
+            send_routes.get_instance_cfgs: lambda: settings.instances,
+            send_routes.get_degraded_instances: lambda: tuple(degraded_boot),
+            # The catch-all's second destination carrier (Phase 1 TASK 1.3),
+            # stringified to the str the DI surface expects.
+            send_routes.get_phantom_default_target: _phantom_default_target,
+            # The public liveness/readiness probes resolve their OWN
+            # placeholders, distinct from the admin router's.
+            health_routes.get_version: lambda: __version__,
+            health_routes.get_dispatcher: dispatcher_slot.get,
+            health_routes.get_degraded_instances: lambda: tuple(degraded_boot),
+            # Admin surface (/v1/admin/*), riding the SAME app.
+            admin_routes.get_dispatcher: dispatcher_slot.get,
+            admin_routes.get_version: lambda: __version__,
+            # Rebuilt per request from the LIVE snapshot, so a reloaded cap
+            # is what /v1/admin/status reports (S3-6).
+            admin_routes.get_resolved_defaults_summary: _live_resolved_defaults,
+            # Plan § 4.2.5 - the observability endpoints' process-wide registry.
+            admin_routes.get_metrics_registry: lambda: metrics_registry,
+            # Plan § 5.2.5 - the quarantine inventory's filesystem root.
+            admin_routes.get_data_root: lambda: Path(settings.storage.data_dir),
+        }
     )
     return app

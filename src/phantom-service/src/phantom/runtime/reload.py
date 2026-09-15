@@ -36,6 +36,7 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
+from weakref import WeakKeyDictionary
 
 import yaml  # type: ignore[import-untyped]  # types-PyYAML not in workspace dev deps
 from pydantic import ValidationError
@@ -79,6 +80,80 @@ current member, and it is listed explicitly because it subclasses
 escape both consumers. All of them strike before any snapshot swap, so
 the running config is unaffected.
 """
+
+_reload_locks: Final[WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]] = (
+    WeakKeyDictionary()
+)
+"""The reload mutex, one per event loop.
+
+:func:`apply_reload` is a read-modify-write over live state that spans an
+await boundary: it swaps the snapshot map, then pushes the new retry
+strategy and the new saturation caps into every live instance. Nothing
+serialised that span. ``SettingsHolder.replace`` locks only the dict swap
+itself, and both triggers can fire concurrently - the SIGHUP handler
+schedules a task per signal and tracks several in flight by design, and
+``POST /v1/admin/reload`` is an ordinary request handler. Two interleaved
+reloads therefore left the gate and the retry strategy on one generation
+while every per-tick snapshot reader saw the other, and nothing corrected
+it until the next reload. The two generations need not even differ in
+YAML: ``reload_from_yaml`` re-probes the host, so ``max_disk_bytes`` and
+``ram_ceiling_bytes`` legitimately differ between two reads of one file.
+
+Keyed by the RUNNING LOOP rather than held as one module-level lock
+because an :class:`asyncio.Lock` binds to the first loop that awaits it
+and raises on a second one; a process that runs more than one loop over
+its lifetime (every async test session does) would otherwise fail on the
+second. Weak keys so a finished loop's entry is collected with it. The
+entry is a mutex and nothing else: it carries no reload state, and
+serialising is its whole contract, so two apps sharing one loop sharing
+one lock is correct, not a collision.
+"""
+
+
+def _reload_lock() -> asyncio.Lock:
+    """Return the reload mutex belonging to the running event loop.
+
+    Returns:
+        The :class:`asyncio.Lock` for this loop, created on first use.
+        See :data:`_reload_locks` for why the lock is per loop.
+    """
+    loop = asyncio.get_running_loop()
+    lock = _reload_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _reload_locks[loop] = lock
+    return lock
+
+
+def _is_configured(holder: SettingsHolder, instance_id: str) -> bool:
+    """Return whether ``instance_id`` is one of THIS process's instances.
+
+    The membership test the topology arms need. It asks the holder, not
+    the live context list: the lifespan installs one snapshot per
+    CONFIGURED instance before any context is built, so an instance that
+    booted DEGRADED (a classified storage fault, no context, no
+    dispatcher entry - ADR-027) has a holder entry and no context. Testing
+    against the contexts therefore reported a configured-but-degraded
+    instance as "added by the YAML" on EVERY reload: a misleading warning
+    pointing the operator at a topology change instead of the storage
+    fault, a deleted holder entry, and a 200 body that silently omitted a
+    configured instance.
+
+    ``snapshot_for`` is the holder's only public read and it documents the
+    ``KeyError``, so this is the membership test its API affords.
+
+    Args:
+        holder: The live :class:`SettingsHolder`.
+        instance_id: The id to test.
+
+    Returns:
+        ``True`` when the holder carries a snapshot for ``instance_id``.
+    """
+    try:
+        holder.snapshot_for(instance_id)
+    except KeyError:
+        return False
+    return True
 
 
 async def _reload_minter(
@@ -236,6 +311,10 @@ async def apply_reload(
 ) -> list[str]:
     """Reload settings from YAML and swap live state atomically.
 
+    Runs under the per-loop reload mutex (:data:`_reload_locks`), so two
+    concurrent reloads queue rather than interleave: the snapshot swap and
+    the live-state pushes below always land as one generation.
+
     Shared by the SIGHUP handler and ``POST /v1/admin/reload``. Loads a
     fresh :class:`Settings` from ``settings_path`` with the host probe
     ON (R7-1: a probe-reliant YAML, the documented smart-defaults
@@ -266,10 +345,15 @@ async def apply_reload(
         instances: The live list of :class:`InstanceContext`. Order is
             preserved across reload; instances added or removed by the
             YAML are NOT handled here (the operator must restart the
-            process for topology changes).
+            process for topology changes). It holds only instances that
+            booted HEALTHY, so it is not the membership test for "is this
+            id configured" - :func:`_is_configured` asks the holder.
 
     Returns:
-        Sorted list of instance ids whose snapshots were installed.
+        Sorted list of instance ids whose snapshots were installed. A
+        configured instance that booted degraded is included: its snapshot
+        is installed like any other, and omitting it would under-report the
+        configured topology.
 
     Raises:
         yaml.YAMLError: If the YAML payload is unparseable.
@@ -282,93 +366,106 @@ async def apply_reload(
             is unaffected; every member of ``RELOAD_FAILURE_ERRORS``
             shares that guarantee.
     """
-    # Probe ON (the classmethod's default): omitted probe-fillable knobs
-    # re-resolve from current machine facts, and Pydantic validation
-    # completes BEFORE the swap below, so a refused reload never touches
-    # the live snapshots (R7-1; ADR-013 atomicity).
-    new_settings = Settings.reload_from_yaml(settings_path)
-    # The retention floor is a CROSS-FIELD invariant pydantic cannot express,
-    # so it rides here rather than in RetentionCfg: bodies must never outlive
-    # their row. The reaper reads retention from the live snapshot per sweep,
-    # so an inverted window installed by a reload takes effect on the next
-    # sweep and strands RAM bodies that RamBodyStore.list_orphans can never
-    # reclaim (F14). Boot runs the identical check (app.py); this is the
-    # second door, not a second rule.
-    check_retention_floor(new_settings)
-    # R9-2: body_store.mode is restart-required (the store wiring is
-    # composition-time per ADR-025/ADR-013), but _build_snapshot
-    # projects the FULL BodyStoreCfg into the live snapshots and
-    # admission reads the mode per request. Unguarded, a reloaded mode
-    # mints rows whose body_location contradicts the wired stores
-    # (boot-hybrid + reload-all_disk births 'file' rows whose bytes
-    # live in RAM: invariant #1 broken at insert, the rows quarantined
-    # corrupted on the next restart). Preserve the LIVE mode in the
-    # reloaded config and WARN, mirroring the ad_mint and topology
-    # restart-required postures.
-    if instances:
-        live_mode = holder.snapshot_for(instances[0].cfg.id).body_store.mode
-        if new_settings.storage.body_store.mode != live_mode:
+    # ONE reload at a time. The whole load-swap-push span is the critical
+    # section, not just the dict swap inside ``SettingsHolder.replace``:
+    # the pushes below write live state (the retry strategy, the gate
+    # caps) that no worker re-derives from the snapshot per tick, so two
+    # interleaved reloads could leave those on one generation while every
+    # snapshot reader saw the other. See :data:`_reload_locks`.
+    async with _reload_lock():
+        # Probe ON (the classmethod's default): omitted probe-fillable knobs
+        # re-resolve from current machine facts, and Pydantic validation
+        # completes BEFORE the swap below, so a refused reload never touches
+        # the live snapshots (R7-1; ADR-013 atomicity).
+        new_settings = Settings.reload_from_yaml(settings_path)
+        # The retention floor is a CROSS-FIELD invariant pydantic cannot express,
+        # so it rides here rather than in RetentionCfg: bodies must never outlive
+        # their row. The reaper reads retention from the live snapshot per sweep,
+        # so an inverted window installed by a reload takes effect on the next
+        # sweep and strands RAM bodies that RamBodyStore.list_orphans can never
+        # reclaim (F14). Boot runs the identical check (app.py); this is the
+        # second door, not a second rule.
+        check_retention_floor(new_settings)
+        # R9-2: body_store.mode is restart-required (the store wiring is
+        # composition-time per ADR-025/ADR-013), but _build_snapshot
+        # projects the FULL BodyStoreCfg into the live snapshots and
+        # admission reads the mode per request. Unguarded, a reloaded mode
+        # mints rows whose body_location contradicts the wired stores
+        # (boot-hybrid + reload-all_disk births 'file' rows whose bytes
+        # live in RAM: invariant #1 broken at insert, the rows quarantined
+        # corrupted on the next restart). Preserve the LIVE mode in the
+        # reloaded config and WARN, mirroring the ad_mint and topology
+        # restart-required postures.
+        if instances:
+            live_mode = holder.snapshot_for(instances[0].cfg.id).body_store.mode
+            if new_settings.storage.body_store.mode != live_mode:
+                logger.warning(
+                    "Reload changed body_store.mode from %s to %s; the deployment "
+                    "mode is restart-required (ADR-013) - keeping %s live",
+                    live_mode,
+                    new_settings.storage.body_store.mode,
+                    live_mode,
+                )
+                preserved_body_store = new_settings.storage.body_store.model_copy(
+                    update={"mode": live_mode}
+                )
+                preserved_storage = new_settings.storage.model_copy(
+                    update={"body_store": preserved_body_store}
+                )
+                new_settings = new_settings.model_copy(update={"storage": preserved_storage})
+        snapshots = {cfg.id: _build_snapshot(new_settings, cfg) for cfg in new_settings.instances}
+        # R9-7: an instance the new YAML ADDS does not exist in this process
+        # (topology is restart-required, same as the omission leg). Warn
+        # like the omission leg does, install no dead holder entry, and do
+        # not report the id as reloaded - a 200 naming it would be positive
+        # confirmation of an instance that is not running.
+        #
+        # "Added" means NOT CONFIGURED IN THIS PROCESS, which is the holder's
+        # key set, not the live context list: an instance that booted
+        # degraded is configured (it has a boot snapshot) and simply has no
+        # context. Comparing against the contexts called it "added" on every
+        # reload - see :func:`_is_configured`.
+        configured_ids = {i for i in snapshots if _is_configured(holder, i)}
+        for added_id in sorted(set(snapshots) - configured_ids):
             logger.warning(
-                "Reload changed body_store.mode from %s to %s; the deployment "
-                "mode is restart-required (ADR-013) - keeping %s live",
-                live_mode,
-                new_settings.storage.body_store.mode,
-                live_mode,
+                "Reload added instance %s; topology changes require a process "
+                "restart - the instance is NOT running and was not installed",
+                added_id,
             )
-            preserved_body_store = new_settings.storage.body_store.model_copy(
-                update={"mode": live_mode}
-            )
-            preserved_storage = new_settings.storage.model_copy(
-                update={"body_store": preserved_body_store}
-            )
-            new_settings = new_settings.model_copy(update={"storage": preserved_storage})
-    snapshots = {cfg.id: _build_snapshot(new_settings, cfg) for cfg in new_settings.instances}
-    # R9-7: an instance the new YAML ADDS does not exist in this process
-    # (topology is restart-required, same as the omission leg). Warn
-    # like the omission leg does, install no dead holder entry, and do
-    # not report the id as reloaded - a 200 naming it would be positive
-    # confirmation of an instance that is not running.
-    live_ids = {ctx.cfg.id for ctx in instances}
-    for added_id in sorted(set(snapshots) - live_ids):
-        logger.warning(
-            "Reload added instance %s; topology changes require a process "
-            "restart - the instance is NOT running and was not installed",
-            added_id,
-        )
-        del snapshots[added_id]
-    # R8-1: a live instance the new YAML omits keeps its previous
-    # snapshot. The holder must never lose a running instance's entry:
-    # every per-tick live read (watcher cadence + ceiling, sender linger
-    # + retention, reaper interval, admission, observability) resolves
-    # holder.snapshot_for(cfg.id), and an evicted entry turns the next
-    # read into a KeyError that escapes the worker loop and tears the
-    # whole process down through the TaskGroup. ADR-013's posture for
-    # topology drift is warn-and-keep-running until restart; the warning
-    # below logs per omitted instance.
-    for ctx in instances:
-        if ctx.cfg.id not in snapshots:
-            snapshots[ctx.cfg.id] = holder.snapshot_for(ctx.cfg.id)
-    await holder.replace(snapshots)
-    # Per-instance live-state propagation. Build a lookup by id so
-    # reload-order independence is explicit (the YAML may reorder
-    # instances; we still match each context to its block by id).
-    new_by_id = {cfg.id: cfg for cfg in new_settings.instances}
-    for ctx in instances:
-        new_cfg = new_by_id.get(ctx.cfg.id)
-        if new_cfg is None:
-            # Operator removed this instance from the YAML - keep
-            # the live instance running with its previous settings (a
-            # topology change requires a process restart).
-            logger.warning("Reload omitted instance %s; keeping previous config", ctx.cfg.id)
-            continue
-        await _reload_minter(ctx, new_cfg, ctx.token_cache)
-        _warn_on_restart_required_drift(ctx.cfg, new_cfg)
-        # Rebuild the retry strategy from the freshly-loaded block so
-        # reloaded retry parameters reach the sender's next scheduling
-        # decision (R5-2). Mirrors the saturation cap push below: a
-        # reload-time push for state the sender does not re-derive
-        # from the snapshot per decision.
-        ctx.retry_strategy = build_retry_strategy(new_settings.retry.default_strategy)
-        snapshot = holder.snapshot_for(ctx.cfg.id)
-        await ctx.saturation.update_caps(snapshot.saturation)
-    return sorted(snapshots.keys())
+            del snapshots[added_id]
+        # R8-1: a live instance the new YAML omits keeps its previous
+        # snapshot. The holder must never lose a running instance's entry:
+        # every per-tick live read (watcher cadence + ceiling, sender linger
+        # + retention, reaper interval, admission, observability) resolves
+        # holder.snapshot_for(cfg.id), and an evicted entry turns the next
+        # read into a KeyError that escapes the worker loop and tears the
+        # whole process down through the TaskGroup. ADR-013's posture for
+        # topology drift is warn-and-keep-running until restart; the warning
+        # below logs per omitted instance.
+        for ctx in instances:
+            if ctx.cfg.id not in snapshots:
+                snapshots[ctx.cfg.id] = holder.snapshot_for(ctx.cfg.id)
+        await holder.replace(snapshots)
+        # Per-instance live-state propagation. Build a lookup by id so
+        # reload-order independence is explicit (the YAML may reorder
+        # instances; we still match each context to its block by id).
+        new_by_id = {cfg.id: cfg for cfg in new_settings.instances}
+        for ctx in instances:
+            new_cfg = new_by_id.get(ctx.cfg.id)
+            if new_cfg is None:
+                # Operator removed this instance from the YAML - keep
+                # the live instance running with its previous settings (a
+                # topology change requires a process restart).
+                logger.warning("Reload omitted instance %s; keeping previous config", ctx.cfg.id)
+                continue
+            await _reload_minter(ctx, new_cfg, ctx.token_cache)
+            _warn_on_restart_required_drift(ctx.cfg, new_cfg)
+            # Rebuild the retry strategy from the freshly-loaded block so
+            # reloaded retry parameters reach the sender's next scheduling
+            # decision (R5-2). Mirrors the saturation cap push below: a
+            # reload-time push for state the sender does not re-derive
+            # from the snapshot per decision.
+            ctx.retry_strategy = build_retry_strategy(new_settings.retry.default_strategy)
+            snapshot = holder.snapshot_for(ctx.cfg.id)
+            await ctx.saturation.update_caps(snapshot.saturation)
+        return sorted(snapshots.keys())

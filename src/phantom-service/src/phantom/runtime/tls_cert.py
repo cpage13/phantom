@@ -40,7 +40,7 @@ import ipaddress
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -48,7 +48,23 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 if TYPE_CHECKING:
+    from cryptography.hazmat.primitives.asymmetric.types import PublicKeyTypes
+
     from phantom.config.settings import TlsCfg
+
+
+class _HasPublicKey(Protocol):
+    """Anything that can hand over its public half.
+
+    Both :class:`x509.Certificate` and every loaded private-key type satisfy
+    this, which is what lets one helper serialize either side of the pair
+    for comparison.
+    """
+
+    def public_key(self) -> PublicKeyTypes:
+        """Return the public half."""
+        ...  # pragma: no cover - Protocol stub.
+
 
 logger = logging.getLogger(__name__)
 
@@ -135,23 +151,65 @@ def _validate_operator_paths(cert_path: str, key_path: str) -> tuple[str, str]:
 def _resolve_autogen(data_dir: str) -> tuple[str, str]:
     """Mint / reuse / rotate the self-signed pair under ``<data_dir>/tls/``.
 
-    Generates when the cert is missing, unparseable, or expired / within
-    :data:`RENEWAL_SKEW` of expiry; otherwise reuses the present-and-valid pair.
+    Generates when EITHER half of the pair is missing, unparseable or
+    mismatched, or when the cert is expired / within :data:`RENEWAL_SKEW` of
+    expiry; otherwise reuses the present-and-valid pair.
     """
     tls_dir = Path(data_dir) / _AUTOGEN_DIRNAME
     cert_path = tls_dir / _AUTOGEN_CERT_NAME
     key_path = tls_dir / _AUTOGEN_KEY_NAME
 
-    if _needs_regeneration(cert_path):
+    if _needs_regeneration(cert_path, key_path):
         _generate_self_signed(tls_dir, cert_path, key_path)
     return str(cert_path), str(key_path)
 
 
-def _needs_regeneration(cert_path: Path) -> bool:
-    """Return whether the cert at ``cert_path`` is absent, corrupt, or expiring.
+def _public_key_der(key: _HasPublicKey) -> bytes:
+    """Return a key holder's public half as DER SubjectPublicKeyInfo bytes.
 
-    Reuse only a cert that loads cleanly AND whose tz-aware
-    ``not_valid_after_utc`` is more than :data:`RENEWAL_SKEW` in the future.
+    The comparable form: two objects describe the same key pair iff their
+    SubjectPublicKeyInfo encodings are byte-equal. Serializing rather than
+    comparing key objects keeps the check algorithm-agnostic, so a
+    hand-placed EC or Ed25519 pair is judged as correctly as the RSA pair
+    this module mints.
+
+    Args:
+        key: Anything exposing ``public_key()`` - a certificate or a loaded
+            private key.
+
+    Returns:
+        The DER-encoded SubjectPublicKeyInfo.
+    """
+    return key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+def _needs_regeneration(cert_path: Path, key_path: Path) -> bool:
+    """Return whether the auto-gen PAIR must be re-minted.
+
+    Both halves are inspected, because uvicorn needs both and it loads them
+    long after this module has decided the pair is fine. Checking only the
+    certificate meant a valid cert beside a missing, unreadable or
+    MISMATCHED key was returned unchanged, and the process then died inside
+    ``load_cert_chain`` with a ``FileNotFoundError`` or an ``ssl.SSLError``
+    - after ``create_app`` had already logged a healthy factory. Since a
+    minted cert stays valid for :data:`CERT_VALIDITY` (825 days), every
+    restart took that identical branch: a self-healing path that could not
+    heal the half that was actually broken.
+
+    Reuse only when: the cert loads cleanly, its tz-aware
+    ``not_valid_after_utc`` is more than :data:`RENEWAL_SKEW` in the future,
+    the key loads cleanly, and the key's public half matches the cert's.
+
+    Args:
+        cert_path: The auto-gen certificate path.
+        key_path: The auto-gen private-key path (unencrypted by design; see
+            the module docstring).
+
+    Returns:
+        ``True`` when the pair must be regenerated.
     """
     if not cert_path.is_file():
         return True
@@ -176,6 +234,34 @@ def _needs_regeneration(cert_path: Path) -> bool:
             cert_path,
             cert.not_valid_after_utc.isoformat(),
             RENEWAL_SKEW,
+        )
+        return True
+    if not key_path.is_file():
+        logger.warning(
+            "TLS cert at %s is valid but its private key %s is missing; "
+            "regenerating the pair (uvicorn would otherwise fail at bind)",
+            cert_path,
+            key_path,
+        )
+        return True
+    try:
+        # password=None: auto-gen keys are written unencrypted (see the
+        # module docstring), so an encrypted file here is not ours and is
+        # replaced like any other unusable key.
+        key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+    except (ValueError, TypeError, OSError) as exc:
+        logger.warning(
+            "TLS private key at %s could not be loaded (%s); regenerating the pair",
+            key_path,
+            exc,
+        )
+        return True
+    if _public_key_der(key) != _public_key_der(cert):
+        logger.warning(
+            "TLS private key at %s does not match the certificate at %s; "
+            "regenerating the pair (a mismatched pair fails the TLS handshake)",
+            key_path,
+            cert_path,
         )
         return True
     return False

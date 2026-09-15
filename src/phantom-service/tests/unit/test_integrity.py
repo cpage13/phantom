@@ -959,11 +959,7 @@ async def test_integrity_checker_check_delegates_to_check_integrity(tmp_path: Pa
     await _create_real_sqlite(db_path)
     body_root = tmp_path / "body_store"
     body_root.mkdir()
-    checker = IntegrityChecker(
-        db_path=db_path,
-        body_store_root=body_root,
-        data_root=tmp_path,
-    )
+    checker = IntegrityChecker(db_path=db_path, body_store_root=body_root)
     result = await checker.check()
     assert result.ok is True
     assert result.message == "ok"
@@ -974,11 +970,7 @@ async def test_integrity_checker_check_flags_corruption(tmp_path: Path) -> None:
     db_path = tmp_path / "uploads.db"
     await _create_real_sqlite(db_path)
     _corrupt_first_bytes(db_path)
-    checker = IntegrityChecker(
-        db_path=db_path,
-        body_store_root=tmp_path / "body_store",
-        data_root=tmp_path,
-    )
+    checker = IntegrityChecker(db_path=db_path, body_store_root=tmp_path / "body_store")
     result = await checker.check()
     assert result.ok is False
 
@@ -992,11 +984,7 @@ def test_integrity_checker_quarantine_now_tolerates_missing(tmp_path: Path, miss
         db_path.write_bytes(b"x")
     if missing != "body":
         body_root.mkdir()
-    checker = IntegrityChecker(
-        db_path=db_path,
-        body_store_root=body_root,
-        data_root=tmp_path,
-    )
+    checker = IntegrityChecker(db_path=db_path, body_store_root=body_root)
     manifest = checker.quarantine_now(_FIXED_TS)
     assert manifest.has_db == (missing != "db")
     assert manifest.has_body == (missing != "body")
