@@ -114,6 +114,12 @@ async def test_budget_exhausted_path_reaches_stored(
     Row effects pinned: attempts incremented by one on this path, the
     typed 5xx last_error, the upstream status code recorded, no next
     attempt, sent_at untouched.
+
+    Coverage note (finding S12-3): the empty ``FixedIntervalsStrategy([])``
+    ladder is what makes this the STORED path, and it means the handler
+    returns before its retry-linger block ever runs. This test therefore
+    covers NOTHING of the RAM-to-disk linger trigger, which is pinned by
+    ``test_retry_linger_persist_enqueue.py``.
     """
     instance = await _build_instance(tmp_path, retry_strategy=FixedIntervalsStrategy([]))
     row = make_upload_row(state="attempting", route_name="files", attempts=0)

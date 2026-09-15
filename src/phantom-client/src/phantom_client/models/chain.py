@@ -379,8 +379,13 @@ class ChainEnvelope(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Response shapes - what Phantom returns on submit and on
-# ``GET /v1/admin/chains/{chain_id}``.
+# Response shapes - what Phantom returns on submit.
+#
+# These are the INGRESS ack shapes only. The admin read surface is
+# elsewhere: ``GET /v1/admin/chains/{chain_id}`` answers with
+# :class:`phantom_client.models.admin.ChainAdminDetail`, and
+# ``GET /v1/admin/chains`` plus the ``/replay`` and ``/cancel`` posts
+# answer with :class:`phantom_client.models.status.UploadRow`.
 # ---------------------------------------------------------------------------
 
 
@@ -400,7 +405,17 @@ class CapturedStep(BaseModel):
 
 
 class ChainResponse(BaseModel):
-    """Phantom's reply to submit_chain and the shape of GET /v1/admin/chains/{chain_id}."""
+    """Phantom's synthetic 202 ack for ``POST /v1/send`` (and the raw-intake catch-all).
+
+    This is the INGRESS reply shape and nothing else. It is NOT the shape
+    of ``GET /v1/admin/chains/{chain_id}``, which answers with
+    :class:`phantom_client.models.admin.ChainAdminDetail`. This model is
+    strict and ``extra="forbid"``, so validating a real admin detail
+    response against it raises ``ValidationError`` on the thirteen fields
+    the detail carries beyond these four. The admin LIST route and the
+    ``/replay`` and ``/cancel`` posts answer with
+    :class:`phantom_client.models.status.UploadRow`.
+    """
 
     model_config = ConfigDict(strict=True, extra="forbid")
 

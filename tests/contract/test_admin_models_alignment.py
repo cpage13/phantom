@@ -43,6 +43,19 @@ The test runs in two modes:
   allowed (the SDK drops them silently); SDK-declared fields the
   service doesn't emit are not, that's broken-on-arrival.
 
+Both registries below are hand-written, and a hand-written registry is
+only as good as its completeness check.
+:func:`test_every_cross_package_duplicate_is_pinned_by_a_drift_test`
+walks both packages and fails if any class duplicated across them is in
+no registry at all, here or in the chain-envelope sibling. Without it a
+duplicated model is unguarded exactly when someone forgets it, which is
+when the guard matters (finding S12-5). The comment further down records
+that six models had already escaped this net once, one of them drifted;
+the fix then was to hand-add six names rather than to close the hole,
+and the sweep found four more when it was finally added:
+``SigV4StaticCredBody``, ``ProfileRefCredBody``, ``SigningService`` and
+``ResolvedDefaultsSummary``.
+
 See:
 
 - ADR-004: admin endpoints loopback / no auth.
@@ -54,11 +67,18 @@ See:
 from __future__ import annotations
 
 import difflib
+import importlib
+import importlib.util
+import inspect
 import json
+import pkgutil
+from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import pytest
 from phantom.models import admin as service_admin
+from phantom.models import credential as service_credential
 from phantom.models import upload as service_upload
 from phantom_client.models import admin as client_admin
 from phantom_client.models import status as client_status
@@ -169,6 +189,28 @@ _STRICT_MODELS: tuple[tuple[str, type[BaseModel], type[BaseModel]], ...] = (
         service_admin.KeyValueMatchFilter,
         client_admin.KeyValueMatchFilter,
     ),
+    # Finding S12-5: the completeness sweep below found four more
+    # duplicated types in NEITHER registry. Three are the request bodies
+    # for PUT /v1/admin/credentials/{dest_host} (ADR-033), so unguarded
+    # drift there fails every operator credential push at runtime with no
+    # test turning red; the fourth is the resolved-defaults echo on the
+    # admin status surface. All four compared byte-equal when pinned, so
+    # this closed an unguarded gap rather than a live drift.
+    (
+        "SigV4StaticCredBody",
+        service_credential.SigV4StaticCredBody,
+        client_admin.SigV4StaticCredBody,
+    ),
+    (
+        "ProfileRefCredBody",
+        service_credential.ProfileRefCredBody,
+        client_admin.ProfileRefCredBody,
+    ),
+    (
+        "ResolvedDefaultsSummary",
+        service_admin.ResolvedDefaultsSummary,
+        client_admin.ResolvedDefaultsSummary,
+    ),
 )
 """Models compared by full schema byte-equality.
 
@@ -204,6 +246,104 @@ known to the SDK are permitted (silently dropped by the SDK).
 
 
 _ALL_MODELS = _STRICT_MODELS + _EXTRAS_TOLERATED_MODELS
+
+
+_SHARED_ENUMS: tuple[tuple[str, type[Enum], type[Enum]], ...] = (
+    ("SigningService", service_credential.SigningService, client_admin.SigningService),
+)
+"""Closed enums duplicated across both packages.
+
+An enum has no JSON Schema of its own to diff here; its wire contract is
+the member-name to member-value map, compared by
+:func:`test_shared_enum_members_match`. ``SigningService`` is REQUIRED on
+every destination credential, so a member the SDK can emit and the
+service cannot parse rejects a credential push outright.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Completeness sweep (finding S12-5).
+#
+# A hand-maintained registry silently stops guarding a model the moment
+# someone forgets to add one. These helpers enumerate what is ACTUALLY
+# duplicated across the two packages so the forgetting is what fails.
+# ---------------------------------------------------------------------------
+
+
+def _wire_classes(package_name: str) -> dict[str, str]:
+    """Map every duplicated-candidate class name in a package to its module.
+
+    Walks the package's own modules and keeps classes DEFINED there (a
+    re-export under another module's name is the same class, not a second
+    copy). Pydantic models and enums both count: both bind the wire.
+
+    Args:
+        package_name: Importable package, e.g. ``"phantom.models"``.
+
+    Returns:
+        ``{class name: defining module name}``.
+    """
+    package = importlib.import_module(package_name)
+    found: dict[str, str] = {}
+    for module_info in pkgutil.walk_packages(package.__path__, prefix=f"{package_name}."):
+        module = importlib.import_module(module_info.name)
+        for name, obj in vars(module).items():
+            if not inspect.isclass(obj) or obj.__module__ != module_info.name:
+                continue
+            if issubclass(obj, BaseModel | Enum):
+                found[name] = module_info.name
+    return found
+
+
+def _duplicated_class_names() -> dict[str, tuple[str, str]]:
+    """Return ``{name: (service module, client module)}`` for every duplicate.
+
+    A class name defined in BOTH packages is a deliberately duplicated
+    wire type per ADR-012, and therefore something a drift test must pin.
+    """
+    service = _wire_classes("phantom.models")
+    client = _wire_classes("phantom_client.models")
+    return {name: (service[name], client[name]) for name in sorted(set(service) & set(client))}
+
+
+def _chain_envelope_model_names() -> tuple[str, ...]:
+    """Read the chain-envelope registry out of the sibling module, BY PATH.
+
+    Loaded by file path rather than by dotted name on purpose: the service
+    package ships its own ``tests`` package (``src/phantom-service/tests/
+    __init__.py``), which SHADOWS the repo-root ``tests`` namespace package the
+    moment ``src/phantom-service`` lands on ``sys.path``, which is exactly what
+    happens in the full-suite run. A dotted ``tests.contract...`` import here
+    works when this directory is run alone and fails in CI.
+
+    Returns:
+        The sibling's ``_MODEL_NAMES`` tuple.
+
+    Raises:
+        RuntimeError: When the sibling module cannot be loaded, which would
+            otherwise leave the completeness check quietly under-informed.
+    """
+    sibling = Path(__file__).with_name("test_chain_models_alignment.py")
+    spec = importlib.util.spec_from_file_location("_chain_models_registry", sibling)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load the chain-envelope model registry from {sibling}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    names: tuple[str, ...] = module._MODEL_NAMES
+    return names
+
+
+_REGISTERED_NAMES: frozenset[str] = frozenset(
+    {name for name, _, _ in _ALL_MODELS}
+    | {name for name, _, _ in _SHARED_ENUMS}
+    | set(_chain_envelope_model_names())
+)
+"""Every name pinned by a drift test, here or in the chain-envelope sibling.
+
+Read from the sibling module rather than copied, so deleting an entry
+there surfaces as an unregistered duplicate here instead of a stale
+copy quietly covering for it.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +439,72 @@ def _wire_schema(model: type[BaseModel]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Strict-match tests — for models that should be byte-equal across packages.
 # ---------------------------------------------------------------------------
+
+
+def test_every_cross_package_duplicate_is_pinned_by_a_drift_test() -> None:
+    """Objective: no deliberately duplicated wire type can sit outside the drift gate.
+
+    Expected outcome: every class defined as a Pydantic model or an enum
+    in BOTH ``phantom.models`` and ``phantom_client.models`` appears in
+    one of the registries, this module's ``_STRICT_MODELS`` /
+    ``_EXTRAS_TOLERATED_MODELS`` / ``_SHARED_ENUMS``, or the chain
+    envelope's ``_MODEL_NAMES``.
+
+    Why it exists (finding S12-5): the registries are hand-written and
+    nothing enumerated the packages to prove they were complete, so a
+    duplicated model was unguarded exactly when someone forgot to add
+    it. Six had already escaped once and one of those six had drifted;
+    this sweep found four more, three of them the request bodies for the
+    admin credential push.
+
+    Falsifier: duplicate a new model across both packages, or delete an
+    entry from either registry, and this goes RED naming the class and
+    both defining modules.
+    """
+    duplicated = _duplicated_class_names()
+    # Guard the guard: if the walk finds nothing, the sweep is broken and
+    # every other assertion in this test would hold vacuously.
+    assert duplicated, (
+        "the cross-package sweep found NO duplicated classes, which cannot be "
+        "true; _wire_classes is no longer walking the model packages"
+    )
+    unregistered = {
+        name: modules for name, modules in duplicated.items() if name not in _REGISTERED_NAMES
+    }
+    assert not unregistered, (
+        "duplicated wire types with no drift test pinning them:\n"
+        + "\n".join(
+            f"  {name}: service={service_module} client={client_module}"
+            for name, (service_module, client_module) in sorted(unregistered.items())
+        )
+        + "\nAdd each to _STRICT_MODELS, _EXTRAS_TOLERATED_MODELS or _SHARED_ENUMS "
+        "in this file (or to _MODEL_NAMES in test_chain_models_alignment.py for a "
+        "chain-envelope type)."
+    )
+
+
+@pytest.mark.parametrize(
+    ("enum_name", "service_enum", "client_enum"),
+    _SHARED_ENUMS,
+    ids=[name for name, _, _ in _SHARED_ENUMS],
+)
+def test_shared_enum_members_match(
+    enum_name: str,
+    service_enum: type[Enum],
+    client_enum: type[Enum],
+) -> None:
+    """Objective: a duplicated closed enum offers identical members and wire values.
+
+    Expected outcome: the member-name to member-value maps are equal in
+    both directions. A member only the SDK knows is a value the service
+    rejects; a member only the service knows is a value the SDK cannot
+    represent.
+    """
+    service_members = {member.name: member.value for member in service_enum}
+    client_members = {member.name: member.value for member in client_enum}
+    assert service_members == client_members, (
+        f"{enum_name} members diverge: service={service_members}, client={client_members}"
+    )
 
 
 @pytest.mark.parametrize(

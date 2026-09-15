@@ -34,6 +34,25 @@ CLI's own directory is appended to the subprocess PATH so Desktop credential
 helpers resolve. Container Phantom runs all-disk bodies with an hour-free
 retry ladder (one immediate attempt, then 20 s rungs) so the evidence row
 stays non-terminal across the replacement and retries promptly after restore.
+
+NOT CONFORMANCE-MARKED, DELIBERATELY (review finding S12-1). This module used
+to carry ``pytest.mark.conformance``, which was false in two independent ways.
+It builds the service image FROM THE REPO'S PYTHON DOCKERFILE and boots that,
+so the ``E2E_SERVICE_CMD`` seam that selects the binary under test is never
+consulted at all. And its per-phase container contract is probed by running
+``docker exec <container> python -c ...`` for the runtime UID/GID, the
+data-dir writability and the compose-DNS check, none of which can exist in a
+distroless Go image. Running ``E2E_SERVICE_CMD=<binary> pytest -m conformance``
+therefore reported green on the Python image while never touching the binary,
+which is exactly the false green ADR-035 warns the marker must not produce.
+
+What is lost is a CLAIM, not coverage: this module remains the executable
+proof of the shipped Python deployment artifact, the nonroot runtime user, the
+mounted config path, compose service DNS, and the named-volume replacement
+matrix, and it still runs in the ``e2e-docker`` job. The port needs its OWN
+deployment lane against its own image; a language-neutral version of this
+module would have to drop the in-container interpreter probes and read the
+same facts from ``docker inspect`` and the admin HTTP surface instead.
 """
 
 from __future__ import annotations
@@ -103,7 +122,9 @@ def _docker_env(binary: str) -> dict[str, str]:
 _DOCKER = _docker_binary()
 
 pytestmark = [
-    pytest.mark.conformance,
+    # No ``conformance``: this module builds and boots the repo's PYTHON image
+    # and probes the container with ``python -c``, so it can neither honour the
+    # E2E_SERVICE_CMD seam nor run against a Go image. See the module docstring.
     pytest.mark.asyncio,
     pytest.mark.e2e,
     pytest.mark.docker,

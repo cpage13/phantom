@@ -1,14 +1,32 @@
-"""E2E-12 — Persist-trigger boundary (memory → disk migration).
+"""E2E-12: the size-threshold persist trigger, RAM to disk and back out.
 
-Submits one envelope while the upstream returns 503 on the metadata
-POST. The sender's first attempt fails; the persist trigger fires
-(``after_attempts: 1``); ``persist_now`` migrates the row from the
-memory tier to the disk tier via the commit-last-column path. Clearing
-the failure lets the next attempt succeed end-to-end.
+What actually fires here (corrected per review finding S12-6). The
+attempt-count trigger ``persist_trigger.after_attempts`` was DELETED in
+Phase 1. This test configures
+``storage.persist_trigger.body_size_threshold_bytes`` instead, which in
+hybrid mode enqueues the chain against the :class:`PersistController` AT
+ADMISSION, before the sender has attempted anything. The injected 100
+percent 5xx no longer drives the migration; its only remaining job is to
+keep the row non-terminal long enough to observe ``body_location`` flip
+to ``file`` and the body land on disk. Clearing the failure then lets the
+chain succeed, which proves the disk-backed body still round-trips to the
+upstream byte-for-byte.
 
-This test exercises the load-bearing attempt-count path that the
-size-aware persist trigger and the startup orphan-body sweep both
-build on.
+What this file does NOT cover, stated plainly so a reader auditing
+coverage is not misled. The module name, the test name and both
+docstrings used to claim "migration fires after the first failed
+attempt", which had not been true since Phase 1. There is no
+attempt-count trigger to cover any more. The OTHER live trigger,
+retry-linger, is a sender-side decision and is covered by
+``src/phantom-service/tests/unit/test_retry_linger_persist_enqueue.py``.
+The RAM-pressure trigger is covered by
+``src/phantom-service/tests/unit/test_ram_pressure_fresh_attempt_bound.py``
+and its reload sibling.
+
+``attempts`` is deliberately NOT asserted here. The size trigger fires at
+admission, so the attempt count at the moment the migration is observed
+depends only on where the sender's poll window happened to fall, and
+pinning it would be a race rather than a contract.
 """
 
 from __future__ import annotations
@@ -30,31 +48,56 @@ from .helpers.stack import boot_stack
 from .helpers.timing import await_until
 
 # Body for the round-trip. Large enough that the disk-tier write is
-# observable as a non-empty file but small enough that the test never
-# crosses the size-aware persist threshold (which is profile-derived
-# and may differ between hosts).
+# observable as a non-empty file, and comfortably over the size
+# threshold this test configures, whatever the codec does to it.
 BODY_BYTES: bytes = b"phantom-e2e-persist-boundary-body-" + b"x" * 256
 
-# Wait budget for the row to migrate. The first failed attempt fires
-# from the sender pool on next poll (poll_interval_ms: 100); the
-# persist runs inline; we observe via admin within a couple of seconds.
+# Wait budget for the row to migrate. Admission enqueues the chain
+# against the PersistController straight away and the controller
+# serializes the migration on its own queue, so the flip is observable
+# via admin within a couple of seconds.
 MIGRATION_WAIT_SECONDS: float = 10.0
+
+# The configured size trigger. Any body at or above this STORED size is
+# enqueued for migration at admission. Pinned at 1 byte so BODY_BYTES is
+# unambiguously over it whatever the configured codec does to it, and
+# named rather than left as a bare literal in the config block so a
+# reader can see what the test is actually turning on.
+PERSIST_SIZE_THRESHOLD_BYTES: int = 1
 
 
 @pytest.mark.e2e
-async def test_e2e_12_persist_boundary(tmp_path: Path) -> None:
-    """Memory → disk migration fires after the first failed attempt."""
+async def test_e2e_12_size_threshold_migrates_ram_body_to_disk(tmp_path: Path) -> None:
+    """Objective: the size trigger migrates a RAM body to disk and delivery still matches.
+
+    Expected outcome, in order:
+
+    1. The admitted row reports ``body_location='file'``, so the
+       size-threshold enqueue at admission reached the
+       :class:`PersistController`.
+    2. The row is still non-terminal at that point, so the migration
+       happened while the chain was undelivered rather than as part of
+       tidying a finished row.
+    3. The body file exists on disk and is non-empty, so the flip is a
+       real durability commit and not a column update on its own.
+    4. Once the injected failure is cleared the chain succeeds and the
+       emulator receives exactly the original byte count, so the
+       disk-backed body round-trips unchanged.
+
+    Falsifier: invert the size comparison, or drop the admission-time
+    enqueue, and step 1 times out with the row still at
+    ``body_location='ram'``.
+    """
     stack = await boot_stack(
         tmp_path=tmp_path,
         config_overrides={
-            # Phase 1 migration: ``persist_trigger.after_attempts: 1``
-            # (force-persist on first failed attempt) is replaced by
-            # the size-threshold immediate-persist path in hybrid mode.
-            # Setting body_size_threshold_bytes=1 ensures any non-trivial
-            # body is enqueued against the PersistController at admission.
+            # The live trigger. ``persist_trigger.after_attempts`` was
+            # deleted in Phase 1; the size threshold is what enqueues a
+            # body against the PersistController, and it does so at
+            # admission rather than after any attempt.
             "storage": {
                 "persist_trigger": {
-                    "body_size_threshold_bytes": 1,
+                    "body_size_threshold_bytes": PERSIST_SIZE_THRESHOLD_BYTES,
                 },
             },
         },
@@ -65,15 +108,17 @@ async def test_e2e_12_persist_boundary(tmp_path: Path) -> None:
         emulator.clear_received()
         emulator.clear_failures()
 
-        # 1. Inject a 100% 5xx so the first attempt fails. We use
+        # 1. Inject a 100% 5xx so the row stays non-terminal while we
+        #    observe the migration. This does NOT trigger the migration;
+        #    the size threshold already did, at admission. We use
         #    GLOBAL scope because the driver's hardcoded POST URL is
         #    `/v2/files`; the emulator's `_scope_for_path` only
         #    recognises `/v1/files/create` (the canonical generic
         #    endpoint). The `/v2/files` alias mounted by
         #    `helpers/stack.py` for driver compatibility passes
-        #    through the middleware as GLOBAL scope. Once the first
-        #    failed attempt fires `persist_now`, we clear the policy
-        #    and let step 2 succeed against the unaltered emulator.
+        #    through the middleware as GLOBAL scope. Once the migration
+        #    is observed we clear the policy and let the chain succeed
+        #    against the unaltered emulator.
         emulator.inject_failure(
             FailurePolicy(  # type: ignore[call-arg]  # FailurePolicy fields have defaults; mypy lacks pydantic plugin
                 scope=FailureScope.GLOBAL,
@@ -91,20 +136,31 @@ async def test_e2e_12_persist_boundary(tmp_path: Path) -> None:
         )
 
         # 3. Wait for the row to migrate to disk. We probe via
-        #    list_uploads (the SDK's get_upload returns ChainResponse
-        #    which doesn't carry the body_location; UploadRow does).
+        #    list_uploads (the SDK's get_upload answers with
+        #    ChainAdminDetail, and the body_location we need is on the
+        #    admin UploadRow shape list_uploads returns).
         #    Phase 1 renamed tier='persisted' → body_location='file'.
         row = await _await_body_location(pc, chain_id, expected_body_location="file")
         assert row.body_location == "file"
         # Body presence is verified directly on disk by the test's
-        # filesystem walk further down — the row no longer carries a
+        # filesystem walk further down; the row no longer carries a
         # ``body_path`` column (Family 1 cut).
-        # State after the PersistController's flip — the row sits
-        # queued or attempting depending on the sender pickup window.
-        # We only assert it's not stranded in a terminal state.
+        #
+        # The row must still be UNDELIVERED at this point: the migration
+        # is a durability step for a live chain, not cleanup of a
+        # finished one. queued or attempting are both legitimate, and
+        # which one it is depends purely on where the sender's poll
+        # window fell, so ``attempts`` is deliberately not pinned here
+        # (see the module docstring, finding S12-6).
         assert row.state in ("queued", "attempting"), (
-            f"post-migration row state={row.state!r}; expected queued or attempting "
-            f"so the sender re-picks it"
+            f"post-migration row state={row.state!r}; expected queued or attempting, "
+            f"so the migration happened to a live undelivered chain and the sender "
+            f"re-picks it"
+        )
+        assert row.sent_at is None, (
+            f"the row reports sent_at={row.sent_at!r}, so it had already been "
+            f"delivered when the migration was observed; this test must observe "
+            f"the RAM to disk flip on an undelivered chain"
         )
 
         # 4. The body must exist on disk now. The InstanceCfg has
@@ -194,12 +250,14 @@ async def _await_body_location(
 ) -> UploadRow:
     """Poll list_uploads until ``chain_id`` reports ``expected_body_location``.
 
-    Returns the matching :class:`UploadRow`. Raises
-    :class:`AssertionError` on deadline exhaustion. We use
-    ``list_uploads`` rather than ``get_upload`` because
-    ``ChainResponse`` doesn't carry the body location; that field is
-    on the admin-side :class:`UploadRow` shape. Phase 1 Slice 1.E
-    renamed ``tier`` → ``body_location``.
+    Returns the matching :class:`UploadRow`, the admin list route's row
+    shape, which carries ``body_location`` and ``sent_at``. Raises
+    :class:`AssertionError` on deadline exhaustion. The stale reason
+    this docstring used to give ("``ChainResponse`` doesn't carry the
+    body location") no longer holds: ``get_upload`` answers with
+    ``ChainAdminDetail`` and carries both fields as well, so either
+    route would serve. Phase 1 Slice 1.E renamed ``tier`` to
+    ``body_location``.
     """
     matched: UploadRow | None = None
 
