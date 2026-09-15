@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from phantom.config.settings import InstanceCfg, RetentionCfg, RouteCfg
@@ -308,3 +308,63 @@ async def test_unresolved_body_window_raises_typed_error(tmp_path: Path) -> None
     reaper = Reaper(instances=[instance])
     with pytest.raises(RetentionConfigError, match="body window for state 'failed'"):
         await reaper._sweep_once()
+
+
+@pytest.mark.asyncio
+async def test_one_unreclaimable_body_does_not_abandon_the_rest_of_the_tick(
+    tmp_path: Path,
+) -> None:
+    """Objective: S8-5's second consequence, pinned where the await lives.
+
+    The sweep awaits the body delete inside a loop over states, with a loop
+    over instances above it, so one ``EACCES``/``EPERM``/``EBUSY`` on a single
+    upload directory used to abandon the rest of the tick for every remaining
+    state AND every remaining instance, taking the metadata pass, the
+    ``max_rows`` backstop and the idempotency-index trim with it.
+
+    ``FileBodyStore.delete`` deliberately still raises, because admission
+    clears this namespace before writing a retry's body and the
+    idempotency-collision rollback turns the failure into a 503 with
+    ``Retry-After``. The reaper absorbs it instead, which is the only caller
+    for which reclaiming is genuinely best effort: the body-orphan janitor
+    re-lists the tree every sweep and meets the remainder again.
+
+    Expected: the second row's body is still discarded after the first row's
+    removal fails, and the sweep returns rather than propagating.
+    """
+    instance = await _build(
+        tmp_path,
+        retention=_full_retention(
+            # Wide enough that the metadata pass cannot reap these rows in the
+            # same tick; this test is about the body pass surviving a failure.
+            succeeded_metadata_seconds=100_000,
+            succeeded_body_seconds=0,
+        ),
+    )
+    old = datetime.now(tz=UTC) - timedelta(seconds=10_000)
+    stuck_id, reachable_id = uuid4(), uuid4()
+    for chain_id in (stuck_id, reachable_id):
+        await instance.store.insert(_row(chain_id, state="succeeded", updated_at=old))
+        await instance.body_store.put(chain_id, {"body": b"bytes"})
+
+    real_delete = instance.body_store.delete
+    seen: list[UUID] = []
+
+    async def _one_stuck_tree(chain_id: UUID) -> None:
+        seen.append(chain_id)
+        if chain_id == stuck_id:
+            raise OSError(f"could not fully remove the body tree for chain_id={chain_id}")
+        await real_delete(chain_id)
+
+    instance.body_store.delete = _one_stuck_tree  # type: ignore[method-assign]
+
+    await Reaper(instances=[instance])._sweep_once()
+
+    assert reachable_id in seen, (
+        "the sweep stopped at the first unreclaimable tree, so every later row, "
+        "state and instance in this tick was skipped"
+    )
+    assert await instance.store.get(stuck_id) is not None, (
+        "the row whose bytes could not be reclaimed should survive for the "
+        "janitor and a later sweep to meet again"
+    )

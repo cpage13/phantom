@@ -27,7 +27,8 @@ same-second disambiguation logic exists (the prior cycle's H-1 / M-3-B bug
 class is unrepresentable, not guarded).
 
 The manifest (cycle-7 seam 2): every backup writes ONE
-:class:`BackupManifest` JSON (temp-then-rename, atomic) into the instance
+:class:`BackupManifest` JSON (temp, fsync, rename, fsync the parent - atomic
+in the name AND durable in the contents) into the instance
 data_root, named by ``backup_id``, BEFORE any artifact moves, so it declares
 intent. The manifest names both artifacts (db path, body path), which
 artifact the pair carries, the reason discriminator, and the display
@@ -80,6 +81,11 @@ from uuid import UUID, uuid4
 import aiosqlite
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+# The one directory-fsync helper in the service, rather than a private second
+# copy here (S6-8). The import cannot cycle: file_body_store imports nothing
+# from phantom, which is the same reason app.py imports _makedirs_durable from
+# it.
+from phantom.storage.file_body_store import _sync_directory
 from phantom.storage.timestamps import utc_stamp
 
 logger = logging.getLogger(__name__)
@@ -294,20 +300,37 @@ class BackupMoveMarker(BaseModel):
 
 
 def _write_json_model_atomic(path: Path, model: BaseModel) -> None:
-    """Atomically write ``model`` as JSON to ``path``.
+    """Durably write ``model`` as JSON to ``path``, via a temp sibling.
 
     Writes a temp sibling then ``os.replace`` so a reader never sees a
     partial file (the rename is atomic on one filesystem). Shared by the
     manifest write and the marker write - the two on-disk records whose
     torn-write would corrupt crash recovery.
 
+    DURABILITY (S6-8): ``os.replace`` gives atomicity of the NAME, not
+    durability of the CONTENTS, and it leaves the new directory entry in the
+    parent's dirty page cache. So the temp file's bytes are fsynced BEFORE
+    the rename and the parent directory is fsynced AFTER it. Without both, a
+    power cut moments after a mode-switch backup begins can replay the
+    rename over unwritten blocks and leave a present-but-empty manifest or
+    marker: the next boot degrades the instance and the live tree stays
+    half-moved with no record naming where the bodies went, which is the
+    exact A-3 state the marker exists to prevent. This is the same contract
+    :class:`phantom.storage.file_body_store.FileBodyStore` already holds for
+    every body file, using the same directory-fsync helper rather than a
+    private second copy of it.
+
     Args:
         path: Destination path (inside the instance ``data_root``).
         model: The Pydantic model to persist.
     """
     tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(model.model_dump_json(), encoding="utf-8")
+    with tmp_path.open("wb") as fh:
+        fh.write(model.model_dump_json().encode("utf-8"))
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp_path, path)
+    _sync_directory(path.parent)
 
 
 def _read_backup_move_marker(marker_path: Path) -> BackupMoveMarker:
@@ -1224,8 +1247,13 @@ class IntegrityChecker:
     Attributes:
         db_path: Persistent SQLite path.
         body_store_root: Body-store root directory.
-        data_root: The Phantom ``storage.data_dir`` directory. Used
-            for :meth:`list_quarantines` inventory queries.
+        data_root: The Phantom ``storage.data_dir`` directory, supplied by
+            the composition root. No method on this class reads it: the
+            inventory is served by the free function
+            :func:`list_quarantines`, which the admin route calls with the
+            per-instance data root it already resolves. The parameter is
+            retained only because its one construction site lives in
+            ``runtime/startup_checks.py``.
     """
 
     def __init__(
@@ -1260,10 +1288,6 @@ class IntegrityChecker:
             timestamp: Optional UTC timestamp override; defaults to now.
         """
         return quarantine(self._db_path, self._body_store_root, timestamp)
-
-    def list_quarantines(self) -> list[QuarantineInventoryEntry]:
-        """Enumerate quarantine artifacts under the data root."""
-        return list_quarantines(self._data_root)
 
 
 __all__ = [
