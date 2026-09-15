@@ -13,10 +13,12 @@ The store lives in its OWN database file (production wires
 file, so the split keeps credential reads and writes off the hot uploads /
 token-cache writer locks, and a credential is shared across many uploads anyway.
 
-Admin reads use :class:`phantom.models.credential.CredentialSlot`, which carries
-no secret material (ADR-004); the store itself never exposes a secret read-back
-endpoint - the credential value is read internally only (the signer retrieves it
-at sign time inside the executor).
+ADR-004 holds here by ABSENCE, not by a redaction model: this store has no list
+method and no read-back endpoint, so no admin response can carry a credential
+at all. The value is read internally only, by the signer at sign time inside
+the executor. A ``CredentialSlot`` model this docstring used to point at as the
+guarantee had no consumer anywhere and has been deleted (finding S9-8); a
+future GET-list brings its own no-secret response model.
 
 The forced differences from the token cache (and nothing else):
 
@@ -26,6 +28,12 @@ The forced differences from the token cache (and nothing else):
   serialized to a ``cred_json`` column, not a bare ``bearer`` string;
 * the wake handler takes one argument ``(dest_host)``, not two
   ``(endpoint, uid)`` - see :data:`CredentialWakeHandler`.
+
+**``set``'s return value is a dead contract** (finding S9-7). All seven call
+sites across both auth stores discard it. It survives only because the
+``CredentialStore`` Protocol in :mod:`phantom.storage.interface` declares it,
+and the two must change together; until then the value it returns describes
+the write it committed rather than a re-read that could report someone else's.
 """
 
 from __future__ import annotations
@@ -37,49 +45,117 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
+from typing import Annotated, Final
 
 import aiosqlite
+from pydantic import Field, TypeAdapter, ValidationError
 
 from phantom.config.settings import SqliteCfg
 from phantom.models.credential import (
     CredCacheRow,
     CredentialSource,
+    CredentialStatus,
     DestinationCredential,
     HostCredKey,
-    ProfileRefCred,
-    SigningService,
-    SigV4StaticCreds,
 )
 from phantom.storage._connection import open_store_connection
 from phantom.storage.interface import CredentialWakeHandler
 
 logger = logging.getLogger(__name__)
 
+# The status every :meth:`SqliteCredentialStore.set` forces. Named once
+# because it appears twice - in the UPSERT and in the row that call returns -
+# and a re-push un-badding the slot is what the credential-recovery loop
+# relies on, so the two must not be able to drift apart.
+_FRESH_STATUS: Final[CredentialStatus] = "fresh"
+
+
+# The ``cred_json`` decoder. A discriminated union on ``kind``, so one adapter
+# validates EVERY field of either variant rather than splatting raw JSON into a
+# frozen dataclass that checks nothing (finding S9-6). It also re-coerces the
+# wire ``service`` string back to :class:`SigningService`, which the write
+# side's ``asdict`` + ``json.dumps`` flattened, so the round trip is exact.
+_CREDENTIAL_ADAPTER: Final = TypeAdapter[DestinationCredential](
+    Annotated[DestinationCredential, Field(discriminator="kind")]
+)
+
+
+def _redacted_decode_reason(exc: ValueError) -> str:
+    """Describe a row-decode failure without echoing the row.
+
+    A ``pydantic.ValidationError`` renders the offending INPUT in its message,
+    and on this model the offending input can be the resolved secret access
+    key. The operator needs to know which field of which variant failed and
+    why, which is exactly the part that carries no value.
+
+    Args:
+        exc: The decode failure. Anything that is not a pydantic
+            ``ValidationError`` is one of this module's own messages, which
+            quote only structural values (a ``kind``, a column name).
+
+    Returns:
+        A one-line, value-free description.
+    """
+    if not isinstance(exc, ValidationError):
+        return str(exc)
+    return "; ".join(
+        f"{'.'.join(str(part) for part in error['loc']) or '<root>'}: {error['type']}"
+        for error in exc.errors(include_url=False)
+    )
+
 
 def _credential_from_json(kind: str, cred_json: str) -> DestinationCredential:
     """Rebuild a frozen credential variant from its ``kind`` + serialized JSON.
 
-    The inverse of the ``set`` write path's ``json.dumps(asdict(credential))``;
-    dispatches on the discriminator ``kind`` to the matching frozen variant.
+    The inverse of the ``set`` write path's ``json.dumps(asdict(credential))``.
+    Validation runs through :data:`_CREDENTIAL_ADAPTER`, so a corrupt row fails
+    on ANY malformed field (a missing ``service``, an unknown service string, a
+    non-string key id, a field the variant does not declare), not only on the
+    two the hand-written splat happened to touch.
 
-    The write side serialized ``service`` to a plain string (the ``StrEnum``
-    member serializes to ``"s3"`` via ``asdict``); this ``**payload`` splat path
-    has NO pydantic, so the body's before-validator cannot run here. ``service``
-    is re-coerced to :class:`SigningService` explicitly before construction. An
-    unknown service string (a corrupt DB row) raises ``ValueError`` - fail loud,
-    correct.
+    ``kind`` arrives twice, as its own column and inside the blob. They are
+    cross-checked rather than one being believed: a row where they disagree is
+    corrupt, and resolving it silently in favour of whichever the code read
+    first is how a credential of one type gets served as another.
+
+    Args:
+        kind: The row's ``kind`` column.
+        cred_json: The row's ``cred_json`` column.
+
+    Returns:
+        The frozen :data:`DestinationCredential` the row holds.
+
+    Raises:
+        ValueError: When the blob is not valid JSON, does not validate against
+            either variant, or carries a ``kind`` other than the column's.
+            ``pydantic.ValidationError`` IS a ``ValueError``, so callers catch
+            the one type. :meth:`SqliteCredentialStore.get` is the caller that
+            does, and it is where the policy for a corrupt row lives.
     """
-    payload = json.loads(cred_json)
-    payload["service"] = SigningService(payload["service"])
-    if kind == "sigv4_static":
-        return SigV4StaticCreds(**payload)
-    if kind == "profile_ref":
-        return ProfileRefCred(**payload)
-    raise ValueError(f"Unknown credential kind {kind!r} in credential_store row")
+    credential = _CREDENTIAL_ADAPTER.validate_json(cred_json)
+    if credential.kind != kind:
+        raise ValueError(
+            f"credential_store row declares kind {kind!r} but its cred_json "
+            f"carries {credential.kind!r}"
+        )
+    return credential
 
 
 def _row_to_cache_row(row: aiosqlite.Row) -> CredCacheRow:
-    """Decode one SQLite row into a :class:`CredCacheRow`."""
+    """Decode one SQLite row into a :class:`CredCacheRow`.
+
+    Args:
+        row: One ``credential_store`` row.
+
+    Returns:
+        The validated row.
+
+    Raises:
+        ValueError: When any column is outside what the row type accepts.
+            The row model is strict (S9-6), so this covers the ``status`` and
+            ``source`` Literals and the timestamp as well as the credential
+            blob; ``pydantic.ValidationError`` is a ``ValueError``.
+    """
     return CredCacheRow(
         dest_host=HostCredKey(row["dest_host"]),
         credential=_credential_from_json(row["kind"], row["cred_json"]),
@@ -194,6 +270,26 @@ class SqliteCredentialStore:
         The row carries ``status``; consumers enforce "bad == unusable" (the
         executor arm treats ``row is None or row.status == 'bad'`` as no-creds,
         the kicker treats ``row is None or row.status != 'fresh'`` as don't-wake).
+
+        A row that does not decode answers ``None`` and logs at ERROR, rather
+        than raising (finding S9-6). Both halves of that are deliberate.
+        ``None`` is the answer both consumers already handle and both handle
+        CONSERVATIVELY: the executor parks the upload and the kicker leaves it
+        parked, which is what an unusable credential means. Raising instead
+        would cross into the credential kicker's scan loop, whose one raising
+        call is documented to be the route resolve, so a single corrupt row
+        would abort a whole rescan pass and strand every row behind it. The
+        ERROR log is what makes the defect loud without making it fatal; it
+        names the host and which field failed, never a stored value, because
+        a validation message renders the input it rejected and on this model
+        that input can be the resolved secret.
+
+        Args:
+            dest_host: The resolved destination host to look up.
+
+        Returns:
+            The validated row, or ``None`` when there is no slot for this host
+            or the slot's stored row is corrupt.
         """
         conn = self._require_conn()
         async with conn.execute(
@@ -201,7 +297,18 @@ class SqliteCredentialStore:
             (dest_host,),
         ) as cur:
             row = await cur.fetchone()
-        return _row_to_cache_row(row) if row else None
+        if row is None:
+            return None
+        try:
+            return _row_to_cache_row(row)
+        except ValueError as exc:
+            logger.error(
+                "credential_store row for dest_host=%s does not decode and is "
+                "being treated as absent (the upload parks); reason: %s",
+                dest_host,
+                _redacted_decode_reason(exc),
+            )
+            return None
 
     async def set(
         self,
@@ -212,37 +319,55 @@ class SqliteCredentialStore:
     ) -> CredCacheRow:
         """Write ``credential`` for ``dest_host`` and fire wake handlers.
 
-        UPSERT forcing ``status='fresh'`` (so a re-push un-bads the slot - the
-        recovery loop relies on this), re-read to return the full row, then fire
-        the registered wake handlers. The ``secret_access_key`` of a
-        :class:`SigV4StaticCreds` persists at rest (the ADR-003 posture the
-        owner's persist-on-restart decision accepts, matching the token
-        precedent).
+        UPSERT forcing :data:`_FRESH_STATUS` (so a re-push un-bads the slot -
+        the recovery loop relies on this), then fire the registered wake
+        handlers. The ``secret_access_key`` of a
+        :class:`~phantom.models.credential.SigV4StaticCreds` persists at rest
+        (the ADR-003 posture the owner's persist-on-restart decision accepts,
+        matching the token precedent).
+
+        The returned row is BUILT FROM THE WRITE, not re-read afterwards
+        (finding S9-7). The re-read ran after ``_write_txn`` released the
+        write lock, so a ``mark_bad`` landing in that window made this method
+        report ``status='bad'`` for a write it had just forced to ``fresh`` -
+        a state its own transaction never saw. Describing the committed write
+        is both the honest answer and one fewer query per push.
+
+        Args:
+            dest_host: The resolved destination host to key the slot on.
+            credential: The structured credential to persist.
+            source: How this credential was supplied.
+
+        Returns:
+            The row this call committed. No caller reads it today; see the
+            module docstring's note on the dead return contract.
         """
         conn = self._require_conn()
-        now_iso = datetime.now(tz=UTC).isoformat()
+        now = datetime.now(tz=UTC)
         cred_json = json.dumps(asdict(credential))
         async with self._write_txn(conn):
             await conn.execute(
-                """
+                f"""
                 INSERT INTO credential_store
                     (dest_host, kind, cred_json, observed_at, source, status)
-                VALUES (?, ?, ?, ?, ?, 'fresh')
+                VALUES (?, ?, ?, ?, ?, '{_FRESH_STATUS}')
                 ON CONFLICT(dest_host) DO UPDATE SET
                   kind = excluded.kind,
                   cred_json = excluded.cred_json,
                   observed_at = excluded.observed_at,
                   source = excluded.source,
-                  status = 'fresh'
+                  status = '{_FRESH_STATUS}'
                 """,
-                (dest_host, credential.kind, cred_json, now_iso, source),
+                (dest_host, credential.kind, cred_json, now.isoformat(), source),
             )
             await conn.commit()
-
-        # Re-read to return the full row.
-        fetched = await self.get(dest_host)
-        if fetched is None:  # pragma: no cover - write just completed
-            raise RuntimeError("Credential store row missing after set")
+        written = CredCacheRow(
+            dest_host=dest_host,
+            credential=credential,
+            observed_at=now,
+            source=source,
+            status=_FRESH_STATUS,
+        )
 
         # Fire wake handlers. Exceptions in handlers are logged, not propagated.
         for handler in self._wake_handlers:
@@ -253,7 +378,7 @@ class SqliteCredentialStore:
                     "Credential store wake handler raised for dest_host=%s",
                     dest_host,
                 )
-        return fetched
+        return written
 
     async def mark_bad(self, dest_host: HostCredKey) -> None:
         """ADR-003: bad credentials stay in the store, status flips to ``bad``."""

@@ -174,6 +174,91 @@ async def test_cold_snapshots_stay_outside_the_manifest_world(tmp_path: Path) ->
     assert stray.exists()
 
 
+async def test_a_failed_snapshot_leaves_no_file_for_rotation_to_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S8-4: a snapshot that raises mid-copy leaves nothing behind.
+
+    Objective: opening the destination CREATES it, so a snapshot that failed
+    after the connect used to leave a zero-byte ``uploads.backup.<iso>.db``
+    that matches the rotation glob and counts as a snapshot.
+
+    Expected outcome: the raise propagates (the run loop logs and continues),
+    and the backup directory holds no file matching the rotation glob, empty
+    or otherwise.
+    """
+    db_path = tmp_path / "uploads.db"
+    await _populate_db(db_path)
+    backup_root = tmp_path / "backups"
+    backup_root.mkdir()
+    scheduler = ColdBackupScheduler(
+        db_path=db_path,
+        backup_root=backup_root,
+        settings=_settings(data_root=tmp_path),
+    )
+
+    async def failing_backup(self: aiosqlite.Connection, target: aiosqlite.Connection) -> None:
+        """Stand in for a locked live DB, a full volume or an IO error."""
+        raise OSError("backup failed mid-copy")
+
+    monkeypatch.setattr(aiosqlite.Connection, "backup", failing_backup)
+    with pytest.raises(OSError, match="backup failed mid-copy"):
+        await scheduler.snapshot_once()
+    assert list(backup_root.glob("uploads.backup.*.db")) == []
+
+
+async def test_failed_snapshots_do_not_rotate_good_snapshots_away(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S8-4: three failed nightly runs plus one success keep real snapshots.
+
+    Objective: the operator's stated recovery position is ``backup_rotate_n``
+    real snapshots. With zero-byte failures counting as snapshots, three
+    consecutive failures followed by one success rotated every previously-good
+    snapshot away and logged nothing, because the deletions are the normal
+    rotation path.
+
+    Expected outcome: every file left after the sequence is a real,
+    non-empty snapshot, and the three seeded good ones are rotated only by
+    the one genuine new snapshot.
+    """
+    db_path = tmp_path / "uploads.db"
+    await _populate_db(db_path)
+    backup_root = tmp_path / "backups"
+    backup_root.mkdir()
+    rotate_n = 3
+    scheduler = ColdBackupScheduler(
+        db_path=db_path,
+        backup_root=backup_root,
+        settings=_settings(data_root=tmp_path, backup_rotate_n=rotate_n),
+    )
+    seeded = [f"uploads.backup.20260101T0{hour}0000Z.db" for hour in (1, 2, 3)]
+    for name in seeded:
+        (backup_root / name).write_bytes(db_path.read_bytes())
+
+    # Distinct, ascending stamps. The real stamp has one-second resolution, so
+    # four snapshots inside one test second would otherwise collide on a single
+    # filename and hide the very accumulation this test is about.
+    stamps = iter(["20260101T040000Z", "20260101T050000Z", "20260101T060000Z", "20260101T070000Z"])
+    monkeypatch.setattr("phantom.workers.cold_backup.utc_stamp", lambda: next(stamps))
+
+    async def failing_backup(self: aiosqlite.Connection, target: aiosqlite.Connection) -> None:
+        """Fail the way a locked live DB does."""
+        raise OSError("backup failed mid-copy")
+
+    real_backup = aiosqlite.Connection.backup
+    monkeypatch.setattr(aiosqlite.Connection, "backup", failing_backup)
+    for _ in range(rotate_n):
+        with pytest.raises(OSError, match="backup failed mid-copy"):
+            await scheduler.snapshot_once()
+    monkeypatch.setattr(aiosqlite.Connection, "backup", real_backup)
+    fresh = await scheduler.snapshot_once()
+
+    survivors = sorted(p.name for p in backup_root.glob("uploads.backup.*.db"))
+    assert all((backup_root / name).stat().st_size > 0 for name in survivors)
+    assert survivors == sorted([*seeded[1:], fresh.name])
+
+
 async def test_snapshot_once_creates_backup_root_if_absent(tmp_path: Path) -> None:
     """run() creates backup_root before the first snapshot; snapshot_once tolerates pre-existing."""
     db_path = tmp_path / "uploads.db"

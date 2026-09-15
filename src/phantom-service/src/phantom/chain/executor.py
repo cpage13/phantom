@@ -230,10 +230,20 @@ class FailedAuth:
 
 @dataclass(frozen=True)
 class Failed4xx:
-    """Non-auth 4xx - terminal."""
+    """Non-auth 4xx - terminal.
+
+    The upstream response body is deliberately NOT carried (finding SL4-9).
+    No consumer read it: the sender's arm formats ``4xx_status_{status}`` and
+    nothing else touches the variant. Holding it was a latent disclosure
+    vector rather than dead weight alone, because a 4xx body routinely echoes
+    the request's own signature or credential identifiers and the field sat
+    one format string away from ``last_error``, which the admin API surfaces.
+    That is the hazard ``TemplateUnresolved`` and ``CaptureNotRenderable``
+    were restructured to make structurally impossible; this is the same rule
+    applied to the one variant that carried upstream bytes.
+    """
 
     status: int
-    body: bytes
 
 
 @dataclass(frozen=True)
@@ -623,7 +633,7 @@ class ChainExecutor:
         if url_refusal is not None:
             return url_refusal
         substituted_url, ok = self._substitute_or_literal(
-            step.url, row.captured_values, templated=envelope.templated
+            step.url, values, templated=envelope.templated
         )
         if not ok:
             return TemplateUnresolved(
@@ -657,7 +667,7 @@ class ChainExecutor:
             if header_refusal is not None:
                 return header_refusal
             rendered, header_ok = self._substitute_or_literal(
-                value, row.captured_values, templated=envelope.templated
+                value, values, templated=envelope.templated
             )
             if not header_ok:
                 return TemplateUnresolved(
@@ -670,7 +680,7 @@ class ChainExecutor:
 
         try:
             body_bytes, body_content_type, sub_ok, body_refusal = self._render_body(
-                step, row.captured_values, body_refs, templated=envelope.templated
+                step, values, body_refs, templated=envelope.templated
             )
         except InlineBodyDecodeError as exc:
             logger.warning(
@@ -883,7 +893,7 @@ class ChainExecutor:
                 status=response.status, observed_at=self._clock(), blocked_host=blocked
             )
         if 400 <= response.status < 500:
-            return Failed4xx(status=response.status, body=response.body)
+            return Failed4xx(status=response.status)
         if response.status >= 500:
             return Failed5xx(status=response.status)
         return FailedNetwork(error=f"Unexpected status {response.status}")
@@ -1059,7 +1069,7 @@ class ChainExecutor:
 
     @staticmethod
     def _substitute_or_literal(
-        template: str, captured: CapturedValues, *, templated: bool
+        template: str, values: dict[str, dict[str, Any]], *, templated: bool
     ) -> tuple[str, bool]:
         """Substitute placeholders, or pass the text through for a literal chain.
 
@@ -1069,9 +1079,16 @@ class ChainExecutor:
         it as one terminated a valid upload as ``failed`` with a template error
         it never had a template for.
 
+        Takes the FLATTENED captures, like its sibling
+        :meth:`_first_unrenderable` (finding SL4-8). It used to take
+        :class:`CapturedValues` and re-flatten the whole structure on every
+        call, so one step attempt rebuilt an identical dict-of-dicts once per
+        header and once per string node of a JSON body, on the event loop,
+        while every call site already held the flattened view.
+
         Args:
             template: The raw text, which may contain ``{{step.capture}}``.
-            captured: The chain's captured values.
+            values: The flattened captures, ``step -> {capture: value}``.
             templated: The envelope's marker. ``False`` short-circuits.
 
         Returns:
@@ -1079,7 +1096,7 @@ class ChainExecutor:
         """
         if not templated:
             return template, True
-        return substitute(template, ChainExecutor._captures_as_dict(captured))
+        return substitute(template, values)
 
     @staticmethod
     def _first_unrenderable(
@@ -1151,7 +1168,7 @@ class ChainExecutor:
     def _render_json_body(
         self,
         value: dict[str, Any],
-        captured: CapturedValues,
+        values: dict[str, dict[str, Any]],
         *,
         templated: bool,
         step_name: str,
@@ -1185,7 +1202,8 @@ class ChainExecutor:
 
         Args:
             value: The parsed JSON body from the envelope.
-            captured: The chain's captured values.
+            values: The flattened captures, ``step -> {capture: value}``,
+                computed once by the caller (SL4-8).
             templated: The envelope's ``templated`` marker (N3).
             step_name: The consuming step, for any refusal raised.
 
@@ -1195,7 +1213,6 @@ class ChainExecutor:
         if not templated:
             return value, True, None  # N3's rule, applied once to the whole body
         resolved = True
-        values = self._captures_as_dict(captured)
 
         def walk(node: Any, *, is_key: bool) -> tuple[Any, CaptureNotRenderable | None]:
             """Rebuild ``node`` with every placeholder resolved in place."""
@@ -1239,7 +1256,7 @@ class ChainExecutor:
             )
             if bad is not None:
                 return None, bad
-            rendered, ok = self._substitute_or_literal(node, captured, templated=True)
+            rendered, ok = self._substitute_or_literal(node, values, templated=True)
             if not ok:
                 resolved = False
             return rendered, None
@@ -1253,7 +1270,20 @@ class ChainExecutor:
     def _captures_as_dict(
         captured: CapturedValues,
     ) -> dict[str, dict[str, Any]]:
-        """Flatten :class:`CapturedValues` for the substitute helper."""
+        """Flatten :class:`CapturedValues` into the view every render site takes.
+
+        Called ONCE per step attempt, at the top of :meth:`execute_one_step`,
+        and threaded from there through the URL, header and body sites
+        (SL4-8). Nothing downstream re-derives it: a step attempt rebuilding
+        an identical dict-of-dicts once per header and once per string node of
+        a JSON body is pure event-loop time for byte-identical output.
+
+        Args:
+            captured: The chain's captured values.
+
+        Returns:
+            ``step -> {capture: value}``.
+        """
         return {name: dict(step.values) for name, step in captured.steps.items()}
 
     @staticmethod
@@ -1277,7 +1307,7 @@ class ChainExecutor:
     def _render_body(
         self,
         step: ChainStep,
-        captured: CapturedValues,
+        values: dict[str, dict[str, Any]],
         body_refs: dict[str, bytes],
         *,
         templated: bool,
@@ -1291,7 +1321,8 @@ class ChainExecutor:
 
         Args:
             step: The step whose body is being rendered.
-            captured: The chain's captured values.
+            values: The flattened captures, ``step -> {capture: value}``,
+                computed once by the caller (SL4-8).
             body_refs: The rehydrated body bytes, keyed by ref name.
             templated: The envelope's ``templated`` marker. ``_render_body``
                 does not receive the envelope, so the flag is passed down; a
@@ -1309,7 +1340,7 @@ class ChainExecutor:
             return b"", None, True, None
         if isinstance(step.body, ChainBodyJson):
             substituted, ok, bad = self._render_json_body(
-                step.body.value, captured, templated=templated, step_name=step.name
+                step.body.value, values, templated=templated, step_name=step.name
             )
             if bad is not None:
                 return b"", None, False, bad
@@ -1323,16 +1354,14 @@ class ChainExecutor:
         if isinstance(step.body, ChainBodyText):
             refusal = self._first_unrenderable(
                 step.body.value,
-                self._captures_as_dict(captured),
+                values,
                 templated=templated,
                 step_name=step.name,
                 site="body",
             )
             if refusal is not None:
                 return b"", None, False, refusal
-            rendered, ok = self._substitute_or_literal(
-                step.body.value, captured, templated=templated
-            )
+            rendered, ok = self._substitute_or_literal(step.body.value, values, templated=templated)
             if not ok:
                 return b"", None, False, None
             return rendered.encode("utf-8"), step.body.content_type, True, None

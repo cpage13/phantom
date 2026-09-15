@@ -11,17 +11,27 @@ stays I/O-free. Each tick:
 1. Re-reads ``saturation.max_disk_bytes`` and logs any enable/disable
    transition. The cap is hot-reloadable (ADR-013), so it is read per
    tick and NEVER decided once at loop entry (F13).
-2. While the cap is positive, reads ``FileBodyStore.total_bytes`` (an
-   ``os.walk``-based sum).
+2. While the cap is positive, reads ``FileBodyStore.total_bytes``.
 3. Calls :meth:`SaturationGate.set_disk_usage_bytes` with the result.
 4. Sleeps :attr:`poll_interval_seconds` until the next tick.
 
-While the cap is ``0`` the walk is skipped, because the observation has
-exactly one consumer and that consumer short-circuits on
-``max_disk_bytes > 0`` before it looks at the observation at all. The
-last observation is left in place rather than zeroed: zeroing would
-replace a stale truth with a fresh lie, and the next tick after a
-re-enable overwrites it anyway.
+**What the sample costs, accurately** (finding S8-9). ``total_bytes`` has
+been an O(1) running counter since CL6: :meth:`FileBodyStore.start` seeds it
+from one boot walk and ``put`` and ``delete`` adjust it per filesystem act.
+Three places here used to justify this module's whole design on an
+``os.walk``-per-sample that had already stopped existing, which is worse than
+a stale comment: it is a rationale a reader would extend. So what remains of
+the structure below is kept on its REAL reasons, not on a cost.
+
+While the cap is ``0`` the sample is skipped, and that is now a
+CLARITY decision rather than a saving: the observation has exactly one
+consumer and that consumer short-circuits on ``max_disk_bytes > 0`` before it
+looks at the observation at all, so a sample taken under a zero cap is a
+number nothing reads. The last observation is left in place rather than
+zeroed: zeroing would replace a stale truth with a fresh lie, and the next
+tick after a re-enable overwrites it anyway. The transition logging earns its
+place independently: it is the only operator-visible signal that a reloaded
+cap reached this worker.
 
 When the cached observation crosses the gate's ``max_disk_bytes`` cap,
 the gate's next admit returns
@@ -42,17 +52,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # 30 s default: the disk_usage_bytes observation feeds the gate's admit
-# decision and nothing else. (An earlier version of this comment also
-# claimed it feeds operator-visible /v1/admin/status; that was already
-# false, since both admin surfaces compute disk usage from a live
-# total_bytes() walk. Corrected with F13, whose skip-the-walk-under-a-
-# zero-cap decision rests on the admit path being the sole consumer.)
-# Staler than 30 s risks tripping max_disk_bytes only after the disk is
-# already full, tighter than 5 s wastes CPU on `os.walk` for no
-# observable benefit. Fixed constant: operators tune the cap
-# (max_disk_bytes) and live with this probe cadence. The cadence also
-# bounds how long a reloaded cap waits for its first observation, since
-# the transition is detected and sampled in the SAME tick.
+# decision and nothing else. Both admin surfaces read
+# FileBodyStore.total_bytes directly, so they never consult this
+# observation and the cadence cannot make them stale.
+#
+# WHY 30 s. The cadence is a STALENESS budget, not a CPU one: an earlier
+# version of this comment argued the lower bound as CPU spent on `os.walk`,
+# which total_bytes stopped being at CL6 (finding S8-9). What the number
+# actually buys is the window in which admitted bytes can outrun the gate's
+# view of the disk. Every byte admitted between two ticks is invisible to the
+# cap, so staler than 30 s risks tripping max_disk_bytes only once the disk
+# is already full; tighter buys a smaller window that the cap's own headroom
+# already covers, and costs a wake-up per instance on hardware chosen for
+# being small. Fixed constant: operators tune the cap (max_disk_bytes) and
+# live with this probe cadence. The cadence also bounds how long a reloaded
+# cap waits for its first observation, since the transition is detected and
+# sampled in the SAME tick.
 DEFAULT_PROBE_INTERVAL_SECONDS = 30.0
 
 
@@ -83,6 +98,9 @@ class DiskPressureProbe:
         ``apply_reload`` pushes it into the gate; a probe that returned at
         boot because the cap was 0 made a later reload unenforceable forever,
         since the gate's disk-usage observation has no other writer (F13).
+        That is the load-bearing half of F13 and it stands; the other half,
+        skipping the sample under a zero cap, rests on the sample being
+        pointless rather than expensive (S8-9).
         """
         cap = self._instance.saturation.max_disk_bytes
         sampling = cap > 0
@@ -120,6 +138,11 @@ class DiskPressureProbe:
                 continue
 
     async def _probe_once(self) -> None:
-        """One sample + one update."""
+        """One sample + one update.
+
+        The sample is an attribute read behind an ``async`` call, not a tree
+        walk: :meth:`FileBodyStore.total_bytes` has kept a running counter
+        since CL6 (S8-9).
+        """
         bytes_used = await self._instance.file_body_store.total_bytes()
         self._instance.saturation.set_disk_usage_bytes(bytes_used)

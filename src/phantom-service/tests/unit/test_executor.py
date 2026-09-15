@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -497,7 +498,25 @@ async def test_4xx_non_auth_classified() -> None:
     row = await _row(chain_id)
     result = await executor.execute_one_step(row, body_refs={"body": b"x"})
     assert isinstance(result, Failed4xx)
-    assert result.body == b"bad request"
+    assert result.status == 400
+
+
+@pytest.mark.asyncio
+async def test_4xx_does_not_carry_the_upstream_body() -> None:
+    """SL4-9: the 4xx variant carries the status and nothing else.
+
+    Objective: ``Failed4xx.body`` had no consumer - the sender's arm formats
+    ``4xx_status_{status}`` and discards it - while pinning the upstream
+    response in memory and sitting one format string away from
+    ``last_error``, which the admin API surfaces. A 4xx body routinely echoes
+    the request's own signature or credential identifiers, so the field was a
+    latent disclosure vector, the hazard the template variants were
+    restructured to make structurally impossible.
+
+    Expected outcome: the variant declares exactly one field, ``status``, so
+    there is no field for a careless format string to reach.
+    """
+    assert [f.name for f in dataclasses.fields(Failed4xx)] == ["status"]
 
 
 @pytest.mark.asyncio

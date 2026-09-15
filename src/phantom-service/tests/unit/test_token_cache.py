@@ -132,3 +132,41 @@ async def test_busy_timeout_pragma_applied(cache: SqliteTokenCache, tmp_path: Pa
         assert row2[0] == cfg.busy_timeout_ms == 2500
     finally:
         await c2.stop()
+
+
+@pytest.mark.asyncio
+async def test_set_returns_the_row_it_wrote_not_a_later_one(tmp_path: Path) -> None:
+    """S9-7: ``set`` describes its own write, not whatever landed afterwards.
+
+    Objective: the token cache's ``set`` re-read the row to return it, and the
+    re-read ran AFTER the write transaction released the write lock. A
+    ``mark_bad`` landing in that window made ``set`` report ``status='bad'``
+    for a write it had just forced to ``fresh``. The credential store's
+    ``set`` is the same code and carries the same test.
+
+    The interleaving is forced by making the lookup itself flip the slot,
+    which is the window the finding describes: after the commit, before the
+    read that used to supply the answer.
+
+    Expected outcome: ``set`` returns the bearer, source and ``fresh`` status
+    it committed.
+    """
+    cache = SqliteTokenCache(str(tmp_path / "token_cache.db"))
+    await cache.start()
+    try:
+        real_get = cache.get
+
+        async def mark_bad_then_get(endpoint: str, uid: str) -> object:
+            """Stand in for a concurrent mark_bad landing after the commit."""
+            await cache.mark_bad(endpoint, uid)
+            return await real_get(endpoint, uid)
+
+        cache.get = mark_bad_then_get  # type: ignore[method-assign]
+        written = await cache.set("files.example.com", "u1", "tok", source="admin_push")
+        assert written.status == "fresh"
+        assert written.bearer == "tok"
+        assert written.endpoint == "files.example.com"
+        assert written.uid == "u1"
+        assert written.source == "admin_push"
+    finally:
+        await cache.stop()
