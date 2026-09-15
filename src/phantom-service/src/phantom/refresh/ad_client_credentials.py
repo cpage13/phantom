@@ -9,6 +9,14 @@ The endpoint+uid the minter writes to is determined per-instance from
 the :class:`phantom.config.ad_mint.AdMintConfig` block on the instance's
 :class:`InstanceCfg`. The driving use is one ``(endpoint, uid)``
 per instance.
+
+The configured ``endpoint`` is normalised through
+:func:`phantom.routing.host_key_for` before it becomes a cache key, so the
+minter writes the SAME key space the reader looks up (SW-2). It previously
+wrote the YAML value verbatim: an operator spelling the natural
+``https://files.upstream.example`` minted successfully into a key nothing
+ever read, every row parked in ``auth_expired``, the kicker (which probes
+the normalised host) woke none of them, and nothing logged an error.
 """
 
 from __future__ import annotations
@@ -19,8 +27,10 @@ import logging
 import os
 import random
 from datetime import UTC, datetime
+from enum import StrEnum
 
 from phantom.config.ad_mint import AdMintConfig
+from phantom.routing import host_key_for
 from phantom.storage.interface import TokenCache
 
 logger = logging.getLogger(__name__)
@@ -46,6 +56,26 @@ class AuthUnavailableError(Exception):
     """Raised when neither primary nor secondary AD credentials succeed."""
 
 
+class AdReachability(StrEnum):
+    """What this minter has actually observed at the AD token endpoint.
+
+    The producer behind ``GET /v1/admin/status``'s ``ad_reachability``
+    (S1-7, ADR-007). Three states, and only one of them is a claim about
+    the authority answering:
+
+    * :attr:`NOT_ATTEMPTED` - no mint cycle has completed yet, so nothing
+      has been observed. The minter mints on its first loop iteration, so
+      this holds for one cycle at boot.
+    * :attr:`REACHABLE` - the most recent cycle obtained a token.
+    * :attr:`UNREACHABLE` - the most recent cycle exhausted every
+      configured credential without obtaining a token.
+    """
+
+    NOT_ATTEMPTED = "not_attempted"
+    REACHABLE = "reachable"
+    UNREACHABLE = "unreachable"
+
+
 class AdMinter:
     """ADR-001 ``ad_client_credentials`` autonomous-mint engine.
 
@@ -68,6 +98,13 @@ class AdMinter:
         self._cache = token_cache
         self._stop_event = asyncio.Event()
         self._immediate_mint = asyncio.Event()
+        # SW-2: the cache key, normalised ONCE at construction through the
+        # one hostname normaliser the reader (BearerAuthProvider) and the
+        # kicker's wake probe already use, so the mint key equals the
+        # lookup key by construction. ``config.endpoint`` stays the raw
+        # operator spelling and is what the logs name.
+        self._endpoint_key = host_key_for(config.endpoint)
+        self._reachability = AdReachability.NOT_ATTEMPTED
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Drive the background mint loop until ``stop_event`` fires.
@@ -114,6 +151,7 @@ class AdMinter:
         while not self._stop_event.is_set():
             try:
                 expires_at = await self._mint_and_store()
+                self._reachability = AdReachability.REACHABLE
                 outage_index = 0
                 # Sleep until refresh-before-expiry minus jitter, or wake on 401.
                 wait = self._next_mint_wait_seconds(expires_at)
@@ -124,6 +162,10 @@ class AdMinter:
                     )
                 self._immediate_mint.clear()
             except AuthUnavailableError as exc:
+                # Record the observation before the fail-fast re-raise, so
+                # the last thing the status surface saw is the truth even
+                # when this loop is about to die.
+                self._reachability = AdReachability.UNREACHABLE
                 if not backoff:
                     # Empty schedule means fail-fast: re-raise so the
                     # supervising TaskGroup observes the failure.
@@ -221,7 +263,19 @@ class AdMinter:
         raise AuthUnavailableError("No AD credentials produced a token")
 
     async def _mint(self, client_secret: str, scope: str) -> datetime:
-        """Mint one token using azure-identity and write it to the cache."""
+        """Mint one token using azure-identity and write it to the cache.
+
+        The cache write uses :attr:`_endpoint_key`, the normalised form of
+        the configured endpoint, NOT the raw YAML string (SW-2).
+
+        Args:
+            client_secret: The client secret to authenticate the app
+                registration with (primary or secondary).
+            scope: The AD scope to request the token for.
+
+        Returns:
+            The expiry datetime of the freshly minted token.
+        """
         # Lazy import - azure-identity is heavy and instances without an
         # AdMinter never need to import it.
         from azure.identity.aio import ClientSecretCredential
@@ -238,21 +292,25 @@ class AdMinter:
             await cred.close()
         expiry = datetime.fromtimestamp(access.expires_on, tz=UTC)
         await self._cache.set(
-            endpoint=self._config.endpoint,
+            endpoint=self._endpoint_key,
             uid=self._config.uid,
             bearer=f"Bearer {access.token}",
             source="plugin_mint",
         )
         return expiry
 
-    def trigger_immediate_mint_for_test(self) -> None:
-        """Test hook - set the immediate-mint event."""
-        self._immediate_mint.set()
-
     @property
-    def latest_expiry(self) -> datetime | None:
-        """Best-effort: most recent mint's expiry (None if never minted).
+    def reachability(self) -> AdReachability:
+        """What this minter last observed at the AD token endpoint.
 
-        Not tracked separately; admin status derives it from the cache.
+        Read by ``GET /v1/admin/status`` to fill ``ad_reachability``
+        (S1-7). Before this existed the field was a hardcoded literal with
+        no producer anywhere, so the one signal designed to tell an
+        operator "your app registration is unreachable and that is why
+        every row is parking in auth_expired" never fired.
+
+        Returns:
+            The observed reachability; :attr:`AdReachability.NOT_ATTEMPTED`
+            until the first mint cycle completes.
         """
-        return None
+        return self._reachability
