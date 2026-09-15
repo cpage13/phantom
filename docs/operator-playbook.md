@@ -1023,9 +1023,18 @@ cross-restart body durability matters.
 ### Vacuum
 
 Cron-scheduled SQLite VACUUM via `VacuumScheduler`. Default
-`storage.sqlite.vacuum_cron: "0 3 * * 0"` (Sunday 03:00). Fires
-only when `in_flight == 0`. No operator action needed in normal
-operation. To force a vacuum, restart at an idle moment.
+`storage.sqlite.vacuum_cron: "0 3 * * 0"` (Sunday 03:00). Fires only
+when no row is in `queued` or `attempting`. No operator action needed
+in normal operation. To force a vacuum, restart at an idle moment.
+
+It deliberately does not read the saturation gate's `in_flight`. That
+is a buffer-occupancy ledger and it counts the terminal `stored`
+state, so a single `stored` row, which one route typo or one exhausted
+retry budget produces, used to suppress the VACUUM every week
+thereafter. Nothing logged it, `stored` metadata retention defaults to
+never, and boot recovery re-seeded the charge, so a restart did not
+clear it either. If you are diagnosing a database that never shrinks
+on an older build, that is the shape to look for.
 
 ### Cold backup
 

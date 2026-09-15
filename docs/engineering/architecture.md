@@ -384,8 +384,11 @@ failure in any of them takes the process down loudly into a restart.
   the disk ceiling, new admissions are refused with a clean 503. Default cadence
   is 30 s.
 - **Vacuum scheduler.** Runs a SQLite `VACUUM` on a cron schedule, and only when
-  the in-flight queue is empty, to reclaim space without the write amplification
-  that autovacuum (locked off) would cause. Default schedule is weekly.
+  no row is in `queued` or `attempting`, to reclaim space without the write
+  amplification that autovacuum (locked off) would cause. Default schedule is
+  weekly. The idle test reads `counts_by_state()` rather than the saturation
+  gate, because the gate's `in_flight` counts the terminal `stored` state and a
+  single such row would otherwise suppress the VACUUM permanently.
 - **Invariant auditor.** Walks the rows on a low frequency and asserts the
   invariants that are checkable by a row walk (a row claiming an on-disk body must
   have that file; the recorded hash set must match the body store). It increments
