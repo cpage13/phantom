@@ -1575,6 +1575,43 @@ class SqliteUploadStore:
             fetched = await cur.fetchall()
         return [UUID(row["chain_id"]) for row in fetched]
 
+    async def list_chain_ids_with_bodies(self) -> list[UUID]:
+        """Return the chain_ids whose bodies SHOULD still exist on disk.
+
+        The orphan janitor's known-set. It used to be every chain_id regardless
+        of state, which made a stamped row shield its own leaked files: the
+        reaper stamps a row and deletes its bodies as two steps, and a crash or
+        a TaskGroup cancellation between them leaves a stamped row whose bytes
+        are still on disk. Every reclaimer was then closed to it. The reaper's
+        own body pass filters ``body_discarded_at IS NULL`` so it never retries;
+        recovery skips stamped rows; the invariant auditor walks
+        ``deliverable_only``; and the janitor treated the surviving row as proof
+        its files were wanted.
+
+        The reaper's comment claims the metadata pass and the janitor converge.
+        For ``stored`` that is weakly true, because the row-count cap eventually
+        evicts the row and that path deletes its bodies. For ``auth_expired`` it
+        is false outright: the state is deliberately excluded from
+        ``TERMINAL_STATES`` so the count-cap eviction can never take it, and
+        ``auth_expired_metadata_seconds`` defaults to never, so the row never
+        leaves the table and its files stay on disk for the life of the
+        deployment while still counting against the disk cap.
+
+        A stamped row is BY DEFINITION one whose bytes should be gone, so
+        excluding it here is what makes the claimed convergence real. The
+        janitor's two-sweep confirmation still covers the ordinary stamp-then-
+        delete window, which is microseconds against a sweep interval.
+
+        Returns:
+            Every chain_id whose ``body_discarded_at`` is NULL.
+        """
+        conn = self._read_connection()
+        async with conn.execute(
+            "SELECT chain_id FROM uploads WHERE body_discarded_at IS NULL"
+        ) as cur:
+            fetched = await cur.fetchall()
+        return [UUID(row["chain_id"]) for row in fetched]
+
     async def list_chain_ids(self) -> list[UUID]:
         """Alias of :meth:`list_all_chain_ids` named for the orphan janitor.
 

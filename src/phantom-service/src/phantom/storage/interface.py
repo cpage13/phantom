@@ -576,8 +576,23 @@ class UploadStore(Protocol):
     async def list_chain_ids(self) -> list[UUID]:
         """Return every chain_id currently in ``uploads`` (alias of list_all_chain_ids).
 
-        Provided so the body-orphan janitor (plan § 2.3.14)
-        gets a clearly-named "known set" source for ``BodyStore.list_orphans``.
+        The reaper folds this into ``cleanup_idempotency_index``'s preserve
+        set. It is NOT the orphan janitor's known-set; see
+        :meth:`list_chain_ids_with_bodies`.
+        """
+        ...
+
+    async def list_chain_ids_with_bodies(self) -> list[UUID]:
+        """Return the chain_ids whose bodies SHOULD still exist.
+
+        The body-orphan janitor's known-set for ``BodyStore.list_orphans``.
+        Distinct from :meth:`list_chain_ids` because a row whose
+        ``body_discarded_at`` is stamped is one whose bytes should be gone, so
+        treating it as evidence that its files are wanted let it shield them.
+        That is what made the reaper's stamp-then-delete crash window
+        permanently leak for ``auth_expired``, a state deliberately excluded
+        from ``TERMINAL_STATES`` so the count-cap eviction can never reach it
+        and whose metadata retention defaults to never.
         """
         ...
 

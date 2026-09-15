@@ -150,7 +150,11 @@ class BodyOrphanJanitor:
         time (live-row re-read). Candidates failing either guard simply
         wait; if they are real orphans the next sweep collects them.
         """
-        known = set(await self._store.list_chain_ids())
+        # Rows that should STILL have bodies, not every row. A stamped row is
+        # one whose bytes should be gone, so including it here made it shield
+        # its own leaked files from this sweep, which is the whole reason the
+        # reaper's stamp-then-delete crash window was not self-healing.
+        known = set(await self._store.list_chain_ids_with_bodies())
         candidates = set(await self._body_store.list_orphans(known))
         confirmed = candidates & self._pending_orphans
         removed = 0

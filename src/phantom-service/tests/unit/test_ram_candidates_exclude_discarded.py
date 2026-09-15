@@ -142,3 +142,51 @@ async def test_a_row_already_moved_to_disk_is_not_a_candidate(
     await store.mark_persisted(migrated.chain_id)
 
     assert await store.list_oldest_ram_bodies(limit=64) == []
+
+
+@pytest.mark.asyncio
+async def test_a_stamped_row_does_not_shield_its_leaked_files(
+    store: SqliteUploadStore, make_upload_row: Callable[..., UploadRow]
+) -> None:
+    """Objective: the orphan janitor's known-set excludes discarded rows.
+
+    Expected: a stamped row is absent from the known-set, so files left behind
+    by an interrupted stamp-then-delete become reclaimable orphans.
+
+    The reaper stamps a row and deletes its bodies as two steps. A crash or a
+    TaskGroup cancellation between them leaves a stamped row whose bytes are
+    still on disk, and every reclaimer was then closed to it: the reaper's own
+    body pass filters on an unstamped row so it never retries, recovery skips
+    stamped rows, the invariant auditor walks deliverable rows only, and the
+    janitor treated the surviving row as proof its files were wanted.
+
+    The reaper's comment claims the metadata pass and the janitor converge. For
+    ``stored`` that is weakly true, because the row-count cap eventually evicts
+    the row and that path deletes its bodies. For ``auth_expired`` it is false
+    outright: the state is deliberately excluded from the terminal set so the
+    count-cap eviction can never take it, and its metadata retention defaults
+    to never, so the row never leaves the table and its files stay on disk for
+    the life of the deployment while still counting against the disk cap.
+    """
+    live = make_upload_row(state="auth_expired", body_discarded_at=None)
+    await store.insert(live)
+    leaked = make_upload_row(state="auth_expired", body_discarded_at=None)
+    await store.insert(leaked)
+
+    # The reaper stamps, and is then interrupted before deleting the files.
+    flip = await store.discard_body_and_zero_accounting(
+        leaked.chain_id, expected_state="auth_expired"
+    )
+    assert flip.flipped is True
+
+    known = set(await store.list_chain_ids_with_bodies())
+
+    assert live.chain_id in known, "a row that still has bytes must be protected"
+    assert leaked.chain_id not in known, (
+        "the stamped row is still in the janitor's known-set, so it shields "
+        "the files the interrupted delete left on disk and nothing can reclaim "
+        "them for the life of the deployment"
+    )
+    # The all-rows alias is unchanged: it feeds the idempotency-index preserve
+    # set, which does want every row.
+    assert leaked.chain_id in set(await store.list_chain_ids())

@@ -127,6 +127,9 @@ class _StubUploadStore:
     async def list_chain_ids(self) -> list:
         return []
 
+    async def list_chain_ids_with_bodies(self) -> list:
+        return []
+
     async def get(self, chain_id) -> None:
         # No live rows: every candidate passes the R6-1 live-row re-read.
         return None

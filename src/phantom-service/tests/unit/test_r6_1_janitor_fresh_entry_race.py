@@ -113,6 +113,15 @@ class _StaleSnapshotStore:
         """The stale snapshot: taken before the chain was admitted."""
         return []
 
+    async def list_chain_ids_with_bodies(self) -> list[UUID]:
+        """The janitor's known-set, equally stale.
+
+        Same emptiness as the alias above: this fake exists to model a snapshot
+        taken before the chain was admitted, and which of the two methods the
+        janitor reads is not what the test is about.
+        """
+        return []
+
     async def get(self, chain_id: UUID) -> UploadRow | None:
         """The live table."""
         return self._live.get(chain_id)
