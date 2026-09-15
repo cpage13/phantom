@@ -179,29 +179,26 @@ class SqliteTokenCache:
         bearer: str,
         *,
         source: TokenSource,
-    ) -> TokenCacheRow:
+    ) -> None:
         """Write ``bearer`` for ``(endpoint, uid)`` and fire wake handlers.
 
         UPSERT forcing :data:`_FRESH_STATUS`, then fire the registered wake
         handlers so parked rows for this slot are re-queued.
 
-        The returned row is BUILT FROM THE WRITE, not re-read afterwards
-        (finding S9-7). The re-read ran after ``_write_txn`` released the
-        write lock, so a ``mark_bad`` landing in that window made this method
-        report ``status='bad'`` for a write it had just forced to ``fresh`` -
-        a state its own transaction never saw. Describing the committed write
-        is both the honest answer and one fewer query per refresh, on the
-        auth-refresh hot path.
+        RETURNS NOTHING (finding S9-7). This used to hand back the slot it had
+        written, and none of the seven call sites ever read it. Producing it
+        also cost a second query that could contradict the write: the re-read
+        ran AFTER ``_write_txn`` released the write lock, so a ``mark_bad``
+        landing in that window made this method report ``status='bad'`` for a
+        write it had just forced to ``fresh``, a state its own transaction
+        never saw. Dropping the return removes the race, the query and an
+        unreachable error arm, on the auth-refresh hot path.
 
         Args:
             endpoint: The upstream host axis of the cache key (ADR-002).
             uid: The opaque caller-supplied credential identifier.
             bearer: The Authorization-header value to cache.
             source: Where this bearer came from.
-
-        Returns:
-            The row this call committed. No caller reads it today; see the
-            module docstring's note on the dead return contract.
         """
         conn = self._require_conn()
         now = datetime.now(tz=UTC)
@@ -219,14 +216,6 @@ class SqliteTokenCache:
                 (endpoint, uid, bearer, now.isoformat(), source),
             )
             await conn.commit()
-        written = TokenCacheRow(
-            endpoint=endpoint,
-            uid=uid,
-            bearer=bearer,
-            observed_at=now,
-            source=source,
-            status=_FRESH_STATUS,
-        )
 
         # Fire wake handlers. Exceptions in handlers are logged, not propagated.
         for handler in self._wake_handlers:
@@ -238,7 +227,6 @@ class SqliteTokenCache:
                     endpoint,
                     uid,
                 )
-        return written
 
     async def mark_bad(self, endpoint: str, uid: str) -> None:
         """ADR-003: bad tokens stay in cache, status flips to ``bad``."""

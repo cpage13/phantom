@@ -135,8 +135,8 @@ async def test_busy_timeout_pragma_applied(cache: SqliteTokenCache, tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_set_returns_the_row_it_wrote_not_a_later_one(tmp_path: Path) -> None:
-    """S9-7: ``set`` describes its own write, not whatever landed afterwards.
+async def test_set_does_not_read_the_slot_back_after_committing(tmp_path: Path) -> None:
+    """S9-7: ``set`` commits and returns; it never re-reads the slot.
 
     Objective: the token cache's ``set`` re-read the row to return it, and the
     re-read ran AFTER the write transaction released the write lock. A
@@ -148,25 +148,38 @@ async def test_set_returns_the_row_it_wrote_not_a_later_one(tmp_path: Path) -> N
     which is the window the finding describes: after the commit, before the
     read that used to supply the answer.
 
-    Expected outcome: ``set`` returns the bearer, source and ``fresh`` status
-    it committed.
+    The whole return contract is now gone, because no call site ever read it,
+    so the property worth pinning is the ABSENCE of the read-back. A test that
+    asserts on a returned row cannot pin it any more.
+
+    Expected outcome: ``set`` consults ``get`` zero times, answers ``None``,
+    and the slot really is ``fresh`` afterwards.
     """
     cache = SqliteTokenCache(str(tmp_path / "token_cache.db"))
     await cache.start()
     try:
         real_get = cache.get
+        reads: list[tuple[str, str]] = []
 
-        async def mark_bad_then_get(endpoint: str, uid: str) -> object:
-            """Stand in for a concurrent mark_bad landing after the commit."""
-            await cache.mark_bad(endpoint, uid)
+        async def recording_get(endpoint: str, uid: str) -> object:
+            """Record every read-back so the test can prove there were none."""
+            reads.append((endpoint, uid))
             return await real_get(endpoint, uid)
 
-        cache.get = mark_bad_then_get  # type: ignore[method-assign]
-        written = await cache.set("files.example.com", "u1", "tok", source="admin_push")
-        assert written.status == "fresh"
-        assert written.bearer == "tok"
-        assert written.endpoint == "files.example.com"
-        assert written.uid == "u1"
-        assert written.source == "admin_push"
+        cache.get = recording_get  # type: ignore[method-assign]
+        result = await cache.set("files.example.com", "u1", "tok", source="admin_push")
+
+        assert result is None, "set still hands back a row that nothing reads"
+        assert reads == [], (
+            f"set re-read the slot after committing ({reads}); that read runs "
+            "outside the write lock, so a concurrent mark_bad can make it "
+            "contradict the write it just made"
+        )
+
+        cache.get = real_get  # type: ignore[method-assign]
+        row = await cache.get("files.example.com", "u1")
+        assert row is not None
+        assert row.status == "fresh"
+        assert row.bearer == "tok"
     finally:
         await cache.stop()

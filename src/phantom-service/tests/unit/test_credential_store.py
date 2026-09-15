@@ -338,7 +338,7 @@ def test_the_credential_row_refuses_a_status_outside_the_literal() -> None:
 
 
 @pytest.mark.asyncio
-async def test_set_returns_the_row_it_wrote_not_a_later_one(
+async def test_set_does_not_read_the_slot_back_after_committing(
     store: SqliteCredentialStore,
 ) -> None:
     """S9-7: ``set`` describes its own write, not whatever landed afterwards.
@@ -352,26 +352,33 @@ async def test_set_returns_the_row_it_wrote_not_a_later_one(
     which is exactly the window the finding describes: after the commit,
     before the read that used to supply the answer.
 
-    Expected outcome: ``set`` returns the credential, source and ``fresh``
-    status it committed.
+    The whole return contract is now gone, because no call site ever read it,
+    so the property worth pinning is the ABSENCE of the read-back.
+
+    Expected outcome: ``set`` consults ``get`` zero times, answers ``None``,
+    and the slot really is ``fresh`` afterwards.
     """
     creds = _static_creds()
     real_get = store.get
     lookups: list[str] = []
 
-    async def mark_bad_then_get(dest_host: HostCredKey) -> object:
-        """Stand in for a concurrent mark_bad landing after the commit."""
+    async def recording_get(dest_host: HostCredKey) -> object:
+        """Record every read-back so the test can prove there were none."""
         lookups.append(dest_host)
-        await store.mark_bad(dest_host)
         return await real_get(dest_host)
 
-    store.get = mark_bad_then_get  # type: ignore[method-assign]
-    written = await store.set(_HOST, creds, source="admin_push")
-    assert written.status == "fresh"
-    assert written.credential == creds
-    assert written.dest_host == _HOST
-    assert written.source == "admin_push"
-    # And there is no post-commit read for a racing writer to land inside.
-    # Before the fix this hook fired once and its answer became the return
-    # value, which is how ``set`` came to report ``bad``.
-    assert lookups == []
+    store.get = recording_get  # type: ignore[method-assign]
+    result = await store.set(_HOST, creds, source="admin_push")
+
+    assert result is None, "set still hands back a row that nothing reads"
+    assert lookups == [], (
+        f"set re-read the slot after committing ({lookups}); that read runs "
+        "outside the write lock, so a concurrent mark_bad can make it "
+        "contradict the write it just made"
+    )
+
+    store.get = real_get  # type: ignore[method-assign]
+    row = await store.get(_HOST)
+    assert row is not None
+    assert row.status == "fresh"
+    assert row.credential == creds

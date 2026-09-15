@@ -316,7 +316,7 @@ class SqliteCredentialStore:
         credential: DestinationCredential,
         *,
         source: CredentialSource,
-    ) -> CredCacheRow:
+    ) -> None:
         """Write ``credential`` for ``dest_host`` and fire wake handlers.
 
         UPSERT forcing :data:`_FRESH_STATUS` (so a re-push un-bads the slot -
@@ -326,21 +326,18 @@ class SqliteCredentialStore:
         (the ADR-003 posture the owner's persist-on-restart decision accepts,
         matching the token precedent).
 
-        The returned row is BUILT FROM THE WRITE, not re-read afterwards
-        (finding S9-7). The re-read ran after ``_write_txn`` released the
-        write lock, so a ``mark_bad`` landing in that window made this method
-        report ``status='bad'`` for a write it had just forced to ``fresh`` -
-        a state its own transaction never saw. Describing the committed write
-        is both the honest answer and one fewer query per push.
+        RETURNS NOTHING (finding S9-7). This used to hand back the slot it had
+        written, and none of the seven call sites ever read it. Producing it
+        also cost a second query that could contradict the write: the re-read
+        ran AFTER ``_write_txn`` released the write lock, so a ``mark_bad``
+        landing in that window made this method report ``status='bad'`` for a
+        write it had just forced to ``fresh``, a state its own transaction
+        never saw.
 
         Args:
             dest_host: The resolved destination host to key the slot on.
             credential: The structured credential to persist.
             source: How this credential was supplied.
-
-        Returns:
-            The row this call committed. No caller reads it today; see the
-            module docstring's note on the dead return contract.
         """
         conn = self._require_conn()
         now = datetime.now(tz=UTC)
@@ -361,13 +358,6 @@ class SqliteCredentialStore:
                 (dest_host, credential.kind, cred_json, now.isoformat(), source),
             )
             await conn.commit()
-        written = CredCacheRow(
-            dest_host=dest_host,
-            credential=credential,
-            observed_at=now,
-            source=source,
-            status=_FRESH_STATUS,
-        )
 
         # Fire wake handlers. Exceptions in handlers are logged, not propagated.
         for handler in self._wake_handlers:
@@ -378,7 +368,6 @@ class SqliteCredentialStore:
                     "Credential store wake handler raised for dest_host=%s",
                     dest_host,
                 )
-        return written
 
     async def mark_bad(self, dest_host: HostCredKey) -> None:
         """ADR-003: bad credentials stay in the store, status flips to ``bad``."""

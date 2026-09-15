@@ -1250,8 +1250,17 @@ class TokenCache(Protocol):
         bearer: str,
         *,
         source: TokenSource,
-    ) -> TokenCacheRow:
-        """Write the slot, update ``observed_at``, fire registered wake handlers."""
+    ) -> None:
+        """Write the slot, update ``observed_at``, fire registered wake handlers.
+
+        Returns nothing on purpose. This used to hand back the written row, and
+        not one of the seven call sites ever read it (S9-7), while producing it
+        cost a second query whose result could disagree with the write: the
+        re-read ran after the write transaction released its lock, so a
+        concurrent :meth:`mark_bad` made the call report ``bad`` for a slot it
+        had just forced ``fresh``. Callers that want the row read it back
+        explicitly and accept that it may have moved.
+        """
         ...
 
     async def mark_bad(self, endpoint: str, uid: str) -> None:
@@ -1303,8 +1312,13 @@ class CredentialStore(Protocol):
         credential: DestinationCredential,
         *,
         source: CredentialSource,
-    ) -> CredCacheRow:
-        """Write the slot, update ``observed_at``, fire registered wake handlers."""
+    ) -> None:
+        """Write the slot, update ``observed_at``, fire registered wake handlers.
+
+        Returns nothing, for the reason given on :meth:`TokenCache.set` (S9-7):
+        no call site read the returned row, and producing it cost a query that
+        ran outside the write lock and could therefore contradict the write.
+        """
         ...
 
     async def mark_bad(self, dest_host: HostCredKey) -> None:
