@@ -64,9 +64,17 @@ Preserved:
 
 ### Registry
 
-GHCR (`ghcr.io/<org>/phantom-service`). The release-tag CI workflow
-(Phase 7) authenticates via the workflow's `GITHUB_TOKEN`; no PAT,
-no AWS-side credential.
+GHCR (`ghcr.io/<org>/phantom-service`). The intended release-tag CI
+workflow (Phase 7) authenticates via the workflow's `GITHUB_TOKEN`;
+no PAT, no AWS-side credential.
+
+**That workflow does not exist as of 2026-09-15.** `.github/workflows/`
+contains only `per_pr.yml`, `nightly_stress.yml` and `perf.yml`.
+Nothing builds, tags, signs or publishes the image this ADR designates
+the deployment artifact, and ADR-016's tag scheme is entirely
+unimplemented, so there is no provenance on any artifact a consumer
+would pull. Read the paragraph above as the intent, not as a
+description of the repository.
 
 ### Base image
 

@@ -1,6 +1,8 @@
 # 016. Phantom container deployment model
 
-Phantom self-builds and publishes two multi-arch (`linux/arm64` + `linux/amd64`) container images: `phantom-service` (the buffering upload-proxy) and `phantom-emulator` (the upstream-shaped test server). The registry is **public Docker Hub** under the `<docker-org>` organization. Consumers deploy by pulling the published tag — Phantom is **not** rebuilt by downstream consumers (notably a downstream Balena overlay does `image: <docker-org>/phantom-service:<tag>`, not `build: ...`).
+> **Superseded in part by ADR-020 on the registry and on how many images are published.** The registry is GHCR, not Docker Hub, and only `phantom-service` is a published artifact. The paragraph below is corrected in place rather than left standing, because it was contradicting both ADR-020 and this file's own Dockerfile list further down. The tag scheme and the multi-arch decision are unchanged and still current. See also the note at the end of this file on what is actually implemented.
+
+Phantom self-builds and publishes one multi-arch (`linux/arm64` + `linux/amd64`) container image, `phantom-service` (the buffering upload-proxy). The registry is **GHCR**, `ghcr.io/<org>/phantom-service`, which is what `src/phantom-deploy/docker-compose.yml` and the deploy README both resolve. `phantom-emulator` is built for e2e and CI infrastructure and is never published. Consumers deploy by pulling the published tag; Phantom is **not** rebuilt by downstream consumers (notably a downstream Balena overlay does `image: ghcr.io/<org>/phantom-service:<tag>`, not `build: ...`).
 
 Tag scheme:
 
@@ -17,6 +19,8 @@ The Dockerfiles live per-package (paths corrected 2026-07-15; ADR-020 consolidat
 - `src/phantom-emulator/Dockerfile` — phantom-emulator (e2e/CI infrastructure; never published).
 
 Earlier Debian-slim placeholders at the repo root (`docker/Dockerfile`, `docker/docker-compose.yml`) are removed in this cycle (Phase 3 of `strategy_05_18.md`). The stub-era `tests/e2e/docker-compose.e2e.yml` was retired 2026-07-15 in favor of the live docker-marked lane (`tests/e2e/docker/compose.yml` + `test_docker_volume_replacement.py`).
+
+**Implementation status as of 2026-09-15.** The tag scheme above is not implemented. `.github/workflows/` contains exactly three workflows, `per_pr.yml`, `nightly_stress.yml` and `perf.yml`, and none of them builds, tags, signs or publishes an image. Nothing produces the versioned or `latest` tags this ADR describes, so there is no provenance on any artifact a consumer would pull and the image must currently be built locally. This paragraph records the gap rather than closing it; publishing is an outward-facing decision that belongs to the repository owner.
 
 Status: Accepted
 Date: 2026-05-20

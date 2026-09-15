@@ -105,9 +105,18 @@ verification — they are never returned as HTTP responses to a `POST
 
 Both map to `PhantomServerError` on the client side so a caller
 dispatching on `EXCEPTION_FOR_CODE` gets a sensible
-"server-side-problem" exception class. The `STATUS_FOR_CODE` map
-records `500` defensively for completeness — the codes never
-actually emit over the wire.
+"server-side-problem" exception class.
+
+The two codes differ on whether they reach the wire, and the section
+heading above is true of only one of them. `codec_round_trip_drift` is
+a `last_error` value alone, so its `STATUS_FOR_CODE` entry of `500` is
+defensive completeness and never emits. `storage_corruption` DOES
+emit: since N2 it is a real admin error BODY with a real `500` status,
+returned by the two single-chain body reads when the store holds fewer
+`body_refs` than the row declares. `models/errors.py` states this on
+the `ErrorCode` docstring. An integrator must therefore treat a
+`storage_corruption` response as a designed refusal on those two
+routes, not as a Phantom bug.
 
 ### DB quarantine — NOT in the matrix
 
