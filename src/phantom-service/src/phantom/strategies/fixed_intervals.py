@@ -5,6 +5,8 @@ from __future__ import annotations
 import random
 from datetime import timedelta
 
+from phantom.strategies.interface import MIN_RETRY_DELAY_SECONDS
+
 
 class FixedIntervalsStrategy:
     """Return the i-th interval (optionally jittered); None past the end."""
@@ -42,5 +44,13 @@ class FixedIntervalsStrategy:
             return None
         base = float(self._intervals[attempts])
         if self._jitter:
-            base = max(0.0, base * (1.0 + random.uniform(-self._jitter, self._jitter)))
+            # Same floor and same reason as the exponential strategy: a
+            # jitter draw must never schedule a delay the sender would
+            # re-claim on its next poll. Unlike the exponential term the
+            # floor is capped at the configured interval, so a deliberate
+            # ``0`` entry ("retry at once") keeps meaning that; the list is
+            # finite, so a zero entry cannot become a loop.
+            floor = min(base, MIN_RETRY_DELAY_SECONDS)
+            jittered = base * (1.0 + random.uniform(-self._jitter, self._jitter))
+            base = max(floor, jittered)
         return timedelta(seconds=base)

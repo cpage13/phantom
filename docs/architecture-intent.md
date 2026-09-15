@@ -67,7 +67,7 @@ cards, modest RAM, and no operator-in-the-loop most of the time. That
 shape drives several decisions visible in the code:
 
 - **No autovacuum on SQLite.** A scheduled VACUUM at 03:00 only fires
-  when the in-flight queue is empty. SD-card-death risk beats
+  when no upload is actively being worked. SD-card-death risk beats
   convenience.
 - **In-process, asyncio-only, single Docker container.** No
   microservice mesh, no Redis, no Kafka. The unit of failure is one
@@ -200,7 +200,7 @@ the write-purpose against `uploads` per the single-writer manifest (plan
 | **Reaper** | `workers/reaper.py` | Deletes terminal-state rows per the retention YAML. Iterates `succeeded`, `failed`, `cancelled`, `stored`, `corrupted`, `auth_expired`, `expired` on the same sweep. Trims `idempotency_index`. | UPDATE `body_discarded_at`; DELETE terminal rows past retention. | Periodic (`reaper_interval_seconds`, default 60). |
 | **Kicker** (bearer flavour) | `workers/kicker.py` | Wakes `auth_expired` rows when a fresh token lands in the cache. Skips body-discarded rows (R6-3, via `is_deliverable`); re-admits through the saturation gate, returning the slot on every outcome except a confirmed wake (R9-3 / R10-2). | UPDATE the `auth_expired → queued` wake via the M-W4-F7-guarded `record_attempt_result(expected_state="auth_expired")`; the sigv4 flavour drives the same guarded transition for `aws_sigv4` rows (doc correction 2026-06-12: this cell previously claimed no `uploads` writes). | `TokenCache.set` fires, plus a 1 s periodic rescan. |
 | **Kicker** (`aws_sigv4` flavour) | `workers/kicker.py` | The SAME class under `AWS_SIGV4_FLAVOUR`: wakes `auth_expired` `aws_sigv4` rows when a fresh destination credential lands in the host-keyed credential store. Inert when the instance wires no credential store. | UPDATE the `auth_expired → queued` wake (the same M-W4-F7-guarded transition). | A credential push for the row's `dest_host`, plus a periodic rescan. |
-| **VacuumScheduler** | `workers/vacuum.py` | Cron-style scheduler for SQLite VACUUM. Only runs when `in_flight == 0`. | None (DDL only). | Cron tick (default Sunday 03:00). |
+| **VacuumScheduler** | `workers/vacuum.py` | Cron-style scheduler for SQLite VACUUM. Only runs when no row is in `queued` or `attempting`, read from `counts_by_state()`. | None (DDL only). | Cron tick (default Sunday 03:00). |
 | **AdMinter.run()** | `refresh/ad_client_credentials.py` | Background loop minting AD tokens before expiry, with `ad_outage_retry_seconds` backoff. Only spawned when an instance's `cfg.ad_mint` is set. Phase 2 H6 closure: supervised by the composition root's TaskGroup (no self-spawned `asyncio.create_task`). | None (touches token_cache only). | Scheduled per the snapshot's AD-mint timings. |
 | **DiskPressureProbe** | `workers/disk_pressure.py` | Background probe of `shutil.disk_usage(data_dir).free`; refuses admission via the saturation gate when the threshold is breached. Ported to the composition root TaskGroup in Phase 1. | None (signals saturation gate). | Periodic (every few seconds). |
 | **ColdBackupScheduler** (optional, Phase 4) | `workers/cold_backup.py` | Periodic SQLite online-backup snapshots to `<data_dir>/backups/`. Off by default; opt-in via `db_integrity.backup_enabled`. | None (read-only on `uploads`; writes to `backups/`). | Periodic (`backup_period_seconds`, default 86400). |
@@ -748,7 +748,14 @@ deploying outside that shape need to read these constraints first:
   with battery-backed write cache should pin `synchronous="FULL"`.
 - **Flash-wear-aware defaults.** `auto_vacuum` is hardcoded NONE
   (no operator knob; plan § 0.3 hard rule). Cron VACUUM at 03:00
-  fires only when `in_flight == 0`. The persist-controller's
+  fires only when no row is actively being worked, meaning none in
+  `queued` or `attempting`. It deliberately does NOT read the
+  saturation gate's `in_flight`, which is a buffer-occupancy ledger
+  counting the terminal `stored` state: one `stored` row, whose
+  metadata retention defaults to never, used to disable the VACUUM
+  every week for the life of the deployment, and boot recovery
+  re-seeded the charge so a restart did not clear it. The
+  persist-controller's
   retry-linger (default 90 s) keeps healthy uploads RAM-resident,
   off the SD card entirely.
 - **Deployment-mode flexibility.** `body_store.mode` is a

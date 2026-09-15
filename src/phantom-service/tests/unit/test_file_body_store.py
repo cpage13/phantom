@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
 from pathlib import Path
 from unittest import mock
 from uuid import UUID, uuid4
@@ -204,6 +206,402 @@ async def test_total_bytes(tmp_path: Path) -> None:
     await s.put(uuid4(), {"body": b"y" * 200})
     total = await s.total_bytes()
     assert total == 300
+    await s.stop()
+
+
+# ---------------------------------------------------------------------
+# The disk counter is the SOLE input to DiskPressureProbe and therefore to
+# admission's ``max_disk_bytes`` gate, and it drifts in both directions.
+#
+# SP-3 / B2: ``put`` applied its increment only after every ref succeeded
+# and after the parent-dir fsync, but each ``_put_one`` has ALREADY renamed
+# its file into place. A multi-ref upload whose second ref hits ENOSPC left
+# the first ref's bytes on disk with the counter unchanged, so the gate was
+# fed a number low by exactly the leaked bytes, the producer's retries
+# compounded it, and the janitor's later reclaim drove the counter negative.
+#
+# S8-5: ``delete`` applied its decrement only after ``_rm_rf`` returned, so
+# a partial removal that raised dropped the accounting for every file it had
+# already unlinked; the counter drifted permanently UPWARD and admission
+# refused with 503 ``disk_pressure`` for space that was free.
+#
+# Every test below asserts the counter against the bytes ACTUALLY on disk,
+# which is the property the gate depends on, rather than against a constant.
+# ---------------------------------------------------------------------
+
+
+def _on_disk_bytes(root: Path) -> int:
+    """Sum the real file sizes under ``root``, excluding the ``.tmp/`` staging dir.
+
+    The independent oracle for the running counter: an assertion against
+    this catches drift in either direction, where an assertion against a
+    hand-computed constant only catches the direction it was written for.
+
+    Args:
+        root: The body-store root to measure.
+
+    Returns:
+        Total bytes of every regular file under ``root`` outside ``.tmp/``.
+    """
+    tmp_dir = root / ".tmp"
+    return sum(
+        p.stat().st_size for p in root.rglob("*") if p.is_file() and tmp_dir not in p.parents
+    )
+
+
+def _fail_fsync_on_call(monkeypatch: pytest.MonkeyPatch, *, nth: int) -> None:
+    """Make the ``nth`` body-file fsync raise ENOSPC, leaving earlier refs on disk.
+
+    ``_put_one`` fsyncs exactly once per ref, before its atomic rename, and
+    fsync is where a filesystem with delayed allocation actually reports
+    ENOSPC. Failing the nth call therefore reproduces "ref n hit ENOSPC"
+    exactly: refs 1..n-1 are renamed into place and stay there, ref n never
+    lands, and ``put`` raises.
+
+    Args:
+        monkeypatch: pytest's monkeypatch fixture.
+        nth: 1-based index of the fsync call that must fail.
+    """
+    from phantom.storage import file_body_store as module
+
+    calls = 0
+    real = module._fsync_file
+
+    def _failing(fd: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == nth:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real(fd)
+
+    monkeypatch.setattr(module, "_fsync_file", _failing)
+
+
+@pytest.mark.asyncio
+async def test_put_counts_the_refs_a_partial_upload_already_landed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A three-ref put whose second ref hits ENOSPC still counts the first ref.
+
+    Objective: close SP-3 / B2. ``_put_one`` renames each ref into place one
+    at a time, so the bytes of every ref that already landed are occupying
+    the disk that the ENOSPC gate protects, whether or not the refs after it
+    succeed.
+
+    Success: ``put`` raises ``OSError``, ref "a" is on disk, and
+    ``total_bytes()`` equals the bytes actually on disk. Before the fix the
+    counter stayed at 0 while 100 bytes sat in the tree.
+    """
+    s = FileBodyStore(tmp_path)
+    await s.start()
+    chain_id = uuid4()
+    _fail_fsync_on_call(monkeypatch, nth=2)
+
+    with pytest.raises(OSError):
+        await s.put(chain_id, {"a": b"x" * 100, "b": b"y" * 200, "c": b"z" * 400})
+
+    assert s.path_for(chain_id, "a").is_file(), "ref 'a' was renamed into place"
+    assert not s.path_for(chain_id, "b").exists(), "ref 'b' never landed"
+    on_disk = _on_disk_bytes(tmp_path)
+    assert on_disk == 100
+    assert await s.total_bytes() == on_disk, (
+        "the counter must match the bytes the partial put left on disk; "
+        "under-counting over-admits straight into ENOSPC"
+    )
+    await s.stop()
+
+
+@pytest.mark.asyncio
+async def test_put_counts_a_landed_ref_when_the_parent_dir_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single-ref put whose closing directory fsync raises still counts the ref.
+
+    Objective: the second half of SP-3. Even a one-ref upload reaches the
+    same hole, because the rename lands before the once-per-upload
+    parent-directory fsync; an EIO there used to discard the whole put's
+    accounting for bytes that are on disk.
+
+    Success: ``put`` raises ``OSError`` and ``total_bytes()`` equals the
+    bytes actually on disk. Before the fix the counter stayed at 0.
+    """
+    from phantom.storage import file_body_store as module
+
+    s = FileBodyStore(tmp_path)
+    await s.start()
+    chain_id = uuid4()
+    upload_dir = s.path_for(chain_id, "body").parent
+    real = module._sync_directory
+
+    def _failing(path: Path) -> None:
+        # Only the closing per-upload fsync fails; the ancestor sweep that
+        # runs before any rename must still work, or the test would prove
+        # nothing about the post-rename window.
+        if path == upload_dir:
+            raise OSError(errno.EIO, "Input/output error")
+        real(path)
+
+    monkeypatch.setattr(module, "_sync_directory", _failing)
+
+    with pytest.raises(OSError):
+        await s.put(chain_id, {"body": b"x" * 100})
+
+    on_disk = _on_disk_bytes(tmp_path)
+    assert on_disk == 100
+    assert await s.total_bytes() == on_disk
+    await s.stop()
+
+
+@pytest.mark.asyncio
+async def test_delete_counts_the_files_it_unlinked_when_the_directory_removal_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A removal that unlinks every file and then fails to rmdir still decrements.
+
+    Objective: close S8-5. ``rmdir`` raises ``ENOTEMPTY`` when a concurrent
+    put lands a file mid-sweep, and ``FileNotFoundError`` when a concurrent
+    delete won the race. Both arrive AFTER the body files have been
+    unlinked, so the bytes are genuinely gone; a decrement applied only on
+    the success path leaves the counter permanently high and admission then
+    refuses with 503 ``disk_pressure`` for space that is free.
+
+    Success: whatever ``delete`` does about the error, ``total_bytes()``
+    equals the bytes actually on disk afterwards. Before the fix the counter
+    stayed at 700 with an empty tree.
+    """
+    s = FileBodyStore(tmp_path)
+    await s.start()
+    chain_id = uuid4()
+    await s.put(chain_id, {"a": b"x" * 100, "b": b"y" * 200, "c": b"z" * 400})
+    assert await s.total_bytes() == 700
+    upload_dir = s.path_for(chain_id, "a").parent
+    real_rmdir = Path.rmdir
+
+    def _failing_rmdir(self: Path) -> None:
+        if self == upload_dir:
+            raise OSError(errno.ENOTEMPTY, "Directory not empty")
+        real_rmdir(self)
+
+    monkeypatch.setattr(Path, "rmdir", _failing_rmdir)
+
+    # Suppressed so this test asserts the ACCOUNTING claim alone; whether
+    # delete propagates the error is the separate claim below.
+    with contextlib.suppress(OSError):
+        await s.delete(chain_id)
+
+    on_disk = _on_disk_bytes(tmp_path)
+    assert on_disk == 0, "every body file was unlinked before the rmdir failed"
+    assert await s.total_bytes() == on_disk, (
+        "the counter must drop by what the removal actually unlinked; "
+        "over-counting refuses admission with 503 disk_pressure for free space"
+    )
+    await s.stop()
+
+
+@pytest.mark.asyncio
+async def test_delete_does_not_propagate_a_partial_removal_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An undeletable body file still leaves the counter matching the disk.
+
+    Objective: pin the accounting half of S8-5 on the raising path. ``delete``
+    signals the failure, because admission clears this namespace before
+    writing a retry's body and the idempotency-collision rollback turns the
+    failure into a 503; swallowing here would silence both. What must NOT
+    happen is the old behaviour, where the decrement was applied only after a
+    clean return, so a partial removal moved the counter by nothing and left
+    it permanently high, refusing admission with 503 ``disk_pressure`` for
+    space that is free.
+
+    S8-5's other consequence, one stuck file abandoning the rest of a reaper
+    tick, is pinned in ``test_reaper.py`` against ``Reaper._reclaim_bodies``,
+    which is where the unguarded await actually lives.
+
+    Success: the raise carries the chain_id, and the counter still equals the
+    bytes genuinely on disk.
+    """
+    s = FileBodyStore(tmp_path)
+    await s.start()
+    chain_id = uuid4()
+    await s.put(chain_id, {"a": b"x" * 100, "b": b"y" * 200})
+    upload_dir = s.path_for(chain_id, "a").parent
+    real_unlink = Path.unlink
+
+    def _failing_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.parent == upload_dir:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _failing_unlink)
+
+    with pytest.raises(OSError, match=str(chain_id)):
+        await s.delete(chain_id)
+
+    on_disk = _on_disk_bytes(tmp_path)
+    assert on_disk == 300, "nothing could be unlinked, so nothing was reclaimed"
+    assert await s.total_bytes() == on_disk, (
+        "the counter must still match the tree after a failed removal; drifting "
+        "high refuses admission with 503 disk_pressure for space that is free"
+    )
+    await s.stop()
+
+
+# ---------------------------------------------------------------------
+# T1: the BOOT SEED. CL6 turned ``total_bytes()`` from a live tree walk into
+# a running counter seeded once by ``start()``, and the seed is the only
+# thing that makes disk accounting survive a restart or notice body files no
+# row claims. It had no assertion anywhere in the tree, because
+# ``test_total_bytes`` constructs its store over an EMPTY tmp_path: the walk
+# returns 0 vacuously there and the assertion is carried entirely by the two
+# put increments.
+#
+# If the seed regresses (assignment dropped, walk rooted wrong, shards
+# skipped, or the walk moved ahead of the ``.tmp/`` purge), ``total_bytes()``
+# reports a number the tree does not support for the whole process lifetime.
+# DiskPressureProbe writes it into ``SaturationGate.set_disk_usage_bytes``
+# every tick and admission evaluates it against ``max_disk_bytes``, so a
+# seed stuck at 0 NEVER REFUSES and the volume fills past the configured cap
+# until an fsync raises ENOSPC mid-write - the F13 harm class, reached from
+# the restart direction.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_seeds_the_counter_from_body_files_it_did_not_write(
+    tmp_path: Path,
+) -> None:
+    """A fresh store over a populated tree boots with the tree's real size.
+
+    Objective: pin the boot seed. This is the restart case and the orphan
+    case at once - the files are in the canonical sharded layout, spread
+    across two shards, and no put in this process created any of them, which
+    is exactly what a body file left by a previous boot (or by a row the
+    janitor has not collected yet) looks like.
+
+    Success: ``total_bytes()`` immediately after ``start()`` equals the bytes
+    on disk, and a second store constructed over the same root reports the
+    same number, so the accounting survives the restart. A seed that is
+    dropped, rooted above or below the shards, or short-circuited to 0
+    reports 0 here and admission's disk gate never refuses again.
+    """
+    first = UUID("ab000000-0000-4000-8000-000000000001")
+    second = UUID("cd000000-0000-4000-8000-000000000002")
+    for chain_id, name, payload in (
+        (first, "body", b"x" * 300),
+        (second, "body", b"y" * 500),
+        (second, "extra", b"z" * 100),
+    ):
+        upload_dir = tmp_path / str(chain_id)[:2] / str(chain_id)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        (upload_dir / name).write_bytes(payload)
+
+    s = FileBodyStore(tmp_path, shard_prefix_chars=2)
+    await s.start()
+    on_disk = _on_disk_bytes(tmp_path)
+    assert on_disk == 900
+    assert await s.total_bytes() == on_disk, (
+        "start() must seed the counter from the tree; a seed of 0 over a "
+        "populated volume makes the max_disk_bytes gate unable to refuse"
+    )
+
+    # The restart: a brand-new store instance over the same root, as a
+    # process rebooting into its existing data directory would construct.
+    restarted = FileBodyStore(tmp_path, shard_prefix_chars=2)
+    await restarted.start()
+    assert await restarted.total_bytes() == on_disk
+    await restarted.stop()
+    await s.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_seeds_the_counter_after_the_tmp_purge_not_before(
+    tmp_path: Path,
+) -> None:
+    """Staged files a crash left behind are purged first and never counted.
+
+    Objective: pin the ORDER of the two things ``start()`` does. The purge
+    deletes the ``.tmp/`` staging tree; seeding ahead of it would count bytes
+    that are about to stop existing, and the counter would then over-report
+    for the process lifetime and refuse admission for free space.
+
+    Success: the counter equals the canonical body alone, with nothing from
+    the nested staging orphan. The orphan is nested one directory deep on
+    purpose: the walk skips the ``.tmp`` directory itself by exact path, so a
+    top-level staged file would be excluded even by a seed that ran too
+    early, and only a nested one can tell the two orderings apart.
+    """
+    chain_id = uuid4()
+    upload_dir = tmp_path / str(chain_id)[:2] / str(chain_id)
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "body").write_bytes(b"k" * 250)
+
+    staging = tmp_path / ".tmp" / "orphan-subdir"
+    staging.mkdir(parents=True)
+    (staging / "nested.tmp").write_bytes(b"j" * 4000)
+
+    s = FileBodyStore(tmp_path)
+    await s.start()
+
+    assert list((tmp_path / ".tmp").iterdir()) == [], "the staging tree was purged"
+    assert await s.total_bytes() == 250, (
+        "the seed must run after the purge; counting the 4000 staged bytes "
+        "leaves the counter permanently high against an empty .tmp/"
+    )
+    await s.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_does_the_boot_work_once_however_often_it_is_called(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second ``start()`` on the same store repeats neither the walk nor the purge.
+
+    Objective: close S8-8. In ``hybrid`` mode the composition root starts
+    this store directly and then hands it to ``build_body_store``, whose
+    :class:`HybridBodyStore` starts both halves again, so ``start()`` runs
+    TWICE per boot. Unguarded, the second run re-walks the entire body tree
+    with a stat per file, which at the 100k ``max_rows`` default doubles the
+    walk portion of boot latency on SD-card-class hardware, and re-purges
+    ``.tmp/``.
+
+    Success: across two ``start()`` calls the seed walk and the staging
+    purge each run exactly once, and the counter still reports the tree.
+    Before the fix both ran twice.
+    """
+    from phantom.storage import file_body_store as module
+
+    walks = 0
+    purges = 0
+    real_walk = FileBodyStore._walk_total_bytes
+    real_purge = module._purge_tmp_orphans
+
+    def _counting_walk(self: FileBodyStore) -> int:
+        nonlocal walks
+        walks += 1
+        return real_walk(self)
+
+    def _counting_purge(tmp_dir: Path) -> None:
+        nonlocal purges
+        purges += 1
+        real_purge(tmp_dir)
+
+    monkeypatch.setattr(FileBodyStore, "_walk_total_bytes", _counting_walk)
+    monkeypatch.setattr(module, "_purge_tmp_orphans", _counting_purge)
+
+    chain_id = uuid4()
+    upload_dir = tmp_path / str(chain_id)[:2] / str(chain_id)
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "body").write_bytes(b"q" * 750)
+
+    s = FileBodyStore(tmp_path)
+    await s.start()
+    await s.start()  # what HybridBodyStore.start() does to an already-started half
+
+    assert (walks, purges) == (1, 1), (
+        f"the boot walk and the .tmp/ purge must not repeat on an already-started "
+        f"store; observed {walks} walk(s) and {purges} purge(s)"
+    )
+    assert await s.total_bytes() == 750
     await s.stop()
 
 

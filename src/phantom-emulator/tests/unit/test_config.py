@@ -84,6 +84,30 @@ def test_env_overlay_layered_over_yaml(tmp_path: Path, monkeypatch: pytest.Monke
     assert cfg.server.port == 12345
 
 
+def test_init_kwargs_outrank_env_vars_in_pydantic_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin the precedence ``load_config``'s env pre-merge exists to invert.
+
+    Objective: the comment on that pre-merge used to claim Pydantic Settings
+    ranks env above init kwargs, which is backwards, and a maintainer acting
+    on it would delete the merge as redundant and silently let any YAML value
+    beat its env var. This test is the executable form of the real rule.
+
+    Expected outcome: an explicit value passed to ``model_validate`` beats the
+    env var; a bare ``AppConfig()`` honors the env var; and ``load_config``
+    over a YAML file that sets the same key lands on the env var, which it can
+    only do because the overlay merged env into the mapping first.
+    """
+    monkeypatch.setenv("PHANTOM_EMULATOR_SERVER__PORT", "9999")
+    yml = tmp_path / "cfg.yml"
+    yml.write_text("server:\n  port: 1234\n", encoding="utf-8")
+
+    assert AppConfig.model_validate({"server": {"port": 1234}}).server.port == 1234
+    assert AppConfig().server.port == 9999
+    assert load_config(yml).server.port == 9999
+
+
 def test_extra_keys_rejected() -> None:
     from pydantic import ValidationError
 

@@ -6,9 +6,10 @@ happens.
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Any, get_args, get_type_hints
 from uuid import UUID, uuid4
 
 import httpx
@@ -28,6 +29,7 @@ from phantom_client.models.chain import (
     ChainEnvelope,
     ChainStep,
 )
+from phantom_client.models.status import UploadState
 from pydantic import ValidationError
 
 
@@ -1063,3 +1065,156 @@ async def test_poll_group_until_finished_flips_mid_poll() -> None:
         rollup = await client.poll_group_until_finished(group_id, initial_delay_seconds=0.0)
     assert calls["count"] == 3
     assert rollup.all_finished is True
+
+
+# ---------------------------------------------------------------------------
+# Query parameters the service does not declare (and the enum behind one).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_uploads_sends_no_sort_parameter() -> None:
+    """Objective: the SDK stops sending a query parameter the service ignores.
+
+    Expected: the outbound query carries no ``sort`` key at all.
+    ``GET /v1/admin/chains`` declares none, and FastAPI drops undeclared query
+    parameters silently, so the ``sort`` sent unconditionally on every call was
+    discarded on arrival while the caller believed it had chosen an ordering.
+    """
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            content=json.dumps({"uploads": [], "next_cursor": None}),
+            headers={"Content-Type": "application/json"},
+        )
+
+    async with _client(handler) as client:
+        await client.list_uploads(limit=10)
+    assert "sort" not in captured["params"]
+    assert captured["params"] == {"limit": "10"}
+
+
+def test_list_uploads_takes_no_sort_keyword() -> None:
+    """Objective: the removed capability is gone from the signature too.
+
+    Expected: ``sort=`` is not an accepted keyword. Leaving the keyword in
+    place while dropping the wire parameter would keep advertising an
+    ordering the store's keyset pagination cannot provide.
+    """
+    parameters = inspect.signature(PhantomClient.list_uploads).parameters
+    assert "sort" not in parameters
+
+
+def test_list_uploads_state_is_typed_as_the_state_alias() -> None:
+    """Objective: ``state`` is the state vocabulary, not a bare ``str``.
+
+    Expected: the annotation resolves to ``UploadState | None``, so a typo
+    like ``state='suceeded'`` fails at type-check time rather than costing a
+    server round-trip. Every other state-carrying model in the package
+    (``DeleteFilter.state``, ``ExtractFilter.state``) already uses it.
+    """
+    hints = get_type_hints(PhantomClient.list_uploads)
+    assert set(get_args(hints["state"])) == {UploadState, type(None)}
+
+
+@pytest.mark.asyncio
+async def test_list_tokens_sends_no_instance_parameter() -> None:
+    """Objective: the SDK stops advertising a token scope the service lacks.
+
+    Expected: only ``endpoint`` reaches the wire. ``GET /v1/admin/tokens``
+    declares ``endpoint`` alone and always fans out across every configured
+    instance, so the discarded ``instance`` handed the caller an UNSCOPED list
+    while it believed the result was narrowed.
+    """
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            content=json.dumps({"tokens": []}),
+            headers={"Content-Type": "application/json"},
+        )
+
+    async with _client(handler) as client:
+        await client.list_tokens(endpoint="files.example.com")
+    assert captured["params"] == {"endpoint": "files.example.com"}
+
+
+def test_list_tokens_takes_no_instance_keyword() -> None:
+    """Objective: the unsupported scope is gone from the signature.
+
+    Expected: ``instance=`` is not an accepted keyword. It returns here in the
+    same change that adds ``instance`` to ``GET /v1/admin/tokens`` service-side
+    via the shared ``_scope_instances`` helper the sibling list routes use.
+    """
+    parameters = inspect.signature(PhantomClient.list_tokens).parameters
+    assert "instance" not in parameters
+
+
+# ---------------------------------------------------------------------------
+# find_by_metadata pre-flights through its own validated model.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("", "x"), ("k", "")],
+    ids=["empty-key", "empty-value"],
+)
+async def test_find_by_metadata_refuses_an_empty_pair_without_a_round_trip(
+    key: str, value: str
+) -> None:
+    """Objective: the KeyValueMatchFilter guard runs before the network call.
+
+    Expected: ``ValidationError`` and ZERO requests issued. ``find_by_metadata``
+    took bare strings and never constructed
+    :class:`KeyValueMatchFilter` - the exported model whose own docstring names
+    this method as its user - so its ``min_length=1`` guard never ran and an
+    empty key cost a full round-trip to come back as the service's
+    ``key_value_match_invalid`` envelope. The SDK already pre-flights the
+    analogous case in ``bulk_delete``.
+    """
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            content=json.dumps({"uploads": [], "next_cursor": None}),
+            headers={"Content-Type": "application/json"},
+        )
+
+    async with _client(handler) as client:
+        with pytest.raises(ValidationError):
+            await client.find_by_metadata(key=key, value=value)
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_find_by_metadata_still_encodes_a_valid_pair() -> None:
+    """Objective: the pre-flight does not change the happy path.
+
+    Expected: a well-formed pair reaches the wire in the documented
+    ``key:value`` encoding and the rows come back.
+    """
+    chain_id = uuid4()
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            content=json.dumps({"uploads": [_ok_upload_row(chain_id)], "next_cursor": None}),
+            headers={"Content-Type": "application/json"},
+        )
+
+    async with _client(handler) as client:
+        rows = await client.find_by_metadata(key="phantom_local_uuid", value=str(chain_id))
+    assert captured["params"]["key_value_match"] == f"phantom_local_uuid:{chain_id}"
+    assert [row.chain_id for row in rows] == [chain_id]

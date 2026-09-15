@@ -210,7 +210,9 @@ async def test_crash_between_mark_persisted_and_ram_delete(tmp_path: Path) -> No
     # Step 2 (file write + fsync) and Step 3 (mark_persisted) both
     # complete. Step 4 (ram.delete) does NOT run.
     await fbs.put(chain_id, {"body": body_bytes})
-    await store.mark_persisted(chain_id)
+    seeded = await store.get(chain_id)
+    assert seeded is not None
+    await store.mark_persisted(chain_id, received_at=seeded.received_at)
 
     assert await fbs.has_body_ref(chain_id, "body")
     mid = await store.get(chain_id)

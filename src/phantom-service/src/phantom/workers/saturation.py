@@ -20,6 +20,12 @@ by every worker that walks rows. :func:`row_holds_slot` answers "does this row
 currently charge the gate", and :func:`is_deliverable` answers "does this row
 still have bytes to send" (the H4 carve-out). Both live here so no caller
 re-derives them by hand.
+
+:data:`ACTIVE_WORK_STATES` is the third, and it is here for the opposite
+reason: to be read NEXT TO the first and not confused with it. "Does this row
+charge the gate" and "is this row still moving" are different questions with
+different answers for ``stored``, and a caller that wants the second one and
+reads the first gets a number that can never return to zero.
 """
 
 from __future__ import annotations
@@ -56,7 +62,40 @@ logger = logging.getLogger(__name__)
 # INSIDE the gate, from the store outcome's in-transaction pre-image,
 # so the ledger cannot drift in either direction and no caller
 # re-derives the crossing.
+#
+# This set answers OCCUPANCY, never ACTIVITY. See ACTIVE_WORK_STATES.
+# Gauge label for a gate that belongs to no named instance: a single-instance
+# deployment or a unit-test construction. The metrics registry is PROCESS-WIDE
+# and gauges are registered by bare name, so every instance's gate writes into
+# the same gauge; an unlabelled write from instance B therefore overwrites
+# instance A's value outright. Passing the instance id as the label keeps one
+# bucket per instance. The empty default is correct where there is only one
+# writer, which is exactly the single-gate case, and it cannot silently mask a
+# multi-instance collision because the composition root always passes the id.
+NO_INSTANCE_LABEL: Final[str] = ""
+
 SLOT_HOLDING_STATES: Final[frozenset[str]] = frozenset({"queued", "attempting", "stored"})
+
+# States whose row is WORK IN PROGRESS: the sender is about to claim it,
+# or has claimed it and is mid-attempt. Everything else is either
+# finished, parked awaiting an external event, or buffered.
+#
+# Deliberately NOT ``SLOT_HOLDING_STATES``, and the difference is the
+# whole reason this constant exists. That set is a buffer-occupancy
+# ledger and it includes the TERMINAL state ``stored``, whose body still
+# occupies space long after the row stopped moving. A row reaches
+# ``stored`` from an exhausted retry budget or from a step whose host
+# matches no configured route, and ``stored_metadata_seconds`` defaults
+# to never, so the occupancy answer for one such row is "charged, from
+# now on, forever". A caller asking "is this instance doing anything" and
+# reading the occupancy number instead gets "yes" for the life of the
+# deployment: exactly the reading that silently disabled the scheduled
+# VACUUM every week (SW-3).
+#
+# ``auth_expired`` is absent for the same reason ``stored`` is: a parked
+# row is waiting on a token push that may never come, it holds no slot,
+# and nothing is writing to it until a kicker wakes it back to ``queued``.
+ACTIVE_WORK_STATES: Final[frozenset[UploadState]] = frozenset({"queued", "attempting"})
 
 
 def row_holds_slot(state: str, body_discarded_at: datetime | None) -> bool:
@@ -286,14 +325,29 @@ class SlotDelta:
         stamp here would re-open the stale-read race the in-transaction
         outcome exists to close (C5).
 
+        That literal after-state is conditioned on the write having LANDED.
+        Hard-coding it unconditionally was a real leak: ``expire_row`` commits
+        its state change to ``expired`` and its body-discard stamp separately,
+        so a row sits in ``expired`` with a NULL stamp between the two, passes
+        both of replay's prechecks, and misses the UPDATE's state list. The
+        delta then read as a charge for a row that had not moved, and because
+        the route reserves before the write, the gate consumed that reservation
+        against a terminal row that can never release it: a permanent slot and
+        its bytes, repeated occurrences walking the gate to its cap.
+
+        On a non-landed write the after-state is the before-state, which makes
+        the crossing a no-op, which is exactly the arm that unwinds the
+        reservation. That is the same rule ``from_attempt`` already applies to
+        its own rowcount, so the two adapters now agree.
+
         Args:
-            outcome: The replay's in-transaction pre-image.
+            outcome: The replay's in-transaction pre-image and rowcount.
             size_bytes: This site's release basis.
         """
         return cls._crossing(
             before_state=outcome.previous_state,
             before_discarded_at=None,
-            after_state="queued",
+            after_state="queued" if outcome.rowcount else outcome.previous_state,
             after_discarded_at=None,
             size_bytes=size_bytes,
         )
@@ -394,6 +448,7 @@ class SaturationGate:
         large_body_threshold_bytes: int = 0,
         max_large_in_flight: int = 0,
         metrics_registry: MetricsRegistry | None = None,
+        instance_label: str = NO_INSTANCE_LABEL,
     ) -> None:
         """Construct the gate.
 
@@ -436,6 +491,7 @@ class SaturationGate:
         # plan-canonical Gauge name for current in-flight declared
         # bytes; admin endpoints serialize it via the registry.
         self._metrics = metrics_registry if metrics_registry is not None else MetricsRegistry()
+        self._instance_label = instance_label
         self._saturation_balance = self._metrics.register_gauge(
             "saturation_balance",
             "Current in-flight declared bytes admitted by the gate.",
@@ -572,7 +628,7 @@ class SaturationGate:
         # Emit gauge after releasing the lock - Gauge.set acquires its
         # own asyncio.Lock and we forbid await inside async with lock
         # (plan § 0.3).
-        await self._saturation_balance.set(self._in_flight_bytes)
+        await self._saturation_balance.set(self._in_flight_bytes, label_value=self._instance_label)
         # The ONE place a SlotReservation is minted (ADR-036): the
         # granted charge travels as a token its holder must consume or
         # unwind, so the release basis is structurally the admit basis.
@@ -619,7 +675,7 @@ class SaturationGate:
                 )
         # Emit after releasing the lock (plan § 0.3 forbids await
         # inside async with lock).
-        await self._saturation_balance.set(self._in_flight_bytes)
+        await self._saturation_balance.set(self._in_flight_bytes, label_value=self._instance_label)
 
     async def settle(self, delta: SlotDelta, *, consumes: SlotReservation | None = None) -> None:
         """Apply one write's effect on the ledger, and dispose of any reservation.
@@ -710,7 +766,7 @@ class SaturationGate:
                 self._large_in_flight = max(0, self._large_in_flight - 1)
         # Emit after releasing the lock (plan § 0.3 forbids await
         # inside async with lock).
-        await self._saturation_balance.set(self._in_flight_bytes)
+        await self._saturation_balance.set(self._in_flight_bytes, label_value=self._instance_label)
 
     async def update_caps(self, snapshot_saturation: SaturationCfg) -> None:
         """Update the gate's caps from a fresh :class:`SaturationCfg`.

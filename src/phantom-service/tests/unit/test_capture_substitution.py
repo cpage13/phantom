@@ -99,7 +99,7 @@ def _executor(client: _CapturingUpstream | None = None) -> ChainExecutor:
     """Build an executor over one forward-as-is route matching ``_HOST``.
 
     ``_render_body`` is an INSTANCE method that reaches for
-    ``self._captures_as_dict`` and ``self._substitute_or_literal``, so every
+    ``self._render_json_body`` and ``self._substitute_or_literal``, so every
     body test binds a real executor exactly as ``test_executor.py`` does.
 
     Args:
@@ -194,7 +194,9 @@ def _render(
     Returns:
         ``(body_bytes, content_type, all_resolved, refusal_or_None)``.
     """
-    result = executor._render_body(step, captured, {}, templated=templated)
+    result = executor._render_body(
+        step, ChainExecutor._captures_as_dict(captured), {}, templated=templated
+    )
     refusal = result[3] if len(result) > 3 else None
     return result[0], result[1], result[2], refusal
 
@@ -483,7 +485,7 @@ def test_unescaped_ascii_scalar_rendering_is_byte_identical() -> None:
             # a scalar (the CR/LF test drives the real header site).
             for context in ("url", "header"):
                 spliced, spliced_ok = executor._substitute_or_literal(
-                    template, captured, templated=True
+                    template, ChainExecutor._captures_as_dict(captured), templated=True
                 )
                 assert spliced_ok is True
                 assert spliced == template.replace(placeholder, rendered_value), (
@@ -545,3 +547,62 @@ def test_literal_chain_body_is_untouched() -> None:
     assert body_bytes == json.dumps(value).encode("utf-8"), (
         f"a literal body must be forwarded verbatim; got {body_bytes.decode('utf-8')!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_one_step_attempt_flattens_the_captures_exactly_once() -> None:
+    """SL4-8: the flattened capture view is built once per step attempt.
+
+    Objective: ``_substitute_or_literal`` used to take :class:`CapturedValues`
+    and re-flatten the whole structure on every call, while every call site
+    already held the flattened view. For C captured steps, H headers and N
+    string nodes of a JSON body that is ``2 + H + N`` rebuilds of an identical
+    dict-of-dicts per attempt, all on the event loop.
+
+    Expected outcome: one rebuild for the whole attempt. The step below has
+    two headers and a JSON body with three string nodes, so the pre-fix count
+    is six and any future re-flattening regression shows as a count above one.
+    """
+    calls: list[int] = []
+    real_flatten = ChainExecutor._captures_as_dict
+
+    def counting_flatten(captured: CapturedValues) -> dict[str, dict[str, Any]]:
+        """Count each rebuild of the flattened capture view."""
+        calls.append(1)
+        return real_flatten(captured)
+
+    client = _CapturingUpstream()
+    envelope = ChainEnvelope(
+        chain_id=uuid4(),
+        idempotency_key="k",
+        steps=[
+            ChainStep(
+                name="upload",
+                method="PUT",
+                url=f"https://{_HOST}/{{{{{_PRODUCER}.v}}}}",
+                headers={
+                    "X-One": f"{{{{{_PRODUCER}.v}}}}",
+                    "X-Two": f"{{{{{_PRODUCER}.v}}}}",
+                },
+                body=ChainBodyJson(
+                    kind="json",
+                    value={
+                        "a": f"{{{{{_PRODUCER}.v}}}}",
+                        "b": [f"{{{{{_PRODUCER}.v}}}}"],
+                        f"{{{{{_PRODUCER}.v}}}}": "literal",
+                    },
+                ),
+                capture=[],
+                idempotency_header=None,
+            )
+        ],
+        default_target=None,
+    )
+    captured = _captured(v="ok")
+    executor = _executor(client)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(ChainExecutor, "_captures_as_dict", staticmethod(counting_flatten))
+        result = await executor.execute_one_step(_row(envelope, captured), body_refs={})
+
+    assert type(result).__name__ == "Succeeded", f"the step must render cleanly; got {result!r}"
+    assert len(calls) == 1, f"the captures were flattened {len(calls)} times, expected once"

@@ -422,6 +422,11 @@ async def test_two_isolated_instances_boot(tmp_path: Path) -> None:
 # check_instance_isolation — pure-function edge cases (§9.11 tweaks).
 # ---------------------------------------------------------------------
 
+# The storage root these pure-function cases compose their relative
+# instance data_dirs against. Any fixed root works — the cases are about
+# how two composed paths relate to each other, not about where the root is.
+_ISOLATION_ROOT = Path("/srv/phantom")
+
 
 def test_isolation_sibling_data_dirs_are_distinct() -> None:
     """``a/b`` and ``a/bc`` are siblings, NOT nested — must pass.
@@ -434,7 +439,8 @@ def test_isolation_sibling_data_dirs_are_distinct() -> None:
         [
             _instance(instance_id="one", data_dir="a/b", host_prefixes=["one.example.com"]),
             _instance(instance_id="two", data_dir="a/bc", host_prefixes=["two.example.com"]),
-        ]
+        ],
+        data_dir_root=_ISOLATION_ROOT,
     )
 
 
@@ -448,7 +454,8 @@ def test_isolation_resolve_normalizes_dot_and_trailing_slash() -> None:
             [
                 _instance(instance_id="one", data_dir="foo", host_prefixes=["one.example.com"]),
                 _instance(instance_id="two", data_dir="./foo", host_prefixes=["two.example.com"]),
-            ]
+            ],
+            data_dir_root=_ISOLATION_ROOT,
         )
 
 
@@ -459,7 +466,8 @@ def test_isolation_true_nesting_is_rejected() -> None:
             [
                 _instance(instance_id="parent", data_dir="a", host_prefixes=["p.example.com"]),
                 _instance(instance_id="child", data_dir="a/b", host_prefixes=["c.example.com"]),
-            ]
+            ],
+            data_dir_root=_ISOLATION_ROOT,
         )
 
 
@@ -469,7 +477,8 @@ def test_isolation_glob_overlap_is_permitted() -> None:
         [
             _instance(instance_id="catchall", data_dir="a", host_prefixes=["*.example.com"]),
             _instance(instance_id="specific", data_dir="b", host_prefixes=["api.example.com"]),
-        ]
+        ],
+        data_dir_root=_ISOLATION_ROOT,
     )
 
 

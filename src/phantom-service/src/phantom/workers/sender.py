@@ -15,6 +15,14 @@ Per worker:
    PersistController is wired, enqueue the chain for RAM→disk migration
    (plan § 2.3.11 retry-linger trigger; § 2.3.18 sender wiring).
 
+EVERY re-queue this worker writes runs on that budget, the ADR-011 capture
+rewind included. A rewind re-executes a producing step upstream, so it is a
+retry of the chain and is scheduled like one; before it consulted the
+strategy the rewind cycle had no attempt budget, no backoff and no
+wall-clock bound, and because the row cycled only between ``queued`` and
+``attempting`` it never released its saturation charge either. See
+``_on_rewind``.
+
 Classified transient SQLite contention is recoverable at both storage
 boundaries in the worker loop. A pre-claim lock retries the claim on a later
 poll. A post-claim lock waits one poll and lets the worker continue; the row is
@@ -542,6 +550,13 @@ class Sender:
                         row.chain_id,
                     )
         else:
+            # ``attempts=0`` is a per-STEP budget reset and it is deliberate:
+            # a step that needed two retries must not hand its spent budget to
+            # the next step. It does mean the attempt ladder cannot accumulate
+            # across an ADR-011 rewind cycle, whose forward half runs through
+            # here; what bounds that cycle is the WALL-CLOCK budget measured
+            # from ``received_at``, which this reset cannot touch. See
+            # ``_on_rewind``.
             write = await store.record_attempt_result(
                 row.chain_id,
                 new_state="queued",
@@ -603,13 +618,82 @@ class Sender:
     async def _on_rewind(
         self, store: UploadStore, row: UploadRow, result: CaptureExpiredRewind
     ) -> None:
-        """ADR-011 reexecute=True - rewind ``current_step_index`` and re-queue."""
+        """ADR-011 reexecute=True - rewind ``current_step_index`` and re-queue.
+
+        THE REWIND RUNS ON THE RETRY BUDGET, like every other re-queue this
+        worker writes. It used to write ``attempts=0`` with
+        ``next_attempt_at=now`` and never consult
+        :meth:`UploadStrategy.schedule_next_attempt`, which left an ADR-011
+        rewind cycle with no attempt budget, no backoff and no wall-clock
+        bound. A three-step chain that captures at step 1 with a TTL shorter
+        than step 2's duration rewinds at step 3, re-executes step 1, succeeds
+        mid-chain (which writes ``attempts=0`` again), runs step 2, and expires
+        at step 3 once more. Because the row only ever cycles between ``queued``
+        and ``attempting``, both slot-holding, the cycle also never releases its
+        saturation charge, so a handful of such rows permanently shrink
+        ``max_in_flight`` until fresh ingress 503s. The route's
+        ``send_deadline_seconds`` DOES bound the cycle when an operator sets
+        one (the next pass runs the producing step, whose placeholders are not
+        the expired ones, so the executor's deadline gate fires); it defaults to
+        ``None``, which is where the cycle ran forever. This is the sixth of the
+        six slot-accounting leaks the full-coverage review found, and it
+        corrects commit 528af9b's claim that all six were already closed.
+
+        ATTEMPTS ARE BURNED HERE, unlike :meth:`_on_stored`'s capture-expired
+        park, and the difference is not an inconsistency. A capture-expired park
+        never reaches the upstream at all. A rewind re-executes the PRODUCING
+        step on the next pass, which ADR-011 says "may create a duplicate" when
+        that step omits an idempotency header, so each rewind costs one real
+        upstream write and must be charged against the budget that exists to
+        bound exactly that cost.
+
+        RESIDUAL, recorded rather than hidden: the mid-chain success branch of
+        :meth:`_on_succeeded` still resets ``attempts`` to 0, which is correct
+        for forward progress (each step earns its own retry budget) but means
+        the ATTEMPT ladder does not accumulate across a full rewind cycle. What
+        bounds the cycle is the WALL-CLOCK budget, which is measured from
+        ``row.received_at`` and therefore survives the reset:
+        ``exponential_backoff`` is the shipped default and its
+        ``max_duration_seconds`` defaults to 86 400 s. Under an explicit
+        ``fixed_intervals`` strategy, which bounds on attempts alone, the cycle
+        keeps its per-rewind backoff but its only ceiling is the route's
+        ``send_deadline_seconds``.
+        """
+        now = datetime.now(tz=UTC)
+        last_error = f"rewind:{result.producing_step}"
+        # The strategy indexes the ladder by attempts ALREADY MADE, so the
+        # call passes ``row.attempts`` and the write below persists the
+        # post-increment count. Same contract, same shape and same off-by-one
+        # correction as ``_on_retryable_failure``.
+        delay = self._instance.retry_strategy.schedule_next_attempt(
+            attempts=row.attempts,
+            since_received=now - row.received_at,
+            last_error=last_error,
+            route_name=row.route_name,
+        )
+        if delay is None:
+            # Budget exhausted: park through the single ``stored`` writer, the
+            # same disposition retry exhaustion already has. ``stored`` retains
+            # the body and the slot, so nothing is destroyed and the operator
+            # can replay; what changes is that the row is TERMINAL, so
+            # ``evict_terminal_over_limit`` and the terminal retention sweeps
+            # can reach it, where a row cycling queued/attempting forever could
+            # be reached by nothing at all.
+            await self._record_stored(
+                store,
+                row,
+                attempts=row.attempts + 1,
+                last_error=last_error,
+                upstream_status=None,
+                no_op_context="_on_rewind(stored)",
+            )
+            return
         write = await store.record_attempt_result(
             row.chain_id,
             new_state="queued",
-            attempts=0,
-            next_attempt_at=datetime.now(tz=UTC),
-            last_error=f"rewind:{result.producing_step}",
+            attempts=row.attempts + 1,
+            next_attempt_at=now + delay,
+            last_error=last_error,
             upstream_status=None,
             upstream_headers_json=None,
             captured_values=None,
@@ -850,8 +934,19 @@ class Sender:
         else:
             last_error = f"network:{result.error}"
             upstream_status = None
+        # The strategy indexes the ladder by PRIOR attempts, so the first retry
+        # must ask for rung 0. ``attempts`` above is the post-increment count
+        # persisted on the row, and passing it here shifted every schedule by
+        # one: with ``intervals_seconds: [1, 5, 20]`` the first retry waited 5 s
+        # rather than 1 s, ``intervals_seconds[0]`` was dead config that never
+        # produced a delay, and the third failure ran off the end so an operator
+        # who configured three intervals got two. Exponential shifted the same
+        # way, making the documented 5, 20, 80 ladder actually run 20, 80, 320
+        # and ``base_seconds`` never the delay. FixedIntervalsStrategy's own
+        # unit test pins ``attempts=0 -> intervals[0]``, which is the contract
+        # this call site was not meeting.
         delay = self._instance.retry_strategy.schedule_next_attempt(
-            attempts=attempts,
+            attempts=row.attempts,
             since_received=since_received,
             last_error=last_error,
             route_name=row.route_name,

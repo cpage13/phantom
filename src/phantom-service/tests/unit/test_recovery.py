@@ -9,8 +9,10 @@ a single missing body_ref in ``body_hashes`` quarantines the row as
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -277,3 +279,66 @@ async def test_recovery_still_quarantines_deliverable_ram_lost_row(tmp_path: Pat
         "a deliverable (queued) RAM-lost row must still quarantine — the fix must "
         "exempt only terminal-state rows, not all missing-body rows"
     )
+
+
+class _WholeRowWalkBanStore:
+    """A store whose whole-row walk is forbidden; everything else delegates.
+
+    Boot reconstruction has no business decoding a strict
+    :class:`~phantom.models.upload.UploadRow` per row, so this proxy makes the
+    attempt loud instead of merely slow.
+    """
+
+    def __init__(self, real: SqliteUploadStore) -> None:
+        self._real = real
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate every untouched store method to the real store."""
+        return getattr(self._real, name)
+
+    def iter_rows(self, *, deliverable_only: bool = False) -> AsyncIterator[UploadRow]:
+        """Refuse the whole-row walk."""
+        del deliverable_only
+        raise AssertionError(
+            "reconcile_saturation walked whole rows: it reads three columns and "
+            "must not build a strict UploadRow per row (finding S7-8)"
+        )
+
+
+@pytest.mark.asyncio
+async def test_boot_reconstruction_reads_three_columns_not_whole_rows(tmp_path: Path) -> None:
+    """Objective: the boot ledger seed must not decode a row per row.
+
+    Expected: the gate is seeded exactly as
+    ``test_boot_reconstructs_only_slot_holding_saturation_rows`` requires, on a
+    store whose whole-row walk raises. At the default ``retention.max_rows``
+    ceiling of 100 000 the old form was a second 100 000-row pydantic walk
+    immediately after recovery's own, 200 000 strict constructions before the
+    first worker starts and before uvicorn accepts a request, on the restart
+    path whose whole purpose is to get a stranded backlog moving again.
+
+    The banned walk is the witness and the counters are the guard: a pass that
+    reads a cheaper projection but seeds the wrong ledger fails here too.
+    """
+    store = await _build_store(tmp_path)
+    await store.insert(_row(uuid4(), state="queued", body_hashes=_hashes_for(b"q")))
+    await store.insert(_row(uuid4(), state="stored", body_hashes=_hashes_for(b"s")))
+    await store.insert(_row(uuid4(), state="auth_expired", body_hashes=_hashes_for(b"a")))
+    await store.insert(
+        _row(
+            uuid4(),
+            state="stored",
+            body_hashes=_hashes_for(b"x"),
+            body_discarded_at=datetime.now(tz=UTC),
+        )
+    )
+    saturation = SaturationGate(
+        max_in_flight=10,
+        max_in_flight_bytes=10_000,
+        max_disk_bytes=0,
+    )
+
+    await reconcile_saturation(_WholeRowWalkBanStore(store), saturation)  # type: ignore[arg-type]
+
+    assert saturation.in_flight == 2, "queued + unstamped stored hold slots"
+    assert saturation.in_flight_bytes == 128

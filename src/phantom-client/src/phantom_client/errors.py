@@ -139,8 +139,16 @@ class PhantomValidationError(PhantomUnprocessableError):
     """422 - envelope_invalid / body_ref_missing / body_ref_orphan / template_unresolved."""
 
 
-class PhantomRateLimitedError(PhantomHttpError):
-    """429 - caller rate-limited."""
+# There is deliberately no PhantomRateLimitedError. Phantom emits no 429:
+# ADR-017's status-by-code table has no 429 row, EXCEPTION_FOR_CODE maps no
+# code to such a class, and the service source contains no 429 anywhere. The
+# class was unreachable by construction, so it was removed rather than kept as
+# forward-looking API - an exception class a caller can never catch teaches
+# them a back-pressure shape the service does not have, when the real
+# back-pressure codes are the 503 family below (saturation_cap, disk_pressure,
+# storage_unavailable), all carrying Retry-After. If Phantom ever rate-limits,
+# the class returns in the same change as its ADR-017 row, its
+# EXCEPTION_FOR_CODE entry and its contract test.
 
 
 class PhantomServerError(PhantomHttpError):
@@ -355,7 +363,7 @@ __all__ = [
     "PhantomHttpError",
     "PhantomNetworkError",
     "PhantomNotFoundError",
-    "PhantomRateLimitedError",
+    "PhantomPayloadTooLargeError",
     "PhantomServerError",
     "PhantomTimeoutError",
     "PhantomTransportError",

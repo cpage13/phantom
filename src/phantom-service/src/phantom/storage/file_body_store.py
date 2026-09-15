@@ -36,13 +36,25 @@ Protocol no longer carries it. :meth:`list_orphans` is unchanged.
 
 Phase 4 § 5.2.3 (WS-4 Finding 9): :meth:`start` purges ``.tmp/``
 orphan files left behind by a crash mid-write so subsequent
-admissions stage into a clean directory.
+admissions stage into a clean directory. That boot work is one-shot per
+store (S8-8): ``hybrid`` mode starts this half twice, once directly from the
+composition root and once through :class:`HybridBodyStore`, and re-walking
+the whole tree for the second call buys nothing.
 
 The stored-byte total is a RUNNING COUNTER (CL6), not a query and not a
 per-read tree walk. :meth:`start` seeds it with one walk immediately after
 that purge, so it counts orphaned body files a SQL sum over ``uploads``
 would miss, and :meth:`put` and :meth:`delete` then adjust it by what the
 tree actually gained or lost.
+
+Neither writer is atomic across the files it touches, so both account on
+their ABORT paths as well as their success paths: :meth:`put` moves the
+counter as each rename lands rather than once at the end (SP-3), and
+:meth:`delete` moves it by what the removal actually unlinked rather than
+only when the whole tree came away (S8-5). The counter is the sole input to
+the disk-pressure gate, where drift in either direction is a real fault:
+under-counting over-admits into ENOSPC, over-counting refuses admission for
+space that is free.
 """
 
 from __future__ import annotations
@@ -51,6 +63,7 @@ import asyncio
 import logging
 import os
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import UUID
 
@@ -127,29 +140,86 @@ def _replace(src: Path, dst: Path) -> None:
     os.replace(src, dst)
 
 
-def _rm_rf(path: Path) -> int:
-    """Recursively remove ``path``; tolerant of partial trees.
+@dataclass
+class _RemovalTally:
+    """What one recursive removal actually accomplished (S8-5).
+
+    A removal is not atomic across the tree it walks, so "it raised" says
+    nothing about how much of the tree is gone. The tally separates the two
+    facts the caller needs: how many bytes really left the disk, and whether
+    anything survived.
+
+    Attributes:
+        freed: Summed size of the files actually unlinked. This is what
+            :meth:`FileBodyStore.delete` subtracts from the running total
+            (CL6), and it is meaningful whether or not ``failed`` is empty.
+        failed: Paths whose unlink, listing or rmdir raised. Non-empty means
+            the tree is still partly there and the body-orphan janitor will
+            meet it again on its next sweep.
+    """
+
+    freed: int = 0
+    failed: list[Path] = field(default_factory=list)
+
+
+def _rm_rf(path: Path) -> _RemovalTally:
+    """Recursively remove ``path``, reporting what happened; never raises.
+
+    Every entry is attempted independently, so one unremovable file does not
+    strand its siblings, and the bytes that did leave the disk are reported
+    whatever else failed. Raising from HERE would lose the caller's accounting
+    for everything already unlinked, which is half of S8-5: the old form
+    subtracted only after a clean return, so a partial removal moved the
+    counter by nothing and left it permanently high.
+
+    Reporting rather than raising is a property of this helper, not of the
+    store. :meth:`FileBodyStore.delete` applies the tally and then raises, so
+    its callers keep the failure signal they are written against.
+
+    A file that vanished between the ``stat`` and the ``unlink`` counts as
+    zero rather than failing, matching the walk's own tolerance.
+
+    Args:
+        path: The file or directory tree to remove.
 
     Returns:
-        The summed size of the files actually unlinked, which is what
-        :meth:`FileBodyStore.delete` subtracts from the running total (CL6).
-        A file that vanished between the ``stat`` and the ``unlink`` counts
-        as zero rather than raising, matching the walk's own tolerance.
+        A :class:`_RemovalTally` naming the bytes freed and the paths that
+        survived.
     """
+    tally = _RemovalTally()
     if not path.exists():
-        return 0
+        return tally
     if path.is_file():
         try:
             removed = path.stat().st_size
         except OSError:  # vanished under us
             removed = 0
-        path.unlink(missing_ok=True)
-        return removed
-    freed = 0
-    for entry in path.iterdir():
-        freed += _rm_rf(entry)
-    path.rmdir()
-    return freed
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            tally.failed.append(path)
+            return tally
+        tally.freed += removed
+        return tally
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        tally.failed.append(path)
+        return tally
+    for entry in entries:
+        child = _rm_rf(entry)
+        tally.freed += child.freed
+        tally.failed.extend(child.failed)
+    if tally.failed:
+        # Something underneath survived, so the directory is known non-empty;
+        # attempting rmdir here would only manufacture a second failure for
+        # the same cause.
+        return tally
+    try:
+        path.rmdir()
+    except OSError:
+        tally.failed.append(path)
+    return tally
 
 
 def _purge_tmp_orphans(tmp_dir: Path) -> None:
@@ -169,8 +239,17 @@ def _purge_tmp_orphans(tmp_dir: Path) -> None:
             if entry.is_dir():
                 # The freed size is discarded deliberately: this purge runs
                 # BEFORE the counter is seeded, and .tmp/ is outside the
-                # counter's scope in any case (CL6).
-                _rm_rf(entry)
+                # counter's scope in any case (CL6). The surviving paths are
+                # not discarded - _rm_rf reports rather than raises, so
+                # without this branch a failed purge would be silent.
+                tally = _rm_rf(entry)
+                if tally.failed:
+                    logger.warning(
+                        "failed to purge %d path(s) under .tmp/ orphan %s (first: %s)",
+                        len(tally.failed),
+                        entry,
+                        tally.failed[0],
+                    )
             else:
                 entry.unlink()
         except OSError:
@@ -200,6 +279,9 @@ class FileBodyStore:
         # and maintained by the two writers; see total_bytes for why the walk
         # is the seed rather than the reader (CL6).
         self._total_bytes: int = 0
+        # Whether start() has completed. The boot work is one-shot per store;
+        # see start() for why it is called more than once (S8-8).
+        self._started: bool = False
 
     async def start(self) -> None:
         """Create the root and tmp directories if missing; purge .tmp/ orphans.
@@ -213,7 +295,18 @@ class FileBodyStore:
         admission can stage a write into it. The canonical body tree is
         NOT touched - that's the body-orphan janitor's steady-state
         responsibility (plan § 2.3.14).
+
+        IDEMPOTENT (S8-8). In ``hybrid`` mode the composition root starts
+        this store directly and then passes it to ``build_body_store``,
+        whose :class:`HybridBodyStore` starts both halves again, so this is
+        called TWICE per boot. Repeating the work means a second full tree
+        walk with a stat per file, which at the 100k ``max_rows`` default
+        doubles the walk portion of boot latency on SD-card-class hardware.
+        The flag is set only once the seed has landed, so a ``start()`` that
+        raised can still be retried.
         """
+        if self._started:
+            return
         await asyncio.to_thread(_makedirs_durable, self._root, self._root.parent)
         tmp_dir = self._tmp_dir()
         await asyncio.to_thread(_makedirs_durable, tmp_dir, self._root)
@@ -223,9 +316,17 @@ class FileBodyStore:
         # orphan-awareness: a body file with no row is still occupying the
         # disk the ENOSPC gate protects, and only a walk can see it.
         self._total_bytes = await asyncio.to_thread(self._walk_total_bytes)
+        self._started = True
 
     async def stop(self) -> None:
-        """No-op."""
+        """Release the started flag; there is nothing else to tear down.
+
+        Clearing it keeps :meth:`start` genuinely restartable rather than
+        permanently inert after a shutdown: a store started again has to
+        re-seed, because the tree it is accounting may have changed while it
+        was stopped.
+        """
+        self._started = False
 
     def _tmp_dir(self) -> Path:
         """Per-store tmp directory for atomic-rename staging."""
@@ -276,23 +377,31 @@ class FileBodyStore:
         returns, so anything left unsynced here is an acknowledged upload that
         a power cut can lose.
 
+        ACCOUNTING ON THE ABORT PATH (SP-3): the running total is moved ref by
+        ref, as each rename lands, NOT once at the end. ``put`` is not atomic
+        across its refs, so a put that raises partway leaves every earlier
+        ref's bytes on the disk the ENOSPC gate protects; a counter updated
+        only on the success path would under-report them for the process
+        lifetime and over-admit by exactly that much.
+
         Returns:
             Total bytes written.
         """
         upload_dir = self._path_for(chain_id)
         await asyncio.to_thread(_makedirs_durable, upload_dir, self._root.parent)
         total = 0
-        grew = 0
         for name, data in body_refs.items():
             written, delta = await self._put_one(chain_id, name, data)
             total += written
-            grew += delta
+            # Account the ref the moment its rename has landed. Anything after
+            # this point can raise - a later ref hitting ENOSPC, or the closing
+            # parent-dir fsync taking an EIO - and these bytes are on disk
+            # regardless (SP-3). The move is the tree's GROWTH, not the bytes
+            # written: put is additive and overwrites a same-named file, so a
+            # re-put of an existing ref adds nothing to the disk (CL6).
+            self._total_bytes += delta
         # Parent-dir fsync once per upload, not per body_ref.
         await asyncio.to_thread(_sync_directory, upload_dir)
-        # The running total moves by the tree's GROWTH, not by the bytes
-        # written: put is additive and overwrites a same-named file, so a
-        # re-put of an existing ref adds nothing to the disk (CL6).
-        self._total_bytes += grew
         return total
 
     async def _put_one(self, chain_id: UUID, name: str, data: bytes) -> tuple[int, int]:
@@ -404,11 +513,48 @@ class FileBodyStore:
 
         The running total is reduced by what the removal actually unlinked
         (CL6), so the janitor's and the reaper's deletions are accounted at
-        the time they happen rather than at the next boot.
+        the time they happen rather than at the next boot. That decrement is
+        taken from the removal's own tally and is applied BEFORE any raise, so
+        a tree that came away only partly still moves the counter by the bytes
+        that really left the disk (S8-5). Dropping it, as the old
+        subtract-after-``_rm_rf`` form did, left the counter permanently high
+        and admission refusing with 503 ``disk_pressure`` for free space.
+
+        A removal that could not finish is accounted, logged, and then RAISED
+        as ``OSError``. The raise is the contract every caller is written
+        against and two of them need it: admission clears this namespace
+        before writing a retry's body and must not put over a half-cleared
+        tree, and the idempotency-collision rollback turns the failure into a
+        503 with ``Retry-After`` so the producer keeps buffering rather than
+        tripping its 5xx fallback.
+
+        S8-5's other consequence, one failed delete abandoning the rest of a
+        reaper tick, is fixed in :mod:`phantom.workers.reaper` where the
+        unguarded await actually lives. Swallowing it here would have fixed
+        the reaper by silencing the signal for everyone, which is why it is
+        guarded at the call site instead.
+
+        Raises:
+            OSError: When any path under the upload directory survived the
+                removal. The bytes that did leave are already accounted.
         """
         upload_dir = self._path_for(chain_id)
-        freed = await asyncio.to_thread(_rm_rf, upload_dir)
-        self._total_bytes -= freed
+        tally = await asyncio.to_thread(_rm_rf, upload_dir)
+        self._total_bytes -= tally.freed
+        if tally.failed:
+            logger.error(
+                "FileBodyStore.delete could not fully remove chain_id=%s: %d path(s) "
+                "survived (first: %s); the %d byte(s) actually unlinked are accounted "
+                "and the body-orphan janitor retries the remainder",
+                chain_id,
+                len(tally.failed),
+                tally.failed[0],
+                tally.freed,
+            )
+            raise OSError(
+                f"could not fully remove the body tree for chain_id={chain_id}: "
+                f"{len(tally.failed)} path(s) survived (first: {tally.failed[0]})"
+            )
 
     def _walk_total_bytes(self) -> int:
         """Sum every file size under the root, excluding ``.tmp/``.
@@ -438,11 +584,16 @@ class FileBodyStore:
         Returns a RUNNING TOTAL rather than a tree walk (CL6). The counter is
         seeded by :meth:`start` from one walk, so it counts orphaned body
         files that no row claims, and is then adjusted by the two methods that
-        can move bytes: :meth:`put` by the delta its rename produced, and
-        :meth:`delete` by the size of the tree it unlinked. A SQL
-        ``SUM(body_size_bytes)`` cannot substitute, because it misses crash
-        orphans and rows already zeroed by a discard, and the consumer is an
-        ENOSPC gate where under-counting is the unsafe direction.
+        can move bytes: :meth:`put` by the delta of each rename it lands, and
+        :meth:`delete` by the size of what the removal actually unlinked. A
+        SQL ``SUM(body_size_bytes)`` cannot substitute, because it misses
+        crash orphans and rows already zeroed by a discard, and the consumer
+        is an ENOSPC gate where under-counting is the unsafe direction.
+
+        Both adjustments are per file system act rather than per method call,
+        so a put or a delete that fails partway still leaves this number
+        describing the tree (SP-3, S8-5) instead of silently dropping the
+        accounting for work the filesystem had already done.
 
         Every mutation is applied on the event loop AFTER the filesystem work
         returns from its thread, so ``+=`` cannot interleave and no lock is

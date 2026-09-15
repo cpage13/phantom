@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import pytest
+from phantom.chain.auth_providers import NO_HOST_TOKEN, AuthParked, SigV4AuthProvider
 from phantom.chain.executor import ChainExecutor, Succeeded
 from phantom.chain.parser import parse_json_request
 from phantom.config.settings import InstanceCfg, RouteCfg
@@ -54,6 +55,17 @@ _PRESIGNED_QUERY = (
     "&partNumber=3"
 )
 _PRESIGNED_URL = f"https://{_HOST}/key?{_PRESIGNED_QUERY}"
+
+# The credential-grade VALUES inside ``_PRESIGNED_QUERY``: the access-key id,
+# the session token and the signature. ``X-Amz-SignedHeaders=host`` and
+# ``X-Amz-Expires=900`` are excluded because their values are not secrets and
+# ``host`` is a substring of ``dest_host=`` in the very log line under test.
+_CREDENTIAL_PARAM_VALUES = (
+    "AKIACLIENT",
+    "CLIENTSESSION",
+    "DEADBEEFCAFE",
+    "20260817T000000Z",
+)
 
 _PRESIGNED_NAMES = (
     "X-Amz-Algorithm",
@@ -180,6 +192,13 @@ async def test_presigned_query_is_stripped_before_signing_on_a_sigv4_route(
     carries none of the seven presigned parameters, carries exactly one
     ``Authorization`` header, and is accompanied by one INFO record naming the
     chain id and the destination host and no parameter value.
+
+    The capture names ``phantom.chain.auth_providers``, which is where the
+    record is emitted. It previously named ``phantom.chain.executor`` and passed
+    only inside the full lane, where an earlier test lowers the root log level
+    far enough for the record to propagate; run in isolation it failed on
+    ``main``. A log assertion that only holds under a particular test order is
+    not an assertion.
     """
     await cred_store.set(HostCredKey(_HOST), _static_creds(), source="admin_push")
     client = FakeUpstreamClient()
@@ -193,7 +212,7 @@ async def test_presigned_query_is_stripped_before_signing_on_a_sigv4_route(
     )
     row = await _presigned_row()
 
-    with caplog.at_level(logging.INFO, logger="phantom.chain.executor"):
+    with caplog.at_level(logging.INFO, logger="phantom.chain.auth_providers"):
         result = await executor.execute_one_step(row, body_refs={"body": b"bytes"})
 
     assert isinstance(result, Succeeded)
@@ -214,8 +233,18 @@ async def test_presigned_query_is_stripped_before_signing_on_a_sigv4_route(
     message = records[0].getMessage()
     assert str(row.chain_id) in message
     assert _HOST in message
-    assert "DEADBEEFCAFE" not in message
-    assert "AKIACLIENT" not in message
+    # The credential-grade VALUES from the presigned set, not just the signature.
+    # This is the one code path guaranteed to be holding a presigned credential,
+    # and the host it renders used to come from ``host_key_for``, which returns
+    # the WHOLE INPUT lower-cased when it finds no host: a pathless step URL
+    # therefore put the access-key id and the signature into the operator log at
+    # INFO, on exactly this line. (``X-Amz-SignedHeaders``' value is the literal
+    # ``host``, which is not credential material and is excluded so the check
+    # stays a real one rather than a substring accident.)
+    for value in _CREDENTIAL_PARAM_VALUES:
+        assert value.lower() not in message.lower(), (
+            f"a presigned credential value reached the log record: {value!r} in {message!r}"
+        )
 
 
 @pytest.mark.asyncio
@@ -288,3 +317,59 @@ async def test_only_the_closed_presigned_set_is_removed(
     query = _query_of(client.requests[0])
     assert query["x-amz-meta-colour"] == ["blue"]
     assert query["partNumber"] == ["3"]
+
+
+@pytest.mark.asyncio
+async def test_a_hostless_presigned_url_logs_the_token_not_the_credential(
+    cred_store: SqliteCredentialStore,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The strip's INFO line renders the SANITISED host, never the raw key.
+
+    Objective: this line is the only site in the service that logged
+    ``host_key_for``'s output, and ``host_key_for``'s own docstring says the
+    output "is UNSANITISED and must not be persisted or logged as-is" - it
+    returns the ENTIRE INPUT lower-cased when no host can be parsed. A step URL
+    of ``/bucket/key?X-Amz-Credential=AKIA...&X-Amz-Signature=...`` therefore
+    wrote the access-key id and the signature into the operator log at INFO, on
+    the ONE code path guaranteed to be carrying a presigned credential.
+
+    The provider is driven DIRECTLY rather than through
+    ``execute_one_step``, because ``resolve_route`` now refuses a URL with no
+    dialable host and the row never reaches the auth arm. That refusal is a
+    second, independent guard; this test pins the first one, so removing either
+    is a visible failure rather than a silently-uncovered path.
+
+    Success: the record carries the fixed ``<no-host>`` token and none of the
+    presigned credential values.
+    """
+    hostless_url = (
+        "/bucket/key?X-Amz-Credential=AKIACLIENT%2F20260817%2Fus-east-1%2Fs3%2Faws4_request"
+        "&X-Amz-Signature=DEADBEEFCAFE&X-Amz-Security-Token=CLIENTSESSION&partNumber=3"
+    )
+    provider = SigV4AuthProvider(store=cred_store)
+
+    with caplog.at_level(logging.INFO, logger="phantom.chain.auth_providers"):
+        outcome = await provider.prepare(
+            full_url=hostless_url,
+            uid="",
+            method="PUT",
+            headers={},
+            body=b"bytes",
+            chain_id=uuid4(),
+        )
+
+    # No credential is provisioned for a hostless key, so the arm parks.
+    assert isinstance(outcome, AuthParked)
+    assert outcome.blocked_host == NO_HOST_TOKEN
+    records = [r for r in caplog.records if "presigned" in r.getMessage()]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert NO_HOST_TOKEN in message, f"a hostless URL must render the fixed token; got {message!r}"
+    for value in _CREDENTIAL_PARAM_VALUES:
+        assert value.lower() not in message.lower(), (
+            f"a presigned credential value reached the log record: {value!r} in {message!r}"
+        )
+    assert "bucket" not in message and "?" not in message, (
+        f"no producer URL text may reach the operator log; got {message!r}"
+    )

@@ -34,7 +34,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from phantom_emulator.routers._deps import UPLOAD_METHODS, get_state
-from phantom_emulator.state import EmulatorState, RawBody
+from phantom_emulator.state import EmulatorState, RawBody, capture_headers
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,10 @@ async def put_raw(path: str, request: Request, state: StateDep) -> Response:
     never captures, in :attr:`RawBody.query` so a test can observe whether the
     forwarder preserved it.
 
+    The header capture goes through :func:`phantom_emulator.state.capture_headers`,
+    so a field name the forwarder sent twice reaches
+    :attr:`RawBody.all_headers` carrying BOTH values rather than only the last.
+
     Returns ``200`` (empty body) on store; ``413`` when the body exceeds the
     reused ``upstream.body_max_bytes`` cap (checked before the store so an
     oversized body is rejected without retaining it).
@@ -63,7 +67,7 @@ async def put_raw(path: str, request: Request, state: StateDep) -> Response:
     body = await request.body()
     if len(body) > state.cfg.upstream.body_max_bytes:
         raise HTTPException(status_code=413, detail="body exceeds upstream cap")
-    all_headers = {k.lower(): v for k, v in request.headers.items()}
+    all_headers = capture_headers(request.headers)
     state.raw_bodies[path] = RawBody(
         path=path,
         method=request.method,

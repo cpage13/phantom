@@ -16,8 +16,9 @@ Coverage targets per the plan acceptance bullets:
   backups minted in the SAME wall-clock second coexist with DISTINCT
   backup_ids (seam-1 acceptance; no disambiguation machinery exists).
 * :func:`isolate_db_file` produces a manifested body-less backup.
-* :class:`BackupManifest` / :class:`BackupMoveMarker` JSON round-trip and
-  are written atomically.
+* :class:`BackupManifest` / :class:`BackupMoveMarker` JSON round-trip, and
+  are written atomically AND durably: contents fsynced before the rename,
+  parent directory fsynced after it (S6-8).
 * :func:`restore_mode_switch_backup` is addressed by MANIFEST, moves the
   pair into empty live targets, deletes the consumed manifest, and clears
   the marker.
@@ -33,6 +34,7 @@ Coverage targets per the plan acceptance bullets:
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from datetime import UTC, datetime
@@ -322,6 +324,78 @@ def test_backup_move_marker_atomic_write_then_read(tmp_path: Path) -> None:
     assert marker_path.exists()
     # No temp sibling is left behind after the atomic replace.
     assert not (tmp_path / (BACKUP_MOVE_MARKER_NAME + ".tmp")).exists()
+    assert _read_backup_move_marker(marker_path) == marker
+
+
+# ---------------------------------------------------------------------
+# S6-8: ``os.replace`` gives atomicity of the NAME, not durability of the
+# CONTENTS. A power cut shortly after a mode-switch backup starts could
+# replay the rename without the data blocks, leaving a present-but-empty
+# manifest or marker: the next boot degrades the instance and the live tree
+# is left half-moved (bodies_root emptied, uploads.db still live) with NO
+# RECORD naming where the bodies went, which is precisely the A-3 state the
+# marker exists to prevent. The manifest is what makes the body tree
+# recoverable, so it gets the same treatment FileBodyStore already gives
+# every body file: fsync the contents before the rename, then fsync the
+# directory that now holds the new name.
+#
+# A real power cut cannot be staged in the suite, so this asserts the call
+# SEQUENCE at the seam, in the same spirit as the F10 fsync-ordering tests
+# in ``test_file_body_store.py``.
+# ---------------------------------------------------------------------
+
+
+def test_write_json_model_atomic_fsyncs_contents_then_rename_then_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The record's bytes and its new directory entry are both made durable.
+
+    Objective: close S6-8. Ordering is the whole claim - an fsync of the
+    contents AFTER the rename would leave a window where the name is
+    published against unwritten blocks, and no directory fsync at all leaves
+    the entry itself in the parent's dirty page cache.
+
+    Success: the recorded sequence is exactly file-fsync, rename,
+    parent-directory fsync, and the record still reads back. Before the fix
+    the sequence was the bare rename.
+    """
+    from phantom.storage import integrity as module
+
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def _recording_fsync(fd: int) -> None:
+        events.append("fsync_file")
+        real_fsync(fd)
+
+    def _recording_replace(src: object, dst: object) -> None:
+        events.append("replace")
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    def _recording_sync_directory(path: Path) -> None:
+        # Recorded but NOT called through: the real helper is already
+        # covered by the F10 tests, and calling it here would add a second
+        # os.fsync to the sequence under test.
+        events.append(f"fsync_dir:{path}")
+
+    monkeypatch.setattr(module.os, "fsync", _recording_fsync)
+    monkeypatch.setattr(module.os, "replace", _recording_replace)
+    # ``raising=False`` so this test fails on the RECORDED SEQUENCE rather
+    # than on a missing attribute: an AttributeError from the patch itself
+    # would prove nothing about what the writer does.
+    monkeypatch.setattr(module, "_sync_directory", _recording_sync_directory, raising=False)
+
+    marker_path = tmp_path / BACKUP_MOVE_MARKER_NAME
+    marker = BackupMoveMarker(backup_id=_FIXED_BACKUP_ID, direction="backup")
+    _write_json_model_atomic(marker_path, marker)
+
+    assert events == ["fsync_file", "replace", f"fsync_dir:{tmp_path}"], (
+        f"the contents must be fsynced BEFORE the rename publishes the name, and the "
+        f"parent directory AFTER it, or the rename can replay without the data blocks. "
+        f"Recorded: {events}"
+    )
+    monkeypatch.undo()
     assert _read_backup_move_marker(marker_path) == marker
 
 
@@ -885,11 +959,7 @@ async def test_integrity_checker_check_delegates_to_check_integrity(tmp_path: Pa
     await _create_real_sqlite(db_path)
     body_root = tmp_path / "body_store"
     body_root.mkdir()
-    checker = IntegrityChecker(
-        db_path=db_path,
-        body_store_root=body_root,
-        data_root=tmp_path,
-    )
+    checker = IntegrityChecker(db_path=db_path, body_store_root=body_root)
     result = await checker.check()
     assert result.ok is True
     assert result.message == "ok"
@@ -900,32 +970,9 @@ async def test_integrity_checker_check_flags_corruption(tmp_path: Path) -> None:
     db_path = tmp_path / "uploads.db"
     await _create_real_sqlite(db_path)
     _corrupt_first_bytes(db_path)
-    checker = IntegrityChecker(
-        db_path=db_path,
-        body_store_root=tmp_path / "body_store",
-        data_root=tmp_path,
-    )
+    checker = IntegrityChecker(db_path=db_path, body_store_root=tmp_path / "body_store")
     result = await checker.check()
     assert result.ok is False
-
-
-def test_integrity_checker_quarantine_now_and_list(tmp_path: Path) -> None:
-    """:meth:`quarantine_now` returns the manifest; :meth:`list_quarantines` reports it."""
-    db_path = tmp_path / "uploads.db"
-    body_root = tmp_path / "body_store"
-    db_path.write_bytes(b"placeholder")
-    body_root.mkdir()
-    (body_root / "x.bin").write_bytes(b"y" * 8)
-    checker = IntegrityChecker(
-        db_path=db_path,
-        body_store_root=body_root,
-        data_root=tmp_path,
-    )
-    manifest = checker.quarantine_now(_FIXED_TS)
-    entries = checker.list_quarantines()
-    assert [e.backup_id for e in entries] == [manifest.backup_id]
-    assert entries[0].db_path == manifest.db_path
-    assert entries[0].body_path == manifest.body_path
 
 
 @pytest.mark.parametrize("missing", ["db", "body"])
@@ -937,11 +984,7 @@ def test_integrity_checker_quarantine_now_tolerates_missing(tmp_path: Path, miss
         db_path.write_bytes(b"x")
     if missing != "body":
         body_root.mkdir()
-    checker = IntegrityChecker(
-        db_path=db_path,
-        body_store_root=body_root,
-        data_root=tmp_path,
-    )
+    checker = IntegrityChecker(db_path=db_path, body_store_root=body_root)
     manifest = checker.quarantine_now(_FIXED_TS)
     assert manifest.has_db == (missing != "db")
     assert manifest.has_body == (missing != "body")

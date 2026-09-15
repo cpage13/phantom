@@ -155,8 +155,9 @@ class MultipartPart(Protocol):
 def _validate_static_placeholders(envelope: ChainEnvelope) -> None:
     """Verify every ``{{step.var}}`` references a prior step's declared capture.
 
-    Walks URL, headers, JSON body string fields. Raises
-    :class:`ParserError("template_unresolved")` on dangling reference.
+    Walks the URL, the header values, and every string node of a JSON body,
+    its KEYS included (SL4-7), plus a text body. Raises
+    :class:`ParserError("template_unresolved")` on a dangling reference.
     """
     seen_captures: dict[str, set[str]] = {}
     for step in envelope.steps:
@@ -185,7 +186,23 @@ def _validate_static_placeholders(envelope: ChainEnvelope) -> None:
 
 
 def _walk_json_for_placeholders(value: Any) -> list[tuple[str, str]]:
-    """Recursive walk over a JSON-shaped tree collecting placeholders."""
+    """Recursive walk over a JSON-shaped tree collecting placeholders.
+
+    KEYS are walked as well as values, and that is the whole point of the dict
+    arm (finding SL4-7). The executor's ``_render_json_body`` threads
+    ``is_key=True`` through dict keys and substitutes into them, so a brace
+    span in a key is a real capture reference. Walking only values meant a
+    producer typo in a key passed this static pass, earned a 202 and a durably
+    admitted row, and was discovered only when the chain terminated ``failed``
+    at delivery. A key is collected BEFORE its value so the refusal names the
+    key's dangling reference rather than a resolvable sibling further along.
+
+    Args:
+        value: Any node of the parsed JSON body.
+
+    Returns:
+        Every ``(step, capture)`` pair the subtree references, in walk order.
+    """
     if isinstance(value, str):
         return find_placeholders(value)
     if isinstance(value, list):
@@ -195,7 +212,8 @@ def _walk_json_for_placeholders(value: Any) -> list[tuple[str, str]]:
         return out
     if isinstance(value, dict):
         out2: list[tuple[str, str]] = []
-        for v in value.values():
+        for k, v in value.items():
+            out2.extend(_walk_json_for_placeholders(k))
             out2.extend(_walk_json_for_placeholders(v))
         return out2
     return []

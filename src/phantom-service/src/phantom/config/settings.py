@@ -11,6 +11,23 @@ overlay:
 List-typed fields (``instances``) are NOT env-overlay-able - they
 live in YAML only.
 
+The environment step
+--------------------
+
+:func:`_apply_env_overlay` is the ONE reader of the ``PHANTOM_*``
+namespace; :class:`_PhantomEnvSource` wires it in as the model's env
+settings source so a bare ``Settings()`` and :func:`load_settings` mean
+the same thing. It resolves each variable's dotted path against the
+model, so it knows two things the raw name cannot tell it: the target
+field's type (the environment carries only strings and every sub-model
+below declares ``strict=True``, so a scalar override MUST be coerced or
+it fails to load) and whether the variable names a settings field at
+all (the ``PHANTOM_`` prefix is a shared namespace - the shipped
+compose file reads ``PHANTOM_ORG`` / ``PHANTOM_TAG``, and operators are
+told to hold secrets in prefixed variables - so an unrecognised one is
+ignored rather than turned into a boot failure). A variable's VALUE is
+never logged and never reaches an error string.
+
 Smart defaults from the host probe
 ----------------------------------
 
@@ -35,17 +52,47 @@ from __future__ import annotations
 import logging
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Final, Literal, get_args
 
 import yaml  # type: ignore[import-untyped]  # types-PyYAML not in workspace dev deps
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    SecretStr,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from pydantic.fields import FieldInfo
+from pydantic_settings import (
+    BaseSettings,
+    EnvSettingsSource,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 from phantom.config.defaults import compute_defaults
 from phantom.config.probe import probe_machine
 from phantom.models.credential import SigningService, _coerce_signing_service
 
 logger = logging.getLogger(__name__)
+
+# Characters that cannot appear in a BARE SQLite json-path label, so their
+# presence would force the quoted-label form. Quotes and backslashes are the
+# escape hazard itself; brackets are the array-index syntax; whitespace and
+# the dollar sign break the bare-label grammar. Dots are legal here because
+# they are the segment separator this field is documented to use.
+_JSON_PATH_FORBIDDEN_CHARS: Final[frozenset[str]] = frozenset("\"'\\[]$ \t\n\r")
+
+# The environment namespace Phantom reads, and the nesting delimiter inside
+# it. Named here rather than inline because BOTH the model config and
+# :func:`_apply_env_overlay` must use the same two strings or the documented
+# override mechanism and the model would disagree about what a variable means.
+ENV_PREFIX: str = "PHANTOM_"
+ENV_NESTED_DELIMITER: str = "__"
 
 
 # Set to ``True`` by :meth:`Settings.reload_from_yaml` when the caller opts
@@ -126,10 +173,19 @@ class TlsCfg(BaseModel):
             "is set, Phantom auto-generates the pair at startup."
         ),
     )
-    key_password: str | None = Field(
+    key_password: SecretStr | None = Field(
         None,
         description=(
-            "Optional passphrase for an encrypted private key (uvicorn ssl_keyfile_password)."
+            "Optional passphrase for an encrypted private key (uvicorn "
+            "``ssl_keyfile_password``). Held as a ``SecretStr``: it is the one "
+            "credential this config carries as a LITERAL rather than as the name "
+            "of an environment variable (see :class:`SigV4CredentialCfg`), and "
+            "``python -m phantom --validate`` - which the operator docs call safe "
+            "to run at deploy time - writes ``model_dump_json`` to stdout, so a "
+            "plain ``str`` put the passphrase into CI job logs and deploy "
+            "transcripts. ``SecretStr`` renders as ``**********`` there and in "
+            "``contracts/settings.schema.json``; the consumer reads the literal "
+            "back with ``.get_secret_value()``."
         ),
     )
 
@@ -241,7 +297,7 @@ class BodyStoreCfg(BaseModel):
     )
     ram_ceiling_bytes: int | None = Field(
         None,
-        ge=0,
+        ge=1,
         description=(
             "RamBodyStore size ceiling in bytes. None means probe-fill "
             "at startup - the ``_resolve_defaults`` model validator "
@@ -249,9 +305,43 @@ class BodyStoreCfg(BaseModel):
             "(preserving the pre-rename ``in_memory_max_bytes`` "
             "probe-fill semantic). Explicit int overrides (e.g., "
             "536_870_912 / 512 MiB). Ignored in all_disk mode (no RAM "
-            "to bound)."
+            "to bound). There is NO 'unlimited' or 'no RAM bodies' "
+            "sentinel: the ceiling is an ENFORCED bound, so every "
+            "accepted value is a real bound and 0 is rejected. To run "
+            "with no RAM-resident bodies, set ``mode: all_disk`` - the "
+            "first-class deployment mode for exactly that posture."
         ),
     )
+
+    @field_validator("ram_ceiling_bytes", mode="before")
+    @classmethod
+    def _reject_zero_ceiling(cls, value: object) -> object:
+        """Turn the withdrawn ``0`` sentinel into an actionable error.
+
+        ``0`` used to be documented as "no RAM bodies" while the only
+        consumer (``RamPressureWatcher._check_once``) read it as "no ceiling"
+        and disabled enforcement entirely, so RAM grew unbounded. The field is
+        now ``ge=1``, but a bare ``greater_than_equal`` error would not tell an
+        operator following the old documentation where to go instead.
+
+        Args:
+            value: The pre-validation value (an ``int`` from YAML, or an
+                already-coerced ``int`` from the env overlay).
+
+        Returns:
+            ``value`` unchanged for everything except the withdrawn sentinel.
+
+        Raises:
+            ValueError: When the value is exactly ``0``.
+        """
+        if isinstance(value, int) and not isinstance(value, bool) and value == 0:
+            raise ValueError(
+                "body_store.ram_ceiling_bytes: 0 is not a sentinel - the ceiling "
+                "is an enforced bound. Set body_store.mode: all_disk to run with "
+                "no RAM-resident bodies, or pin a real byte ceiling"
+            )
+        return value
+
     ram_pressure_poll_seconds: float = Field(
         1.0,
         gt=0.0,
@@ -282,6 +372,14 @@ class BodyStoreCfg(BaseModel):
             "non-zero label."
         ),
     )
+
+
+# Highest compression level each storage codec accepts, keyed by the
+# ``CompressionCfg.algorithm`` literal. These are the LIBRARY limits, not a
+# Phantom policy: ``zstandard.ZstdCompressor`` raises "level must be less
+# than 23" above 22, and ``gzip.compress`` raises "Bad compression level"
+# above 9. ``original`` (PassthroughCodec) reads no level and is absent.
+_CODEC_MAX_LEVEL: dict[str, int] = {"zstd": 22, "gzip": 9}
 
 
 class CompressionCfg(BaseModel):
@@ -316,8 +414,39 @@ class CompressionCfg(BaseModel):
     level: int = Field(
         3,
         ge=1,
-        description="Codec compression level (zstd 1..22 / gzip 1..9).",
+        description=(
+            "Codec compression level (zstd 1..22 / gzip 1..9; ignored by "
+            "``original``). The upper bound depends on ``algorithm`` and is "
+            "enforced by ``_check_level_for_algorithm`` at load, because the "
+            "codec is built per admission rather than at boot: an out-of-range "
+            "level otherwise passed ``--validate``, exported to the contract, "
+            "and only surfaced as a ValueError inside the codec on the FIRST "
+            "upload, leaving a healthy-looking service that accepts nothing."
+        ),
     )
+
+    @model_validator(mode="after")
+    def _check_level_for_algorithm(self) -> CompressionCfg:
+        """Bound ``level`` by the range the chosen ``algorithm`` accepts.
+
+        ``algorithm`` is a sibling ``Literal`` on this same model, so the model
+        has everything it needs to reject the combination at load instead of at
+        the first admission. ``original`` is the identity codec and reads no
+        level, so it is unbounded here.
+
+        Returns:
+            ``self`` when ``level`` is inside the codec's accepted range.
+
+        Raises:
+            ValueError: When ``level`` exceeds the maximum for ``algorithm``.
+        """
+        maximum = _CODEC_MAX_LEVEL.get(self.algorithm)
+        if maximum is not None and self.level > maximum:
+            raise ValueError(
+                f"storage.compression.level {self.level} is out of range for "
+                f"algorithm {self.algorithm!r} (1..{maximum})"
+            )
+        return self
 
 
 class SqliteCfg(BaseModel):
@@ -673,6 +802,18 @@ class RetentionCfg(BaseModel):
     )
 
 
+# Upper bound on ``RetryStrategyCfg.jitter``. 1.0 is "±100% of the computed
+# delay", the widest spread that still leaves the schedule recognisable as
+# the configured one; past it the jitter, not the schedule, sets the delay.
+_MAX_RETRY_JITTER_FRACTION: float = 1.0
+
+# Default ``fixed_intervals`` schedule: quick first retries, then back off to
+# five minutes. Lives on the settings model (not in the strategy builder) so
+# it exports into contracts/settings.schema.json and a port built from the
+# contract schedules the same retries.
+_DEFAULT_FIXED_INTERVALS_SECONDS: list[int] = [1, 5, 20, 60, 300]
+
+
 class RetryStrategyCfg(BaseModel):
     """Configuration for the default retry strategy."""
 
@@ -688,29 +829,56 @@ class RetryStrategyCfg(BaseModel):
     jitter: float = Field(
         0.2,
         ge=0.0,
+        le=_MAX_RETRY_JITTER_FRACTION,
         description=(
-            "Uniform jitter fraction (e.g. 0.2 → ±20%). Applied by BOTH "
-            "``exponential_backoff`` AND ``fixed_intervals`` (V5-C) so a backlog "
-            "that fails in the same poll round de-correlates on retry instead of "
-            "firing in lockstep (thundering herd) on upstream recovery. ``0.0`` "
-            "preserves an exact fixed-interval schedule."
+            "Uniform jitter FRACTION, not a percentage (e.g. 0.2 → ±20%). "
+            "Applied by BOTH ``exponential_backoff`` AND ``fixed_intervals`` "
+            "(V5-C) so a backlog that fails in the same poll round de-correlates "
+            "on retry instead of firing in lockstep (thundering herd) on upstream "
+            "recovery. ``0.0`` preserves an exact fixed-interval schedule. Bounded "
+            "at 1.0 (±100%): an operator reading '±20%' and writing ``20`` meaning "
+            "'20 percent' otherwise got a ±2000% swing, which put about half of "
+            "all retries at a zero delay (the sender re-claims on its next "
+            "``poll_interval_ms`` poll and hammers a failing upstream) and the "
+            "other half far past ``cap_seconds``."
         ),
     )
     max_attempts: int = Field(
         -1,
-        description="-1 = unbounded.",
+        ge=-1,
+        description=(
+            "Attempt budget. ``-1`` is the ONE unbounded sentinel and is the "
+            "default; ``0`` means give up without ever retrying; any positive "
+            "value is the attempt count. Validated ``ge=-1`` for the same reason "
+            "every :class:`RetentionCfg` window is (C11): the strategy's guard is "
+            "``0 <= max_attempts <= attempts``, so an unvalidated typo like ``-5`` "
+            "silently meant UNBOUNDED retries instead of being a loud error."
+        ),
     )
     max_duration_seconds: int = Field(
         86_400,
-        ge=0,
+        ge=-1,
         description=(
             "Hard ceiling on retry-attempt span before the row transitions to "
-            "``stored``. Default 86 400 s (24 hours)."
+            "``stored``. Default 86 400 s (24 hours). ``-1`` is the unbounded "
+            "sentinel, matching ``max_attempts`` and the strategy's own "
+            "``0 <= max_duration <= elapsed`` guard, which promised it while "
+            "``ge=0`` made it unreachable from config. ``0`` means give up on the "
+            "first scheduling call (no retry budget at all)."
         ),
     )
     intervals_seconds: list[int] = Field(
-        default_factory=list,
-        description="Fixed-intervals schedule (when ``type == 'fixed_intervals'``).",
+        default=_DEFAULT_FIXED_INTERVALS_SECONDS,
+        description=(
+            "Fixed-intervals schedule (when ``type == 'fixed_intervals'``): the "
+            "delay before attempt ``i`` is ``intervals_seconds[i]``, and a row "
+            "past the end of the list goes to ``stored``. The default is the "
+            "five-step quick-then-back-off schedule; an EXPLICIT empty list means "
+            "no retries at all. The default lives here, on the model, rather than "
+            "as a builder-side fallback, so ``contracts/settings.schema.json`` "
+            "carries it and an implementation built from the contract schedules "
+            "the same retries this one does (ADR-035)."
+        ),
     )
 
 
@@ -1027,9 +1195,50 @@ class AdminLookupCfg(BaseModel):
         description=(
             "Dotted path under that step's 'values' map down to the "
             "upstream identifier field (capture name first, then keys "
-            "inside the captured object)."
+            "inside the captured object). Plain dotted segments only: "
+            "this value is spliced into a SQLite json_extract path, so a "
+            "character needing a quoted label is refused at boot."
         ),
     )
+
+    @field_validator("json_path")
+    @classmethod
+    def _reject_characters_needing_a_quoted_label(cls, value: str) -> str:
+        """Refuse a path that would need a quoted JSON-path label.
+
+        This value is spliced into the ``$.values.<json_path>`` argument of a
+        SQLite ``json_extract`` call. A segment carrying a quote, a bracket or
+        whitespace cannot be written as a bare label, so it would have to be
+        emitted as a quoted one, and an escaped quoted label is exactly the
+        construction that older SQLite builds cannot parse: ``json_extract``
+        then yields NULL rather than raising, and the by-captured-id route maps
+        the miss to ``found=false``. The deployment would look configured and
+        the lookup would report every chain absent, silently, for as long as
+        the config stood.
+
+        The store's own query sites were moved off quoted labels for the same
+        reason, and a pre-commit gate keeps them off. This closes the operator
+        -supplied second-order route into the same failure, at the boot
+        boundary where it can still be refused loudly.
+
+        Args:
+            value: The configured dotted path.
+
+        Returns:
+            The value unchanged when every segment is a bare label.
+
+        Raises:
+            ValueError: When a character requiring a quoted label is present.
+        """
+        offenders = sorted({c for c in value if c in _JSON_PATH_FORBIDDEN_CHARS})
+        if offenders:
+            raise ValueError(
+                f"admin_lookup.json_path may only contain plain dotted segments; "
+                f"{offenders!r} would require a quoted json_extract label, which "
+                f"older SQLite builds parse as NULL rather than rejecting, making "
+                f"every by-captured-id lookup silently report the chain absent"
+            )
+        return value
 
 
 class InstanceCfg(BaseModel):
@@ -1131,12 +1340,49 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_prefix="PHANTOM_",
-        env_nested_delimiter="__",
+        env_prefix=ENV_PREFIX,
+        env_nested_delimiter=ENV_NESTED_DELIMITER,
         case_sensitive=False,
         extra="forbid",
+        # NOTE: this flag governs THIS model's own fields only. Every
+        # sub-model above re-declares ``strict=True``, so it says nothing
+        # about nested values; the env path's string-to-scalar coercion is
+        # done explicitly by :func:`_coerce_env_value`, not by this flag.
         strict=False,
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Read the environment through Phantom's one overlay reader.
+
+        Replaces the stock env source with :class:`_PhantomEnvSource` so a
+        bare ``Settings()`` and :func:`load_settings` apply the environment by
+        the same rules (coerced scalars, unrecognised prefixed variables
+        ignored, values never logged). The dotenv and secrets-directory
+        sources are dropped: ``model_config`` declares neither ``env_file``
+        nor ``secrets_dir``, so both produce an empty mapping and keeping them
+        would imply a configuration path that does not exist.
+
+        Args:
+            settings_cls: The settings class being constructed.
+            init_settings: Explicit keyword arguments (highest precedence).
+            env_settings: The stock env source, replaced.
+            dotenv_settings: The ``.env`` source, unused.
+            file_secret_settings: The secrets-directory source, unused.
+
+        Returns:
+            ``(init_settings, _PhantomEnvSource(...))``, highest precedence
+            first, matching the documented YAML < env < kwargs order.
+        """
+        del env_settings, dotenv_settings, file_secret_settings
+        return (init_settings, _PhantomEnvSource(settings_cls))
 
     server: ServerCfg = Field(
         default_factory=ServerCfg,  # type: ignore[arg-type]
@@ -1328,24 +1574,140 @@ class Settings(BaseSettings):
             _SKIP_PROBE_FLAG.reset(token)
 
 
-def _apply_env_overlay(raw: dict[str, Any]) -> dict[str, Any]:
+def _nested_model(annotation: object) -> type[BaseModel] | None:
+    """Return the sub-model a field annotation nests, or ``None``.
+
+    Scans a union's members too, so an optional sub-block
+    (``InstanceCfg.ad_mint``, typed ``AdMintConfig | None``) resolves exactly
+    like a required one.
+
+    Args:
+        annotation: A field's resolved type annotation.
+
+    Returns:
+        The nested :class:`~pydantic.BaseModel` subclass, or ``None`` when the
+        annotation nests no model (a scalar, a list, an enum).
+    """
+    for candidate in (annotation, *get_args(annotation)):
+        if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+            return candidate
+    return None
+
+
+def _resolve_settings_field(parts: tuple[str, ...]) -> FieldInfo | None:
+    """Resolve a lower-cased environment path to the settings field it names.
+
+    Args:
+        parts: The variable name with :data:`ENV_PREFIX` stripped, split on
+            :data:`ENV_NESTED_DELIMITER` and lower-cased, e.g.
+            ``("storage", "sqlite", "busy_timeout_ms")``.
+
+    Returns:
+        The :class:`~pydantic.fields.FieldInfo` the path names, or ``None``
+        when any segment is not a field of the model at that depth - meaning
+        the variable shares Phantom's prefix but is not a Phantom setting.
+    """
+    model: type[BaseModel] = Settings
+    for depth, part in enumerate(parts):
+        field = model.model_fields.get(part)
+        if field is None:
+            return None
+        if depth == len(parts) - 1:
+            return field
+        nested = _nested_model(field.annotation)
+        if nested is None:
+            return None
+        model = nested
+    return None
+
+
+def _coerce_env_value(field: FieldInfo, raw: str) -> object:
+    """Coerce one environment string to the type its target field declares.
+
+    The environment carries only strings, and every sub-model in this module
+    declares ``strict=True``, so an uncoerced ``"2000"`` reaches
+    ``storage.sqlite.busy_timeout_ms`` as an ``int_type`` validation error and
+    the process refuses to start. Coercion happens HERE, on the environment
+    path only, so a value that came from YAML keeps its strict typing: a
+    quoted ``busy_timeout_ms: "2000"`` in the YAML file is still the operator
+    mistake it always was.
+
+    Coercion is lax (pydantic's own string-to-scalar rules), which is the
+    right posture for a source whose wire format has no types.
+
+    Args:
+        field: The resolved target field.
+        raw: The environment variable's literal string value.
+
+    Returns:
+        The coerced value, or ``raw`` unchanged when the target type refuses
+        it - so the model raises its own error, naming the field path and the
+        constraint, rather than this helper inventing a second error channel.
+    """
+    if field.annotation is None:
+        return raw
+    try:
+        return TypeAdapter(field.annotation).validate_python(raw)
+    except ValidationError:
+        return raw
+
+
+def _apply_env_overlay(raw: dict[str, Any], *, log_decisions: bool = True) -> dict[str, Any]:
     """Apply ``PHANTOM_<UPPER>__<UPPER>...`` env vars on top of a YAML mapping.
 
-    Walks ``os.environ`` for keys starting with the prefix and overlays
-    nested dict values into ``raw`` (mutating a deep-merged copy).
+    Walks ``os.environ`` for keys carrying :data:`ENV_PREFIX`, resolves each
+    key's dotted path against the :class:`Settings` model, coerces the string
+    to the target field's type, and overlays the result into a deep copy of
+    ``raw``. Two rules keep the mechanism from leaking or refusing to boot:
+
+    * **A variable's VALUE is never logged and never reaches an error
+      string.** The log line carries the variable NAME and the field path it
+      resolved to, nothing else. Operators are told to hold credentials in
+      prefixed variables (``config/phantom.yaml.example`` names
+      ``PHANTOM_UPSTREAM_CLIENT_SECRET`` for the AD client secret) and
+      ``server.tls.key_password`` is itself a settings field, so echoing
+      values put live secrets into every sink and, through
+      :class:`SettingsError`, into the CLI's stderr crash text.
+    * **A prefixed variable that names no settings field is IGNORED**, with a
+      DEBUG line naming only the key. The prefix is a shared namespace rather
+      than Phantom's alone: the shipped ``docker-compose.yml`` reads
+      ``PHANTOM_ORG`` and ``PHANTOM_TAG``, and the documented way to hold a
+      secret is a prefixed variable. Injecting those hit ``extra="forbid"``
+      and turned an unrelated variable into a boot failure. Ignoring is also
+      what pydantic-settings' own ``EnvSettingsSource`` does with a variable
+      that matches no field.
+
+    Args:
+        raw: The parsed YAML mapping. Not mutated; a deep copy is returned.
+        log_decisions: Whether to emit the per-variable applied / ignored
+            lines. The settings source (:class:`_PhantomEnvSource`) passes
+            ``False`` because :func:`load_settings` has already reported the
+            same overlay for the same process; without it every load would
+            report each variable twice.
+
+    Returns:
+        A deep copy of ``raw`` with every resolvable environment override
+        applied at its nested path.
     """
     import copy
     import os
 
-    prefix = "PHANTOM_"
-    sep = "__"
     overlaid = copy.deepcopy(raw)
     for env_key, env_val in os.environ.items():
-        if not env_key.startswith(prefix):
+        if not env_key.startswith(ENV_PREFIX):
             continue
-        key = env_key[len(prefix) :]
-        parts = [p.lower() for p in key.split(sep)]
-        if not parts or parts == [""]:
+        parts = tuple(
+            part.lower() for part in env_key[len(ENV_PREFIX) :].split(ENV_NESTED_DELIMITER)
+        )
+        field = _resolve_settings_field(parts)
+        if field is None:
+            if log_decisions:
+                logger.debug(
+                    "Ignoring %s: it names no Phantom settings field (the %s prefix "
+                    "is a shared namespace, not Phantom's alone)",
+                    env_key,
+                    ENV_PREFIX,
+                )
             continue
         cursor: dict[str, Any] = overlaid
         for part in parts[:-1]:
@@ -1354,14 +1716,33 @@ def _apply_env_overlay(raw: dict[str, Any]) -> dict[str, Any]:
                 existing = {}
                 cursor[part] = existing
             cursor = existing
-        cursor[parts[-1]] = env_val
-        logger.info(
-            "Applied env override %s -> %s = %r",
-            env_key,
-            ".".join(parts),
-            env_val,
-        )
+        cursor[parts[-1]] = _coerce_env_value(field, env_val)
+        if log_decisions:
+            # Key and resolved path ONLY. Never the value.
+            logger.info("Applied env override %s -> %s", env_key, ".".join(parts))
     return overlaid
+
+
+class _PhantomEnvSource(EnvSettingsSource):
+    """The ONE reader of the ``PHANTOM_*`` environment namespace.
+
+    pydantic-settings ships its own ``EnvSettingsSource``, but its
+    string-to-scalar coercion is gated on the SETTINGS model's ``strict``
+    flag, which is ``False`` here, so every non-string knob an operator set
+    through the environment reached a ``strict=True`` sub-model as a raw
+    ``str`` and the process refused to start. Rather than keep two env
+    readers with different rules, this one delegates to
+    :func:`_apply_env_overlay` - the same function :func:`load_settings` and
+    :meth:`Settings.reload_from_yaml` use - so the environment means exactly
+    one thing however :class:`Settings` is constructed.
+
+    Only ``__call__`` is overridden; the inherited per-field machinery is
+    unused because the overlay builds the whole mapping in one pass.
+    """
+
+    def __call__(self) -> dict[str, Any]:
+        """Return the settings mapping the ``PHANTOM_*`` environment declares."""
+        return _apply_env_overlay({}, log_decisions=False)
 
 
 def load_settings(path: Path | str) -> Settings:

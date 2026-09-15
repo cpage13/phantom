@@ -6,6 +6,7 @@ Pins the exported names so accidental renames or removals fail loudly.
 from __future__ import annotations
 
 import phantom_client
+from phantom_client import errors
 
 
 def test_init_exports_phantom_client() -> None:
@@ -45,7 +46,6 @@ def test_init_exports_admin_and_status_types() -> None:
         "UploadRow",
         "UploadState",
         "TERMINAL_STATES",
-        "SortKey",
         "StatsResponse",
         "TokenSlot",
         "HealthResponse",
@@ -71,7 +71,6 @@ def test_init_exports_errors() -> None:
         "PhantomPayloadTooLargeError",
         "PhantomUnprocessableError",
         "PhantomValidationError",
-        "PhantomRateLimitedError",
         "PhantomServerError",
         "PhantomUnavailableError",
         "PhantomEnvelopeError",
@@ -125,14 +124,47 @@ def test_init_exports_group_methods_and_poller() -> None:
         assert hasattr(cls, name), name
 
 
-def test_no_excluded_aliases() -> None:
-    """The SDK deliberately excludes these names."""
+def test_errors_all_declares_every_exception_class() -> None:
+    """Objective: ``errors.__all__`` lists every exception class the module defines.
+
+    Expected: the set of ``PhantomClientError`` subclasses defined in
+    :mod:`phantom_client.errors` equals the exception names in its ``__all__``,
+    and every one of those is reachable from the package root.
+    ``PhantomPayloadTooLargeError`` - the class ``body_too_large`` actually
+    maps to - was re-exported from the root and named in ADR-017 while missing
+    from ``errors.__all__`` entirely, so the module's own declared surface
+    disagreed with the package's.
+    """
+    defined = {
+        name
+        for name, obj in vars(errors).items()
+        if isinstance(obj, type)
+        and issubclass(obj, errors.PhantomClientError)
+        and obj.__module__ == errors.__name__
+    }
+    declared = {name for name in errors.__all__ if name in defined}
+    assert defined == declared, f"missing from errors.__all__: {sorted(defined - declared)}"
+    for name in sorted(defined):
+        assert hasattr(phantom_client, name), name
+
+
+def test_no_excluded_names() -> None:
+    """The SDK deliberately excludes these names.
+
+    ``PhantomRateLimitedError`` joined the list: Phantom emits no 429
+    anywhere (no ADR-017 row, no EXCEPTION_FOR_CODE entry, no 429 in the
+    service), so the class was unreachable by construction. ``SortKey``
+    joined it because ``GET /v1/admin/chains`` declares no ``sort``
+    parameter to carry its values.
+    """
     for name in (
         "send_chain",
         "send_request_chain",
         "send_files",
         "send_passthrough",
         "Method_B",
+        "PhantomRateLimitedError",
+        "SortKey",
     ):
         assert not hasattr(phantom_client, name), f"{name} must not exist"
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import logging
+from collections.abc import Mapping
 
 from phantom.config.settings import ObservabilityCfg
 from phantom.observability import (
@@ -164,3 +165,77 @@ def test_redactor_drives_end_to_end_through_log_handler() -> None:
     output = stream.getvalue()
     assert "<redacted>" in output
     assert "https://example.com/secret" not in output
+
+
+def test_mapping_args_survive_the_bearer_filter() -> None:
+    """A ``%(name)s``-style record must not be destroyed by redaction.
+
+    Objective: ``LogRecord.__init__`` special-cases a single non-empty Mapping
+    argument and stores THE MAPPING, not a one-tuple. The filter coerced
+    ``record.args`` to a tuple regardless, so ``getMessage()`` then evaluated
+    ``"%(who)s" % ({...},)`` and raised ``TypeError: format requires a
+    mapping``. ``configure_logging`` attaches this filter to EVERY root
+    handler, so the blast radius was every mapping-style record from every
+    dependency, not only Phantom's own.
+
+    Success: the args stay a Mapping, the message still interpolates, and the
+    bearer inside a mapping VALUE is still redacted.
+    """
+    record = logging.LogRecord(
+        name="phantom.test",
+        level=logging.INFO,
+        pathname="x.py",
+        lineno=1,
+        msg="%(who)s presented %(token)s",
+        args=({"who": "alice", "token": "Bearer eyJ.value.here"},),
+        exc_info=None,
+    )
+
+    assert BearerRedactionFilter().filter(record) is True
+
+    assert isinstance(record.args, Mapping), f"args became {type(record.args).__name__}"
+    message = record.getMessage()
+    assert message == "alice presented Bearer <redacted>"
+    assert "eyJ.value.here" not in message
+
+
+def test_a_mapping_style_record_reaches_the_handler() -> None:
+    """The end-to-end proof: the record is emitted, not swallowed.
+
+    Objective: the ``TypeError`` above happened inside ``Handler.emit``, so
+    the visible symptom was an empty emission plus ``--- Logging error ---``
+    on stderr - the record was LOST rather than mangled. Success: the
+    formatted line reaches the stream with its arguments interpolated.
+    """
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.addFilter(BearerRedactionFilter())
+    test_logger = logging.getLogger("phantom.test_logging_filter.mapping")
+    test_logger.handlers.clear()
+    test_logger.addHandler(handler)
+    test_logger.setLevel(logging.INFO)
+    test_logger.propagate = False
+
+    test_logger.info("%(rows)d rows for %(who)s", {"rows": 3, "who": "alice"})
+
+    assert stream.getvalue().strip() == "3 rows for alice"
+
+
+def test_positional_args_are_still_redacted() -> None:
+    """The tuple path must keep working beside the new Mapping path."""
+    record = logging.LogRecord(
+        name="phantom.test",
+        level=logging.INFO,
+        pathname="x.py",
+        lineno=1,
+        msg="upstream returned %s for %s",
+        args=("Bearer eyJ.value.here", 42),
+        exc_info=None,
+    )
+
+    BearerRedactionFilter().filter(record)
+
+    message = record.getMessage()
+    assert message == "upstream returned Bearer <redacted> for 42"
+    assert "eyJ.value.here" not in message

@@ -12,7 +12,9 @@ header it signed with throwaway credentials; it knows nothing of Phantom's
   ``OPTIONS``) with a bare 404 so an unknown ``GET`` stays 404 rather than
   flipping to 405 service-wide. A reserved-prefix guard 404s any first
   path segment in Phantom's own namespace (``v1/`` today, plus the
-  forward-reserved set).
+  forward-reserved set) UNCONDITIONALLY - no destination carrier makes a
+  reserved name addressable - and its refusal carries the canonical error
+  envelope naming the segment.
 
 * TASK 1.3 - destination resolution. The raw request line carries no real
   host (the client's ``Host`` is Phantom itself), so the synthesized step
@@ -56,6 +58,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from typing import Annotated
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -98,9 +101,21 @@ _SYNTHETIC_BODY_REF_NAME = "payload"
 # would fall through to the raw-intake handler and be treated as an upload.
 # Phantom serves ONLY ``/v1`` today; the rest are forward-reserved so a future
 # surface added under one of these prefixes is never silently captured as an
-# object upload. Only the FIRST path segment is checked (a bucket literally
-# named ``v1`` is addressable as ``/v1/...`` via the explicit ``?phantom=``
-# carrier, which bypasses this handler's resolution entirely).
+# object upload. Only the FIRST path segment is checked, and it is checked
+# UNCONDITIONALLY: these names are not addressable through the catch-all by
+# any carrier, ``?phantom=`` included.
+#
+# That is a deliberate choice over the alternative (consume the explicit
+# carrier first, then guard). Whether a path inside Phantom's own namespace
+# is addressable must not depend on producer-supplied input, or the
+# reservation is only as strong as a query parameter; and the guard would
+# then have to run AFTER ``_resolve_destination`` parses that input, which
+# inverts the cheapest-check-first ordering the rest of this boundary is
+# built on. The cost is that a bucket literally named ``v1`` (or any other
+# reserved name) cannot be reached through the raw-intake landing at all,
+# because a stock S3 client derives the local path from the bucket and key
+# and cannot be pointed elsewhere. Such a producer uses ``POST /v1/send``,
+# whose envelope names the destination outright.
 _RESERVED_FIRST_SEGMENTS: frozenset[str] = frozenset(
     {"v1", "v2", "oauth", "control", ".well-known"}
 )
@@ -138,6 +153,62 @@ _RESERVED_FIRST_SEGMENTS: frozenset[str] = frozenset(
 # it as the destination carrier and strips it before forwarding.
 _PHANTOM_QUERY_CARRIER = "phantom"
 
+# The characters that may appear UNESCAPED in a URL path and therefore
+# survive :func:`_encode_object_path` byte for byte. This is RFC 3986's
+# ``pchar`` set (``unreserved`` / ``sub-delims`` / ``":"`` / ``"@"``) plus
+# ``"/"`` for the segment separators, minus the alphanumerics and
+# ``-._~`` that ``urllib.parse.quote`` never escapes anyway. Everything
+# outside it - critically ``#`` and ``?``, the two delimiters that end a
+# path - is percent-encoded back to the form the client must have sent it
+# in, because neither can appear literally in a request target.
+_OBJECT_PATH_SAFE_CHARS = "/:@!$&'()*+,;="
+
+# Separator used when repeated inbound field lines are combined into the
+# single value :class:`phantom.models.chain.ChainStep` can hold. RFC 7230
+# section 3.2.2 specifies a comma; it carries NO trailing space because
+# SigV4's canonical request joins a repeated header's values with a bare
+# comma, so the combined line re-canonicalises upstream to exactly the
+# string the client signed over the separate ones.
+_REPEATED_HEADER_JOINER = ","
+
+
+def _encode_object_path(phantom_path: str) -> str:
+    """Percent-encode a decoded object path back into URL path form.
+
+    The ASGI server hands ``scope["path"]`` (and therefore the
+    ``{phantom_path:path}`` parameter) ALREADY percent-decoded, so a
+    perfectly legal object key containing an encoded ``#`` or ``?``
+    arrives with that byte live. Splicing it straight into the
+    destination re-opened it as a delimiter: ``PUT /bucket/my%23key``
+    became ``https://target/bucket/my#key``, whose ``key`` half
+    :func:`_with_forwarded_query` treats as a fragment and httpx drops at
+    send time, so the object landed upstream under the key ``my`` while
+    Phantom had already answered 202. The ``?`` variant is worse: the key
+    bytes after it become query parameters, and on an ``aws_sigv4`` route
+    they are folded into Phantom's own signature over a canonical request
+    the client never made.
+
+    Re-encoding is the inverse of the server's decode for every character
+    that had to be escaped on the wire, so the upstream receives the key
+    the client sent and no key byte can act as a delimiter. Characters
+    that are legal unescaped in a path pass through untouched
+    (:data:`_OBJECT_PATH_SAFE_CHARS`), which keeps the ordinary key byte
+    identical and leaves a client's own path signature intact.
+
+    One residue is NOT recoverable here and is the server's, not
+    Phantom's: an encoded ``%2F`` is decoded to a real ``/`` before this
+    function ever sees it, so it re-emits a separator. That names the same
+    object key in path-style addressing, since the key is the whole path
+    after the bucket.
+
+    Args:
+        phantom_path: The decoded catch-all path parameter.
+
+    Returns:
+        The same path with every delimiter-capable byte percent-encoded.
+    """
+    return quote(phantom_path, safe=_OBJECT_PATH_SAFE_CHARS)
+
 
 router = APIRouter()
 
@@ -165,13 +236,18 @@ def _with_forwarded_query(url: str, request: Request) -> str:
     would put the whole surviving query inside the fragment, which the
     transport drops, silently losing exactly what F4 exists to preserve.
 
-    The INBOUND half is starlette's, not Phantom's: ``request.url.query`` comes
-    from a parsed view rather than the raw ``query_string``, so a ``#`` in the
-    request target truncates the query before this function runs
-    (``query_string=b"a=1#frag&b=2"`` yields ``"a=1"``). A ``#`` is not a legal
-    part of a request target, so this is the client's error rather than
-    Phantom's; nothing after it is forwarded. A percent-encoded ``%23`` is
-    data, not a delimiter, and it survives byte for byte.
+    The INBOUND half reads the ASGI scope's raw ``query_string``, which is
+    the SAME source the carrier detection reads (starlette builds
+    ``request.query_params`` from it), so detection and strip cannot see
+    different text. ``request.url.query`` is not that source: starlette
+    assembles a URL string from the already-decoded ``scope["path"]`` and
+    re-splits it, so a percent-encoded ``?`` inside an object key comes back
+    out as a live query. ``PUT /bucket/my%3Ffoo=bar`` then had ``foo=bar``
+    appended to the destination as a real parameter while
+    ``request.query_params`` was empty, which on an ``aws_sigv4`` route means
+    Phantom signs a canonical request the client never made. A ``#`` in the
+    request target is likewise not a legal part of one, and the raw
+    ``query_string`` carries whatever the server put there.
 
     Args:
         url: The resolved destination, which may already carry its own query
@@ -183,7 +259,8 @@ def _with_forwarded_query(url: str, request: Request) -> str:
         surviving query joined after ``?`` or ``&`` as appropriate and any
         fragment re-attached at the end. Never emits a bare trailing ``?``.
     """
-    kept = filter_raw_query(request.url.query, keep=lambda key: key != _PHANTOM_QUERY_CARRIER)
+    raw_query = request.scope.get("query_string", b"").decode("latin-1")
+    kept = filter_raw_query(raw_query, keep=lambda key: key != _PHANTOM_QUERY_CARRIER)
     if not kept:
         return url
     base, hash_sep, fragment = url.partition("#")
@@ -206,7 +283,10 @@ def _resolve_destination(
        path). Phase 1 accepts a FULL URL only; bare ids are not resolved here.
     2. A configured ``Settings.phantom_default_target`` - the path is
        appended (``{default}/{phantom_path}``) for the single-upstream
-       convenience case.
+       convenience case. The path is percent-encoded back into URL form
+       first (:func:`_encode_object_path`), because the ASGI server hands
+       it over already decoded and a key byte must never re-enter the URL
+       as a live ``#`` or ``?`` delimiter.
 
     BOTH carriers preserve the rest of the inbound query byte-for-byte
     (:func:`_with_forwarded_query`), so a query-addressed operation such as a
@@ -241,7 +321,7 @@ def _resolve_destination(
 
     if phantom_default_target:
         return _with_forwarded_query(
-            phantom_default_target.rstrip("/") + "/" + phantom_path, request
+            phantom_default_target.rstrip("/") + "/" + _encode_object_path(phantom_path), request
         )
 
     return None
@@ -265,6 +345,22 @@ def _forwarded_headers(request: Request) -> dict[str, str]:
     byte-identically. ``Authorization`` is kept so the client's header-signed
     signature is forwarded as-is.
 
+    REPEATED field lines are COMBINED, not overwritten. ``Headers.items()``
+    yields one entry per raw occurrence, so accumulating straight into a
+    dict was last-value-wins: a client that sent a header twice and SIGNED
+    OVER BOTH got exactly one forwarded, the upstream's validation of the
+    client's own signature failed 403, and because ``retry.max_attempts``
+    defaults to ``-1`` the row retried a request that could never validate
+    for the process lifetime, holding its saturation slot and its buffered
+    body. RFC 7230 section 3.2.2 permits combining repeated field lines
+    into one, values in order separated by a comma, and
+    :data:`_REPEATED_HEADER_JOINER` is bare (no space) on purpose: SigV4's
+    canonical request joins a repeated header's values with exactly that,
+    so an upstream re-canonicalising the combined line reproduces what the
+    client signed over the split ones. A space would not survive
+    canonicalisation identically and would break the signature this fix
+    exists to preserve.
+
     The executor applies the same two strips again at forward time, and THAT
     is the guarantee (it also covers the envelope path, which never comes
     through here); stripping here keeps the persisted envelope honest.
@@ -273,18 +369,29 @@ def _forwarded_headers(request: Request) -> dict[str, str]:
         request: The inbound raw-intake request.
 
     Returns:
-        The forwarded-header mapping for the synthesized step (original
-        header casing preserved).
+        The forwarded-header mapping for the synthesized step, one entry
+        per distinct field name, under the casing of that name's FIRST
+        occurrence.
     """
     hop_by_hop = _hop_by_hop_names(request.headers)
     forwarded: dict[str, str] = {}
+    # Field names are case-insensitive, so the accumulator is keyed on the
+    # lowered name while the emitted mapping keeps the first-seen casing:
+    # a client repeating a header under two casings still gets ONE combined
+    # field line, exactly as a signer canonicalising them would.
+    first_casing: dict[str, str] = {}
     for name, value in request.headers.items():
         lowered = name.lower()
         if lowered.startswith(_PHANTOM_RESERVED_HEADER_PREFIX):
             continue
         if lowered in hop_by_hop:
             continue
-        forwarded[name] = value
+        seen_as = first_casing.get(lowered)
+        if seen_as is None:
+            first_casing[lowered] = name
+            forwarded[name] = value
+        else:
+            forwarded[seen_as] = f"{forwarded[seen_as]}{_REPEATED_HEADER_JOINER}{value}"
     return forwarded
 
 
@@ -382,14 +489,31 @@ async def raw_intake(
 
     Returns:
         A 202 :class:`Response` on admission, or a canonical error
-        :class:`Response` (404 reserved prefix, 421 no destination, 413
-        oversized, or any admission refusal).
+        :class:`Response` (404 ``not_found`` reserved prefix, 421 no
+        destination, 413 oversized, or any admission refusal).
     """
     request_id = request.headers.get("X-Request-Id") or str(uuid4())
 
     first_segment = phantom_path.split("/", 1)[0].lower()
     if first_segment in _RESERVED_FIRST_SEGMENTS:
-        return Response(status_code=404)
+        # Unconditional: no carrier reaches Phantom's own namespace (see
+        # _RESERVED_FIRST_SEGMENTS for why the explicit ?phantom= carrier
+        # is not an escape hatch). The refusal carries the canonical error
+        # envelope rather than a bare 404, so a producer that hits it can
+        # tell "this name is reserved" from "this path does not exist".
+        return _error_response(
+            "not_found",
+            (
+                f"First path segment {first_segment!r} is reserved for Phantom's own "
+                "API namespace and is not addressable as an object path"
+            ),
+            instance_id="unrouted",
+            request_id=request_id,
+            details={
+                "reason": "reserved_path_prefix",
+                "segment": first_segment,
+            },
+        )
 
     resolved_url = _resolve_destination(phantom_path, request, phantom_default_target)
     if resolved_url is None:

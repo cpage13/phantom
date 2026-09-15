@@ -17,8 +17,10 @@ Tests cover:
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from phantom.config.settings import RetentionCfg, Settings
@@ -278,3 +280,83 @@ def test_check_invariants_rejects_forever_body_with_finite_metadata() -> None:
     )
     with pytest.raises(ConfigInvariantError, match="forever"):
         check_retention_floor(settings)
+
+
+# How many rows the concurrency witness below drives through one sweep. Any
+# number above one proves the fan-out; four keeps the barrier small and stays
+# well inside the auditor's own per-batch ceiling.
+_CONCURRENT_ROWS = 4
+
+# The witness's own guard. A sweep that checks rows one at a time never
+# satisfies the barrier, and a hung test is a wedged suite rather than a
+# failure, so the guard turns the hang into a visible TimeoutError.
+_SWEEP_GUARD_SECONDS = 5.0
+
+
+class _BarrieredRamBodyStore(RamBodyStore):
+    """A RAM body store whose presence check waits for company.
+
+    Every ``has_body_ref`` blocks on a barrier sized to the number of rows in
+    the sweep, so the sweep can only finish if that many checks are in flight
+    at once. It stands in for the real cost: the file store's check is an
+    ``aiofiles`` hop measured at 135 us against 4.7 us synchronous, so the
+    expense is round-trip latency, which overlapping removes and serialising
+    multiplies by the row count.
+    """
+
+    def __init__(self, parties: int) -> None:
+        """Build a store whose checks release only once ``parties`` are waiting."""
+        super().__init__()
+        self._barrier = asyncio.Barrier(parties)
+
+    async def has_body_ref(self, chain_id: UUID, name: str) -> bool:
+        """Wait for the other in-flight checks, then answer normally."""
+        await self._barrier.wait()
+        return await super().has_body_ref(chain_id, name)
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_checks_body_refs_concurrently(
+    tmp_path: Path,
+    make_upload_row: Callable[..., UploadRow],
+) -> None:
+    """S8-7: one sweep overlaps its body-store round trips instead of serialising.
+
+    Objective: the walk covers a population unbounded BY DESIGN, because
+    ``auth_expired`` is deliberately not terminal and nothing trims it. One
+    round trip per declared body_ref per row, taken strictly in turn, is about
+    two minutes of event-loop time every 300 s at 864k parked rows, all of it
+    on the loop every other worker shares.
+
+    Expected outcome: the sweep completes. Each row's presence check blocks
+    until every other row's check has also started, which a sweep that waits
+    for each answer before issuing the next can never satisfy.
+    """
+    registry = MetricsRegistry()
+    store = track_started(
+        SqliteUploadStore(str(tmp_path / "uploads.db"), metrics_registry=registry)
+    )
+    await store.start()
+    body_store = track_started(_BarrieredRamBodyStore(_CONCURRENT_ROWS))
+    await body_store.start()
+    auditor = InvariantAuditor(
+        store=store,
+        body_store=body_store,
+        current_settings=snapshot_thunk(make_snapshot()),
+        metrics_registry=registry,
+    )
+    from phantom.models.upload import BodyHash, BodyHashes, StorageHash
+
+    for _ in range(_CONCURRENT_ROWS):
+        row = make_upload_row(
+            body_location="ram",
+            body_hashes={
+                "a": BodyHashes(body_hash=BodyHash("bh"), storage_hash=StorageHash("sh")),
+            },
+        )
+        await store.insert(row)
+        await body_store.put(row.chain_id, dict.fromkeys(row.body_hashes, b"data"))
+
+    async with asyncio.timeout(_SWEEP_GUARD_SECONDS):
+        await auditor._sweep_once()  # type: ignore[reportPrivateUsage]
+    assert _violations(registry) == {"": 0}

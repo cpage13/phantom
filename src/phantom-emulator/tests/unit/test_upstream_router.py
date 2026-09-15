@@ -10,7 +10,19 @@ import pytest
 from phantom_emulator.app import create_app
 from phantom_emulator.auth.modes import AuthMode
 from phantom_emulator.config import AppConfig, AuthCfg
-from phantom_emulator.state import BodyPutEvent, MetadataCreateEvent
+from phantom_emulator.state import BodyPutEvent, EmulatorState, MetadataCreateEvent
+
+# The create-file body these tests post when the payload is not the subject.
+_CREATE_PAYLOAD: dict[str, object] = {
+    "domain": "D",
+    "fileName": "f",
+    "metadata": {"keyValueStore": {}},
+}
+
+
+def _relative(upload_url: str) -> str:
+    """Re-point an absolute emulator upload URL at the in-process test client."""
+    return upload_url.replace("http://emulator", "")
 
 
 async def _mint_token(client: httpx.AsyncClient) -> str:
@@ -42,6 +54,25 @@ async def no_auth_client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[httpx
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://emulator") as c:
         yield c
+
+
+@pytest.fixture
+async def no_auth_client_and_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[tuple[httpx.AsyncClient, EmulatorState]]:
+    """An auth-free client plus its state, for tests that assert what was stored."""
+    monkeypatch.setenv("EMULATOR_SIGNING_KEY", "x" * 32)
+    app = create_app(AppConfig(auth=AuthCfg(default_mode=AuthMode.NONE)))
+    state: EmulatorState = app.state.emulator_state
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://emulator") as c:
+        yield c, state
+
+
+async def _mint_upload_url(client: httpx.AsyncClient) -> str:
+    """Create a file on an auth-free client and return the relative upload URL."""
+    created = await client.post("/v1/files/create", json=_CREATE_PAYLOAD)
+    return _relative(created.json()["uploadUrl"])
 
 
 async def test_create_returns_upload_url(client: httpx.AsyncClient) -> None:
@@ -240,6 +271,136 @@ async def test_put_unknown_token_403(client: httpx.AsyncClient) -> None:
     assert r.status_code == 403
 
 
+async def test_put_with_the_minted_presigned_query_is_accepted(
+    no_auth_client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """The URL exactly as minted -> 200 and the bytes stored.
+
+    Objective: the positive control for the three rejection tests below. The
+    signature check must accept the URL the emulator itself issued, or the
+    checks would only be proving that PUTs fail.
+
+    Expected outcome: 200, and the body readable back off the state.
+    """
+    client, state = no_auth_client_and_state
+    upload_url = await _mint_upload_url(client)
+
+    r = await client.put(upload_url, content=b"the body bytes")
+
+    assert r.status_code == 200
+    assert [body.body for body in state.accepted_bodies.values()] == [b"the body bytes"]
+
+
+async def test_put_with_stripped_presigned_query_is_rejected(
+    no_auth_client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """The right path with no query at all -> 403, nothing stored.
+
+    Objective: the emulator mints an S3-shaped presigned URL specifically so a
+    forwarder cannot drop the query and still be served. The handler only ever
+    looked up the path token, so a PUT with ``?expires=…&sig=…`` stripped
+    stored the body and returned 200, and every forwarding-fidelity assertion
+    built on that URL was vacuous.
+
+    Expected outcome: 403 SignatureDoesNotMatch and an empty accepted-body
+    store, so the rejection is a real refusal rather than a late error after
+    the side effect.
+    """
+    client, state = no_auth_client_and_state
+    upload_url = await _mint_upload_url(client)
+    path_only = upload_url.split("?", 1)[0]
+
+    r = await client.put(path_only, content=b"body")
+
+    assert r.status_code == 403
+    assert r.json()["detail"] == "SignatureDoesNotMatch"
+    assert state.accepted_bodies == {}
+
+
+async def test_put_with_wrong_signature_is_rejected(
+    no_auth_client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """A ``sig`` that is not the minted one -> 403, nothing stored.
+
+    Objective: a query that is present but wrong is the case a stripped-query
+    check alone would miss. The signature is the emulator's stand-in for the
+    S3 HMAC, so a rewritten value must be refused exactly like a missing one.
+
+    Expected outcome: 403 SignatureDoesNotMatch and an empty accepted-body store.
+    """
+    client, state = no_auth_client_and_state
+    upload_url = await _mint_upload_url(client)
+    pending = next(iter(state.pending_uploads.values()))
+    tampered = upload_url.replace(f"sig={pending.signature}", "sig=not-the-minted-signature")
+    assert tampered != upload_url
+
+    r = await client.put(tampered, content=b"body")
+
+    assert r.status_code == 403
+    assert r.json()["detail"] == "SignatureDoesNotMatch"
+    assert state.accepted_bodies == {}
+
+
+async def test_put_with_expires_disagreeing_with_the_record_is_rejected(
+    no_auth_client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """An ``expires`` the emulator did not mint -> 403, nothing stored.
+
+    Objective: the expiry advertised in the URL is part of what was signed, so
+    a caller must not be able to extend (or otherwise edit) it and be served.
+    The record carries the epoch that was minted, and the handler compares
+    against that rather than trusting the inbound value.
+
+    Expected outcome: 403 SignatureDoesNotMatch and an empty accepted-body
+    store, even though the token and the signature are both genuine and the
+    edited deadline is in the future.
+    """
+    client, state = no_auth_client_and_state
+    upload_url = await _mint_upload_url(client)
+    pending = next(iter(state.pending_uploads.values()))
+    extended = upload_url.replace(
+        f"expires={pending.expires_epoch}",
+        f"expires={pending.expires_epoch + 1}",
+    )
+    assert extended != upload_url
+
+    r = await client.put(extended, content=b"body")
+
+    assert r.status_code == 403
+    assert r.json()["detail"] == "SignatureDoesNotMatch"
+    assert state.accepted_bodies == {}
+
+
+async def test_clear_received_drops_the_idempotency_cache(
+    no_auth_client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """One Idempotency-Key across a reset -> a fresh file id, not the cached one.
+
+    Objective: ``clear_received`` reset the accepted bodies and the event log
+    but left ``idempotency_cache``, whose entries live for the dedup window
+    (an hour by default) and are pruned only lazily on a same-key lookup. Two
+    scenarios in one emulator process that happened to use the same literal
+    key therefore shared a file id and an upload token, with the second one
+    silently served the first one's create response.
+
+    Expected outcome: after ``POST /control/clear-received`` the same key
+    mints a new file id and upload token, and the cache is empty.
+    """
+    client, state = no_auth_client_and_state
+    headers = {"Idempotency-Key": "shared-literal-key"}
+    first = await client.post("/v1/files/create", json=_CREATE_PAYLOAD, headers=headers)
+
+    cleared = await client.post("/control/clear-received")
+    assert cleared.status_code == 204
+    assert state.idempotency_cache == {}
+
+    second = await client.post("/v1/files/create", json=_CREATE_PAYLOAD, headers=headers)
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["fileInformation"]["id"] != second.json()["fileInformation"]["id"]
+    assert first.json()["uploadUrl"] != second.json()["uploadUrl"]
+
+
 async def test_get_returns_minted_file_information(client: httpx.AsyncClient) -> None:
     token = await _mint_token(client)
     create_r = await client.post(
@@ -358,3 +519,109 @@ async def test_received_log_records_all_headers(client: httpx.AsyncClient) -> No
     assert not any(k.startswith("x-phantom-") for k in headers)
     # x-amz-meta capture still works (back-compat with the narrower field).
     assert entry["x_amz_meta_headers"]["x-amz-meta-ref-id"] == "hist-001"
+
+
+# One field name sent TWICE, the second occurrence under a different casing.
+# Field names are case-insensitive, so this is one field with two values and
+# not two fields - the shape a duplicate most often takes on the wire.
+_DUPLICATE_TRACE_LINES: list[tuple[str, str]] = [("X-Trace", "one"), ("x-trace", "two")]
+
+# The same shape on a metadata header, to pin the narrower x-amz-meta view
+# against the same defect.
+_DUPLICATE_META_LINES: list[tuple[str, str]] = [
+    ("x-amz-meta-ref-id", "first"),
+    ("X-Amz-Meta-Ref-Id", "second"),
+]
+
+# What the capture must report for each: every occurrence in arrival order,
+# joined by the bare comma the service side combines with. Spelled out as a
+# literal rather than built from the production constant, so the assertion
+# still describes the expected wire value if that constant ever moves.
+_COMBINED_TRACE_VALUE = "one,two"
+_COMBINED_META_VALUE = "first,second"
+
+
+async def test_received_log_keeps_both_values_of_a_duplicate_header(
+    client: httpx.AsyncClient,
+) -> None:
+    """Objective: a header sent twice reaches ``/control/received`` with BOTH values.
+
+    Phantom is a transparent proxy, so a duplicate inbound header that it
+    drops, reorders or merges wrongly is a real regression class, and this
+    emulator is the ORACLE the end-to-end and conformance tiers use to judge
+    it. Capturing straight into a dict was last-value-wins: the first value
+    vanished inside the emulator before any assertion could reach it, so a
+    dropped duplicate and a faithful forward produced the identical record and
+    the suite certified the wrong behaviour as correct.
+
+    Expected outcome: the recorded entry reports ``one,two`` for ``x-trace``
+    (the case variant is the SAME field, so it combines instead of
+    overwriting) and ``first,second`` for the repeated metadata header in both
+    the full capture and the narrower ``x_amz_meta_headers`` view. Against the
+    unfixed capture this fails on the first assertion, which sees only the
+    surviving last value ``two``.
+    """
+    token = await _mint_token(client)
+    create_r = await client.post(
+        "/v1/files/create",
+        json=_CREATE_PAYLOAD,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    relative = _relative(create_r.json()["uploadUrl"])
+
+    put_r = await client.put(
+        relative,
+        content=b"payload-bytes",
+        headers=[
+            ("Authorization", f"Bearer {token}"),
+            *_DUPLICATE_TRACE_LINES,
+            *_DUPLICATE_META_LINES,
+        ],
+    )
+    assert put_r.status_code == 200
+
+    received_r = await client.get("/control/received")
+    entry = received_r.json()["received"][0]
+
+    assert entry["headers"]["x-trace"] == _COMBINED_TRACE_VALUE
+    assert entry["headers"]["x-amz-meta-ref-id"] == _COMBINED_META_VALUE
+    # The narrower metadata view is a filter of the same capture, so it must
+    # not reintroduce the flattening the full capture just avoided.
+    assert entry["x_amz_meta_headers"]["x-amz-meta-ref-id"] == _COMBINED_META_VALUE
+
+
+async def test_duplicate_authorization_is_judged_on_both_values(
+    client: httpx.AsyncClient,
+) -> None:
+    """Objective: presenting ``Authorization`` twice does not authenticate.
+
+    The auth check reads the same capture, so the flattening hid duplicates
+    here too: a caller that sent a good bearer twice was admitted on the
+    surviving copy, which is not what a real upstream does with a combined
+    ``Bearer a,Bearer b`` field line. That blindness sat directly under the
+    bearer-duplication finding the oracle exists to catch.
+
+    Expected outcome: ``401 invalid_token`` for the duplicated bearer, while
+    the identical request carrying it ONCE is accepted, so the rejection is
+    attributable to the duplication and not to a bad token. Against the
+    unfixed capture the duplicated request returns 200.
+    """
+    token = await _mint_token(client)
+
+    single_r = await client.post(
+        "/v1/files/create",
+        json=_CREATE_PAYLOAD,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert single_r.status_code == 200
+
+    duplicated_r = await client.post(
+        "/v1/files/create",
+        json=_CREATE_PAYLOAD,
+        headers=[
+            ("Authorization", f"Bearer {token}"),
+            ("authorization", f"Bearer {token}"),
+        ],
+    )
+
+    assert duplicated_r.status_code == 401

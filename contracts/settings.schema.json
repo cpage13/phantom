@@ -35,14 +35,16 @@
         },
         "refresh_jitter_seconds": {
           "default": 0.5,
-          "description": "Random jitter added to refresh scheduling to spread load.",
+          "description": "Random jitter SUBTRACTED from the refresh wait to spread the mint cycles of sibling instances. Bounded above, and further bounded by ``_check_jitter_fits_refresh_window`` to at most ``refresh_seconds_before_expiry``, so jitter can consume the pre-expiry margin but never more than it.",
+          "maximum": 60.0,
           "minimum": 0.0,
           "title": "Refresh Jitter Seconds",
           "type": "number"
         },
         "refresh_seconds_before_expiry": {
-          "default": 12,
-          "description": "Seconds before token expiry to mint a replacement.",
+          "default": 300,
+          "description": "Seconds before token expiry to mint a replacement. Default 300 (5 minutes), matching the refresh window the Azure Identity / MSAL clients use. The previous 12 s left no allowance for the two clocks involved: ``expires_on`` is an absolute instant from Entra ID's clock, and a few seconds of container clock skew plus the mint's own round trip to the authority could land the replacement AFTER the cached token had already expired, 401ing every request in between. Bounded above at the minimum access-token lifetime any tenant policy can configure, so the margin can never exceed the token's own life.",
+          "maximum": 600,
           "minimum": 1,
           "title": "Refresh Seconds Before Expiry",
           "type": "integer"
@@ -98,7 +100,7 @@
           "type": "string"
         },
         "json_path": {
-          "description": "Dotted path under that step's 'values' map down to the upstream identifier field (capture name first, then keys inside the captured object).",
+          "description": "Dotted path under that step's 'values' map down to the upstream identifier field (capture name first, then keys inside the captured object). Plain dotted segments only: this value is spliced into a SQLite json_extract path, so a character needing a quoted label is refused at boot.",
           "minLength": 1,
           "title": "Json Path",
           "type": "string"
@@ -150,7 +152,7 @@
         "ram_ceiling_bytes": {
           "anyOf": [
             {
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             {
@@ -158,7 +160,7 @@
             }
           ],
           "default": null,
-          "description": "RamBodyStore size ceiling in bytes. None means probe-fill at startup - the ``_resolve_defaults`` model validator sets this to a hardware-aware fraction of available RAM (preserving the pre-rename ``in_memory_max_bytes`` probe-fill semantic). Explicit int overrides (e.g., 536_870_912 / 512 MiB). Ignored in all_disk mode (no RAM to bound).",
+          "description": "RamBodyStore size ceiling in bytes. None means probe-fill at startup - the ``_resolve_defaults`` model validator sets this to a hardware-aware fraction of available RAM (preserving the pre-rename ``in_memory_max_bytes`` probe-fill semantic). Explicit int overrides (e.g., 536_870_912 / 512 MiB). Ignored in all_disk mode (no RAM to bound). There is NO 'unlimited' or 'no RAM bodies' sentinel: the ceiling is an ENFORCED bound, so every accepted value is a real bound and 0 is rejected. To run with no RAM-resident bodies, set ``mode: all_disk`` - the first-class deployment mode for exactly that posture.",
           "title": "Ram Ceiling Bytes"
         },
         "ram_pressure_poll_seconds": {
@@ -189,7 +191,7 @@
         },
         "level": {
           "default": 3,
-          "description": "Codec compression level (zstd 1..22 / gzip 1..9).",
+          "description": "Codec compression level (zstd 1..22 / gzip 1..9; ignored by ``original``). The upper bound depends on ``algorithm`` and is enforced by ``_check_level_for_algorithm`` at load, because the codec is built per admission rather than at boot: an out-of-range level otherwise passed ``--validate``, exported to the contract, and only surfaced as a ValueError inside the codec on the FIRST upload, leaving a healthy-looking service that accepts nothing.",
           "minimum": 1,
           "title": "Level",
           "type": "integer"
@@ -551,7 +553,14 @@
           "type": "number"
         },
         "intervals_seconds": {
-          "description": "Fixed-intervals schedule (when ``type == 'fixed_intervals'``).",
+          "default": [
+            1,
+            5,
+            20,
+            60,
+            300
+          ],
+          "description": "Fixed-intervals schedule (when ``type == 'fixed_intervals'``): the delay before attempt ``i`` is ``intervals_seconds[i]``, and a row past the end of the list goes to ``stored``. The default is the five-step quick-then-back-off schedule; an EXPLICIT empty list means no retries at all. The default lives here, on the model, rather than as a builder-side fallback, so ``contracts/settings.schema.json`` carries it and an implementation built from the contract schedules the same retries this one does (ADR-035).",
           "items": {
             "type": "integer"
           },
@@ -560,21 +569,23 @@
         },
         "jitter": {
           "default": 0.2,
-          "description": "Uniform jitter fraction (e.g. 0.2 \u2192 \u00b120%). Applied by BOTH ``exponential_backoff`` AND ``fixed_intervals`` (V5-C) so a backlog that fails in the same poll round de-correlates on retry instead of firing in lockstep (thundering herd) on upstream recovery. ``0.0`` preserves an exact fixed-interval schedule.",
+          "description": "Uniform jitter FRACTION, not a percentage (e.g. 0.2 \u2192 \u00b120%). Applied by BOTH ``exponential_backoff`` AND ``fixed_intervals`` (V5-C) so a backlog that fails in the same poll round de-correlates on retry instead of firing in lockstep (thundering herd) on upstream recovery. ``0.0`` preserves an exact fixed-interval schedule. Bounded at 1.0 (\u00b1100%): an operator reading '\u00b120%' and writing ``20`` meaning '20 percent' otherwise got a \u00b12000% swing, which put about half of all retries at a zero delay (the sender re-claims on its next ``poll_interval_ms`` poll and hammers a failing upstream) and the other half far past ``cap_seconds``.",
+          "maximum": 1.0,
           "minimum": 0.0,
           "title": "Jitter",
           "type": "number"
         },
         "max_attempts": {
           "default": -1,
-          "description": "-1 = unbounded.",
+          "description": "Attempt budget. ``-1`` is the ONE unbounded sentinel and is the default; ``0`` means give up without ever retrying; any positive value is the attempt count. Validated ``ge=-1`` for the same reason every :class:`RetentionCfg` window is (C11): the strategy's guard is ``0 <= max_attempts <= attempts``, so an unvalidated typo like ``-5`` silently meant UNBOUNDED retries instead of being a loud error.",
+          "minimum": -1,
           "title": "Max Attempts",
           "type": "integer"
         },
         "max_duration_seconds": {
           "default": 86400,
-          "description": "Hard ceiling on retry-attempt span before the row transitions to ``stored``. Default 86 400 s (24 hours).",
-          "minimum": 0,
+          "description": "Hard ceiling on retry-attempt span before the row transitions to ``stored``. Default 86 400 s (24 hours). ``-1`` is the unbounded sentinel, matching ``max_attempts`` and the strategy's own ``0 <= max_duration <= elapsed`` guard, which promised it while ``ge=0`` made it unreachable from config. ``0`` means give up on the first scheduling call (no retry budget at all).",
+          "minimum": -1,
           "title": "Max Duration Seconds",
           "type": "integer"
         },
@@ -997,14 +1008,16 @@
         "key_password": {
           "anyOf": [
             {
-              "type": "string"
+              "format": "password",
+              "type": "string",
+              "writeOnly": true
             },
             {
               "type": "null"
             }
           ],
           "default": null,
-          "description": "Optional passphrase for an encrypted private key (uvicorn ssl_keyfile_password).",
+          "description": "Optional passphrase for an encrypted private key (uvicorn ``ssl_keyfile_password``). Held as a ``SecretStr``: it is the one credential this config carries as a LITERAL rather than as the name of an environment variable (see :class:`SigV4CredentialCfg`), and ``python -m phantom --validate`` - which the operator docs call safe to run at deploy time - writes ``model_dump_json`` to stdout, so a plain ``str`` put the passphrase into CI job logs and deploy transcripts. ``SecretStr`` renders as ``**********`` there and in ``contracts/settings.schema.json``; the consumer reads the literal back with ``.get_secret_value()``.",
           "title": "Key Password"
         },
         "key_path": {

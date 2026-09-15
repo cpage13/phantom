@@ -13,15 +13,20 @@ token shapes are:
 
 :class:`CredCacheRow` is the boundary type between the SQLite
 ``credential_store`` table and Phantom's in-memory code. It is **internal
-only**; the credential value never crosses an HTTP response boundary
-(ADR-004). Admin-facing serialization uses :class:`CredentialSlot` instead,
-which carries no secret material (only the credential *type* and status). The
-admin push *into* the store uses :data:`CredentialPushBody`; that secret is
-never returned in any response.
+only**, and what enforces ADR-004 is that NOTHING SERIALIZES IT: the store
+exposes no list method and no read-back endpoint, so there is no admin
+response for a credential to leave through. An admin-facing
+``CredentialSlot`` model was declared here for a GET-list that was never
+built; it had no consumer anywhere in ``src/``, ``tests/``, ``scripts/`` or
+``contracts/``, and pointing at it as the redaction guarantee sent an auditor
+to an unused model instead of to the absence of a read path (finding S9-8).
+It is deleted; a future GET-list adds its own no-secret response model beside
+the route that needs it. The admin push *into* the store uses
+:data:`CredentialPushBody`; that secret is never returned in any response.
 
 Everything around the value field (the ``observed_at`` / ``source`` /
-``status`` columns, the internal-vs-admin two-model split) copies the token
-shapes verbatim.
+``status`` columns, the strict-model row boundary) copies the token shapes
+verbatim.
 
 Both SigV4 credential variants carry an explicit, REQUIRED ``service`` (a
 :class:`SigningService`), the scope sibling of ``region``. It is the AWS
@@ -172,8 +177,7 @@ class ProfileRefCred:
 DestinationCredential: TypeAlias = SigV4StaticCreds | ProfileRefCred  # noqa: UP040
 
 
-@dataclass(frozen=True)
-class CredCacheRow:
+class CredCacheRow(BaseModel):
     """One credential slot; INTERNAL ONLY (the credential never crosses an
     HTTP response boundary, ADR-004).
 
@@ -184,41 +188,38 @@ class CredCacheRow:
     ADR-003 (the store survives Phantom restart). Bad slots stay in the cache
     rather than being deleted so the admin API can surface "this is the only
     credential I have for this host, and it's bad".
+
+    A STRICT pydantic model, as the twin it copies is, and for the reason that
+    twin is one: this is the boundary type for a SQLite row, so it is where a
+    column value that is outside its ``Literal`` has to fail. As a bare frozen
+    dataclass the decode splatted raw column strings in and any value passed,
+    so a ``status`` of neither ``fresh`` nor ``bad`` read as USABLE to the
+    executor (``status == 'bad'`` is False) and as UNWAKEABLE to the kicker
+    (``status != 'fresh'``), and the two consumers silently disagreed about
+    one row (finding S9-6). ``frozen=True`` keeps the dataclass's immutability.
     """
 
-    dest_host: HostCredKey
-    credential: DestinationCredential
-    observed_at: datetime
-    source: CredentialSource
-    status: CredentialStatus
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-
-class CredentialSlot(BaseModel):
-    """Admin-facing credential slot; NO secret material (ADR-004).
-
-    COPY of :class:`phantom.models.admin.TokenSlot`. This is the only
-    credential shape any admin HTTP response may carry (if a GET-list is ever
-    added): it exposes the credential *type* (``kind``) and freshness, never
-    the resolved secret.
-    """
-
-    model_config = ConfigDict(strict=True, extra="forbid")
-
-    dest_host: str = Field(
+    dest_host: HostCredKey = Field(
         ...,
-        description="The destination host this credential is keyed on.",
+        description="Lower-cased resolved destination host; the slot's whole key (ADR-033).",
     )
-    kind: Literal["sigv4_static", "profile_ref"] = Field(
+    credential: DestinationCredential = Field(
         ...,
-        description="The credential TYPE (never its value).",
+        description="The structured credential value; never serialized to any HTTP response.",
     )
-    last_updated: datetime = Field(
+    observed_at: datetime = Field(
         ...,
-        description="When this slot's credential was last written.",
+        description="When this credential was last written (UTC).",
+    )
+    source: CredentialSource = Field(
+        ...,
+        description="Where this credential came from.",
     )
     status: CredentialStatus = Field(
         ...,
-        description="Current freshness state (per ADR-003).",
+        description="Whether the cached credential last succeeded or failed.",
     )
 
 

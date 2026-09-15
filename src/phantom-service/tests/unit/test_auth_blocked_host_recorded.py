@@ -32,7 +32,7 @@ from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
-from phantom.chain.executor import ChainExecutor, FailedAuth
+from phantom.chain.executor import ChainExecutor, FailedAuth, RouteUnresolved
 from phantom.config.settings import InstanceCfg, RouteCfg
 from phantom.instances.context import InstanceContext
 from phantom.models.credential import HostCredKey, SigningService, SigV4StaticCreds
@@ -684,13 +684,19 @@ def test_the_uploads_schema_carries_the_new_column() -> None:
 async def _park_hostless_row(tmp_path: Path, *, auth_mode: str) -> UploadRow:
     """Drive a row with a hostless step URL through the executor and the park.
 
-    A ``hosts: ["*"]`` catch-all route is what lets the row reach the auth arm
-    at all: without it ``resolve_route`` raises and the row is classified
-    ``RouteUnresolved`` instead.
+    The route table is declared ``hosts: ["*"]``, the documented catch-all
+    convention, and the row STILL does not reach the auth arm: ``resolve_route``
+    decides policy on the host the transport would dial, and a bare path names
+    none, so it matches no pattern at all. That refusal replaced the older
+    behaviour where ``host_key_for``'s whole-input fallback keyed the URL by its
+    own path-plus-query and the catch-all fnmatched THAT, which is how an
+    undialable URL used to collect injected auth on its way to a transport that
+    could never send it.
 
     Args:
         tmp_path: The test's temporary directory.
-        auth_mode: The catch-all route's auth mode, which selects the arm.
+        auth_mode: The catch-all route's auth mode. Retained across both arms
+            because neither may be reachable for a hostless URL.
 
     Returns:
         The re-read parked row.
@@ -703,28 +709,35 @@ async def _park_hostless_row(tmp_path: Path, *, auth_mode: str) -> UploadRow:
     row = _row_on_second_step(uuid4(), second_step_url=HOSTLESS_STEP_URL)
     await instance.store.insert(row)
     result = await instance.executor.execute_one_step(row, {})
-    assert isinstance(result, FailedAuth), f"the row must reach the auth arm; got {result!r}"
+    assert isinstance(result, RouteUnresolved), (
+        f"a hostless step URL must be refused at the route gate, catch-all included; got {result!r}"
+    )
+    assert result.host == NO_HOST_TOKEN, (
+        f"the classification's host rides into last_error, which the admin API "
+        f"surfaces; got {result.host!r}"
+    )
 
     sender = Sender(instance=instance, worker_count=1, poll_interval_ms=250)
-    await sender._on_auth_failure(instance.store, row, result)
+    await sender._on_route_unresolved(instance.store, row, result)
     parked = await instance.store.get(row.chain_id)
     assert parked is not None
     return parked
 
 
 def _assert_sanitised(parked: UploadRow) -> None:
-    """Assert the recorded host is the fixed token and leaks no producer text.
+    """Assert no persisted, admin-surfaced field carries producer URL text.
 
     Args:
         parked: The re-read parked row.
     """
-    assert parked.auth_blocked_host == NO_HOST_TOKEN, (
-        f"a hostless step URL must record the fixed placeholder; got {parked.auth_blocked_host!r}"
+    surfaced = f"{parked.auth_blocked_host or ''} {parked.last_error or ''}"
+    assert NO_HOST_TOKEN in surfaced, (
+        f"a hostless step URL must record the fixed placeholder; got {surfaced!r}"
     )
     for leak in ("?", "sig", "SECRET", "/v1/files"):
-        assert leak not in (parked.auth_blocked_host or ""), (
-            f"the persisted, admin-surfaced column must carry no producer URL text; "
-            f"{leak!r} appears in {parked.auth_blocked_host!r}"
+        assert leak not in surfaced, (
+            f"the persisted, admin-surfaced fields must carry no producer URL text; "
+            f"{leak!r} appears in {surfaced!r}"
         )
 
 
@@ -732,28 +745,28 @@ def _assert_sanitised(parked: UploadRow) -> None:
 async def test_a_hostless_step_url_never_leaks_a_query_string_into_the_column(
     tmp_path: Path,
 ) -> None:
-    """The bearer arm records the placeholder, never the raw path and query.
+    """A bearer catch-all records the placeholder, never the raw path and query.
 
-    Objective: the sanitisation rule. ``host_key_for`` is not a hostname function:
-    it returns the WHOLE INPUT lower-cased when urlparse finds no host, and a
-    step URL can legitimately be a bare path carrying a presigned query string.
-    ``auth_blocked_host`` is persisted and surfaced on four admin paths, so it
-    takes the parsed hostname or a fixed token and nothing else.
+    Objective: the sanitisation rule. ``host_key_for`` is not a hostname
+    function: it returns the WHOLE INPUT lower-cased when no host can be
+    parsed, and a step URL can legitimately be a bare path carrying a presigned
+    query string. Every persisted host field is surfaced by the admin API, so
+    each takes a parsed hostname or a fixed token and nothing else.
 
-    Success: the parked row's column is the ``<no-host>`` literal and contains
-    none of the URL's own text.
+    Success: the parked row's admin-surfaced fields carry the ``<no-host>``
+    literal and none of the URL's own text.
     """
     _assert_sanitised(await _park_hostless_row(tmp_path, auth_mode="phantom_bearer"))
 
 
 @pytest.mark.asyncio
 async def test_the_sigv4_arm_sanitises_the_recorded_host_too(tmp_path: Path) -> None:
-    """The credential arm applies the same rule at its own construction sites.
+    """The credential route applies the same rule at its own construction sites.
 
-    Objective: pin the rule on the OTHER arm. The bearer test exercises the
-    slot-check site only, and the sigv4 sites are the ones where passing
-    ``str(dest_host)`` would be identity over ``host_key_for`` and would reinstate
-    exactly the raw-input fallback the rule forbids.
+    Objective: pin the rule on the OTHER arm's route. The sigv4 sites are the
+    ones where passing ``str(dest_host)`` would be identity over
+    ``host_key_for`` and would reinstate exactly the raw-input fallback the rule
+    forbids.
 
     Success: the same assertions as the bearer case.
     """

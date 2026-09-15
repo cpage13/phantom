@@ -72,7 +72,11 @@ _SAT_BYTES_B = 123_456
 _SAT_DISK_B = 999_999
 _RETRY_INTERVALS_B = [9, 9]
 _LOOKUP_CAPTURE_B = "create_file"
-_LOOKUP_PATH_B = "$.id"
+# A plain dotted path, because the store splices this value into
+# "$.values.<json_path>". The previous value here was "$.id", which
+# produced "$.values.$.id" and could never have matched anything; it
+# validated only because the field had no shape guard until SW-13.
+_LOOKUP_PATH_B = "create_file.id"
 # Distinct from the probe-derived defaults so the before != expected
 # guard holds on any host.
 _SAT_LARGE_THRESHOLD_B = 7_654_321

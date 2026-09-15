@@ -41,13 +41,22 @@ crash survives. RED before the fix (restart subprocess fails to become healthy;
 its log carries the recovery lock). GREEN after.
 
 Determinism: the kill fires only AFTER the on-disk census shows at least
-``_MIN_BUFFERED_ROWS`` committed rows — NOT on a fixed wall-clock timer. Each
+``_MIN_BUFFERED_ROWS`` committed rows, NOT on a fixed wall-clock timer. Each
 ``submit_chain`` round-trip is ~2 s, so a fixed short sleep raced admission and
 could SIGKILL the process before a single row landed (recovery then had nothing
 to quarantine and the WAL was empty). The test does NOT assert a "hot WAL" at
 kill: the fix checkpoints + TRUNCATEs the WAL at ``store.start()``, so recovery
-always runs against a cold WAL on restart — the WAL size at the crash instant is
+always runs against a cold WAL on restart. The WAL size at the crash instant is
 neither externally observable in a stable way nor relevant to the contract.
+
+Durability bar (review finding S12-2). ``_MIN_BUFFERED_ROWS`` is the KILL
+TRIGGER and nothing else. The survival assertion compares the post-restart
+census against ``buffered``, the count this run actually MEASURED on disk just
+before the kill, which at ``_BURST`` 200 and concurrency 32 is routinely far
+above the trigger floor. Asserting against the floor instead let a recovery
+regression lose 125 of 150 buffered uploads and still pass, which is the exact
+failure this module exists to catch, and it certified the trailing Go port's
+crash recovery through the ``conformance`` marker as well.
 """
 
 from __future__ import annotations
@@ -76,12 +85,18 @@ pytestmark = [pytest.mark.conformance, pytest.mark.asyncio]
 _BURST = 200
 _BODY_BYTES = 4 * 1024
 _UPSTREAM_5XX_RATE = 0.85
-# Deterministic kill trigger. A fixed wall-clock sleep RACED admission: each
-# ``submit_chain`` round-trip is ~2 s (slow on a loaded host / Pi), so the
-# process could be SIGKILLed before a single body was buffered — recovery then
-# had nothing to quarantine and the test asserted against an empty DB. Instead
-# we SIGKILL only AFTER at least this many uploads are durably committed in a
-# non-terminal state, guaranteeing recovery has real buffered work to perform.
+# Deterministic kill TRIGGER, and only that. A fixed wall-clock sleep RACED
+# admission: each ``submit_chain`` round-trip is ~2 s (slow on a loaded host or
+# Pi), so the process could be SIGKILLed before a single body was buffered.
+# Recovery then had nothing to quarantine and the test asserted against an empty
+# DB. Instead we SIGKILL only AFTER at least this many uploads are durably
+# committed in a non-terminal state, guaranteeing recovery has real buffered
+# work to perform.
+#
+# This constant is NOT the durability bar (finding S12-2). The survival
+# assertion uses the count actually measured on disk at kill time, which is
+# routinely far larger than this floor; comparing against the floor made the
+# assertion unfailable for any regression that left 25 rows behind.
 _MIN_BUFFERED_ROWS = 25
 _PRECONDITION_TIMEOUT_SECONDS = 90.0
 _PRECONDITION_POLL_SECONDS = 0.2
@@ -96,10 +111,10 @@ def _overrides(mode: str) -> dict:
     quarantine WRITE path (the path that crashed before the fix). Immediate
     retry (``intervals_seconds=[0,...]``) keeps rows churning
     queued↔attempting so recovery's attempting→queued reset write also fires.
-    The reaper interval is pushed far out so the post-recovery census is
-    independent of reaper timing — this test pins crash recovery, not
-    terminal-state reaping (``corrupted`` rows retain 30 days by default, so
-    they survive regardless, but the override makes that intent explicit).
+    The reaper interval is pushed far out AND the one short terminal-state
+    metadata window is pinned to forever, so the post-recovery census is
+    independent of reaper timing. This test pins crash recovery, not
+    terminal-state reaping.
     """
     return {
         "storage": {"body_store": {"mode": mode}},
@@ -115,7 +130,19 @@ def _overrides(mode: str) -> dict:
                 "intervals_seconds": [0, 0, 0, 0, 0, 0],
             },
         },
-        "retention": {"reaper_interval_seconds": 3600},
+        "retention": {
+            "reaper_interval_seconds": 3600,
+            # The reaper still sweeps ONCE at boot however long the interval
+            # is, and ``succeeded_metadata_seconds`` is the one default short
+            # enough (180 s) that a row which succeeded early in the burst
+            # could legitimately age out of it before the post-restart census.
+            # The durability assertion compares that census against the
+            # measured pre-crash count, so pin the window to forever and the
+            # count becomes reaper-independent by construction rather than by
+            # timing luck. Every other terminal-state metadata window already
+            # defaults to 30 days or forever.
+            "succeeded_metadata_seconds": -1,
+        },
     }
 
 
@@ -142,14 +169,64 @@ async def _await_buffered_rows(data_dir: Path) -> int:
     )
 
 
+def _assert_no_buffered_rows_lost(*, census: dict[str, int], buffered: int, mode: str) -> None:
+    """Objective: no upload durably buffered before the SIGKILL is missing after recovery.
+
+    Expected outcome: the post-restart on-disk census totals AT LEAST
+    ``buffered``, the count this run measured on disk in the instant
+    before the kill. Recovery quarantines RAM-lost rows to ``corrupted``
+    (hybrid) and resumes file-backed rows (all_disk); it resets
+    ``attempting`` rows to ``queued``. Every one of those outcomes KEEPS
+    the row, so the total may only grow (rows admitted between the census
+    read and the kill), never shrink. The reaper interval is pushed to an
+    hour by ``_overrides`` so no retention pass can legitimately delete a
+    row inside the test window.
+
+    The comparison is against the MEASURED pre-crash count, deliberately
+    not against ``_MIN_BUFFERED_ROWS`` (finding S12-2): the floor is the
+    kill trigger, and a recovery regression that aborts the ``iter_rows``
+    walk at the first quarantine target leaves exactly the floor's worth
+    of rows behind. Comparing to the floor passed that regression.
+
+    Args:
+        census: ``{state: count}`` read from the on-disk uploads table
+            after the restarted process answered ``/v1/healthz``.
+        buffered: Rows durably committed before the kill, as measured by
+            :func:`_await_buffered_rows`.
+        mode: The parametrized body-store mode, for the failure message.
+
+    Raises:
+        AssertionError: When recovery dropped rows that were durable.
+    """
+    total = sum(census.values())
+    assert total >= buffered, (
+        f"[{mode}] recovery LOST durably buffered rows: {buffered} rows were "
+        f"committed on disk before the SIGKILL, only {total} survived the restart "
+        f"({buffered - total} gone). census={census}"
+    )
+
+
 @pytest.mark.parametrize("mode", ["hybrid", "all_disk"])
 async def test_sigkill_under_load_then_restart_recovers_healthy(tmp_path: Path, mode: str) -> None:
-    """Real SIGKILL mid-load → restart on same data_dir → service comes back healthy.
+    """Objective: a real SIGKILL mid-load must cost neither availability nor rows.
 
-    ``hybrid`` exercises V1 (RAM-lost ``mark_corrupted`` quarantine); ``all_disk``
-    exercises V2 (file-missing ``mark_corrupted`` quarantine). Before the fix BOTH
-    crash in ``run_recovery`` with ``database is locked`` over the SIGKILL-hot WAL
-    and never become healthy. After the fix both recover cleanly.
+    Expected outcome, both halves asserted:
+
+    1. Restarting on the same data_dir brings the service back HEALTHY,
+       so recovery completed without ``database is locked``.
+    2. The post-restart on-disk census holds at least as many rows as
+       were measured durably buffered in the instant before the kill.
+
+    ``hybrid`` exercises V1 (RAM-lost ``mark_corrupted`` quarantine);
+    ``all_disk`` exercises V2 (file-missing ``mark_corrupted``
+    quarantine). Before the fix BOTH crash in ``run_recovery`` with
+    ``database is locked`` over the SIGKILL-hot WAL and never become
+    healthy. After the fix both recover cleanly.
+
+    Falsifier for part 2: make recovery abandon its ``iter_rows`` walk at
+    the first quarantine target, or delete quarantined rows instead of
+    marking them ``corrupted``, and the surviving count drops below the
+    measured pre-crash count, so the run goes RED.
     """
     emu = await boot_emulator()
     data_dir = tmp_path / "phantom-data"
@@ -228,15 +305,13 @@ async def test_sigkill_under_load_then_restart_recovers_healthy(tmp_path: Path, 
 
         # GREEN: the restart subprocess answered /v1/healthz, so recovery
         # completed without 'database is locked'. Durability check: every row we
-        # confirmed buffered before the crash must still be present. Recovery
-        # quarantines RAM-lost rows to 'corrupted' (hybrid) and resumes
-        # file-backed rows (all_disk) — it never silently drops them; the reaper
-        # is deferred so this count is reaper-independent.
+        # confirmed buffered before the crash must still be present, measured
+        # against the count this run OBSERVED, not against the kill trigger.
+        # Recovery quarantines RAM-lost rows to 'corrupted' (hybrid) and resumes
+        # file-backed rows (all_disk); it never silently drops them, and the
+        # reaper is deferred so this count is reaper-independent.
         census = await count_rows_by_state(data_dir)
-        assert sum(census.values()) >= _MIN_BUFFERED_ROWS, (
-            f"[{mode}] recovered DB lost buffered rows: confirmed {buffered} buffered "
-            f"before SIGKILL, expected >= {_MIN_BUFFERED_ROWS} after recovery, census={census}"
-        )
+        _assert_no_buffered_rows_lost(census=census, buffered=buffered, mode=mode)
     finally:
         p1.terminate()
         if p2 is not None:

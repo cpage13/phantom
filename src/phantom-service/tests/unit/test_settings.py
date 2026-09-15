@@ -242,6 +242,32 @@ def test_config_yaml_example_loads_cleanly() -> None:
     assert len(instance.routes) == 2
 
 
+def test_config_yaml_example_enumerates_every_top_level_block() -> None:
+    """The example config's header promise, made mechanical.
+
+    Objective: the file opens with "Every operator-tunable knob is enumerated
+    below", and it is what an operator copies as a starting config, so a
+    missing block is a knob nobody knows exists. ``upstream`` was the one
+    absent block, which mattered because ``upstream.timeout_seconds`` defaults
+    to 30 s and is the per-request ceiling a route falls back to: an operator
+    copying the example's S3 route verbatim saw every large PUT time out and
+    retry forever with nothing in the reference config pointing at the knob
+    that governs it.
+
+    A block may be COMMENTED OUT (that is how the file shows an optional or
+    probe-filled block), so the test asserts the key is mentioned in the text
+    rather than present in the parsed mapping.
+
+    Success: every top-level field of ``Settings`` appears in the file.
+    """
+    repo_root = Path(__file__).resolve().parents[4]
+    text = (repo_root / "config" / "phantom.yaml.example").read_text(encoding="utf-8")
+
+    missing = [name for name in Settings.model_fields if f"{name}:" not in text]
+
+    assert not missing, f"top-level Settings blocks absent from the example config: {missing}"
+
+
 def test_upstream_timeout_knob_parses_and_reaches_the_client(tmp_path: Path) -> None:
     """``upstream.timeout_seconds`` is configurable and reaches the transport (CL12).
 

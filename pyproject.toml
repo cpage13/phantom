@@ -26,9 +26,14 @@ members = [
 # docker-compose.yml + README.md.
 
 # Internal workspace deps — declare a package name in any member's dependencies
-# and uv will resolve it from the workspace instead of PyPI.
+# and uv will resolve it from the workspace instead of PyPI. Keys are
+# DISTRIBUTION names, so they must match each member's [project] name.
+# `phantom` was listed here and is not a distribution in this workspace: the
+# service's [project] name is `phantom-service` (`phantom` is its import
+# package and its console script). A source entry for a name no member
+# publishes binds nothing.
 [tool.uv.sources]
-phantom = { workspace = true }
+phantom-service = { workspace = true }
 phantom-client = { workspace = true }
 phantom-emulator = { workspace = true }
 
@@ -41,6 +46,8 @@ dev = [
   "mypy>=1.13",
   "hatchling>=1.25",
   "pre-commit>=3.7",
+  "jsonschema>=4.23",
+  "types-jsonschema>=4.23",
 ]
 
 # ---------------------------------------------------------------------------
@@ -85,11 +92,17 @@ warn_redundant_casts = true
 warn_return_any = true
 disallow_untyped_defs = true
 no_implicit_optional = true
-# Type-check each package's production source. Tests are excluded here so the
-# per-package `tests/unit/__init__.py` files don't collide on the "unit" module
-# name when mypy walks all of src/ at once; per-package mypy runs can target
-# tests explicitly.
-files = ["src/*/src"]
+# NOTE ON SCOPE. This block is read only by a mypy invocation made FROM THE
+# REPOSITORY ROOT. Both enforcing paths (the `types` CI job and the
+# `mypy-strict` pre-commit hook) run scripts/precommit/run_mypy_per_package.sh,
+# which cds into each package directory and runs `mypy --strict -p <module>`
+# there; mypy reads config from the invocation directory and does not walk up,
+# and no package carries a [tool.mypy] of its own, so those runs get their
+# strictness from the --strict FLAG, not from here.
+#
+# A `files = ["src/*/src"]` key used to sit here. It was dead twice over: the
+# per-package runs never read this file, and a root-level run always names its
+# targets on the command line, which overrides `files` anyway.
 explicit_package_bases = true
 namespace_packages = true
 
@@ -106,10 +119,14 @@ testpaths = [
 # imports resolve against the repo-root tests/ package.
 pythonpath = ["."]
 python_files = ["test_*.py", "*_test.py"]
-# Load tests live under tests/e2e/test_e2e_2[1234]_*.py and carry the
-# `load` marker. They take minutes (test_e2e_23 alone runs 15 minutes
-# wall-clock) so the default suite filters them out. Explicit
-# `pytest -m load tests/e2e/` runs them.
+# Load tests are the files carrying the `load` marker: today
+# tests/e2e/test_e2e_23_sustained_15min.py and
+# tests/e2e/test_e2e_24_sigkill_idempotency.py. (The old
+# `test_e2e_2[1234]_*` shorthand named two files, 21 and 22, that do not
+# exist.) The marker, not a filename glob, is what selects the tier. They
+# take minutes (test_e2e_23 alone runs 15 minutes wall-clock) so the
+# default suite filters them out. Explicit `pytest -m load tests/e2e/`
+# runs them.
 #
 # `perf` tests assert the tight synthetic-return budget
 # (SYNTHETIC_RETURN_BUDGET_SECONDS, 0.1-0.25s) on the buffering POST.
@@ -121,7 +138,7 @@ python_files = ["test_*.py", "*_test.py"]
 addopts = "-m 'not load and not perf and not stress'"
 markers = [
   "e2e: end-to-end test exercising the full package stack (tests/e2e/)",
-  "load: long-running load test gated out of the default suite (tests/e2e/test_e2e_2[1234]_*); run via `pytest -m load`",
+  "load: long-running load test gated out of the default suite (tests/e2e/test_e2e_23_sustained_15min.py, tests/e2e/test_e2e_24_sigkill_idempotency.py); run via `pytest -m load`",
   "stress: stress test run on the nightly CI cron only; run via `pytest -m stress` (plan § 1.1.10)",
   "perf: performance-budget assertions (SYNTHETIC_RETURN_BUDGET_SECONDS); run on a quiet/dedicated lane via `-m perf`; excluded from the default suite because a loaded host produces false failures",
   "docker: compose-topology E2E requiring a Docker daemon (tests/e2e/test_docker_volume_replacement.py); runs in the dedicated e2e-docker CI job, excluded from e2e-core",

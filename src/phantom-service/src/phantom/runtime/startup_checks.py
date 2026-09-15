@@ -17,7 +17,8 @@ five startup behaviors that defend a Pi-class deployment:
   (plan § 9.10.1): every configured instance must be *completely
   isolated* (unique id, its own storage partition, unambiguous
   routing). Fail-closed on a duplicate ``id``, a colliding/nested
-  ``data_dir``, or a duplicate ``host_prefix``.
+  ``data_dir`` (composed against ``storage.data_dir`` the way the running
+  stores compose it), or a duplicate ``host_prefix``.
 * :func:`check_body_store_mode` - per-instance back-up-and-run guard
   (findings A-3 + F-2, plan § 1.2 / ADR-025): when ``all_ram`` is
   selected over a populated on-disk body tree it relocates the live DB +
@@ -28,6 +29,12 @@ five startup behaviors that defend a Pi-class deployment:
   opens, quarantines a corrupt DB + body tree, bumps
   ``db_quarantine_total``, and either proceeds fresh (``fail_open``)
   or aborts startup.
+
+It also owns :func:`parse_bind_tcp`, the ONE parse of ``server.bind_tcp``.
+Both readers of that field - the launcher's ``uvicorn.run`` call and
+``app.py``'s loopback trust-boundary warning - resolve it here, so the
+listen address and the ADR-004 warning can never disagree about which
+host is being bound.
 
 It also owns the single mode-wiring decision table
 (:func:`build_body_store`) so the ``hybrid`` / ``all_ram`` / ``all_disk``
@@ -56,6 +63,7 @@ from typing import TYPE_CHECKING, Literal, assert_never
 import aiosqlite
 
 from phantom.config.settings import Settings
+from phantom.instances.context import instance_storage_paths
 from phantom.storage.file_body_store import FileBodyStore
 from phantom.storage.hybrid_body_store import HybridBodyStore
 from phantom.storage.integrity import BackupManifest, IntegrityChecker, quarantine
@@ -76,6 +84,17 @@ logger = logging.getLogger(__name__)
 # Owner-only umask for bare-metal deploys (WS-4 F6): strip group + world
 # bits so buffered bodies + the SQLite DB are created ``0o600``/``0o700``.
 UMASK_OWNER_ONLY: int = 0o077
+
+# Defaults applied by :func:`parse_bind_tcp` when ``server.bind_tcp`` omits a
+# segment. They mirror the ``ServerCfg.bind_tcp`` default "127.0.0.1:8080",
+# so an operator who writes only a host still binds loopback:8080 - the
+# same-machine-only posture (ADR-004 / ADR-034).
+DEFAULT_TCP_HOST: str = "127.0.0.1"
+DEFAULT_TCP_PORT: int = 8080
+# The TCP port number space (RFC 793). 0 is kept legal: it asks the kernel
+# for an ephemeral port, which the e2e harness uses to avoid bind collisions.
+MIN_TCP_PORT: int = 0
+MAX_TCP_PORT: int = 65535
 
 # Canonical ``db_quarantine_total`` metric identity. Registered on the
 # process-wide MetricsRegistry by the composition root AND (idempotently)
@@ -181,7 +200,7 @@ class DegradeReason(enum.Enum):
     Each member corresponds to a classified fault at one stage of the
     per-instance boot pipeline in ``phantom.app._build_instance_context``
     (directory prep, integrity gate, backup reconcile, mode guard, schema
-    gate, upload-store open, token-cache open). The boot loop folds the
+    gate, the three DB opens, body-store start). The boot loop folds the
     typed ``BootOutcome`` union exhaustively, so an UNenumerated fault
     cannot silently join the degrade family: a new member without a match
     arm in :func:`degrade_action_hint` fails mypy strict.
@@ -219,6 +238,13 @@ class DegradeReason(enum.Enum):
         STORE_OPEN_FAILED: The instance's auxiliary store (the token
             cache) failed open past the same recovery ladder on a writable
             substrate; the detail names the store.
+        BODY_STORE_UNAVAILABLE: The body substrate could not be opened -
+            ``<data_root>/bodies`` is a file, is unreadable, or the tree
+            could not be created / swept at ``FileBodyStore.start()``. The
+            instance can neither buffer nor replay bodies, so it cannot
+            serve; this is the LAST boot stage, and it runs with the three
+            SQLite connections already open (they are closed before the
+            degrade returns).
     """
 
     SUBSTRATE_UNWRITABLE = "substrate_unwritable"
@@ -228,6 +254,7 @@ class DegradeReason(enum.Enum):
     SCHEMA_GATE_FAILED = "schema_gate_failed"
     DB_UNRECOVERABLE = "db_unrecoverable"
     STORE_OPEN_FAILED = "store_open_failed"
+    BODY_STORE_UNAVAILABLE = "body_store_unavailable"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -305,6 +332,12 @@ def degrade_action_hint(reason: DegradeReason) -> str:
                 "the token cache database could not be opened, isolated, or "
                 "recreated; inspect the data_dir and the quarantine "
                 "inventory, then restart"
+            )
+        case DegradeReason.BODY_STORE_UNAVAILABLE:
+            return (
+                "the body store could not be opened; inspect "
+                "<data_dir>/bodies (a stray FILE at that path, wrong "
+                "ownership, or a full disk), then restart"
             )
         case _:
             assert_never(reason)
@@ -441,29 +474,177 @@ def check_retention_floor(settings: Settings) -> None:
             raise ConfigInvariantError(msg)
 
 
-def check_instance_isolation(instances: Sequence[InstanceCfg]) -> None:
+@dataclasses.dataclass(frozen=True)
+class BindAddress:
+    """One parsed ``server.bind_tcp`` value: the listen host and port.
+
+    Attributes:
+        host: The host segment with IPv6 brackets STRIPPED, so it compares
+            directly against :data:`phantom.config.settings.LOOPBACK_HOSTS`
+            and is the exact string ``uvicorn.run(host=...)`` wants.
+        port: The resolved port (:data:`DEFAULT_TCP_PORT` when the value
+            carried no ``:port`` suffix).
+    """
+
+    host: str
+    port: int
+
+
+def parse_bind_tcp(bind_tcp: str) -> BindAddress:
+    """Split a ``server.bind_tcp`` value into its host and port.
+
+    The ONE parse of that field. Two consumers read it - the launcher
+    (``phantom.__main__``, which hands the pair to ``uvicorn.run``) and the
+    loopback trust-boundary warning
+    (``phantom.app._warn_if_bound_non_loopback``) - and they previously
+    carried a copy each of ``bind_tcp.partition(":")``, which mis-parses
+    EVERY IPv6 spelling: ``"[::1]:8080"`` yielded host ``"["`` and port
+    ``":1]:8080"`` (an unhandled ``ValueError`` at launch), and ``"::1"``
+    yielded the empty host. ``::1`` is a declared member of
+    :data:`phantom.config.settings.LOOPBACK_HOSTS`, so the mis-parse both
+    crashed the launcher and emitted the "bound to NON-LOOPBACK host"
+    warning on every boot of a correctly-configured IPv6 loopback listener.
+    That warning is the only thing standing in front of an unauthenticated
+    destructive admin surface (ADR-004 / ADR-034), and a warning that cries
+    wolf on every boot is one an operator learns to ignore.
+
+    Accepted spellings:
+
+    * ``""`` - both defaults (:data:`DEFAULT_TCP_HOST` / :data:`DEFAULT_TCP_PORT`).
+    * ``"host"`` / ``"host:port"`` - IPv4 literal or hostname.
+    * ``"[::1]"`` / ``"[::1]:8080"`` - bracketed IPv6, the only spelling that
+      can carry a port unambiguously (RFC 3986 § 3.2.2).
+    * ``"::1"`` - a BARE IPv6 literal (two or more colons and no brackets)
+      is the whole host; the port is the default. A bare IPv6 literal cannot
+      also carry a port, which is exactly why the bracket form exists.
+
+    Args:
+        bind_tcp: The raw ``server.bind_tcp`` string.
+
+    Returns:
+        The parsed :class:`BindAddress`.
+
+    Raises:
+        ConfigInvariantError: The value is unparseable - an unclosed or
+            empty ``[...]`` group, trailing junk after ``]``, or a port that
+            is not an integer in ``0..65535``. Raised (rather than a raw
+            ``ValueError`` at bind time) so ``--validate`` refuses the
+            config at deploy time and the launcher prints one operator-
+            actionable line.
+    """
+    text = bind_tcp.strip()
+    if not text:
+        return BindAddress(host=DEFAULT_TCP_HOST, port=DEFAULT_TCP_PORT)
+
+    if text.startswith("["):
+        closing = text.find("]")
+        if closing < 0:
+            msg = (
+                f"server.bind_tcp {bind_tcp!r}: the IPv6 bracket group is never "
+                f"closed. Write a bracketed IPv6 literal as '[::1]:8080'."
+            )
+            raise ConfigInvariantError(msg)
+        host = text[1:closing]
+        remainder = text[closing + 1 :]
+        if not host:
+            msg = f"server.bind_tcp {bind_tcp!r}: the IPv6 bracket group is empty."
+            raise ConfigInvariantError(msg)
+        if not remainder:
+            return BindAddress(host=host, port=DEFAULT_TCP_PORT)
+        if not remainder.startswith(":"):
+            msg = (
+                f"server.bind_tcp {bind_tcp!r}: expected ':port' or nothing after "
+                f"the closing ']', found {remainder!r}."
+            )
+            raise ConfigInvariantError(msg)
+        return BindAddress(host=host, port=_parse_port(remainder[1:], bind_tcp))
+
+    if text.count(":") > 1:
+        # A bare IPv6 literal. It carries no port - the bracket form is the
+        # only way to write one - so the whole value is the host.
+        return BindAddress(host=text, port=DEFAULT_TCP_PORT)
+
+    host, _, port_text = text.partition(":")
+    return BindAddress(
+        host=host or DEFAULT_TCP_HOST,
+        port=DEFAULT_TCP_PORT if not port_text else _parse_port(port_text, bind_tcp),
+    )
+
+
+def _parse_port(port_text: str, bind_tcp: str) -> int:
+    """Parse and range-check the port segment of a ``bind_tcp`` value.
+
+    Args:
+        port_text: The text after the host/port separator.
+        bind_tcp: The whole original value, for the error message.
+
+    Returns:
+        The port as an int.
+
+    Raises:
+        ConfigInvariantError: ``port_text`` is not an integer in
+            ``0..65535``.
+    """
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        msg = (
+            f"server.bind_tcp {bind_tcp!r}: port segment {port_text!r} is not an "
+            f"integer. Write the address as 'host:port' (IPv6 as '[::1]:8080')."
+        )
+        raise ConfigInvariantError(msg) from exc
+    if not MIN_TCP_PORT <= port <= MAX_TCP_PORT:
+        msg = (
+            f"server.bind_tcp {bind_tcp!r}: port {port} is outside the valid "
+            f"range {MIN_TCP_PORT}-{MAX_TCP_PORT}."
+        )
+        raise ConfigInvariantError(msg)
+    return port
+
+
+def check_instance_isolation(instances: Sequence[InstanceCfg], *, data_dir_root: Path) -> None:
     """Fail closed unless every instance is completely isolated.
 
     Plan § 9.10.1 (human-approved 2026-05-29). Each instance must have a
     unique identity, its own storage partition, and unambiguous routing.
     Without this guard a duplicate ``id`` silently collapses in the
-    dispatcher's ``_by_id`` map (an instance becomes unreachable) and a
-    shared ``data_dir`` puts two stores on one ``uploads.db`` (a
-    single-writer violation that corrupts the DB). This runs once,
-    process-wide, at the top of the lifespan - before any instance
-    context is built.
+    dispatcher's ``_by_id`` map (an instance becomes unreachable), and a
+    shared ``data_dir`` gives two instances one storage partition.
+
+    What a shared partition actually costs: SQLite serialises two
+    connections on one file, so the DB does NOT corrupt. The damage is
+    application-level, and arguably worse for being less visible. Two full
+    ``InstanceContext`` bundles come up on the same ``uploads`` rows and
+    the same ``bodies/`` tree, each with its OWN SaturationGate, sender
+    pool, kickers and reaper - two independent admission budgets over one
+    byte ledger, two senders claiming the same rows, and two reapers
+    deleting bodies the other still has rows for. Nothing in ``src/``
+    takes an ``flock`` or writes a lockfile, so this guard is the only
+    thing standing between that configuration and a running process.
+
+    This runs once, process-wide, at the top of the lifespan - before any
+    instance context is built.
 
     Three collisions are rejected:
 
     * **Duplicate ``id``** - exact string match.
-    * **Colliding ``data_dir``** - compared after :meth:`Path.resolve`
-      normalization (so ``foo`` == ``./foo`` == ``foo/``). Rejected on
-      an exact match AND on true path-*component* nesting (one resolved
-      path is an ancestor of another via :attr:`Path.parents`), so
-      siblings ``a/b`` and ``a/bc`` stay distinct while ``a`` nested
-      inside ``a/b`` is caught. Raw-string prefix comparison is
-      deliberately NOT used (it both missed ``./foo`` dups and falsely
-      rejected sibling prefixes).
+    * **Colliding ``data_dir``** - each instance's ``data_dir`` is
+      COMPOSED against ``data_dir_root`` through
+      :func:`phantom.instances.context.instance_storage_paths` (the one
+      join the running stores use) and only then
+      :meth:`Path.resolve`-normalized. Composing first is load-bearing:
+      resolving ``cfg.data_dir`` on its own measures it against the
+      process CWD, which is not where the instance's storage lives, so
+      the MIXED form an operator actually writes - ``beta`` in one block
+      and ``<root>/beta`` in another - looked like two different
+      directories and was admitted. Resolving after the join also
+      collapses symlinks, so two blocks pointing at one real directory
+      through a link are caught. Rejected on an exact match AND on true
+      path-*component* nesting (one resolved path is an ancestor of
+      another via :attr:`Path.parents`), so siblings ``a/b`` and ``a/bc``
+      stay distinct while ``a`` nested inside ``a/b`` is caught.
+      Raw-string prefix comparison is deliberately NOT used (it both
+      missed ``./foo`` dups and falsely rejected sibling prefixes).
     * **Duplicate ``host_prefix``** - lower-cased before comparing
       (matching the dispatcher's ``.lower()``), exact-match only. Glob
       *overlap* (e.g. ``*.example.com`` vs ``api.example.com``) stays
@@ -472,6 +653,9 @@ def check_instance_isolation(instances: Sequence[InstanceCfg]) -> None:
 
     Args:
         instances: The configured instances, in declaration order.
+        data_dir_root: ``Settings.storage.data_dir`` - the root every
+            instance's ``data_dir`` is resolved against, exactly as the
+            per-instance boot resolves it.
 
     Raises:
         ConfigInvariantError: On the first collision found, naming the
@@ -494,15 +678,17 @@ def check_instance_isolation(instances: Sequence[InstanceCfg]) -> None:
             raise ConfigInvariantError(msg)
         seen_ids.add(cfg.id)
 
-        # 2. Colliding / nested data_dir (resolve-normalized).
-        resolved = Path(cfg.data_dir).resolve()
+        # 2. Colliding / nested data_dir (composed against the storage root,
+        # THEN resolve-normalized - see the docstring).
+        resolved = instance_storage_paths(data_dir_root, cfg).data_root.resolve()
         for other_dir, other_id in resolved_dirs.items():
             if resolved == other_dir:
                 msg = (
                     f"Instances {other_id!r} and {cfg.id!r} share data_dir "
-                    f"{resolved} (two stores on one uploads.db is a single-writer "
-                    f"violation that corrupts the DB). Give each instance its own "
-                    f"data_dir."
+                    f"{resolved} (one storage partition for two instances: two "
+                    f"SaturationGates, two sender pools, two reapers driving the "
+                    f"same uploads rows and the same bodies tree). Give each "
+                    f"instance its own data_dir."
                 )
                 raise ConfigInvariantError(msg)
             # True component nesting in either direction - an instance's
@@ -636,7 +822,6 @@ async def run_integrity_gate(
     *,
     db_path: Path,
     bodies_root: Path,
-    data_root: Path,
     fail_open: bool,
     metrics_registry: MetricsRegistry,
 ) -> None:
@@ -659,8 +844,6 @@ async def run_integrity_gate(
         db_path: This instance's ``<data_root>/uploads.db``.
         bodies_root: This instance's ``<data_root>/bodies`` directory
             (the production layout).
-        data_root: This instance's storage root (used by the checker's
-            quarantine inventory).
         fail_open: When ``True`` (strategy §3 default) the service
             proceeds fresh after quarantining; when ``False`` it raises
             after quarantining so the process exits.
@@ -676,11 +859,7 @@ async def run_integrity_gate(
         DB_QUARANTINE_COUNTER_NAME,
         DB_QUARANTINE_COUNTER_DESCRIPTION,
     )
-    integrity_checker = IntegrityChecker(
-        db_path=db_path,
-        body_store_root=bodies_root,
-        data_root=data_root,
-    )
+    integrity_checker = IntegrityChecker(db_path=db_path, body_store_root=bodies_root)
     integrity_result = await integrity_checker.check()
     if integrity_result.ok:
         return
@@ -987,6 +1166,7 @@ async def build_body_store(
     file_body_store: FileBodyStore,
     store: SqliteUploadStore,
     metrics_registry: MetricsRegistry,
+    instance_label: str,
 ) -> tuple[BodyStore, PersistController | None]:
     """Compose the mode-selected body store + optional PersistController.
 
@@ -1035,6 +1215,7 @@ async def build_body_store(
             ram_body_store=ram_body_store,
             file_body_store=file_body_store,
             metrics_registry=metrics_registry,
+            instance_label=instance_label,
         )
         return body_store, persist_controller
     if mode == "all_ram":
@@ -1048,13 +1229,18 @@ async def build_body_store(
 __all__ = [
     "DB_QUARANTINE_COUNTER_DESCRIPTION",
     "DB_QUARANTINE_COUNTER_NAME",
+    "DEFAULT_TCP_HOST",
+    "DEFAULT_TCP_PORT",
     "EXPECTED_UPLOADS_COLUMNS",
+    "MAX_TCP_PORT",
+    "MIN_TCP_PORT",
     "MODE_SWITCH_BACKUP_COUNTER_DESCRIPTION",
     "MODE_SWITCH_BACKUP_COUNTER_NAME",
     "SCHEMA_DISCARD_COUNTER_DESCRIPTION",
     "SCHEMA_DISCARD_COUNTER_NAME",
     "SCHEMA_MIGRATIONS",
     "UMASK_OWNER_ONLY",
+    "BindAddress",
     "BodyStoreMode",
     "ConfigInvariantError",
     "DegradeReason",
@@ -1070,6 +1256,7 @@ __all__ = [
     "check_retention_floor",
     "decide_schema_action",
     "degrade_action_hint",
+    "parse_bind_tcp",
     "run_integrity_gate",
     "run_schema_gate",
 ]

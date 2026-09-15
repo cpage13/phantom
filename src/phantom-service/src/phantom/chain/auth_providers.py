@@ -26,13 +26,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import Protocol
-from urllib.parse import urlparse
 from uuid import UUID
 
+from phantom.chain.headers import set_header
 from phantom.chain.query import filter_raw_query
 from phantom.chain.sigv4_signer import SigV4SigningError, sign_sigv4
 from phantom.models.credential import CredCacheRow, HostCredKey
-from phantom.routing import host_key_for
+from phantom.routing import dialled_host_for, host_key_for
 from phantom.storage.interface import CredentialStore, TokenCache
 
 logger = logging.getLogger(__name__)
@@ -75,14 +75,27 @@ def sanitised_host_for(url: str) -> str:
     host at all, so producer-supplied path and query text can never reach the
     admin API through a host field.
 
+    **TOTAL, and that is load-bearing.** It is called from the executor's
+    ``except ValueError`` handler for route resolution, so a raise here escapes
+    that handler uncaught, kills the sender's ``asyncio.TaskGroup`` and stops
+    delivery service-wide. The previous implementation used ``urlparse``, whose
+    ``.hostname`` raises ``ValueError('Invalid IPv6 URL')`` on exactly the input
+    that sent the caller into that handler (a step 2 URL rendered from a capture
+    as ``https://[bad/obj``). :func:`~phantom.routing.dialled_host_for` swallows
+    every parse failure into ``None``, so this returns a token instead.
+
+    Sharing that one parser also keeps the wake path honest: the value returned
+    here is persisted as ``uploads.auth_blocked_host`` and the kickers probe
+    ``HostCredKey(auth_blocked_host)``, so it must be the SAME string
+    ``host_key_for`` produces for the same destination.
+
     Args:
         url: The absolute step URL being authenticated against.
 
     Returns:
         The lower-cased hostname, or :data:`NO_HOST_TOKEN`.
     """
-    parsed_host = urlparse(url).hostname
-    return parsed_host.lower() if parsed_host else NO_HOST_TOKEN
+    return dialled_host_for(url) or NO_HOST_TOKEN
 
 
 @dataclass(frozen=True)
@@ -164,12 +177,47 @@ class BearerAuthProvider:
         body: bytes,
         chain_id: UUID,
     ) -> AuthOutcome:
-        """Inject the cached bearer, or park when the slot is absent or bad."""
+        """Inject the cached bearer, or park when the slot is absent or bad.
+
+        **The lookup is keyed on THIS step's URL**, because the executor picks a
+        provider per step and a chain can cross hosts. Admission is the writer
+        that has to agree: it earmarks the producer's inbound ``Authorization``
+        for one ``(host_key_for(step url), uid)`` key per step whose route is
+        ``phantom_bearer``, not for the first step alone. When it wrote only the
+        first key, a chain whose bearer-protected step came later parked here
+        against a key no writer ever filled, and no kicker could wake it.
+
+        Parking happens BEFORE any forwarding, so a producer cannot work around
+        a missing slot by putting the credential in that step's own headers: a
+        miss never reaches the send, and a hit overwrites the header anyway.
+
+        The write goes through :func:`~phantom.chain.headers.set_header`, which
+        DROPS every other casing of ``Authorization`` before inserting Phantom's
+        own. Both halves of that matter and neither is cosmetic.
+
+        The producer's credential must not be forwarded. This route exists to
+        substitute Phantom's bearer for whatever the client held, and
+        ``routes/catch_all.py`` deliberately preserves an inbound
+        ``Authorization`` into the synthesized step; ASGI lower-cases it on the
+        way in, so the persisted header is ``authorization``. A producer-authored
+        envelope can spell it that way too, and admission's header-name check
+        only tests RFC 7230 token characters. Assigning the canonical spelling
+        beside the lower-cased one left the producer's credential in the map.
+
+        And a duplicate is not merely untidy: verified against the pinned httpx,
+        a request built from a dict holding both spellings emits BOTH raw names
+        on the wire. Once anything rotates the slot the two values disagree, the
+        upstream 401s, the executor marks the slot bad, every buffered row for
+        that ``(endpoint, uid)`` parks, the kicker wakes them, and they re-send
+        the same persisted stale header beside the fresh bearer and mark it bad
+        again - a livelock holding a valid credential. The sigv4 arm was already
+        immune because ``sign_sigv4`` rebuilds the map; this is the equivalent.
+        """
         del method, body, chain_id  # A bearer injection reads neither.
         slot = await self.cache.get(host_key_for(full_url), uid)
         if slot is None or slot.status == "bad":
             return AuthParked(status=401, blocked_host=sanitised_host_for(full_url))
-        headers["Authorization"] = slot.bearer
+        set_header(headers, "Authorization", slot.bearer)
         return AuthReady(url=full_url)
 
     async def mark_bad(self, *, host_key: str, uid: str) -> None:
@@ -209,19 +257,27 @@ class SigV4AuthProvider:
         # another is a canonical-query mismatch that earns a 403
         # SignatureDoesNotMatch on every presigned upload.
         stripped = _strip_presigned_query(full_url)
-        if stripped != full_url:
-            logger.info(
-                "stripped client presigned credentials on aws_sigv4 route for "
-                "chain_id=%s dest_host=%s",
-                chain_id,
-                host_key_for(full_url),
-            )
         # ``dest_host`` is the credential-store KEY and keeps the raw-input
         # fallback; the parked host is the SANITISED one. Stripping the
         # presigned query span never touches the host, so both name the same
         # host either side of the strip.
         dest_host = HostCredKey(host_key_for(stripped))
         blocked = sanitised_host_for(stripped)
+        if stripped != full_url:
+            # ``blocked``, NOT ``host_key_for``. This is the one code path in
+            # the service GUARANTEED to be holding a presigned credential, and
+            # ``host_key_for`` returns the WHOLE INPUT lower-cased when it finds
+            # no host - so a pathless step URL such as
+            # ``/bucket/key?X-Amz-Credential=AKIA...&X-Amz-Signature=...``
+            # wrote the access-key id and the signature into the operator log at
+            # INFO. Its own docstring says the output must not be logged as-is.
+            # The sanitised host is already computed two lines up.
+            logger.info(
+                "stripped client presigned credentials on aws_sigv4 route for "
+                "chain_id=%s dest_host=%s",
+                chain_id,
+                blocked,
+            )
         row_cred = await self._credential_for(dest_host)
         if row_cred is None or row_cred.status == "bad":
             # The EAGER mark-bad, which the bearer arm has no analogue of and

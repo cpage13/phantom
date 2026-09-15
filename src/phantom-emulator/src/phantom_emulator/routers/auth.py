@@ -127,6 +127,11 @@ async def token_endpoint(
     token, expires_at = state.jwt_minter.mint(client_id=client_id, extra_claims=extra)
     state.extra_claims.clear()
 
+    # Record the issuance on the credential ledger the verify path consults,
+    # so a later revoke catches this token and so a mint that reproduces a
+    # revoked token (the claim set is deterministic within one second) is
+    # reinstated rather than born rejected.
+    state.credentials.note_issued(token)
     state.issued_tokens[token] = IssuedToken(
         client_id=client_id,
         expires_at=expires_at,

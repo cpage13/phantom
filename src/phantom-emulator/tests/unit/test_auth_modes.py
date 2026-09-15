@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import pytest
 from phantom_emulator.auth.jwt_minter import JwtMinter
-from phantom_emulator.auth.modes import AuthMode, AuthModePolicy, authenticate
+from phantom_emulator.auth.modes import AuthMode, AuthModePolicy, authenticate, bearer_credential
 from phantom_emulator.config import AuthCfg, AuthSigningCfg
 
 _LONG_SECRET: str = "x" * 32
+
+# Lifetime for a token that is already dead on arrival: past ``exp`` by more
+# than the configured clock-skew leeway (300 s), so PyJWT rejects it.
+_ALREADY_EXPIRED_SECONDS: int = -400
 
 
 def _minter() -> JwtMinter:
@@ -54,6 +59,79 @@ def test_oauth_client_credentials_rejects_garbage() -> None:
     policy = AuthModePolicy(mode=AuthMode.OAUTH_CLIENT_CREDENTIALS)
     assert authenticate({"authorization": "Bearer not-a-jwt"}, policy, minter) is False
     assert authenticate({}, policy, minter) is False
+
+
+def test_oauth_mode_rejects_a_credential_the_control_surface_invalidated() -> None:
+    """A listed bearer -> False, though the JWT itself still verifies cleanly.
+
+    Objective: prove the revoke / expire controls can reach the DEFAULT auth
+    mode. The check there is a stateless JWT decode, so a good signature and
+    a future ``exp`` cannot be the whole story: the policy's invalidated set
+    is what carries the control surface's decision into the check.
+
+    Expected outcome: one unchanged token and one unchanged minter, accepted
+    under a policy that does not list it and refused under one that does.
+    """
+    minter = _minter()
+    token, _ = minter.mint(client_id="test-client")
+    headers = {"authorization": f"Bearer {token}"}
+    live = AuthModePolicy(mode=AuthMode.OAUTH_CLIENT_CREDENTIALS)
+    revoked = AuthModePolicy(
+        mode=AuthMode.OAUTH_CLIENT_CREDENTIALS,
+        invalidated_credentials=frozenset({token}),
+    )
+
+    assert authenticate(headers, live, minter) is True
+    assert authenticate(headers, revoked, minter) is False
+
+
+def test_oauth_mode_rejects_an_expired_token() -> None:
+    """A JWT past ``exp`` beyond the skew leeway -> False, no exception escapes.
+
+    Objective: the narrowed ``except`` must still absorb every PyJWT verdict
+    that means "this token is not acceptable". Expiry is the one that would
+    hurt most if it started propagating, since the emulator hands out
+    short-lived tokens on purpose.
+
+    Expected outcome: ``authenticate`` returns False rather than raising.
+    """
+    minter = _minter()
+    token, _ = minter.mint(
+        client_id="test-client",
+        expires_in_seconds=_ALREADY_EXPIRED_SECONDS,
+    )
+    policy = AuthModePolicy(mode=AuthMode.OAUTH_CLIENT_CREDENTIALS)
+
+    assert authenticate({"authorization": f"Bearer {token}"}, policy, minter) is False
+
+
+def test_oauth_mode_surfaces_a_broken_minter_instead_of_reporting_a_bad_caller() -> None:
+    """A minter with no key material -> the ValueError propagates, not False.
+
+    Objective: a broken emulator configuration must be distinguishable from a
+    caller presenting an invalid token. The blanket ``except Exception`` made
+    them identical, so a misconfigured emulator answered 401 to every request
+    and read as an upstream legitimately rejecting the credential.
+
+    Expected outcome: the configuration error escapes ``authenticate``.
+    """
+    token, _ = _minter().mint(client_id="test-client")
+    broken = JwtMinter(
+        cfg=AuthCfg(signing=AuthSigningCfg(mode="HS256")),
+        hs256_secret=None,
+        rsa_keys=None,
+    )
+    policy = AuthModePolicy(mode=AuthMode.OAUTH_CLIENT_CREDENTIALS)
+
+    with pytest.raises(ValueError, match="HS256 mode requires hs256_secret"):
+        authenticate({"authorization": f"Bearer {token}"}, policy, broken)
+
+
+def test_bearer_credential_extracts_what_authenticate_checks() -> None:
+    """The exported extractor agrees with the check, so the ledger records the same string."""
+    assert bearer_credential({"Authorization": "Bearer abc"}) == "abc"
+    assert bearer_credential({"authorization": "abc"}) == "abc"
+    assert bearer_credential({}) is None
 
 
 def test_header_lookup_is_case_insensitive() -> None:

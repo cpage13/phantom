@@ -49,6 +49,7 @@ from phantom.routes.admission import (
     _maybe_enqueue_immediate_persist,
     _persist_row_and_claim,
     _resolve_collision,
+    admit_chain,
 )
 from phantom.routing import resolve_route
 from phantom.storage import (
@@ -404,15 +405,49 @@ async def test_build_row_blank_header_minted(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_build_row_caches_authorization(tmp_path: Path) -> None:
-    """An inbound Authorization header is written to the token cache."""
+async def test_build_row_defers_the_authorization_cache_write(tmp_path: Path) -> None:
+    """Objective: preparing a row must not touch the token cache.
+
+    Expected: the write is CARRIED on the prepared row and the cache is still
+    empty. Four rejection arms lie between preparation and a committed row, and
+    ``TokenCache.set`` resets the slot to fresh and wakes every parked row for
+    it, so performing it here let a request Phantom answered with 409 overwrite
+    a cached bearer, flip a bad slot healthy in the operator's own token view,
+    and re-admit every parked row through the saturation gate. The write is
+    durable SQLite, so it also survived the restart that would clear a memory
+    cache.
+    """
     instance = await _build_instance(tmp_path)
     envelope = _envelope()
     encoded = await _encode_and_hash_bodies(instance, {})
-    await _build_row(_inputs(envelope, authorization="Bearer xyz"), instance, encoded)
-    slot = await instance.token_cache.get("files.example.com", "user-1")
-    assert slot is not None
-    assert slot.status == "fresh"
+
+    prepared = await _build_row(_inputs(envelope, authorization="Bearer xyz"), instance, encoded)
+
+    assert len(prepared.bearer_cache_writes) == 1, "the intent must be carried"
+    assert prepared.bearer_cache_writes[0].endpoint == "files.example.com"
+    assert prepared.bearer_cache_writes[0].uid == "user-1"
+    assert prepared.bearer_cache_writes[0].bearer == "Bearer xyz"
+    assert await instance.token_cache.get("files.example.com", "user-1") is None, (
+        "row preparation wrote to the token cache before the row was committed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_row_carries_no_cache_write_without_authorization(
+    tmp_path: Path,
+) -> None:
+    """Objective: no inbound credential means no deferred write.
+
+    Expected: ``bearer_cache_writes`` is empty, so the committed path has
+    nothing to perform and the D3 mode gate is unchanged by the deferral.
+    """
+    instance = await _build_instance(tmp_path)
+    envelope = _envelope()
+    encoded = await _encode_and_hash_bodies(instance, {})
+
+    prepared = await _build_row(_inputs(envelope), instance, encoded)
+
+    assert prepared.bearer_cache_writes == ()
 
 
 @pytest.mark.asyncio
@@ -556,6 +591,67 @@ async def test_resolve_collision_chain_id_arm_preserves_shared_body(
     assert await instance.body_store.get_all(envelope.chain_id) == {"body": b"winning-bytes"}
 
 
+@pytest.mark.asyncio
+async def test_resolve_collision_rollback_fault_maps_to_storage_unavailable(
+    tmp_path: Path,
+) -> None:
+    """Objective: the collision rollback's delete must not escape as an OSError.
+
+    ``FileBodyStore.delete`` reaches ``_rm_rf``, whose exists/iterdir/unlink/
+    rmdir each raise ``OSError`` on EIO, EACCES or a directory that will not
+    empty. This was the ONE body-store call in the whole admission flow outside
+    the ``storage_unavailable`` mapping that ``_persist_row_and_claim`` applies
+    to its own delete and put.
+
+    Expected: a typed ``storage_unavailable`` (503) carrying ``Retry-After``,
+    and the slot released exactly once, back to the live baseline and not below
+    it. Before the fix two POSTs sharing an idempotency key while the data
+    volume returned I/O errors sent the raw ``OSError`` past
+    ``resolve_and_admit``'s ``except ChainAdmissionError`` and out of the
+    ``/send`` handler, where no global handler exists: a bare 500 with no
+    ErrorEnvelope, no ``error.code`` and no ``Retry-After``, tripping the
+    producer's 5xx fallback instead of preserving its buffered retry.
+    """
+
+    class _FailingDeleteBodyStore:
+        async def delete(self, _chain_id: object) -> None:
+            raise OSError("simulated I/O error on rollback")
+
+        async def put(self, _chain_id: object, _refs: object) -> int:
+            return 0
+
+    instance = await _build_instance(tmp_path)
+    envelope = _envelope()
+    encoded = await _encode_and_hash_bodies(instance, {"body": b"duplicate-bytes"})
+    prepared = await _build_row(_inputs(envelope), instance, encoded)
+
+    # A different, LIVE row's slot, owned by the sender: the baseline the
+    # rejection must restore the counters to, never below.
+    live = await _admit_saturation_slot(instance, _SLOT_BYTES)
+    live.commit()
+    baseline_rows = instance.saturation.in_flight
+    baseline_bytes = instance.saturation.in_flight_bytes
+
+    instance.body_store = _FailingDeleteBodyStore()  # type: ignore[assignment]
+    slot = await _admit_saturation_slot(instance, encoded.admit_bytes)
+    with pytest.raises(ChainAdmissionError) as exc_info:
+        async with slot:
+            await _resolve_collision(
+                _inputs(envelope),
+                instance,
+                outcome=InsertClaimOutcome.IDEMPOTENCY_COLLISION,
+                prepared=prepared,
+                encoded=encoded,
+                slot=slot,
+            )
+    assert exc_info.value.code == "storage_unavailable"
+    assert exc_info.value.details == {"reason": "body_store_rollback_failed"}
+    assert exc_info.value.headers is not None
+    assert exc_info.value.headers.get("Retry-After")
+    assert instance.saturation.in_flight == baseline_rows
+    assert instance.saturation.in_flight_bytes == baseline_bytes
+
+
 # ---------------------------------------------------------------------------
 # Stage: respond (_maybe_enqueue_immediate_persist).
 # ---------------------------------------------------------------------------
@@ -678,3 +774,58 @@ async def test_admitted_slot_direct_lifecycle() -> None:
     async with slot:
         await slot.release_on_rejection()
     assert gate.in_flight == 0 and gate.in_flight_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_admission_does_not_touch_the_token_cache(tmp_path: Path) -> None:
+    """Objective: a refused request must leave the cached credential alone.
+
+    Expected: after a 409 on a chain_id already in use, the token cache still
+    holds the ORIGINAL bearer, still marked bad, and no wake handler fired.
+
+    This is the whole point of deferring the write. ``TokenCache.set`` upserts
+    the bearer, resets the slot to ``fresh`` and awaits every registered wake
+    handler, so performing it during row preparation meant a request Phantom
+    ADMITTED NOTHING FOR still replaced the operator's credential, flipped a
+    bad slot healthy in their own token view, and re-admitted every parked row
+    for that slot through the saturation gate. The kicker's handler discards
+    the pair it is given and rescans everything, so a client retry-looping into
+    409s became a repeated kicker storm.
+    """
+    instance = await _build_instance(tmp_path)
+    envelope = _envelope()
+
+    # Seed the operator's real credential and mark it bad, which is the state
+    # a parked row leaves behind.
+    await instance.token_cache.set(
+        endpoint="files.example.com",
+        uid="user-1",
+        bearer="Bearer operator-real",
+        source="admin_push",
+    )
+    await instance.token_cache.mark_bad("files.example.com", "user-1")
+
+    wakes: list[tuple[str, str]] = []
+
+    async def _record(endpoint: str, uid: str) -> None:
+        wakes.append((endpoint, uid))
+
+    instance.token_cache.register_wake_handler(_record)
+
+    # Admit once so the chain_id is live, then collide on it.
+    first = await admit_chain(_inputs(envelope), instance)
+    assert first.status_code == 202
+
+    with pytest.raises(ChainAdmissionError) as refused:
+        await admit_chain(_inputs(envelope, authorization="Bearer attacker-garbage"), instance)
+    assert refused.value.code == "chain_id_in_use"
+
+    slot = await instance.token_cache.get("files.example.com", "user-1")
+    assert slot is not None
+    assert slot.bearer == "Bearer operator-real", (
+        "a refused request overwrote the operator's cached credential"
+    )
+    assert slot.status == "bad", (
+        "a refused request flipped a bad slot back to fresh in the operator's view"
+    )
+    assert wakes == [], "a refused request woke every parked row for the slot"

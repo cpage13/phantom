@@ -15,6 +15,12 @@ under ``/control/*`` and the in-process :class:`phantom_emulator.server.Server`
 oracle. That is what keeps the e2e tier (which reads the HTTP surface) and
 the conformance tier (which reads the oracle) looking at ONE implementation
 rather than at two copies that can drift apart.
+
+For the same reason the inbound-header capture (:func:`capture_headers`)
+lives here rather than in a router: it is the ground truth behind the
+``all_headers`` field of all three body stores, and every capture site must
+apply ONE rule for repeated field lines or the stores disagree about what
+arrived.
 """
 
 from __future__ import annotations
@@ -34,6 +40,8 @@ from phantom_emulator.config import AppConfig
 from phantom_emulator.control_models import ReceivedEntry
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports
+    from starlette.datastructures import Headers
+
     from phantom_emulator.auth.jwks import RsaKeyPair
     from phantom_emulator.auth.jwt_minter import JwtMinter
     from phantom_emulator.failure.injection import FailureInjectionState
@@ -47,6 +55,61 @@ UploadToken = str
 
 # Type alias for the Idempotency-Key header value.
 IdempotencyKey = str
+
+# Type alias for an inbound HTTP field name AS CAPTURED: always lower-cased,
+# because field names are case-insensitive and one field must produce exactly
+# one captured entry however the client cased its occurrences.
+HeaderName = str
+
+# Separator used when the repeated occurrences of one inbound field name are
+# combined into the single value a captured entry holds. RFC 7230 section
+# 3.2.2 permits combining repeated field lines into one, values in order,
+# separated by a comma. It carries NO trailing space because the service side
+# of this boundary combines with a bare comma too
+# (``phantom.routes.catch_all._REPEATED_HEADER_JOINER``, bare so a combined
+# line re-canonicalises under SigV4 to what the client signed over the split
+# ones). The two halves MUST agree: this emulator is the oracle that compares
+# what it received against what the service forwarded, so a joiner of its own
+# would report a value the wire never carried and would make a faithful
+# forward look like a regression.
+REPEATED_HEADER_JOINER = ","
+
+
+def capture_headers(headers: Headers) -> dict[HeaderName, str]:
+    """Capture every inbound field line, keyed by lower-cased field name.
+
+    The ground truth behind ``all_headers`` on :class:`AcceptedBody`,
+    :class:`S3Object` and :class:`RawBody`, and so behind
+    :attr:`phantom_emulator.control_models.ReceivedEntry.headers`.
+
+    REPEATED field lines are COMBINED, not overwritten. ``Headers.items()``
+    yields one entry per raw occurrence with NO merging, so capturing into a
+    dict comprehension was last-value-wins: the first value vanished before
+    any test could see it. That blinded the oracle to precisely the class of
+    regression a transparent proxy must not have - a duplicate inbound header
+    dropped, reordered or merged wrongly on the way through - because the
+    surviving value looked like a correct single-valued forward and the suite
+    certified it.
+
+    Field names are case-insensitive, so a duplicate arriving as a case
+    variant (``X-Trace`` then ``x-trace``) is the SAME field and combines into
+    one entry. ASGI lower-cases field names in the scope, so both occurrences
+    reach this function under one name already.
+
+    Args:
+        headers: The inbound request headers.
+
+    Returns:
+        One entry per distinct field name, lower-cased, whose value is every
+        occurrence of that name in arrival order joined by
+        :data:`REPEATED_HEADER_JOINER`.
+    """
+    captured: dict[HeaderName, str] = {}
+    for name, value in headers.items():
+        lowered = name.lower()
+        seen = captured.get(lowered)
+        captured[lowered] = value if seen is None else f"{seen}{REPEATED_HEADER_JOINER}{value}"
+    return captured
 
 
 class UpstreamEventKind(StrEnum):
@@ -119,8 +182,14 @@ class PendingUpload:
             other keys byte-for-byte).
         created_at: When the URL was issued.
         presigned_ttl_seconds: Lifetime of the URL.
-        signature: Opaque signature stub baked into the URL; the PUT
-            handler verifies the inbound URL carries the same value.
+        signature: Opaque signature stub baked into the URL as ``sig``;
+            the PUT handler compares the inbound query parameter against
+            this value and answers 403 SignatureDoesNotMatch when it is
+            missing or different.
+        expires_epoch: The ``expires`` query parameter baked into the URL
+            (whole seconds since the epoch, ``created_at`` plus the TTL).
+            Carried rather than recomputed so the PUT handler compares
+            against the value that was actually signed into the URL.
     """
 
     upload_token: UploadToken
@@ -130,6 +199,7 @@ class PendingUpload:
     created_at: datetime
     presigned_ttl_seconds: int
     signature: str
+    expires_epoch: int
 
 
 @dataclass
@@ -145,20 +215,23 @@ class AcceptedBody:
             ``None`` if unset). Captured so transparent-proxy tests can
             assert byte-identity plus header preservation.
         all_headers: Every inbound HTTP header on the PUT, lowercased
-            keys with original values. Captured so transparent-proxy
-            tests can audit the full request envelope (e.g., that
-            ``X-Phantom-*`` headers were stripped, that ``Authorization``
-            carries the cached bearer byte-equal, that ``User-Agent``
-            is preserved). Multi-value headers are joined with ``", "``
-            per Starlette's header-dict semantics.
+            keys with original values, per :func:`capture_headers`.
+            Captured so transparent-proxy tests can audit the full
+            request envelope (e.g., that ``X-Phantom-*`` headers were
+            stripped, that ``Authorization`` carries the cached bearer
+            byte-equal, that ``User-Agent`` is preserved). A field name
+            that arrived more than once, under any casing, keeps ALL of
+            its values: they are joined in arrival order by
+            :data:`REPEATED_HEADER_JOINER`, the bare comma the service
+            side combines with.
         accepted_at: Server-side timestamp at acceptance.
     """
 
     upload_token: UploadToken
     body: bytes
-    headers: dict[str, str]
+    headers: dict[HeaderName, str]
     content_encoding: str | None
-    all_headers: dict[str, str]
+    all_headers: dict[HeaderName, str]
     accepted_at: datetime
 
 
@@ -187,7 +260,8 @@ class S3Object:
         all_headers: Every inbound header (lowercased keys, original
             values), captured so round-trip / transparent-proxy
             assertions can audit the envelope - mirrors
-            :attr:`AcceptedBody.all_headers`.
+            :attr:`AcceptedBody.all_headers`, repeated field lines
+            combined and all.
         stored_at: Server-side acceptance timestamp.
     """
 
@@ -196,7 +270,7 @@ class S3Object:
     method: str
     body: bytes
     content_type: str | None
-    all_headers: dict[str, str]
+    all_headers: dict[HeaderName, str]
     stored_at: datetime
 
 
@@ -207,9 +281,10 @@ class RawBody:
     The forward-as-is Phase-1 analogue of :class:`AcceptedBody`: no token,
     no auth - the full forwarded path itself is the key. Accepts any forwarded
     upload verb (PUT/POST/PATCH), recording it in :attr:`method`.
-    ``all_headers`` is captured (lowercased keys, original values) so the e2e
-    can assert that ``X-Phantom-*`` headers were stripped and a benign upstream
-    header survived.
+    ``all_headers`` is captured by :func:`capture_headers` (lowercased keys,
+    original values, repeated field lines combined) so the e2e can assert that
+    ``X-Phantom-*`` headers were stripped and a benign upstream header
+    survived.
 
     Attributes:
         path: The full forwarded path (no leading slash) used as the store
@@ -226,7 +301,8 @@ class RawBody:
         body: Raw bytes the unsigned, tokenless upload stored (byte-identical).
         content_type: The request ``Content-Type``, or ``None``.
         all_headers: Every inbound header (lowercased keys, original
-            values) - mirrors :attr:`AcceptedBody.all_headers`.
+            values) - mirrors :attr:`AcceptedBody.all_headers`, repeated
+            field lines combined and all.
         stored_at: Server-side acceptance timestamp.
     """
 
@@ -235,7 +311,7 @@ class RawBody:
     query: str
     body: bytes
     content_type: str | None
-    all_headers: dict[str, str]
+    all_headers: dict[HeaderName, str]
     stored_at: datetime
 
 
@@ -283,6 +359,63 @@ class MintAttempt:
 
 
 @dataclass
+class CredentialLedger:
+    """Emulator-side validity overlay for bearer credentials.
+
+    A JWT is stateless. The default ``oauth_client_credentials`` check is a
+    signature plus ``exp`` decode against the signing key, so nothing the
+    control surface does to the emulator's own bookkeeping can invalidate a
+    token that is already in a caller's hands. Revoke and expire have to be
+    observable to the caller, so the emulator records every credential it
+    issues or accepts here and the verify path consults this ledger after
+    the decode contract and before answering ``True``.
+
+    Membership is the mechanism, not identity: a credential the emulator has
+    never issued and never seen is judged on its own merits, which is what
+    keeps a test-minted JWT (signed with the shared secret, never presented
+    to this process) working. A credential that has been presented once is
+    in ``seen``, so a later revoke catches it even though the emulator did
+    not mint it. Both sets are bounded by the number of distinct credentials
+    one emulator process handles, which for test infrastructure is a handful.
+
+    Attributes:
+        seen: Every credential the emulator has issued or authenticated.
+        invalidated: The subset the control surface has revoked or expired.
+            The verify path rejects these.
+    """
+
+    seen: set[str] = field(default_factory=set)
+    invalidated: set[str] = field(default_factory=set)
+
+    def note_issued(self, token: str) -> None:
+        """Record a credential the emulator just minted, reinstating it.
+
+        Minting is deterministic over the claim set, so a re-mint inside the
+        same whole second reproduces a just-invalidated token byte for byte.
+        The emulator has deliberately issued this one as valid, so issuance
+        wins over the earlier invalidation and the recovery path works.
+        """
+        self.seen.add(token)
+        self.invalidated.discard(token)
+
+    def note_accepted(self, token: str) -> None:
+        """Record a credential that just passed authentication.
+
+        Never reinstates: acceptance is reached only after
+        :meth:`is_invalidated` has already cleared the credential.
+        """
+        self.seen.add(token)
+
+    def invalidate_all(self) -> None:
+        """Invalidate every credential issued or accepted so far."""
+        self.invalidated.update(self.seen)
+
+    def is_invalidated(self, token: str) -> bool:
+        """Whether the control surface has revoked or expired ``token``."""
+        return token in self.invalidated
+
+
+@dataclass
 class AuthTokenGate:
     """Test-only gate on the AUTH_TOKEN middleware path (T3 lifecycle).
 
@@ -313,6 +446,10 @@ class EmulatorState:
     Attributes:
         cfg: The application configuration this state was built from.
         issued_tokens: Active tokens keyed by their JWT string.
+        credentials: Validity overlay consulted by the stateless JWT verify
+            path, so ``revoke_tokens`` and ``expire_all_now`` are observable
+            in ``oauth_client_credentials`` mode. See
+            :class:`CredentialLedger`.
         extra_claims: Claims to inject into the next mint (drained on
             use or persisted depending on test setup; per the plan,
             stored for the next mint and cleared after).
@@ -360,6 +497,7 @@ class EmulatorState:
     seed: int = 0
 
     issued_tokens: dict[str, IssuedToken] = field(default_factory=dict)
+    credentials: CredentialLedger = field(default_factory=CredentialLedger)
     extra_claims: dict[str, Any] = field(default_factory=dict)
     pending_uploads: dict[UploadToken, PendingUpload] = field(default_factory=dict)
     file_id_to_token: dict[UUID, UploadToken] = field(default_factory=dict)
@@ -424,19 +562,32 @@ class EmulatorState:
         self.global_paused = False
 
     def expire_all_now(self) -> None:
-        """Age every issued JWT past its ``exp``, re-minting the static token.
+        """Age every credential past its expiry, re-minting the static token.
+
+        The recorded ``expires_at`` of each issued token moves to the epoch,
+        and the credential ledger is invalidated so the stateless
+        ``oauth_client_credentials`` decode path answers 401 as well: the
+        ``exp`` claim inside an already-issued JWT cannot be moved, so
+        without the ledger this control is invisible in the default mode.
+        A credential the emulator merely accepted (a test-minted bearer it
+        never issued) is in play just as much as one it minted, so it expires
+        here too.
 
         In static-token mode the pre-minted JWT is cleared and re-minted, so
         subsequent mints succeed against a fresh token rather than a
-        deliberately expired one.
+        deliberately expired one. The re-mint is recorded as an issuance,
+        which reinstates it even when it reproduces the aged token byte for
+        byte.
         """
         past = datetime.fromtimestamp(0, tz=UTC)
         for issued in self.issued_tokens.values():
             issued.expires_at = past
+        self.credentials.invalidate_all()
         self.static_jwt = None
         if self.cfg.auth.default_mode is AuthMode.STATIC_TOKEN and self.jwt_minter is not None:
             token, expires_at = self.jwt_minter.mint(client_id="static-client")
             self.static_jwt = token
+            self.credentials.note_issued(token)
             self.issued_tokens[token] = IssuedToken(
                 client_id="static-client",
                 expires_at=expires_at,
@@ -445,7 +596,17 @@ class EmulatorState:
             )
 
     def revoke_tokens(self) -> None:
-        """Drop every issued JWT, including the static one."""
+        """Revoke every credential the emulator has issued or accepted.
+
+        Clearing the ``issued_tokens`` bookkeeping is invisible to the
+        default ``oauth_client_credentials`` mode, whose check is a stateless
+        JWT decode that never reads that dict. Revocation therefore marks the
+        credential ledger the decode path consults, so a bearer that was
+        valid a moment ago now 401s and the caller has to obtain a fresh one.
+        ``static_token`` mode is unaffected by the ledger and keeps working
+        through the cleared ``static_jwt`` it already relied on.
+        """
+        self.credentials.invalidate_all()
         self.issued_tokens.clear()
         self.static_jwt = None
 
@@ -463,6 +624,10 @@ class EmulatorState:
     def set_presigned_ttl(self, seconds: int) -> None:
         """Set the default presigned URL lifetime for new mints."""
         self.cfg.upstream.presigned_ttl_seconds = seconds
+
+    def set_idempotency_dedup_window(self, seconds: int) -> None:
+        """Set the create-response idempotency cache lifetime for new entries."""
+        self.cfg.upstream.idempotency_dedup_window_seconds = seconds
 
     def received(self) -> list[ReceivedEntry]:
         """Project the token-keyed latest accepted-body view, oldest first.
@@ -502,7 +667,33 @@ class EmulatorState:
         return entries
 
     def clear_received(self) -> None:
-        """Drop the latest accepted bodies and the append-only event log."""
+        """Drop every record of what the emulator has received.
+
+        ONE reset for the whole received-side surface, so a store added later
+        has an obvious home and cannot be silently left behind. That omission
+        is what let ``idempotency_cache`` survive a reset: its entries live up
+        to ``idempotency_dedup_window_seconds`` (an hour by default) and are
+        pruned only lazily on a same-key lookup, so a second scenario reusing
+        a literal ``Idempotency-Key`` transparently received the first one's
+        cached file id and upload token. What this resets:
+
+        - ``accepted_bodies`` and ``accepted_idempotency_keys``: the
+          token-keyed latest-value views of the upload PUT.
+        - ``upstream_events``: the append-only create/PUT event oracle.
+        - ``s3_objects`` and ``raw_bodies``: the SigV4-validated sink and the
+          auth-free raw sink stores.
+        - ``idempotency_cache``: cached create responses.
+
+        Deliberately NOT reset, because each is owned elsewhere:
+        ``pending_uploads`` and ``file_id_to_token`` are issued state an
+        in-flight chain still resolves its upload URL against (and the join
+        behind :meth:`received`), credential state belongs to
+        :meth:`revoke_tokens`, and failure policies belong to
+        ``FailureInjectionState.clear_all``.
+        """
         self.accepted_bodies.clear()
         self.accepted_idempotency_keys.clear()
         self.upstream_events.clear()
+        self.s3_objects.clear()
+        self.raw_bodies.clear()
+        self.idempotency_cache.clear()

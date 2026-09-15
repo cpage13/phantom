@@ -70,6 +70,7 @@ def _initialize_state(cfg: AppConfig) -> EmulatorState:
     if cfg.auth.default_mode.value == "static_token":
         token, expires_at = state.jwt_minter.mint(client_id="static-client")
         state.static_jwt = token
+        state.credentials.note_issued(token)
         from phantom_emulator.state import IssuedToken
 
         state.issued_tokens[token] = IssuedToken(

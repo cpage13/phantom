@@ -187,13 +187,17 @@ async def test_enqueue_failure_sets_handle_exception_then_continues(
 async def test_enqueue_after_migration_completes_returns_fresh_future(
     fixture_stack: dict[str, object],
 ) -> None:
-    """A re-enqueue AFTER the first migration completes gets a new Future.
+    """Objective: a re-enqueue after a completed migration is a clean no-op.
 
-    The in-flight dict pops the chain on completion, so a subsequent
-    enqueue for the same chain_id allocates a fresh future (re-running
-    the migration on the now-empty RAM is a no-op for the body but
-    re-flips body_location — a defensive no-op via the mark_persisted
-    WHERE-guard).
+    The in-flight dict pops the chain on completion, so a subsequent enqueue
+    for the same chain_id allocates a fresh future.
+
+    Expected: that future resolves to ``None``. The row is already at
+    body_location='file', so there is nothing to migrate and the pre-check
+    skips before reading RAM. It used to read RAM anyway, hit the ``KeyError``
+    step 4 of the first migration left behind, and log an ERROR plus a
+    ``persist_total{failure}`` for a migration that had already succeeded
+    (SW-4).
     """
     store = fixture_stack["store"]
     ram = fixture_stack["ram"]
@@ -217,13 +221,11 @@ async def test_enqueue_after_migration_completes_returns_fresh_future(
     try:
         await asyncio.wait_for(first, timeout=5.0)
         # A second enqueue (after the first completed + popped) gets a
-        # NEW Future, not the same as `first`. RAM is empty now; the
-        # controller will raise KeyError on get_all and set the
-        # exception.
+        # NEW Future, not the same as `first`, and it resolves cleanly:
+        # the row already reads body_location='file'.
         second = await controller.enqueue(row.chain_id)
         assert second is not first
-        with pytest.raises(KeyError):
-            await asyncio.wait_for(second, timeout=5.0)
+        assert await asyncio.wait_for(second, timeout=5.0) is None
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

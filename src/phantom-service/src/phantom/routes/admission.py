@@ -61,7 +61,13 @@ from phantom.models.upload import (
     StorageHash,
     UploadRow,
 )
-from phantom.routing import ResolvedRoute, host_key_for, resolve_first_step_url, resolve_route
+from phantom.routing import (
+    ResolvedRoute,
+    host_key_for,
+    is_absolute_url,
+    resolve_first_step_url,
+    resolve_route,
+)
 from phantom.storage.interface import InsertClaimOutcome
 from phantom.storage.sqlite_store import is_transient_lock_error
 from phantom.workers.saturation import (
@@ -228,6 +234,30 @@ def _resolved_route_or_none(url: str, instance_ctx: InstanceContext) -> Resolved
         return resolve_route(url, instance_ctx.cfg)
     except ValueError:
         return None
+
+
+def _resolved_step_url(envelope: ChainEnvelope, step_url: str) -> str:
+    """Resolve ANY step's URL the way the executor will dial it.
+
+    :func:`~phantom.routing.resolve_first_step_url` answers this for step 1
+    only. The bearer-cache walk needs the same answer for every step, and it
+    must agree with ``ChainExecutor._absolute_url`` byte for byte or the key
+    admission writes is not the key the provider reads. Both tests
+    absoluteness with :func:`~phantom.routing.is_absolute_url`, which is
+    anchored at position zero rather than the ``"://" in url`` substring search
+    a relative URL carrying a URL in its QUERY satisfies.
+
+    Args:
+        envelope: The submitted chain envelope (supplies ``default_target``).
+        step_url: The step's own ``url``, before any join.
+
+    Returns:
+        The absolute URL when one can be formed, else ``step_url`` unchanged.
+    """
+    if is_absolute_url(step_url) or envelope.default_target is None:
+        return step_url
+    base = str(envelope.default_target).rstrip("/")
+    return base + (step_url if step_url.startswith("/") else "/" + step_url)
 
 
 def _route_name(url: str, instance_ctx: InstanceContext) -> str:
@@ -619,6 +649,93 @@ async def _admit_saturation_slot(
     return _AdmittedSlot(instance_ctx.saturation, result.reservation)
 
 
+def _bearer_endpoints_for(
+    envelope: ChainEnvelope, instance_ctx: InstanceContext
+) -> tuple[str, ...]:
+    """Return every token-cache key this chain will READ a bearer from.
+
+    One key per step whose route resolves to ``phantom_bearer``, in step
+    order, de-duplicated, keyed exactly as
+    :meth:`~phantom.chain.auth_providers.BearerAuthProvider.prepare` keys its
+    lookup: :func:`~phantom.routing.host_key_for` over the step URL the
+    executor will dial.
+
+    **Per STEP, because the read is per step.** The cache used to be gated and
+    keyed on step 1 alone, while the executor picks a provider and looks a slot
+    up for the CURRENT step on every hop. A chain whose bearer-protected step
+    is not the first one - step 1 PUTs to object storage on an ``aws_sigv4`` or
+    ``none`` route, step 2 POSTs a completion callback to a bearer-protected
+    API - saw step 1's mode, cached NOTHING, and parked at step 2 in
+    ``auth_expired`` against a key no writer ever fills. Only an admin push
+    could then unblock it, and putting the credential in step 2's own headers
+    does not help either: the provider parks before the header would be
+    forwarded. The producer supplied a working token and Phantom threw it away.
+    The pilot's two-step shape happens to be the one ordering where the old
+    gate worked, which is why it never surfaced.
+
+    A step whose URL names no dialable host - a relative URL, or one still
+    holding a ``{{step.capture}}`` placeholder that only renders at send time -
+    resolves to no route and contributes no key, which is the same
+    no-route-means-no-cache arm :func:`_build_row` documents.
+
+    Args:
+        envelope: The submitted chain envelope.
+        instance_ctx: The owning instance, whose ``cfg`` carries the routes.
+
+    Returns:
+        The ordered, de-duplicated host keys to cache the inbound bearer
+        under; empty when no step authenticates with a Phantom bearer.
+    """
+    endpoints: list[str] = []
+    for step in envelope.steps:
+        step_url = _resolved_step_url(envelope, step.url)
+        resolved = _resolved_route_or_none(step_url, instance_ctx)
+        if resolved is None or resolved.auth_mode != "phantom_bearer":
+            continue
+        endpoint = host_key_for(step_url)
+        if endpoint not in endpoints:
+            endpoints.append(endpoint)
+    return tuple(endpoints)
+
+
+@dataclass(frozen=True)
+class _PendingBearerCacheWrite:
+    """A token-cache write that must not happen until the row lands.
+
+    D3 caches a producer's inbound ``Authorization`` so the sender can re-send
+    with it. That write used to happen during row PREPARATION, which is before
+    the primary-key pre-check, the body-store failure arm, the locked-database
+    arm and the whole collision resolver, every one of which can still reject
+    the request. ``TokenCache.set`` upserts the bearer, resets the slot status
+    to ``fresh`` and then awaits every registered wake handler, so a request
+    Phantom ANSWERED WITH 409 still replaced the cached credential, flipped a
+    bad slot healthy in the operator's own token view, and re-admitted every
+    parked row for that slot through the saturation gate. The kicker's handler
+    discards the ``(endpoint, uid)`` it is given and rescans everything, so a
+    client retry-looping into 409s became a repeated kicker storm, and the
+    write is durable SQLite so it survived the restart that would have cleared
+    a memory cache.
+
+    ``_build_row``'s own docstring already reasoned carefully about which auth
+    MODES must not cache and named these three harms. The mode gate was built;
+    the OUTCOME gate was never considered. Carrying the intent here and
+    performing it only on a committed row closes that.
+
+    One instance per bearer-protected STEP (see
+    :func:`_bearer_endpoints_for`), not one per chain.
+
+    Attributes:
+        endpoint: Canonical host key the slot is filed under, exactly as
+            ``BearerAuthProvider`` will key its lookup for that step.
+        uid: The uid the slot is keyed by.
+        bearer: The producer's inbound credential.
+    """
+
+    endpoint: str
+    uid: str
+    bearer: str
+
+
 @dataclass(frozen=True)
 class _PreparedRow:
     """Typed output of the row-preparation stage.
@@ -629,12 +746,16 @@ class _PreparedRow:
     ``idempotency_index`` claim so the two can never diverge; ``snapshot``
     is the settings snapshot read ONCE during preparation, so the
     persist-trigger stage decides against the same configuration the row
-    was built under (a concurrent hot-reload cannot split the two).
+    was built under (a concurrent hot-reload cannot split the two);
+    ``bearer_cache_writes`` are the D3 token-cache writes this row EARNS if and
+    only if it commits, one per bearer-protected step, deferred here rather
+    than performed during preparation (see :class:`_PendingBearerCacheWrite`).
     """
 
     row: UploadRow
     ingress_dedup_key: str
     snapshot: InstanceSettingsSnapshot
+    bearer_cache_writes: tuple[_PendingBearerCacheWrite, ...]
 
 
 async def _build_row(
@@ -644,14 +765,14 @@ async def _build_row(
 ) -> _PreparedRow:
     """Build the upload row and its dedup key; cache inbound auth on bearer routes.
 
-    The one side effect is deliberate and stated: when the submission
-    carries an ``Authorization`` header AND the first step resolves to a
-    route whose ``auth_mode`` is ``phantom_bearer``, it is written to the
-    token cache (keyed by the resolved first-step endpoint + uid) before the
-    row is constructed.
+    The one side effect is deliberate and stated: when the submission carries
+    an ``Authorization`` header, it is earmarked for the token cache under one
+    ``(endpoint, uid)`` key per step whose route resolves to ``phantom_bearer``
+    (:func:`_bearer_endpoints_for` derives the keys).
 
-    The ``auth_mode`` gate is D3 (F11). The four cases are exhaustive over
-    ``AuthMode`` plus the no-route miss:
+    The ``auth_mode`` gate is D3 (F11), and it is applied PER STEP because the
+    executor picks a provider and reads a slot per step. For each step the four
+    cases are exhaustive over ``AuthMode`` plus the no-route miss:
 
     * ``phantom_bearer``: CACHE. The only mode where Phantom injects a
       bearer at egress, so the only mode where a cached bearer is ever read.
@@ -673,9 +794,16 @@ async def _build_row(
       delivery, and the write would wake parked rows on that slot for
       nothing.
 
-    The row's ``endpoint`` column is set from the first step's hostname on
-    EVERY path, gate or no gate: it records where the row was headed, and it
-    is not a cache-key decision.
+    An earlier form of this gate read only the FIRST step's mode and wrote only
+    the FIRST step's key, so the claim of exhaustiveness held over one step of
+    a chain the executor authenticates on every step. See
+    :func:`_bearer_endpoints_for` for what that cost.
+
+    The row's ``endpoint`` column is still set from the first step's hostname
+    on EVERY path, gate or no gate: it records where the row was headed, and it
+    is not a cache-key decision. On a multi-host chain it deliberately differs
+    from the keys above, which is exactly why ``uploads.auth_blocked_host``
+    exists as a separate column.
 
     Args:
         inputs: The parsed admission inputs.
@@ -687,13 +815,20 @@ async def _build_row(
     """
     first_step_url = resolve_first_step_url(inputs.envelope)
     endpoint = host_key_for(first_step_url)
-    resolved = _resolved_route_or_none(first_step_url, instance_ctx)
-    if inputs.authorization and resolved is not None and resolved.auth_mode == "phantom_bearer":
-        await instance_ctx.token_cache.set(
-            endpoint=endpoint,
-            uid=inputs.uid_header,
-            bearer=inputs.authorization,
-            source="inbound_request",
+    # DEFERRED, not performed. Four rejection arms still lie ahead of this
+    # point, and these writes reset a slot to fresh and wake every parked row
+    # for it, so a refused request used to inflict all three harms this
+    # function's own docstring warns about. The caller performs them only after
+    # the row is durably committed.
+    bearer_cache_writes: tuple[_PendingBearerCacheWrite, ...] = ()
+    if inputs.authorization:
+        bearer_cache_writes = tuple(
+            _PendingBearerCacheWrite(
+                endpoint=bearer_endpoint,
+                uid=inputs.uid_header,
+                bearer=inputs.authorization,
+            )
+            for bearer_endpoint in _bearer_endpoints_for(inputs.envelope, instance_ctx)
         )
 
     chain_id = inputs.envelope.chain_id
@@ -774,7 +909,12 @@ async def _build_row(
         storage_encoding=encoded.storage_encoding,
         body_hashes=encoded.body_hashes_map,
     )
-    return _PreparedRow(row=row, ingress_dedup_key=ingress_dedup_key, snapshot=snapshot)
+    return _PreparedRow(
+        row=row,
+        ingress_dedup_key=ingress_dedup_key,
+        snapshot=snapshot,
+        bearer_cache_writes=bearer_cache_writes,
+    )
 
 
 async def _persist_row_and_claim(
@@ -1018,7 +1158,9 @@ async def _resolve_collision(
     Raises:
         ChainAdmissionError: ``chain_id_in_use`` (409) on a PK collision;
             ``idempotency_key_conflict`` (422) on an orphaned claim or a
-            body/destination divergence.
+            body/destination divergence; ``storage_unavailable`` (503,
+            Retry-After) when the body-store rollback below hits an
+            ``OSError``.
     """
     chain_id = prepared.row.chain_id
     idempotency_key = prepared.ingress_dedup_key
@@ -1039,8 +1181,42 @@ async def _resolve_collision(
     #   loss. So we DO NOT delete on a chain_id collision. (Under the
     #   normal single-retry path the pre-check already rejected
     #   before any put, so no put of ours exists here anyway.)
+    #
+    # The delete is wrapped for the same reason ``_persist_row_and_claim``
+    # wraps its own delete and put (R7-1-A/B): ``FileBodyStore.delete`` reaches
+    # ``_rm_rf``, whose exists/iterdir/unlink/rmdir each raise ``OSError`` on
+    # EIO, EACCES or a directory that will not empty. This was the ONE
+    # body-store call in the whole admission flow outside that mapping, so two
+    # POSTs sharing an idempotency key while the data volume returned I/O
+    # errors sent the ``OSError`` straight past ``resolve_and_admit``'s
+    # ``except ChainAdmissionError`` and out of the ``/send`` handler. There is
+    # no global handler, so starlette answered a BARE 500 with no ErrorEnvelope,
+    # no ``error.code`` and no ``Retry-After``, tripping the producer's 5xx
+    # fallback instead of preserving its buffered retry - the D-1/R7-1
+    # naked-500 class this flow closed everywhere else.
+    #
+    # The slot is released BEFORE the raise here rather than left to the
+    # scope's ``__aexit__``, so the single-release invariant reads the same on
+    # this arm as on the rejections below: exactly one release, from the named
+    # operation (R3-1). The orphaned bytes at ``chain_id`` are left behind on
+    # this arm, which is the body-orphan janitor's job and the same outcome the
+    # storage volume's failure forces on every other writer.
     if encoded.stored_body_refs and outcome is InsertClaimOutcome.IDEMPOTENCY_COLLISION:
-        await instance_ctx.body_store.delete(chain_id)
+        try:
+            await instance_ctx.body_store.delete(chain_id)
+        except OSError as exc:
+            await slot.release_on_rejection()
+            raise ChainAdmissionError(
+                code="storage_unavailable",
+                message=(
+                    "Phantom could not roll back the duplicate submission's "
+                    "buffered body: a storage delete failed (the disk may be "
+                    "returning I/O errors); retry shortly"
+                ),
+                instance_id=instance_ctx.cfg.id,
+                details={"reason": "body_store_rollback_failed"},
+                headers={"Retry-After": str(_RETRY_AFTER_SECONDS)},
+            ) from exc
     await slot.release_on_rejection()
 
     if outcome is InsertClaimOutcome.CHAIN_ID_COLLISION:
@@ -1260,10 +1436,38 @@ async def admit_chain(
                 slot=slot,
             )
 
-        # Stage 6: respond. The persist-trigger enqueue runs before the
-        # slot commit, exactly as the monolithic flow ordered it: an
-        # enqueue failure unwinds into the slot's release (no committed
-        # slot is left behind by a failed respond stage).
+        # Stage 6: respond.
+        #
+        # The slot commits FIRST, immediately after the row is durable. ADR-036
+        # says a reservation is consumed by the CREATION of the row it was
+        # taken for, and the row now exists. The previous ordering ran the
+        # persist enqueue first so that "an enqueue failure unwinds into the
+        # slot's release", but that reasoning inverts once the insert has
+        # committed: unwinding then returns a charge a LIVE row still holds.
+        # PersistController.enqueue suspends on a lock, a queue put and a gauge
+        # write, so a producer disconnect at any of those raised CancelledError,
+        # the slot scope unwound, and the durably committed queued row was in
+        # flight with nothing behind it. The sender later settled a real
+        # crossing and released a second time against one charge, and because
+        # release floors at zero the decrement came out of another row's
+        # accounting, leaving in_flight permanently short and admitting past
+        # max_in_flight for the process lifetime.
+        slot.commit()
+
+        # The D3 token-cache writes, performed HERE rather than during row
+        # preparation, so a request Phantom rejects cannot overwrite a cached
+        # bearer, flip a bad slot to fresh, or wake every parked row for it.
+        # One per bearer-protected STEP, because the executor reads a slot per
+        # step and a chain whose bearer step is not the first one would
+        # otherwise park against a key nothing ever writes.
+        for cache_write in prepared.bearer_cache_writes:
+            await instance_ctx.token_cache.set(
+                endpoint=cache_write.endpoint,
+                uid=cache_write.uid,
+                bearer=cache_write.bearer,
+                source="inbound_request",
+            )
+
         await _maybe_enqueue_immediate_persist(
             instance_ctx,
             chain_id=prepared.row.chain_id,
@@ -1271,10 +1475,6 @@ async def admit_chain(
             snapshot=prepared.snapshot,
         )
 
-        # Happy path: a new in-flight row landed. The saturation slot
-        # stays held; the sender releases it when the row reaches a
-        # terminal state.
-        slot.commit()
         return AdmissionOutcome(row=prepared.row, status_code=202)
 
 

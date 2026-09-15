@@ -9,6 +9,14 @@ The endpoint+uid the minter writes to is determined per-instance from
 the :class:`phantom.config.ad_mint.AdMintConfig` block on the instance's
 :class:`InstanceCfg`. The driving use is one ``(endpoint, uid)``
 per instance.
+
+The configured ``endpoint`` is normalised through
+:func:`phantom.routing.host_key_for` before it becomes a cache key, so the
+minter writes the SAME key space the reader looks up (SW-2). It previously
+wrote the YAML value verbatim: an operator spelling the natural
+``https://files.upstream.example`` minted successfully into a key nothing
+ever read, every row parked in ``auth_expired``, the kicker (which probes
+the normalised host) woke none of them, and nothing logged an error.
 """
 
 from __future__ import annotations
@@ -19,15 +27,53 @@ import logging
 import os
 import random
 from datetime import UTC, datetime
+from enum import StrEnum
 
 from phantom.config.ad_mint import AdMintConfig
+from phantom.routing import host_key_for
 from phantom.storage.interface import TokenCache
 
 logger = logging.getLogger(__name__)
 
+# Hard floor on the wait between two mints, applied AFTER the jitter
+# subtraction. Without it the arithmetic could produce a non-positive wait
+# (``asyncio.wait_for`` with a negative timeout raises TimeoutError with zero
+# delay), and the loop would mint against the authority's token endpoint as
+# fast as the event loop allows until Entra ID throttled the app registration
+# or locked it. Thirty seconds is well below any healthy refresh interval, so
+# it never shapes a correct schedule, and it bounds the pathological case to
+# two mints a minute - a rate no authority treats as abuse.
+_MIN_MINT_WAIT_SECONDS: float = 30.0
+
+# The last-resort positive wait, used when even half the remaining lifetime is
+# tiny. Its only job is to keep the wait strictly positive so
+# ``asyncio.wait_for`` actually waits; the proportionate floor above does the
+# rate limiting.
+_ABSOLUTE_MIN_WAIT: float = 1.0
+
 
 class AuthUnavailableError(Exception):
     """Raised when neither primary nor secondary AD credentials succeed."""
+
+
+class AdReachability(StrEnum):
+    """What this minter has actually observed at the AD token endpoint.
+
+    The producer behind ``GET /v1/admin/status``'s ``ad_reachability``
+    (S1-7, ADR-007). Three states, and only one of them is a claim about
+    the authority answering:
+
+    * :attr:`NOT_ATTEMPTED` - no mint cycle has completed yet, so nothing
+      has been observed. The minter mints on its first loop iteration, so
+      this holds for one cycle at boot.
+    * :attr:`REACHABLE` - the most recent cycle obtained a token.
+    * :attr:`UNREACHABLE` - the most recent cycle exhausted every
+      configured credential without obtaining a token.
+    """
+
+    NOT_ATTEMPTED = "not_attempted"
+    REACHABLE = "reachable"
+    UNREACHABLE = "unreachable"
 
 
 class AdMinter:
@@ -52,6 +98,13 @@ class AdMinter:
         self._cache = token_cache
         self._stop_event = asyncio.Event()
         self._immediate_mint = asyncio.Event()
+        # SW-2: the cache key, normalised ONCE at construction through the
+        # one hostname normaliser the reader (BearerAuthProvider) and the
+        # kicker's wake probe already use, so the mint key equals the
+        # lookup key by construction. ``config.endpoint`` stays the raw
+        # operator spelling and is what the logs name.
+        self._endpoint_key = host_key_for(config.endpoint)
+        self._reachability = AdReachability.NOT_ATTEMPTED
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Drive the background mint loop until ``stop_event`` fires.
@@ -98,15 +151,10 @@ class AdMinter:
         while not self._stop_event.is_set():
             try:
                 expires_at = await self._mint_and_store()
+                self._reachability = AdReachability.REACHABLE
                 outage_index = 0
                 # Sleep until refresh-before-expiry minus jitter, or wake on 401.
-                refresh_before = self._config.refresh_seconds_before_expiry
-                jitter = self._config.refresh_jitter_seconds
-                wait = max(
-                    1.0,
-                    (expires_at - datetime.now(tz=UTC)).total_seconds() - refresh_before,
-                )
-                wait -= random.uniform(0, jitter)
+                wait = self._next_mint_wait_seconds(expires_at)
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(
                         self._immediate_mint.wait(),
@@ -114,6 +162,10 @@ class AdMinter:
                     )
                 self._immediate_mint.clear()
             except AuthUnavailableError as exc:
+                # Record the observation before the fail-fast re-raise, so
+                # the last thing the status surface saw is the truth even
+                # when this loop is about to die.
+                self._reachability = AdReachability.UNREACHABLE
                 if not backoff:
                     # Empty schedule means fail-fast: re-raise so the
                     # supervising TaskGroup observes the failure.
@@ -123,6 +175,64 @@ class AdMinter:
                 logger.warning("AD mint failed (%s); retry in %ds", exc, delay)
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+
+    def _next_mint_wait_seconds(self, expires_at: datetime) -> float:
+        """Seconds to wait before minting a replacement for a token.
+
+        The schedule is "the token's remaining lifetime, less the pre-expiry
+        refresh margin, less a jitter draw", floored so it is always strictly
+        positive. The floor is applied LAST, after the jitter subtraction:
+        applied before it (as it once was) the subtraction could take the
+        floored value negative, and ``asyncio.wait_for`` treats a negative
+        timeout as already-expired, so the loop minted continuously.
+
+        Args:
+            expires_at: Expiry of the token just minted, from the authority's
+                own ``expires_on``.
+
+        Returns:
+            The wait in seconds, always strictly positive and never later
+            than the token's own expiry.
+        """
+        refresh_before = self._config.refresh_seconds_before_expiry
+        jitter = self._config.refresh_jitter_seconds
+        lifetime_remaining = (expires_at - datetime.now(tz=UTC)).total_seconds()
+        scheduled = lifetime_remaining - refresh_before - random.uniform(0.0, jitter)
+        # The floor is PROPORTIONATE to the token's own lifetime, not a flat
+        # constant. A flat 30 s floor was wrong in a way the original comment
+        # asserted it was not ("well below any healthy refresh interval, so it
+        # never shapes a correct schedule"): a legitimately short-lived token,
+        # which the AD-mint e2e uses and which real app registrations can be
+        # configured for, has a whole lifetime under a minute, so a flat floor
+        # overrides its correct schedule and the token expires before the
+        # replacement is minted.
+        #
+        # Half the remaining lifetime is never sooner than the token needs and
+        # never later than its expiry, and the absolute guard still caps the
+        # rate for a long-lived token whose margin was misconfigured. Both
+        # goals hold: the wait is always strictly positive, so ``wait_for``
+        # cannot treat it as already-expired and spin, and the mint rate stays
+        # bounded by the lifetime rather than by an unrelated constant.
+        floor = min(_MIN_MINT_WAIT_SECONDS, max(lifetime_remaining / 2.0, _ABSOLUTE_MIN_WAIT))
+        if scheduled < floor:
+            # Not a hypothetical: pinning refresh_seconds_before_expiry above
+            # the token's actual lifetime lands here on EVERY cycle, so say so
+            # rather than quietly minting at the floor rate forever.
+            logger.warning(
+                "AD mint refresh window collapsed for endpoint=%s uid=%s: token "
+                "lifetime %.1fs vs refresh_seconds_before_expiry=%d (+ up to "
+                "%.1fs jitter) computes a %.1fs wait; using the %.1fs floor. "
+                "Lower refresh_seconds_before_expiry or check the app "
+                "registration's token lifetime",
+                self._config.endpoint,
+                self._config.uid,
+                lifetime_remaining,
+                refresh_before,
+                jitter,
+                scheduled,
+                floor,
+            )
+        return max(floor, scheduled)
 
     async def _mint_and_store(self) -> datetime:
         """Mint a token via azure-identity and write it to the cache.
@@ -153,7 +263,19 @@ class AdMinter:
         raise AuthUnavailableError("No AD credentials produced a token")
 
     async def _mint(self, client_secret: str, scope: str) -> datetime:
-        """Mint one token using azure-identity and write it to the cache."""
+        """Mint one token using azure-identity and write it to the cache.
+
+        The cache write uses :attr:`_endpoint_key`, the normalised form of
+        the configured endpoint, NOT the raw YAML string (SW-2).
+
+        Args:
+            client_secret: The client secret to authenticate the app
+                registration with (primary or secondary).
+            scope: The AD scope to request the token for.
+
+        Returns:
+            The expiry datetime of the freshly minted token.
+        """
         # Lazy import - azure-identity is heavy and instances without an
         # AdMinter never need to import it.
         from azure.identity.aio import ClientSecretCredential
@@ -170,21 +292,25 @@ class AdMinter:
             await cred.close()
         expiry = datetime.fromtimestamp(access.expires_on, tz=UTC)
         await self._cache.set(
-            endpoint=self._config.endpoint,
+            endpoint=self._endpoint_key,
             uid=self._config.uid,
             bearer=f"Bearer {access.token}",
             source="plugin_mint",
         )
         return expiry
 
-    def trigger_immediate_mint_for_test(self) -> None:
-        """Test hook - set the immediate-mint event."""
-        self._immediate_mint.set()
-
     @property
-    def latest_expiry(self) -> datetime | None:
-        """Best-effort: most recent mint's expiry (None if never minted).
+    def reachability(self) -> AdReachability:
+        """What this minter last observed at the AD token endpoint.
 
-        Not tracked separately; admin status derives it from the cache.
+        Read by ``GET /v1/admin/status`` to fill ``ad_reachability``
+        (S1-7). Before this existed the field was a hardcoded literal with
+        no producer anywhere, so the one signal designed to tell an
+        operator "your app registration is unreachable and that is why
+        every row is parking in auth_expired" never fired.
+
+        Returns:
+            The observed reachability; :attr:`AdReachability.NOT_ATTEMPTED`
+            until the first mint cycle completes.
         """
-        return None
+        return self._reachability

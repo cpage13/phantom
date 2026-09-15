@@ -94,7 +94,11 @@ async def _build_instance(tmp_path: Path) -> InstanceContext:
         id="primary",
         host_prefixes=["*"],
         data_dir="primary",
-        routes=[RouteCfg(name="r", hosts=["*"], auth_mode="none")],
+        # ``phantom_bearer``, so this kicker flavour is live for the instance
+        # and the row survives the auth_mode partition. With ``none`` the
+        # flavour is inert (E6) and the row is discarded before the H4 stamp
+        # filter this test exists to exercise ever sees it.
+        routes=[RouteCfg(name="r", hosts=["*"], auth_mode="phantom_bearer")],
     )
     sat = SaturationGate(
         max_in_flight=100,

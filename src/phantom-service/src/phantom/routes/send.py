@@ -11,14 +11,15 @@ without booting FastAPI.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Request, Response
-from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from phantom.chain.parser import (
+    ENVELOPE_MAX_BYTES,
     ParserError,
     parse_json_request,
     parse_multipart_request,
@@ -54,6 +55,10 @@ logger = logging.getLogger(__name__)
 # 202. A coarse hint by design; clients may poll on their own schedule.
 SUGGESTED_POLL_AFTER_SECONDS: int = 5
 
+# Content-Type prefix that selects the multipart ingress path. Everything
+# else is read as a JSON envelope.
+MULTIPART_CONTENT_TYPE_PREFIX = "multipart/"
+
 
 def get_dispatcher() -> InstanceDispatcher:
     """Dependency placeholder - wired by the composition root."""
@@ -64,9 +69,12 @@ def get_max_buffered_bytes() -> int:
     """Dependency placeholder - returns ``Settings.storage.max_buffered_bytes``.
 
     The composition root binds this to the resolved YAML value (default
-    2 GiB; see :class:`phantom.config.settings.StorageCfg`). The route
-    uses it both as the parser cap and as the multipart ``max_part_size``
-    so the two limits move together.
+    2 GiB; see :class:`phantom.config.settings.StorageCfg`). It is the
+    per-upload body cap: the Content-Length precheck compares against it
+    directly, and :func:`_body_read_cap` derives the streaming backstop
+    and starlette's ``max_part_size`` from it, so the read ceilings move
+    with it. A JSON envelope is clamped further, to the parser's
+    ``ENVELOPE_MAX_BYTES``.
     """
     raise NotImplementedError("max_buffered_bytes dependency must be overridden by app factory")
 
@@ -125,7 +133,8 @@ async def post_send(
     """Ingress endpoint - accept a chain submission and return 202.
 
     The handler stays HTTP-shaped: parse headers (the grouping/ordering
-    trio through :func:`_parse_grouping_headers`), then
+    trio through :func:`_parse_grouping_headers`, which runs before any
+    body byte is read because it can only accept or reject), then
     :func:`_parse_and_resolve` (Content-Length precheck, body parsing,
     the host-route § 4D.2 degraded guard, dispatcher resolution),
     delegate to :func:`admit_chain`, build the response. Every refusal
@@ -156,18 +165,13 @@ async def post_send(
         if degraded is not None:
             return degraded
 
-    parsed = await _parse_and_resolve(
-        request,
-        max_buffered_bytes=max_buffered_bytes,
-        request_id=request_id,
-    )
-    if isinstance(parsed, Response):
-        return parsed
-    envelope, body_refs = parsed
-
-    # The grouping/ordering trio is parsed here (before the shared
-    # resolve_and_admit prelude) because only the JSON/multipart ingress
-    # path carries X-Phantom-Group-Id / -Multifile-Id / -Order; the
+    # The grouping/ordering trio is parsed BEFORE any body byte is read, for
+    # the same reason the explicit-route degraded guard above is: it depends
+    # on nothing the body provides and it can only accept or reject, so a
+    # request destined for a 400 must not first be allowed to stream up to
+    # max_buffered_bytes into the process. It is parsed here rather than in
+    # the shared resolve_and_admit prelude because only the JSON/multipart
+    # ingress path carries X-Phantom-Group-Id / -Multifile-Id / -Order; the
     # raw-intake adapter (which shares the same prelude) never sends them.
     # A malformed value is attributed to ``"unrouted"`` - the request has
     # not yet been admitted to any instance at this point - matching the
@@ -185,6 +189,15 @@ async def post_send(
             details=dict(exc.details) if exc.details else None,
             headers=exc.headers,
         )
+
+    parsed = await _parse_and_resolve(
+        request,
+        max_buffered_bytes=max_buffered_bytes,
+        request_id=request_id,
+    )
+    if isinstance(parsed, Response):
+        return parsed
+    envelope, body_refs = parsed
 
     result = await resolve_and_admit(
         request_id=request_id,
@@ -419,6 +432,13 @@ async def _parse_and_resolve(
        caught by the streaming size cap inside :func:`_parse_body`.
     2. Body parsing (JSON or multipart) into ``(envelope, body_refs)``.
 
+    The precheck stays on the per-upload cap while :func:`_body_read_cap`
+    can clamp the READ tighter (a JSON envelope to 1 MiB). The two are
+    deliberately not merged: the precheck's subject is the declared
+    per-upload size, and hoisting the envelope clamp into it would refuse
+    at header time a request whose body the read already bounds anyway,
+    for no reduction in what Phantom actually buffers.
+
     Destination resolution and the § 4D.2 host-prefix-route degraded
     guard moved into :func:`resolve_and_admit` (the shared post-resolution
     prelude), which both this route and the raw-intake catch-all call.
@@ -436,6 +456,42 @@ async def _parse_and_resolve(
         return content_length_check
 
     return await _parse_body(request, max_buffered_bytes, request_id=request_id)
+
+
+def _body_read_cap(content_type: str, max_buffered_bytes: int) -> int:
+    """The byte ceiling this request's body is READ under.
+
+    Both readers consult it, so the JSON accumulator and the multipart
+    stream counter enforce one number per content type; the
+    ``Content-Length`` precheck keeps the per-upload cap (see
+    :func:`_parse_and_resolve`).
+
+    A JSON submission IS the chain envelope, so it is bounded by the
+    envelope cap the multipart path already applies to its ``envelope``
+    part (:data:`phantom.chain.parser.ENVELOPE_MAX_BYTES`, 1 MiB) rather
+    than by the per-upload body cap. Charging the body cap here let a JSON
+    envelope be read at the 2 GiB default: 2000x the size the same
+    envelope is allowed on the multipart path, and an envelope carries no
+    body_refs, so admission accounts it zero bytes and the saturation
+    gate's byte cap never constrains how many can be in parse at once.
+    ``min`` keeps an operator who pins a cap BELOW 1 MiB in charge.
+
+    Multipart bodies carry the upload payload itself and keep the
+    per-upload cap. The parser's per-part limits stay the precise
+    contract (``ENVELOPE_MAX_BYTES`` for the ``envelope`` part,
+    ``max_buffered_bytes`` for each ``body_refs[...]`` part); this is the
+    coarse ceiling on the raw byte stream that feeds them.
+
+    Args:
+        content_type: The inbound ``Content-Type`` (``""`` when absent).
+        max_buffered_bytes: The configured per-upload cap.
+
+    Returns:
+        The maximum number of raw body bytes this request may deliver.
+    """
+    if content_type.startswith(MULTIPART_CONTENT_TYPE_PREFIX):
+        return max_buffered_bytes
+    return min(ENVELOPE_MAX_BYTES, max_buffered_bytes)
 
 
 def _check_content_length(
@@ -510,6 +566,27 @@ class _BodyTooLargeError(Exception):
         self.limit = limit
 
 
+class _MultipartStreamTooLargeError(MultiPartException):
+    """The multipart sibling of :class:`_BodyTooLargeError`.
+
+    A :class:`MultiPartException` subclass on purpose: starlette's
+    ``MultiPartParser.parse`` wraps its read loop in
+    ``except MultiPartException`` to CLOSE every spooled temporary file
+    before re-raising the exception object unchanged. Raising this from
+    the byte counter therefore gets the partial spool cleaned up on the
+    way out, and the subclass survives that re-raise, so
+    :func:`_parse_body` can still tell a size refusal from a malformed
+    body. It carries the same ``observed`` / ``limit`` pair, and the two
+    are refused by one shared ``except``.
+    """
+
+    def __init__(self, *, observed: int, limit: int) -> None:
+        """Record the breach for the canonical ``body_too_large`` details."""
+        super().__init__(f"multipart stream exceeded cap {limit} bytes (observed {observed})")
+        self.observed = observed
+        self.limit = limit
+
+
 async def _parse_body(
     request: Request, max_buffered_bytes: int, *, request_id: str
 ) -> tuple[ChainEnvelope, dict[str, bytes]] | Response:
@@ -518,16 +595,20 @@ async def _parse_body(
     Returns the parsed pair on success or a Response on failure. The
     Response carries the canonical ErrorEnvelope shape so the caller
     can return it verbatim.
+
+    Both paths read under :func:`_body_read_cap` and surface the two
+    distinct failure classes distinctly: a size overrun is 413
+    ``body_too_large`` (``reason="streaming_cap"``), while a multipart
+    body the parser cannot make sense of is 422 ``envelope_invalid``
+    (``reason="multipart_malformed"``).
     """
     content_type = request.headers.get("Content-Type", "")
+    read_cap = _body_read_cap(content_type, max_buffered_bytes)
     try:
-        if content_type.startswith("multipart/"):
-            # Starlette's MultiPartParser respects ``max_part_size``
-            # internally and raises HTTPException(400) when a part runs
-            # over - that's the streaming cap for the multipart path.
-            form_iter = _multipart_iter(request, max_part_size=max_buffered_bytes)
+        if content_type.startswith(MULTIPART_CONTENT_TYPE_PREFIX):
+            parts = await _read_multipart_parts(request, max_bytes=read_cap)
             return await parse_multipart_request(
-                form_iter,
+                _iter_parts(parts),
                 instance_id="unrouted",
                 request_id=request_id,
                 max_buffered_bytes=max_buffered_bytes,
@@ -535,14 +616,19 @@ async def _parse_body(
         # JSON path: stream + accumulate with a cumulative-size guard so
         # a chunked transfer-encoded body without ``Content-Length`` is
         # caught mid-stream before RAM blows up (H2 streaming cap).
-        raw = await _read_body_capped(request, max_buffered_bytes)
+        raw = await _read_body_capped(request, read_cap)
         return await parse_json_request(
             raw,
             instance_id="unrouted",
             request_id=request_id,
-            max_buffered_bytes=max_buffered_bytes,
+            max_buffered_bytes=read_cap,
         )
-    except _BodyTooLargeError as exc:
+    except (_BodyTooLargeError, _MultipartStreamTooLargeError) as exc:
+        # Both breaches are the SAME refusal and share one shape. The
+        # multipart variant is listed first on purpose: it is a
+        # MultiPartException subclass, so the malformed-body clause below
+        # would otherwise swallow it and report a size refusal as a parse
+        # failure.
         return _error_response(
             "body_too_large",
             f"Streaming body exceeded max_buffered_bytes cap of {exc.limit}",
@@ -562,17 +648,22 @@ async def _parse_body(
             request_id=request_id,
             details=exc.details,
         )
-    except StarletteHTTPException as exc:
-        # Starlette's MultiPartParser raises HTTPException(400) when a
-        # part exceeds ``max_part_size``; map to the canonical
-        # body_too_large shape (H2 closure: oversized multipart parts
-        # are size-driven failures, not malformed-envelope failures).
+    except MultiPartException as exc:
+        # Everything starlette's MultiPartParser rejects that is NOT the
+        # size overrun above: a missing boundary parameter, a part with no
+        # Content-Disposition ``name``, more files or fields than its caps
+        # allow. Every one of those is a MALFORMED body, so it maps to the
+        # 422 envelope_invalid family the parser's own structural refusals
+        # use - never to 413. Reporting them as body_too_large made the
+        # status, the message and the details contradict each other and
+        # told a client that branches on 413 to shrink and retry a payload
+        # whose size was never the problem.
         return _error_response(
-            "body_too_large",
-            exc.detail if isinstance(exc.detail, str) else "Multipart part exceeded limit",
+            "envelope_invalid",
+            f"Malformed multipart body: {exc.message}",
             instance_id="unrouted",
             request_id=request_id,
-            details={"reason": "multipart_part_too_large", "limit": max_buffered_bytes},
+            details={"reason": "multipart_malformed"},
         )
 
 
@@ -698,29 +789,111 @@ def _error_response(
     )
 
 
-async def _multipart_iter(request: Request, *, max_part_size: int) -> AsyncIterator[_PartShim]:
-    """Adapter - yield parts from FastAPI/starlette's form parser.
+async def _capped_multipart_stream(request: Request, max_bytes: int) -> AsyncGenerator[bytes]:
+    """Yield the raw request stream, aborting once ``max_bytes`` is passed.
 
-    The Pydantic parser expects an async iterator of objects with
-    ``.name`` / ``.read(max_bytes)``. We adapt FastAPI's
-    ``request.form()`` into that shape.
+    The cap is enforced BEFORE the chunk is handed to the parser, so the
+    bytes that would breach it never reach a spooled temporary file or a
+    ``bytes`` object. This is the whole multipart size contract: starlette
+    checks ``max_part_size`` only in ``on_part_data``'s
+    ``if self._current_part.file is None`` branch, so a part whose
+    Content-Disposition carries a filename (which the phantom-client
+    transport gives EVERY part) takes the else branch and is appended to a
+    ``SpooledTemporaryFile`` with no check at all. Under a chunked request
+    there is no ``Content-Length`` for the precheck to read either, which
+    left the path with no ceiling of any kind.
 
     Args:
         request: Incoming FastAPI request.
-        max_part_size: Per-multipart-part byte cap passed straight to
-            starlette's ``MultiPartParser`` (whose own default is 1 MiB -
-            far below Phantom's per-upload cap). Driven by
-            ``Settings.storage.max_buffered_bytes`` so the parser ceiling
-            and the post-parse buffered-bytes cap move together.
+        max_bytes: Cumulative raw-byte ceiling for the whole body.
+
+    Yields:
+        Each chunk of the request stream, up to the cap.
+
+    Raises:
+        _MultipartStreamTooLargeError: As soon as the cumulative size
+            would exceed ``max_bytes``.
     """
-    form = await request.form(max_part_size=max_part_size)
-    for name, value in form.multi_items():
-        if hasattr(value, "read"):
-            data = await value.read()
-            content_type = getattr(value, "content_type", "application/octet-stream")
-            yield _PartShim(name=name, data=data, content_type=content_type)
-        else:
-            yield _PartShim(name=name, data=str(value).encode("utf-8"), content_type="text/plain")
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise _MultipartStreamTooLargeError(observed=total, limit=max_bytes)
+        yield chunk
+
+
+async def _read_multipart_parts(request: Request, *, max_bytes: int) -> list[_PartShim]:
+    """Parse the multipart body under a hard read cap into part shims.
+
+    Drives starlette's ``MultiPartParser`` directly rather than through
+    ``request.form()`` for two reasons, both load-bearing:
+
+    1. The parser is fed :func:`_capped_multipart_stream` instead of the
+       raw request stream, which is what actually bounds the read.
+    2. ``Request._get_form`` converts EVERY ``MultiPartException`` into
+       ``HTTPException(400)`` whenever ``"app"`` is in the ASGI scope,
+       which FastAPI always sets. That collapses five distinct parser
+       refusals (missing boundary, missing part name, too many files, too
+       many fields, part too large) into one opaque object, so the route
+       could not tell a size overrun from a malformed body. Parsing here
+       keeps the typed exception, and :func:`_parse_body` maps the two
+       classes to their own status codes.
+
+    The form is closed in a ``finally`` so the spooled temporary files go
+    away on the success path too, not only on starlette's error path.
+
+    Args:
+        request: Incoming FastAPI request.
+        max_bytes: Cumulative raw-byte ceiling for the whole body. Also
+            passed as starlette's own ``max_part_size`` so a non-file part
+            cannot outgrow the request that carries it.
+
+    Returns:
+        One :class:`_PartShim` per submitted part, in wire order.
+    """
+    parser = MultiPartParser(
+        request.headers,
+        _capped_multipart_stream(request, max_bytes),
+        max_part_size=max_bytes,
+    )
+    form = await parser.parse()
+    try:
+        parts: list[_PartShim] = []
+        for name, value in form.multi_items():
+            if hasattr(value, "read"):
+                data = await value.read()
+                content_type = getattr(value, "content_type", "application/octet-stream")
+                parts.append(_PartShim(name=name, data=data, content_type=content_type))
+            else:
+                parts.append(
+                    _PartShim(
+                        name=name,
+                        data=str(value).encode("utf-8"),
+                        content_type="text/plain",
+                    )
+                )
+        return parts
+    finally:
+        await form.close()
+
+
+async def _iter_parts(parts: Sequence[_PartShim]) -> AsyncIterator[_PartShim]:
+    """Adapt an already-read part list to the parser's async-iterator shape.
+
+    :func:`phantom.chain.parser.parse_multipart_request` consumes an async
+    iterator of objects with ``.name`` / ``.read(max_bytes)``; the parts
+    are materialised first (see :func:`_read_multipart_parts`) so the form
+    can be closed deterministically rather than inside a generator that a
+    raising consumer would abandon mid-iteration.
+
+    Args:
+        parts: The shims to replay.
+
+    Yields:
+        Each shim in order.
+    """
+    for part in parts:
+        yield part
 
 
 class _PartShim:

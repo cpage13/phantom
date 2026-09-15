@@ -32,6 +32,11 @@ Key behaviors:
 - Non-2xx responses are parsed as the ADR-010 ``ErrorEnvelope`` and
   raised as a typed :class:`~phantom_client.errors.PhantomHttpError`
   subclass.
+- EVERY method that issues a request, streaming included, translates its
+  ``httpx`` failures through the one :func:`_translate_httpx_error` mapping,
+  so ``except PhantomTransportError`` around an SDK call holds whichever
+  method raised. ``stream_request`` retries only the never-landed class and
+  only before its first chunk reaches the caller; see its docstring.
 - ``Authorization`` is never logged - the logging filter redacts it.
 - A ``unix:`` ``phantom_url`` (the documented UDS form of the service
   connections table) is routed through a real
@@ -46,6 +51,7 @@ import asyncio
 import logging
 import random
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -57,9 +63,10 @@ from phantom_client.errors import (
     PhantomEnvelopeError,
     PhantomNetworkError,
     PhantomTimeoutError,
+    PhantomTransportError,
     raise_for_error_body,
 )
-from phantom_client.headers import build_request_headers
+from phantom_client.headers import X_PHANTOM_SUGGESTED_POLL_AFTER, build_request_headers
 from phantom_client.models.chain import ChainEnvelope, ChainResponse
 
 _LOG = logging.getLogger(__name__)
@@ -74,8 +81,68 @@ _LOG = logging.getLogger(__name__)
 # rejects the older spelling.
 type QueryParamValue = str | int
 
-# Path constants - single source of truth for the v1 URL space.
-_PATH_SEND = "/v1/send"
+# ---------------------------------------------------------------------------
+# Path constants - the single source of truth for the v1 URL space.
+#
+# Every path lives HERE, in the one module that owns the wire, rather than
+# beside whichever caller issues it. Two modules drive requests against the
+# same paths: :class:`~phantom_client.client.PhantomClient` for the one-shot
+# admin calls and :mod:`phantom_client.poller` for its loops. Declaring them
+# per-caller is how ``_PATH_UPLOADS`` came to name the chain COLLECTION in one
+# module and ONE chain's detail template in the other - the same name with
+# opposite meanings, which no reader could be expected to survive.
+#
+# The names carry no leading underscore because they are imported by name
+# across the package's internal modules; the module itself is internal (nothing
+# it defines is re-exported from the package root), so nothing here reaches SDK
+# callers.
+# ---------------------------------------------------------------------------
+
+PATH_SEND = "/v1/send"
+
+# Chain admin surface. Singular names template one chain_id; the plural
+# ``PATH_CHAINS`` is the collection.
+PATH_CHAIN = "/v1/admin/chains/{chain_id}"
+PATH_CHAINS = "/v1/admin/chains"
+PATH_CHAIN_BODY = "/v1/admin/chains/{chain_id}/body"
+PATH_CHAIN_BUNDLE = "/v1/admin/chains/{chain_id}/bundle"
+PATH_CHAIN_REPLAY = "/v1/admin/chains/{chain_id}/replay"
+PATH_CHAIN_CANCEL = "/v1/admin/chains/{chain_id}/cancel"
+PATH_CHAINS_EXTRACT = "/v1/admin/chains/extract"
+PATH_EXPORT_TAR = "/v1/admin/export.tar"
+
+# Cycle-7 group rollup + either-identifier lookups (plan § 6 task 5.1).
+PATH_GROUP_STATUS = "/v1/admin/groups/{group_id}"
+PATH_LOOKUP_BY_CAPTURED_ID = "/v1/admin/uploads/by-captured-id/{captured_id}"
+PATH_LOOKUP_BY_LOCAL_UUID = "/v1/admin/uploads/by-local-uuid/{local_uuid}"
+
+PATH_TOKENS = "/v1/admin/tokens"
+PATH_TOKEN_FOR = "/v1/admin/tokens/{endpoint}/{uid}"
+
+# Destination SigV4 credential push - host-keyed, the analogue of the
+# per-(endpoint, uid) token slot above (the executor looks it up by host).
+PATH_CREDENTIAL_FOR = "/v1/admin/credentials/{dest_host}"
+
+PATH_STATS = "/v1/admin/stats"
+# Liveness + readiness are the public, unprefixed probe paths (GET
+# /v1/healthz, GET /v1/readyz). Phantom serves intake, admin, and health
+# on one listener (loopback by default per ADR-004), so every path here
+# rides the same base_url; these two just live outside the /v1/admin/
+# prefix.
+PATH_HEALTH = "/v1/healthz"
+PATH_READY = "/v1/readyz"
+PATH_ADMIN_STATUS = "/v1/admin/status"
+PATH_INSTANCE_STATUS = "/v1/admin/instances/{instance_id}/status"
+PATH_INSTANCES = "/v1/admin/instances"
+
+# Plan § 4.2.5 observability endpoints.
+PATH_OBSERVABILITY_COUNTERS = "/v1/admin/observability/counters"
+PATH_OBSERVABILITY_GAUGES = "/v1/admin/observability/gauges"
+PATH_OBSERVABILITY_RAM_PRESSURE = "/v1/admin/observability/ram_pressure"
+
+# Plan § 5.2.5 quarantine inventory + § 1.5 restore.
+PATH_QUARANTINE = "/v1/admin/quarantine"
+PATH_QUARANTINE_RESTORE = "/v1/admin/quarantine/restore"
 
 # Backoff jitter range; ±50% per RetryPolicy.backoff_jitter docstring.
 _JITTER_HALF_RANGE = 0.5
@@ -172,6 +239,103 @@ class _AuthorizationRedactor(logging.Filter):
 
 
 _LOG.addFilter(_AuthorizationRedactor())
+
+
+# ---------------------------------------------------------------------------
+# httpx -> SDK exception translation.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _TranslatedTransportError:
+    """One ``httpx`` failure rendered as the SDK's typed equivalent.
+
+    Attributes:
+        error: The :class:`~phantom_client.errors.PhantomTransportError`
+            subclass a caller should see.
+        never_landed: True when the request PROVABLY never reached the
+            server, so a retry cannot duplicate anything.
+    """
+
+    error: PhantomTransportError
+    never_landed: bool
+
+
+def _translate_httpx_error(exc: httpx.HTTPError) -> _TranslatedTransportError:
+    """Map one ``httpx`` request failure onto the SDK exception hierarchy.
+
+    The SINGLE mapping site. Every path that issues a request through this
+    module funnels its ``httpx`` failures here, so a caller wrapping SDK calls
+    in ``except PhantomTransportError`` sees the documented hierarchy no matter
+    which method raised - buffered or streaming.
+
+    The retry decision and the surfaced error TYPE are independent axes, which
+    is why this returns both. A ``ConnectTimeout`` is never-landed AND a
+    timeout, so it keeps its :class:`PhantomTimeoutError` mapping; the clause
+    order below is load-bearing for that, because ``ConnectTimeout`` and
+    ``PoolTimeout`` subclass ``TimeoutException`` and ``ConnectError`` is a
+    ``NetworkError`` sibling of ``ReadError``.
+
+    ``HTTPStatusError`` is outside the split: it comes from
+    ``raise_for_status()``, never from a request call, and 5xx responses are
+    deliberately passed through to the caller.
+
+    Args:
+        exc: The failure raised by an ``httpx`` request or stream call.
+
+    Returns:
+        The typed error plus whether the request provably never landed.
+    """
+    if isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+        # NEVER DELIVERED, but still a timeout for callers: a dropped SYN is
+        # the most common "Phantom unreachable" shape on a real producer
+        # network, and an exhausted pool never reached the wire at all.
+        return _TranslatedTransportError(PhantomTimeoutError(f"timeout: {exc}"), never_landed=True)
+    if isinstance(exc, httpx.ConnectError):
+        # Never delivered: the connection itself was refused. A missing UDS
+        # socket arrives here too, which is what makes the module docstring's
+        # "like any refused TCP connect" promise true.
+        return _TranslatedTransportError(
+            PhantomConnectError(f"connect refused: {exc}"), never_landed=True
+        )
+    if isinstance(exc, (httpx.LocalProtocolError, httpx.UnsupportedProtocol)):
+        # No request was ever built: a malformed local request and an
+        # unsupported URL scheme both fail before the wire.
+        return _TranslatedTransportError(
+            PhantomNetworkError(f"network error: {exc}"), never_landed=True
+        )
+    if isinstance(exc, httpx.TimeoutException):
+        # ReadTimeout / WriteTimeout: the server MAY have received and
+        # executed this request, and only the response was lost (F12).
+        return _TranslatedTransportError(PhantomTimeoutError(f"timeout: {exc}"), never_landed=False)
+    # Not provably undelivered: a reset or a server disconnect can land AFTER
+    # the request executed (ReadError, RemoteProtocolError).
+    return _TranslatedTransportError(
+        PhantomNetworkError(f"network error: {exc}"), never_landed=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Poll-hinted read result.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PollHintedResponse[T: BaseModel]:
+    """A parsed admin body plus the service's suggested next-poll delay.
+
+    Returned by :meth:`Transport.get_json_with_poll_hint`. A tuple would
+    carry the same two values; a named pair is what makes ``body`` and
+    ``suggested_poll_after_seconds`` readable at the call site.
+
+    Attributes:
+        body: The response body validated against the caller's model.
+        suggested_poll_after_seconds: The ``X-Phantom-Suggested-Poll-After``
+            hint in seconds, or ``None`` when the response carried no hint.
+    """
+
+    body: T
+    suggested_poll_after_seconds: float | None
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +455,7 @@ class Transport:
             # atomic claim turns a re-arrival into a 200 replay.
             response = await self._send_with_retry(
                 "POST",
-                _PATH_SEND,
+                PATH_SEND,
                 headers=headers,
                 files=self._build_multipart(envelope_json, body_refs),
                 retry_if_may_have_landed=True,
@@ -301,7 +465,7 @@ class Transport:
             # encoding silently loses its retry.
             response = await self._send_with_retry(
                 "POST",
-                _PATH_SEND,
+                PATH_SEND,
                 headers={**headers, "Content-Type": "application/json"},
                 content=envelope_json,
                 retry_if_may_have_landed=True,
@@ -341,6 +505,53 @@ class Transport:
         )
         self._raise_for_status(response)
         return self._parse_json(response, model)
+
+    async def get_json_with_poll_hint[T: BaseModel](
+        self,
+        path: str,
+        *,
+        model: type[T],
+        params: dict[str, QueryParamValue] | None = None,
+    ) -> PollHintedResponse[T]:
+        """GET ``path``, parse it against ``model``, and read the poll hint.
+
+        :meth:`get_json` with one addition: the service's
+        ``X-Phantom-Suggested-Poll-After`` header is parsed and returned
+        alongside the body. It exists because the pollers need the header and
+        :meth:`get_json` throws the response away; they used to reach through
+        ``_require_client`` and ``_raise_for_status`` and issue the GET on the
+        raw ``httpx`` client to get it, which silently cost them
+        :meth:`_send_with_retry`'s retry policy AND its exception translation.
+        The hint belongs on this class's PUBLIC surface, not behind a reach-in.
+
+        Args:
+            path: Path on the configured ``phantom_url``.
+            model: Pydantic model class to validate the response body.
+            params: Optional query parameters; values are ``str`` or ``int``.
+
+        Returns:
+            The parsed body paired with the suggested next-poll delay
+            (``None`` when the response carried no hint).
+
+        Raises:
+            PhantomTransportError or subclass: On transport failure after
+                exhausting :class:`RetryPolicy.max_attempts`.
+            PhantomHttpError or subclass: On a non-2xx with a parsable error
+                envelope.
+            PhantomEnvelopeError: When the body fails to parse against
+                ``model`` or the poll hint is not an integer.
+        """
+        # Opt in for the same reason get_json does: read-only, so a re-arrival
+        # changes nothing. A Phantom restarting mid-poll costs one retry
+        # rather than aborting the whole poll.
+        response = await self._send_with_retry(
+            "GET", path, params=params, retry_if_may_have_landed=True
+        )
+        self._raise_for_status(response)
+        return PollHintedResponse(
+            body=self._parse_json(response, model),
+            suggested_poll_after_seconds=self._parse_poll_hint(response),
+        )
 
     async def post_json[T: BaseModel](
         self,
@@ -442,9 +653,24 @@ class Transport:
         bulk extract, which used to reach through two private members of this
         class to re-implement it.
 
-        No retry on partial-stream failures: the upstream is the recovery
-        surface. That rule is about streaming in general rather than about
-        GET, which is why it lives here.
+        ``httpx`` failures are translated through the same
+        :func:`_translate_httpx_error` mapping the buffered path uses, so a
+        caller wrapping every SDK call in ``except PhantomTransportError``
+        holds for the streaming methods too. Before the fix these three leaked
+        raw ``httpx`` errors, so a missing UDS socket surfaced as
+        ``httpx.ConnectError`` here while the same socket surfaced as
+        :class:`~phantom_client.errors.PhantomConnectError` from every buffered
+        read - contradicting this module's own docstring.
+
+        Retry is scoped to the never-landed class and only BEFORE the first
+        chunk reaches the caller. That is the deliberate reading of the
+        no-retry-on-partial-stream rule: the rule protects a stream that
+        already started, whereas a refused connect never landed and the caller
+        has seen nothing, so re-opening cannot duplicate or interleave bytes.
+        It also makes a restarting Phantom survivable here exactly as it is on
+        the buffered reads. Once ANY chunk has been yielded, nothing is
+        retried, whatever the failure class: the SDK cannot rewind bytes the
+        caller already holds, and the upstream is the recovery surface.
 
         An async generator, deliberately, so the not-started check runs LAZILY
         on first iteration exactly as it did before. A caller that needs the
@@ -460,18 +686,58 @@ class Transport:
 
         Yields:
             Response body chunks, in order.
+
+        Raises:
+            PhantomTransportError or subclass: On a transport failure, after
+                exhausting :class:`RetryPolicy.max_attempts` for a never-landed
+                failure that struck before the first chunk.
+            PhantomHttpError or subclass: On a non-2xx with a parsable error
+                envelope.
         """
         client = self._require_client()
-        # Stream rather than buffer so memory stays bounded.
-        async with client.stream(
-            method, path, params=params, content=content, headers=headers
-        ) as response:
-            if response.status_code >= 400:
-                # Drain so we can parse the error envelope.
-                await response.aread()
-                self._raise_for_status(response)
-            async for chunk in response.aiter_bytes():
-                yield chunk
+        policy = self._config.retry_policy
+        max_attempts = policy.max_attempts if policy.enabled else 1
+        attempt = 0
+        while True:
+            attempt += 1
+            # Reset per attempt: a retry re-opens the stream from scratch, so
+            # only chunks yielded on THIS attempt bar a further retry.
+            yielded_any = False
+            try:
+                # Stream rather than buffer so memory stays bounded.
+                async with client.stream(
+                    method, path, params=params, content=content, headers=headers
+                ) as response:
+                    if response.status_code >= 400:
+                        # Drain so we can parse the error envelope.
+                        await response.aread()
+                        self._raise_for_status(response)
+                    async for chunk in response.aiter_bytes():
+                        yielded_any = True
+                        yield chunk
+                return
+            except httpx.HTTPError as exc:
+                translated = _translate_httpx_error(exc)
+                if yielded_any or not translated.never_landed or attempt >= max_attempts:
+                    _LOG.error(
+                        "stream failure on %s %s after %d attempt(s): %s",
+                        method,
+                        path,
+                        attempt,
+                        translated.error,
+                    )
+                    raise translated.error from exc
+                delay = _compute_backoff(policy, attempt)
+                _LOG.warning(
+                    "retrying stream %s %s after %.3fs (attempt %d/%d): %s",
+                    method,
+                    path,
+                    delay,
+                    attempt,
+                    max_attempts,
+                    translated.error,
+                )
+            await asyncio.sleep(delay)
 
     def require_started(self) -> None:
         """Raise if the transport has not been started.
@@ -516,6 +782,27 @@ class Transport:
         except ValidationError as exc:
             raise PhantomEnvelopeError(
                 f"could not parse {model.__name__} from {response.request.url}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _parse_poll_hint(response: httpx.Response) -> float | None:
+        """Return ``X-Phantom-Suggested-Poll-After`` in seconds, or None.
+
+        The header is documented as integer seconds; a value that is not an
+        integer is a service-contract violation rather than a hint to round,
+        so it raises rather than being silently ignored.
+
+        Raises:
+            PhantomEnvelopeError: When the header is present but non-integer.
+        """
+        raw = response.headers.get(X_PHANTOM_SUGGESTED_POLL_AFTER)
+        if raw is None:
+            return None
+        try:
+            return float(int(raw))
+        except (TypeError, ValueError) as exc:
+            raise PhantomEnvelopeError(
+                f"non-integer {X_PHANTOM_SUGGESTED_POLL_AFTER!r}: {raw!r}"
             ) from exc
 
     @staticmethod
@@ -580,16 +867,10 @@ class Transport:
           request and only the response was lost. Retried ONLY when the caller
           passes ``retry_if_may_have_landed=True``.
 
-        The retry decision and the surfaced error TYPE are independent axes.
-        A ``ConnectTimeout`` is never-landed AND a timeout, so it keeps its
-        ``PhantomTimeoutError`` mapping; the clause order below is load-bearing
-        for that, because ``ConnectTimeout`` and ``PoolTimeout`` subclass
-        ``TimeoutException`` and ``ConnectError`` is a ``NetworkError`` sibling
-        of ``ReadError``.
-
-        ``HTTPStatusError`` is outside the split: it comes from
-        ``raise_for_status()``, never from the request call this wraps, and 5xx
-        responses are deliberately passed through to the caller.
+        Which class a failure falls into, and which typed exception it becomes,
+        are both decided by :func:`_translate_httpx_error` - the one mapping
+        site, shared with :meth:`stream_request` so the buffered and streaming
+        paths cannot drift apart.
 
         Args:
             method: The HTTP verb.
@@ -641,34 +922,11 @@ class Transport:
                     len(response.content),
                 )
                 return response
-            except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
-                # NEVER DELIVERED, but still a timeout for callers: a dropped
-                # SYN is the most common "Phantom unreachable" shape on a real
-                # producer network, and an exhausted pool never reached the
-                # wire at all. Both keep the PhantomTimeoutError mapping the
-                # committed exhaustion pin requires. This clause MUST precede
-                # the broad TimeoutException clause below, which they subclass.
-                last_error = PhantomTimeoutError(f"timeout: {exc}")
-            except httpx.ConnectError as exc:
-                # Never delivered: the connection itself was refused.
-                last_error = PhantomConnectError(f"connect refused: {exc}")
-            except (httpx.LocalProtocolError, httpx.UnsupportedProtocol) as exc:
-                # No request was ever built: a malformed local request and an
-                # unsupported URL scheme both fail before the wire.
-                last_error = PhantomNetworkError(f"network error: {exc}")
-            except httpx.TimeoutException as exc:
-                # ReadTimeout / WriteTimeout: the server MAY have received and
-                # executed this request, and only the response was lost (F12).
-                if not retry_if_may_have_landed:
-                    raise PhantomTimeoutError(f"timeout: {exc}") from exc
-                last_error = PhantomTimeoutError(f"timeout: {exc}")
             except httpx.HTTPError as exc:
-                # Not provably undelivered: a reset or a server disconnect can
-                # land AFTER the request executed (ReadError,
-                # RemoteProtocolError). Same gate.
-                if not retry_if_may_have_landed:
-                    raise PhantomNetworkError(f"network error: {exc}") from exc
-                last_error = PhantomNetworkError(f"network error: {exc}")
+                translated = _translate_httpx_error(exc)
+                if not translated.never_landed and not retry_if_may_have_landed:
+                    raise translated.error from exc
+                last_error = translated.error
             if attempt < max_attempts:
                 delay = _compute_backoff(policy, attempt)
                 _LOG.warning(
@@ -715,4 +973,4 @@ def _compute_backoff(policy: RetryPolicy, attempt: int) -> float:
     return max(0.0, capped + jitter)
 
 
-__all__ = ["Transport"]
+__all__ = ["PollHintedResponse", "Transport"]

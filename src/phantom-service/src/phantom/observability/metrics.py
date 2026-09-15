@@ -97,6 +97,23 @@ class Gauge:
     async def set(self, value: float, label_value: str = _NO_LABEL_BUCKET) -> None:
         """Set the gauge for ``label_value`` to ``value``.
 
+        NEVER SUSPENDS, and emit sites depend on that. Acquiring ``_lock`` is
+        the only await here, and a free ``asyncio.Lock`` is taken on a
+        synchronous fast path, so a second task can only find the lock held if
+        one is already suspended inside this method - which nothing can be,
+        because nothing here suspends. Contention cannot bootstrap. A caller
+        that reads a counter and passes it straight to ``set`` therefore
+        publishes atomically with that read, and concurrent callers publish in
+        the order they read, because the lock is FIFO either way.
+
+        :class:`phantom.workers.saturation.SaturationGate` relies on exactly
+        this: it mutates its ledger under its OWN lock, then emits outside it
+        (a state lock may not be held across an await), and what makes the
+        published value trustworthy is that no suspension exists between the
+        read and the write. ADDING AN AWAIT TO THIS METHOD would silently open
+        that window, so an exporter push or any other I/O belongs in a
+        separate method rather than here.
+
         Args:
             value: New value. Integer values are accepted and stored as
                 float; consumers serialize via ``json.dumps`` which

@@ -54,7 +54,10 @@ server:
   #   # for auto-gen). Exactly ONE is a boot error (the XOR rule).
   #   # cert_path: "/etc/phantom/tls/phantom.crt"
   #   # key_path:  "/etc/phantom/tls/phantom.key"
-  #   # key_password: null     # only for an encrypted operator key (ignored for auto-gen)
+  #   # key_password: null     # only for an encrypted operator key (ignored for auto-gen).
+  #   #                        # The ONE credential held here as a literal rather than as
+  #   #                        # an env-var name; it is a SecretStr, so `--validate` and
+  #   #                        # contracts/settings.schema.json show ********** instead.
 
 
 # ---------------------------------------------------------------------------
@@ -100,9 +103,15 @@ storage:
 
     # ram_ceiling_bytes: RamBodyStore size ceiling. ``null`` (default)
     # asks the probe to fill from a hardware-aware fraction of total
-    # RAM. Pin to an explicit byte count to override; 0 means "no RAM
-    # bodies" (effectively forces hybrid into all_disk-like behavior).
+    # RAM. Pin to an explicit byte count to override.
     # Ignored in all_disk mode (no RAM body store to bound).
+    #
+    # There is NO "unlimited" and no "no RAM bodies" sentinel here: the
+    # ceiling is an ENFORCED bound (the RamPressureWatcher migrates the
+    # oldest body once it is breached), so every accepted value is a real
+    # bound and 0 is a validation error. To run with no RAM-resident
+    # bodies, set ``mode: all_disk`` above - that is the first-class
+    # deployment mode for exactly that posture.
     # ram_ceiling_bytes: 536870912              # 512 MiB pin example
 
     ram_pressure_poll_seconds: 1.0          # ram_pressure watcher cadence
@@ -171,9 +180,15 @@ storage:
                                             # ``original`` selects PassthroughCodec
                                             # (identity; pays zero codec overhead
                                             # at the cost of no compression).
-    level: 3                                # zstd 1..22 / gzip 1..9. Default 3
-                                            # balances throughput vs. ratio for
-                                            # typical producer artifacts.
+    level: 3                                # zstd 1..22 / gzip 1..9 (ignored by
+                                            # ``original``). Default 3 balances
+                                            # throughput vs. ratio for typical
+                                            # producer artifacts. The upper bound
+                                            # is checked against ``algorithm`` at
+                                            # load, so an out-of-range level is a
+                                            # boot / --validate error rather than
+                                            # a codec ValueError on the first
+                                            # upload of a running service.
 
   # sqlite: pragma-level knobs for the single persistent SQLite.
   # ``auto_vacuum`` is hardcoded NONE in code per the SD-card-wear hard
@@ -290,10 +305,42 @@ retry:
     base_seconds: 5.0                       # first retry delay
     factor: 4.0                             # backoff factor
     cap_seconds: 1800.0                     # max per-attempt delay (30 min)
-    jitter: 0.2                             # uniform jitter fraction
-    max_attempts: -1                        # -1 = unbounded; bounded by max_duration_seconds
-    max_duration_seconds: 86400             # 24 h ceiling → row → ``stored``
-    # intervals_seconds: [5, 30, 300]       # only when type == "fixed_intervals"
+    jitter: 0.2                             # uniform jitter FRACTION, not a percent:
+                                            # 0.2 means +/-20%. Range 0.0..1.0.
+                                            # Applied to the computed delay, then the
+                                            # cap, then a positive-delay floor, so a
+                                            # jitter draw can never schedule an
+                                            # immediate retry or exceed cap_seconds.
+    max_attempts: -1                        # -1 = unbounded (the only such sentinel);
+                                            # 0 = never retry. Any other negative is a
+                                            # validation error, not a silent "forever".
+    max_duration_seconds: 86400             # 24 h ceiling → row → ``stored``.
+                                            # -1 = unbounded; 0 = give up on the first
+                                            # scheduling call.
+    # intervals_seconds: [5, 30, 300]       # only when type == "fixed_intervals".
+                                            # Defaults to [1, 5, 20, 60, 300]; an
+                                            # explicit [] means no retries at all.
+
+
+# ---------------------------------------------------------------------------
+# upstream: how Phantom talks to destination hosts
+# ---------------------------------------------------------------------------
+#
+# One httpx client is built at boot around ``timeout_seconds`` and is the
+# timeout every outbound call uses UNLESS the matched route sets its own
+# ``timeout_seconds`` (under instances[].routes below), which wins per call.
+#
+# Read this one before copying the S3 route further down: 30 s is a fine
+# ceiling for a metadata POST and far too short for a multi-hundred-megabyte
+# PUT, which will time out and be retried forever at whatever the retry
+# strategy says. Either raise the global default here or - better, because it
+# keeps fast metadata calls failing fast - set ``timeout_seconds`` on the
+# route that carries the big bodies.
+#
+# Restart-required (ADR-013): the client is constructed once at boot.
+
+upstream:
+  timeout_seconds: 30.0                     # default per-request HTTP timeout (seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -349,8 +396,12 @@ instances:
     #   secondary_client_secret_env: "PHANTOM_UPSTREAM_CLIENT_SECRET_2"  # rotation
     #   authority_url: "https://login.microsoftonline.com"
     #   scope: "api://files.upstream.example/.default"
-    #   refresh_seconds_before_expiry: 12
-    #   refresh_jitter_seconds: 0.5
+    #   refresh_seconds_before_expiry: 300   # 5 min, the Azure Identity/MSAL window.
+    #                                        # Range 1..600. Must leave room for clock
+    #                                        # skew against Entra ID's expires_on plus
+    #                                        # the mint's own round trip.
+    #   refresh_jitter_seconds: 0.5          # subtracted from the wait; 0..60 and never
+    #                                        # more than refresh_seconds_before_expiry
     #   ad_outage_retry_seconds: [1, 2, 4, 8, 30]
     #   endpoint: "files.upstream.example"
     #   uid: "upstream-sp"

@@ -57,10 +57,32 @@ if TYPE_CHECKING:
     from uuid import UUID
 
     from phantom.instances.snapshot import InstanceSettingsSnapshot
+    from phantom.models.upload import UploadRow
     from phantom.storage.interface import BodyStore
     from phantom.storage.sqlite_store import SqliteUploadStore
 
 logger = logging.getLogger(__name__)
+
+# How many rows of the walk are checked at once.
+#
+# The sweep's cost is ROUND-TRIP LATENCY, not CPU: the file body store's
+# presence check is an ``aiofiles`` hop measured at 135 us against 4.7 us for
+# the synchronous call, so taking them strictly in turn multiplies that
+# latency by the number of declared body_refs in the whole deliverable
+# population (finding S8-7). That population is unbounded BY DESIGN -
+# ``auth_expired`` is deliberately not terminal, ``evict_terminal_over_limit``
+# cannot trim it and its metadata retention defaults to forever - so a
+# producer whose token dies for a day at 10 uploads/s parks 864k rows and the
+# serialised sweep spends about two minutes of event-loop time every period,
+# on the loop every other worker shares.
+#
+# WHY 32. asyncio's default thread-pool executor is sized
+# ``min(32, cpu_count + 4)``, and each presence check on the file binding
+# occupies one of those threads for its hop. Fanning out wider than the pool
+# does not add parallelism, it just queues inside the executor, where the
+# waiting is invisible. 32 is therefore the widest value that still buys
+# something on any machine, and on a small one the pool caps it lower anyway.
+_SWEEP_BATCH_ROWS: int = 32
 
 # Stable label-value bucket keys for ``invariant_violation_total``.
 # Surface bumps for each so the admin endpoint shows a zero-valued
@@ -193,66 +215,98 @@ class InvariantAuditor:
         The FRESH re-read below is untouched and must stay: it asks the same
         question of a live row to decide whether a row legally finished
         mid-sweep, which is a different question from what to walk.
+
+        Rows are checked :data:`_SWEEP_BATCH_ROWS` at a time rather than one
+        after another (S8-7). The walk still STREAMS, so the sweep's memory is
+        one batch rather than the whole deliverable population; what the batch
+        buys is that the body-store round trips inside it overlap, which is
+        the whole cost of the pass. Rows are independent of each other here -
+        each bumps its own counters and re-reads only its own row - so the
+        order they are checked in carries no meaning.
         """
+        batch: list[UploadRow] = []
         async for row in self._store.iter_rows(deliverable_only=True):
-            # Invariant #1 + #3 checks per body_hash entry.
-            present_names: set[str] = set()
-            # Lazily resolved on the FIRST miss; one live re-read per
-            # row at most (R5-1). True means the row legally finished
-            # mid-sweep and the whole row is skipped, mismatch check
-            # included.
-            live_cleared: bool | None = None
-            for name in row.body_hashes:
-                present = await self._body_store.has_body_ref(row.chain_id, name)
-                if present:
-                    present_names.add(name)
-                    continue
-                if live_cleared is None:
-                    live_cleared = await self._row_cleared_since_snapshot(row.chain_id)
-                if live_cleared:
-                    break
-                if row.body_location == "file":
-                    # Invariant #1 - body_location='file' claims files
-                    # exist on disk.
-                    logger.error(
-                        "invariant violation: missing_body_file chain_id=%s name=%s",
-                        row.chain_id,
-                        name,
-                    )
-                    await self._violation_counter.inc(label_value=_VIOLATION_MISSING_BODY_FILE)
-                else:
-                    # body_location='ram' - RAM body absent on a row
-                    # claiming RAM presence. Could be a transient
-                    # post-power-cut state before recovery runs
-                    # (strategy §3 "implicit consistency rule"), but
-                    # in steady state it indicates an invariant break.
-                    logger.error(
-                        "invariant violation: missing_body_in_ram chain_id=%s name=%s",
-                        row.chain_id,
-                        name,
-                    )
-                    await self._violation_counter.inc(label_value=_VIOLATION_MISSING_BODY_IN_RAM)
+            batch.append(row)
+            if len(batch) >= _SWEEP_BATCH_ROWS:
+                await self._check_batch(batch)
+                batch = []
+        if batch:
+            await self._check_batch(batch)
+
+    async def _check_batch(self, batch: list[UploadRow]) -> None:
+        """Check one batch of rows concurrently.
+
+        Args:
+            batch: Rows from the walk, at most :data:`_SWEEP_BATCH_ROWS` of
+                them. Exceptions propagate to :meth:`run`'s broad ``except``,
+                which logs and lets the next period try again; a failed
+                sweep only delays detection.
+        """
+        await asyncio.gather(*(self._check_row(row) for row in batch))
+
+    async def _check_row(self, row: UploadRow) -> None:
+        """Check invariants #1 and #3 against one row; bump on violation.
+
+        Args:
+            row: One row of the walk's snapshot. Writes NOTHING to
+                ``uploads`` (single-writer manifest, plan § 0.5).
+        """
+        # Invariant #1 + #3 checks per body_hash entry.
+        present_names: set[str] = set()
+        # Lazily resolved on the FIRST miss; one live re-read per
+        # row at most (R5-1). True means the row legally finished
+        # mid-sweep and the whole row is skipped, mismatch check
+        # included.
+        live_cleared: bool | None = None
+        for name in row.body_hashes:
+            present = await self._body_store.has_body_ref(row.chain_id, name)
+            if present:
+                present_names.add(name)
+                continue
+            if live_cleared is None:
+                live_cleared = await self._row_cleared_since_snapshot(row.chain_id)
             if live_cleared:
                 # Legal mid-sweep transition; nothing on this row is a
                 # violation, including the emptiness mismatch below.
-                continue
-            # Invariant #3 - body_hash set cardinality match. If the
-            # body store knows extras not in the row's declared
-            # body_hashes, the orphan janitor catches them (invariant
-            # #4). We only assert the row-declared set is a *subset*
-            # of body-store presence; missing names already bumped
-            # above. If declared cardinality > present, that's already
-            # covered. Add an explicit check for emptiness mismatch.
-            declared = set(row.body_hashes.keys())
-            if declared and not present_names and row.body_location in ("ram", "file"):
-                # All declared body_hashes absent from store - a
-                # stronger #3 violation worth tracking distinctly.
+                return
+            if row.body_location == "file":
+                # Invariant #1 - body_location='file' claims files
+                # exist on disk.
                 logger.error(
-                    "invariant violation: body_hash_set_mismatch chain_id=%s declared=%d present=0",
+                    "invariant violation: missing_body_file chain_id=%s name=%s",
                     row.chain_id,
-                    len(declared),
+                    name,
                 )
-                await self._violation_counter.inc(label_value=_VIOLATION_BODY_HASH_SET_MISMATCH)
+                await self._violation_counter.inc(label_value=_VIOLATION_MISSING_BODY_FILE)
+            else:
+                # body_location='ram' - RAM body absent on a row
+                # claiming RAM presence. Could be a transient
+                # post-power-cut state before recovery runs
+                # (strategy §3 "implicit consistency rule"), but
+                # in steady state it indicates an invariant break.
+                logger.error(
+                    "invariant violation: missing_body_in_ram chain_id=%s name=%s",
+                    row.chain_id,
+                    name,
+                )
+                await self._violation_counter.inc(label_value=_VIOLATION_MISSING_BODY_IN_RAM)
+        # Invariant #3 - body_hash set cardinality match. If the
+        # body store knows extras not in the row's declared
+        # body_hashes, the orphan janitor catches them (invariant
+        # #4). We only assert the row-declared set is a *subset*
+        # of body-store presence; missing names already bumped
+        # above. If declared cardinality > present, that's already
+        # covered. Add an explicit check for emptiness mismatch.
+        declared = set(row.body_hashes.keys())
+        if declared and not present_names and row.body_location in ("ram", "file"):
+            # All declared body_hashes absent from store - a
+            # stronger #3 violation worth tracking distinctly.
+            logger.error(
+                "invariant violation: body_hash_set_mismatch chain_id=%s declared=%d present=0",
+                row.chain_id,
+                len(declared),
+            )
+            await self._violation_counter.inc(label_value=_VIOLATION_BODY_HASH_SET_MISMATCH)
 
 
 __all__ = ["InvariantAuditor"]

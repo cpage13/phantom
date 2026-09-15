@@ -190,14 +190,21 @@ always runs FULL on its own database file (ADR-030); this knob governs
 ### Validating a config without binding
 
 ```bash
-uv run python -c "
-import yaml
-from phantom.config.settings import Settings
-cfg = yaml.safe_load(open('/etc/phantom/phantom.yaml'))
-Settings.model_validate(cfg)
-print('OK')
-"
+uv run python -m phantom --config /etc/phantom/phantom.yaml --validate
 ```
+
+This is the only correct way to validate. It exits 0 or 1 so CI can
+branch on it, and on success it prints the fully resolved settings so
+you can confirm that what you are reading is what production will see.
+
+Do NOT reach for `Settings.model_validate` on a `yaml.safe_load` result.
+That path bypasses the environment-variable overlay, the guard that
+rejects a YAML file whose top level is not a mapping, and the host
+probe, so it will report OK on a config the service would refuse, and
+it validates neither the bind address the container will actually use
+nor the overrides layered on top of the file. Both the shipped
+`docker run` command and the shipped compose file set
+`PHANTOM_SERVER__BIND_TCP`, so the overlay is not hypothetical.
 
 ### Hot reload
 
@@ -213,10 +220,16 @@ capture re-execution, retry params, the admin lookup binding, and
 body-store tuning (linger, RAM ceiling, RAM-pressure poll).
 **Restart-required:** worker count, the instance list
 (adding/removing an instance), `body_store.mode`,
-`storage.max_buffered_bytes`, every
+`storage.max_buffered_bytes`, `upstream.timeout_seconds` (the one
+`httpx.AsyncClient` is built around it at construction, so a live
+client's timeout cannot be re-pointed; a route's own `timeout_seconds`
+still overrides it per call), every
 `ad_mint` knob including the refresh timings (the reload logs a
 WARNING when `ad_mint` changes), and the **per-instance route block**:
-`routes`, `host_prefixes` and the per-instance `data_dir`. See ADR-013.
+`routes`, `host_prefixes` and the per-instance `data_dir`.
+Neither list here is exhaustive. ADR-013 carries one row per knob and
+that table is the contract; read it per row, because a single YAML
+namespace can mix mechanisms.
 
 The route block is restart-required *and enforced*. The boot
 `InstanceCfg` is frozen, and admission, the dispatcher, both kickers,
@@ -1010,9 +1023,18 @@ cross-restart body durability matters.
 ### Vacuum
 
 Cron-scheduled SQLite VACUUM via `VacuumScheduler`. Default
-`storage.sqlite.vacuum_cron: "0 3 * * 0"` (Sunday 03:00). Fires
-only when `in_flight == 0`. No operator action needed in normal
-operation. To force a vacuum, restart at an idle moment.
+`storage.sqlite.vacuum_cron: "0 3 * * 0"` (Sunday 03:00). Fires only
+when no row is in `queued` or `attempting`. No operator action needed
+in normal operation. To force a vacuum, restart at an idle moment.
+
+It deliberately does not read the saturation gate's `in_flight`. That
+is a buffer-occupancy ledger and it counts the terminal `stored`
+state, so a single `stored` row, which one route typo or one exhausted
+retry budget produces, used to suppress the VACUUM every week
+thereafter. Nothing logged it, `stored` metadata retention defaults to
+never, and boot recovery re-seeded the charge, so a restart did not
+clear it either. If you are diagnosing a database that never shrinks
+on an older build, that is the shape to look for.
 
 ### Cold backup
 

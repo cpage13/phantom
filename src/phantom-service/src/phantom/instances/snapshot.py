@@ -99,6 +99,16 @@ def _build_snapshot(settings: Settings, cfg: InstanceCfg) -> InstanceSettingsSna
     Per-instance variation comes from ``cfg.capture_reexecution`` and
     ``cfg.admin_lookup``, the two reloadable knobs on
     :class:`InstanceCfg`.
+
+    What sharing means for a reader aggregating across instances (SW-5):
+    a shared knob is ONE GLOBAL VALUE that each instance's worker enforces
+    against ITS OWN measurement, never a per-instance quota. Summing it
+    over N instances publishes a bound no enforcement point uses.
+    ``body_store.ram_ceiling_bytes`` is the case that reached an operator
+    surface: ``RamPressureWatcher`` compares one instance's
+    ``ram_body_store.total_bytes()`` against this single ceiling, so
+    ``GET /v1/admin/observability/ram_pressure`` reports the ceiling
+    itself rather than a sum.
     """
     return InstanceSettingsSnapshot(
         persist_trigger=settings.storage.persist_trigger,

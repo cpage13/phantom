@@ -1,8 +1,10 @@
 """Upload-row, state-alias, and admin-status response models.
 
 These mirror the shapes Phantom emits on the admin API:
-- ``UploadRow`` - the row as returned by ``GET /v1/admin/chains/{chain_id}``
-  and ``GET /v1/admin/chains``. ``extra="ignore"`` so unknown fields
+- ``UploadRow`` - the row as returned by ``GET /v1/admin/chains``, and by
+  ``POST /v1/admin/chains/{chain_id}/replay`` and ``.../cancel``. NOT the
+  single-chain detail route (S10-3): ``GET /v1/admin/chains/{chain_id}``
+  returns ``ChainAdminDetail``. ``extra="ignore"`` so unknown fields
   on the wire round-trip silently rather than failing the SDK; integration
   tests pin the documented field set.
 - ``UploadState`` - alias for ``ChainState`` from
@@ -13,15 +15,22 @@ These mirror the shapes Phantom emits on the admin API:
   condition. Includes ``auth_expired`` because no further attempt
   happens without external intervention (see §4.2 of the plan and
   ADR-011).
-- ``SortKey`` - enum of valid ``sort`` query-param values.
 - ``StatsResponse``, ``TokenSlot``, ``HealthResponse``,
   ``ReadyResponse`` - admin response payload shapes.
+
+There is deliberately no ``SortKey``. It advertised three orderings for a
+``sort`` query parameter that ``GET /v1/admin/chains`` has never declared, so
+every value was dropped by FastAPI on arrival; two of the three named
+``next_attempt_at``, which is nullable and therefore cannot be the store's
+keyset-pagination axis at all. The service's list order is fixed at
+``received_at ASC, chain_id ASC`` (``send_order ASC`` under the multifile
+filter). If Phantom ever grows a declared sort parameter, the enum returns
+with the members the store can actually serve.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from enum import StrEnum
 from typing import Any, Literal, TypeAlias
 from uuid import UUID
 
@@ -65,19 +74,6 @@ must override with a smaller set, typically
 
 
 # ---------------------------------------------------------------------------
-# Sort key enum for list endpoints.
-# ---------------------------------------------------------------------------
-
-
-class SortKey(StrEnum):
-    """Valid values for the ``sort`` query parameter on list endpoints."""
-
-    NEXT_ATTEMPT_AT_ASC = "next_attempt_at_asc"
-    NEXT_ATTEMPT_AT_DESC = "next_attempt_at_desc"
-    RECEIVED_AT_DESC = "received_at_desc"
-
-
-# ---------------------------------------------------------------------------
 # Captured-values store - nested per step on each UploadRow.
 # Duplicates phantom.models.upload.{CapturedStepValues,CapturedValues}
 # byte-for-byte; the contract test enforces alignment.
@@ -87,7 +83,7 @@ class SortKey(StrEnum):
 class CapturedStepValues(BaseModel):
     """One step's captured values plus TTL bookkeeping."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     values: dict[str, Any] = Field(
         ...,
@@ -109,7 +105,7 @@ class CapturedStepValues(BaseModel):
 class CapturedValues(BaseModel):
     """Per-step captured-values store on the upload row."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     steps: dict[str, CapturedStepValues] = Field(
         default_factory=dict,
@@ -239,7 +235,7 @@ class TokenSlot(BaseModel):
     body contains a substring matching the bearer-token regex.
     """
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     endpoint: str = Field(..., description="Upstream hostname (e.g., upstream.example.com).")
     uid: str = Field(..., description="The opaque caller-supplied identifier.")
@@ -271,7 +267,7 @@ alias (``memory`` / ``persisted``) per plan § 2.3.19 / § 2.3.20."""
 class TierBreakdown(BaseModel):
     """A count + bytes pair for one storage tier or state."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     count: int = Field(..., ge=0, description="Number of rows in this slice.")
     bytes: int = Field(..., ge=0, description="Summed body bytes in this slice.")
@@ -280,7 +276,7 @@ class TierBreakdown(BaseModel):
 class StateBreakdown(BaseModel):
     """Per-state count+bytes breakdown for the stats endpoint."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     queued: TierBreakdown = Field(..., description="Rows in the ``queued`` state.")
     attempting: TierBreakdown = Field(
@@ -307,7 +303,7 @@ class StateBreakdown(BaseModel):
 class SaturationStatus(BaseModel):
     """Current saturation cap state."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     max_in_flight: int = Field(..., ge=0, description="Current row-count cap.")
     max_in_flight_bytes: int = Field(..., ge=0, description="Current in-flight byte cap.")
@@ -320,7 +316,7 @@ class SaturationStatus(BaseModel):
 class AuthStatus(BaseModel):
     """Auth-cache summary for the stats endpoint."""
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     phantom_token_expires_at: datetime | None = Field(
         None,
@@ -343,7 +339,7 @@ class StatsResponse(BaseModel):
     enforced by ``tests/contract/test_admin_models_alignment.py``.
     """
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     in_flight: TierBreakdown = Field(
         ...,
@@ -444,7 +440,6 @@ __all__ = [
     "HealthResponse",
     "ReadyResponse",
     "SaturationStatus",
-    "SortKey",
     "StateBreakdown",
     "StatsResponse",
     "TierBreakdown",

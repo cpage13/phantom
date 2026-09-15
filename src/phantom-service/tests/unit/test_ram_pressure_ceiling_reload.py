@@ -116,10 +116,14 @@ class _OneCandidateStore:
     """Upload store exposing exactly one oldest RAM-resident chain.
 
     ``list_oldest_ram_bodies`` yields the single seeded chain_id;
-    ``get_persist_candidate_state`` reports it ``queued`` (state !=
-    ``attempting`` so
-    the fresh-attempt skip never applies and a healthy ceiling breach
-    enqueues it).
+    ``get_persist_candidate_state`` reports it ``queued``. The state is
+    deliberately NOT ``attempting``, so the fresh-attempt skip never
+    applies and a healthy ceiling breach enqueues the row. That keeps
+    this file about the reload contract alone, which means it covers
+    NOTHING of the fresh-attempt filter: that mechanism is pinned by
+    ``test_ram_pressure_fresh_attempt_bound.py`` (finding S12-4), which
+    exists because this seed choice left it unreached by the whole unit
+    lane.
     """
 
     def __init__(self, *, chain_id: UUID, row: UploadRow) -> None:

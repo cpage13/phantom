@@ -35,6 +35,10 @@ from phantom.storage.hybrid_body_store import HybridBodyStore
 from phantom.storage.ram_body_store import RamBodyStore
 from phantom.storage.sqlite_store import SqliteUploadStore
 
+# The composition root passes each instance's own id so the process-wide
+# gauges stay attributable per instance; any stable string serves here.
+_INSTANCE_LABEL = "primary"
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -68,6 +72,7 @@ async def test_hybrid_wires_hybrid_store_and_persist_controller(tmp_path: Path) 
             file_body_store=file_bs,
             store=store,
             metrics_registry=registry,
+            instance_label=_INSTANCE_LABEL,
         )
         assert isinstance(body_store, HybridBodyStore)
         assert controller is not None
@@ -85,6 +90,7 @@ async def test_all_ram_wires_ram_half_no_controller(tmp_path: Path) -> None:
             file_body_store=file_bs,
             store=store,
             metrics_registry=registry,
+            instance_label=_INSTANCE_LABEL,
         )
         assert body_store is ram
         assert controller is None
@@ -102,6 +108,7 @@ async def test_all_disk_wires_file_half_no_controller(tmp_path: Path) -> None:
             file_body_store=file_bs,
             store=store,
             metrics_registry=registry,
+            instance_label=_INSTANCE_LABEL,
         )
         assert body_store is file_bs
         assert controller is None
@@ -126,6 +133,7 @@ async def test_unknown_mode_raises(tmp_path: Path) -> None:
                 file_body_store=file_bs,
                 store=store,
                 metrics_registry=registry,
+                instance_label=_INSTANCE_LABEL,
             )
     finally:
         await store.stop()

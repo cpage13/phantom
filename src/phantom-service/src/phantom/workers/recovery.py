@@ -288,14 +288,31 @@ async def reconcile_saturation(store: UploadStore, saturation: SaturationGate) -
     aligned with the ownership every settled write derives from the same
     predicate.
 
+    THE WALK READS THREE COLUMNS, not a row. This pass used to run over
+    :meth:`UploadStore.iter_rows`, which decodes a complete strict
+    :class:`~phantom.models.upload.UploadRow` per row, immediately after
+    :func:`run_recovery`'s own full walk: at the default
+    ``retention.max_rows`` ceiling of 100 000 that was 200 000 pydantic
+    constructions before the first worker started and before uvicorn accepted
+    a request, on the restart path whose whole purpose is to get the backlog
+    moving again (finding S7-8). It reads
+    :meth:`UploadStore.iter_slot_charge_candidates` instead.
+
+    THE TWO WALKS STAY TWO, and that is not an oversight. ``run_recovery``
+    issues its ``mark_corrupted`` quarantine writes AFTER its own cursor
+    drains, and a quarantined row is ``corrupted``, which does NOT hold a
+    slot. Folding this pass into that walk would seed the ledger from the
+    PRE-quarantine states and charge a slot for every row recovery was in the
+    middle of condemning.
+
     Args:
         store: Recovered persistent upload store.
         saturation: Fresh per-process gate to seed.
     """
     charge_sizes: list[int] = []
-    async for row in store.iter_rows():
-        if row_holds_slot(row.state, row.body_discarded_at):
-            charge_sizes.append(row.body_size_bytes)
+    async for candidate in store.iter_slot_charge_candidates():
+        if row_holds_slot(candidate.state, candidate.body_discarded_at):
+            charge_sizes.append(candidate.body_size_bytes)
     for body_size_bytes in charge_sizes:
         await saturation.reconcile_admit(body_size_bytes)
     if charge_sizes:

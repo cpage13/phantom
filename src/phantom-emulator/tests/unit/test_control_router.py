@@ -8,8 +8,18 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from phantom_emulator.app import create_app
-from phantom_emulator.config import AppConfig
+from phantom_emulator.auth.modes import AuthMode
+from phantom_emulator.config import AppConfig, AuthCfg
 from phantom_emulator.failure.injection import FailurePolicy, FailureScope
+from phantom_emulator.state import EmulatorState
+
+# A create-file body with nothing scenario-specific in it: these tests are
+# about who is allowed to call, not about what the call carries.
+_CREATE_PAYLOAD: dict[str, object] = {
+    "domain": "D",
+    "fileName": "f",
+    "metadata": {"keyValueStore": {}},
+}
 
 
 @pytest.fixture
@@ -19,6 +29,53 @@ async def client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[httpx.AsyncCl
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://emulator") as c:
         yield c
+
+
+@pytest.fixture
+async def client_and_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[tuple[httpx.AsyncClient, EmulatorState]]:
+    """The default-mode client plus the state, for tests that mint out of band."""
+    monkeypatch.setenv("EMULATOR_SIGNING_KEY", "x" * 32)
+    app = create_app(AppConfig())
+    state: EmulatorState = app.state.emulator_state
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://emulator") as c:
+        yield c, state
+
+
+@pytest.fixture
+async def static_token_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """A client whose emulator runs the ``static_token`` auth mode."""
+    monkeypatch.setenv("EMULATOR_SIGNING_KEY", "x" * 32)
+    app = create_app(AppConfig(auth=AuthCfg(default_mode=AuthMode.STATIC_TOKEN)))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://emulator") as c:
+        yield c
+
+
+async def _mint(client: httpx.AsyncClient) -> str:
+    """Mint a bearer through the token endpoint and return it."""
+    r = await client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": "test-client",
+            "client_secret": "test-secret",
+        },
+    )
+    return str(r.json()["access_token"])
+
+
+async def _create_with(client: httpx.AsyncClient, bearer: str) -> httpx.Response:
+    """Call the authenticated create endpoint with ``bearer``."""
+    return await client.post(
+        "/v1/files/create",
+        json=_CREATE_PAYLOAD,
+        headers={"Authorization": f"Bearer {bearer}"},
+    )
 
 
 async def test_status_shape(client: httpx.AsyncClient) -> None:
@@ -90,6 +147,126 @@ async def test_revoke_tokens(client: httpx.AsyncClient) -> None:
     assert r.status_code == 204
     status = await client.get("/control/status")
     assert status.json()["issued_tokens_count"] == 0
+
+
+async def test_revoke_tokens_makes_the_bearer_401_in_the_default_mode(
+    client: httpx.AsyncClient,
+) -> None:
+    """Revoke -> the bearer that just worked 401s, and a fresh one works again.
+
+    Objective: the emulator is the oracle for Phantom's auth-recovery path, so
+    ``POST /control/revoke-tokens`` has to be observable in the DEFAULT
+    ``oauth_client_credentials`` mode. It used to clear the ``issued_tokens``
+    bookkeeping only, which that mode never reads, so a test that revoked and
+    expected a 401 got a 200 and the whole auth_expired plus kicker-wake path
+    went unexercised.
+
+    Expected outcome: create 200 before the revoke, 401 with the identical
+    credential after it, and 200 again on a newly minted credential, which is
+    the recovery the parked row depends on.
+    """
+    token = await _mint(client)
+    assert (await _create_with(client, token)).status_code == 200
+
+    revoke = await client.post("/control/revoke-tokens")
+    assert revoke.status_code == 204
+
+    rejected = await _create_with(client, token)
+    assert rejected.status_code == 401
+
+    fresh = await _mint(client)
+    assert (await _create_with(client, fresh)).status_code == 200
+
+
+async def test_revoke_tokens_reaches_a_credential_the_emulator_never_issued(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """A bearer minted out of band, then accepted once, is revocable too.
+
+    Objective: the e2e suite signs its own bearer with the shared secret and
+    pushes it to Phantom, so that credential never passes through
+    ``/oauth/token`` and never lands in ``issued_tokens``. Revocation keyed on
+    the issuance bookkeeping alone would leave exactly the credential the
+    auth-recovery scenario cares about untouched.
+
+    Expected outcome: the out-of-band credential authenticates, and after the
+    revoke the identical credential 401s, because the emulator revokes what it
+    has ACCEPTED as well as what it has issued.
+    """
+    client, state = client_and_state
+    assert state.jwt_minter is not None
+    token, _expires_at = state.jwt_minter.mint(client_id="out-of-band-client")
+    assert token not in state.issued_tokens
+
+    assert (await _create_with(client, token)).status_code == 200
+
+    assert (await client.post("/control/revoke-tokens")).status_code == 204
+
+    assert (await _create_with(client, token)).status_code == 401
+
+
+async def test_expire_all_now_makes_the_bearer_401_in_the_default_mode(
+    client: httpx.AsyncClient,
+) -> None:
+    """Expire -> the bearer 401s even though its own ``exp`` is still ahead.
+
+    Objective: ``POST /control/expire-all-now`` aged the emulator's recorded
+    expiry, which the stateless JWT check never consults. The claim inside an
+    issued token cannot be moved, so without the credential ledger this control
+    was a no-op in the default mode and no test could stage an expired
+    upstream credential.
+
+    Expected outcome: create 200 before the call, 401 with the same credential
+    after it, and 200 again once a fresh credential is minted.
+    """
+    token = await _mint(client)
+    assert (await _create_with(client, token)).status_code == 200
+
+    expire = await client.post("/control/expire-all-now")
+    assert expire.status_code == 204
+
+    assert (await _create_with(client, token)).status_code == 401
+    assert (await _create_with(client, await _mint(client))).status_code == 200
+
+
+async def test_expire_all_now_keeps_static_token_mode_serving(
+    static_token_client: httpx.AsyncClient,
+) -> None:
+    """static_token mode: expire re-mints, and the re-issued token still works.
+
+    Objective: the credential ledger must not disturb the mode that already
+    answered to the control surface. ``static_token`` authenticates by
+    comparing the bearer against the pre-minted JWT, so expiry there means
+    "clear it and mint another", and a caller that re-fetches must be served.
+
+    Expected outcome: the token endpoint hands out a working credential both
+    before and after ``expire-all-now``.
+    """
+    before = await _mint(static_token_client)
+    assert (await _create_with(static_token_client, before)).status_code == 200
+
+    assert (await static_token_client.post("/control/expire-all-now")).status_code == 204
+
+    after = await _mint(static_token_client)
+    assert (await _create_with(static_token_client, after)).status_code == 200
+
+
+async def test_idempotency_dedup_window_endpoint_sets_the_window(
+    client_and_state: tuple[httpx.AsyncClient, EmulatorState],
+) -> None:
+    """POST /control/idempotency-dedup-window -> 204 and the configured window moves.
+
+    Objective: the dedup window was reachable only from the in-process oracle,
+    which reached around ``EmulatorState`` into the config object, so the HTTP
+    tier had no way to set it and the two control surfaces were not mirrors.
+
+    Expected outcome: the endpoint answers 204 and the value the create path
+    reads is the one it was given.
+    """
+    client, state = client_and_state
+    r = await client.post("/control/idempotency-dedup-window", json={"seconds": 11})
+    assert r.status_code == 204
+    assert state.cfg.upstream.idempotency_dedup_window_seconds == 11
 
 
 async def test_set_extra_claims(client: httpx.AsyncClient) -> None:

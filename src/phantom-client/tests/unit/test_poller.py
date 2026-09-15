@@ -9,8 +9,15 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from phantom_client import client as client_module
+from phantom_client import poller as poller_module
+from phantom_client import transport as transport_module
 from phantom_client.config import ClientConfig, RetryPolicy
-from phantom_client.errors import PhantomNotFoundError, PollDeadlineExceeded
+from phantom_client.errors import (
+    PhantomConnectError,
+    PhantomNotFoundError,
+    PollDeadlineExceeded,
+)
 from phantom_client.poller import poll_group_until_finished, poll_until
 from phantom_client.transport import Transport
 
@@ -395,3 +402,192 @@ async def test_group_poll_404_propagates() -> None:
             await poll_group_until_finished(transport, group_id, initial_delay_seconds=0.0)
     finally:
         await transport.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Public-path, deadline and path-constant regressions.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_poll_retries_a_connect_error_mid_poll() -> None:
+    """Objective: a Phantom restarting mid-poll costs a retry, not the poll.
+
+    Expected: the ConnectError attempt is retried per the client's RetryPolicy
+    and the poll then reaches ``succeeded``. The pollers used to issue the GET
+    on the transport's raw httpx client through ``_require_client``, which
+    bypassed ``_send_with_retry`` entirely: a single ConnectError aborted the
+    whole poll with zero retries.
+    """
+    chain_id = uuid4()
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("phantom restarting")
+        return _row_response("succeeded", chain_id=str(chain_id), poll_after="0")
+
+    cfg = ClientConfig(
+        phantom_url="http://test",
+        retry_policy=RetryPolicy(
+            max_attempts=3, backoff_initial_seconds=0.001, backoff_jitter=False
+        ),
+    )
+    transport = Transport(cfg, transport=httpx.MockTransport(handler))
+    await transport.start()
+    try:
+        response = await poll_until(transport, chain_id, initial_delay_seconds=0.0)
+    finally:
+        await transport.aclose()
+    assert calls == 2
+    assert response.state == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_poll_translates_exhausted_transport_failure() -> None:
+    """Objective: an exhausted transport failure surfaces as the SDK's own type.
+
+    Expected: ``PhantomConnectError``, never a raw ``httpx.ConnectError``. The
+    documented ``Raises`` contract lists only SDK exceptions, and a caller
+    guarding with ``except PhantomTransportError`` must not be handed an httpx
+    class the reach-through used to leak.
+    """
+    chain_id = uuid4()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("phantom is gone")
+
+    transport = _make_transport(handler)
+    await transport.start()
+    try:
+        with pytest.raises(PhantomConnectError) as caught:
+            await poll_until(transport, chain_id, initial_delay_seconds=0.0)
+    finally:
+        await transport.aclose()
+    assert not isinstance(caught.value, httpx.HTTPError)
+
+
+@pytest.mark.asyncio
+async def test_group_poll_translates_exhausted_transport_failure() -> None:
+    """Objective: the group poller shares the chain poller's typed contract.
+
+    Expected: ``PhantomConnectError``. Both pollers route through the same
+    public transport read, so neither can regress on its own.
+    """
+    group_id = uuid4()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("phantom is gone")
+
+    transport = _make_transport(handler)
+    await transport.start()
+    try:
+        with pytest.raises(PhantomConnectError):
+            await poll_group_until_finished(transport, group_id, initial_delay_seconds=0.0)
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_naive_deadline_is_read_as_utc() -> None:
+    """Objective: a naive deadline is honoured as UTC, not a TypeError.
+
+    Expected: the poll completes and returns the terminal row.
+    ``datetime.utcnow() + timedelta(...)`` is the most natural spelling of the
+    parameter's own documentation ("an absolute UTC timestamp") and returns a
+    NAIVE value; comparing it against ``datetime.now(tz=UTC)`` raised a bare
+    ``TypeError`` before the first HTTP call, an exception absent from the
+    documented ``Raises`` list.
+    """
+    chain_id = uuid4()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _row_response("succeeded", chain_id=str(chain_id), poll_after="0")
+
+    naive_deadline = datetime.now(tz=UTC).replace(tzinfo=None) + timedelta(seconds=30)
+    assert naive_deadline.tzinfo is None
+    transport = _make_transport(handler)
+    await transport.start()
+    try:
+        response = await poll_until(
+            transport, chain_id, initial_delay_seconds=0.0, deadline=naive_deadline
+        )
+    finally:
+        await transport.aclose()
+    assert response.state == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_naive_deadline_already_elapsed_still_raises_the_typed_error() -> None:
+    """Objective: reading a naive deadline as UTC keeps the documented failure.
+
+    Expected: ``PollDeadlineExceeded``, not ``TypeError``. Tolerating the naive
+    spelling must not lose the deadline semantics it was asking for.
+    """
+    chain_id = uuid4()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _row_response("queued", chain_id=str(chain_id), poll_after="60")
+
+    past = datetime.now(tz=UTC).replace(tzinfo=None) - timedelta(seconds=30)
+    transport = _make_transport(handler)
+    await transport.start()
+    try:
+        with pytest.raises(PollDeadlineExceeded):
+            await poll_until(transport, chain_id, initial_delay_seconds=0.0, deadline=past)
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_group_poll_accepts_a_naive_deadline() -> None:
+    """Objective: the group poller shares the naive-deadline handling.
+
+    Expected: the rollup returns rather than raising ``TypeError``.
+    """
+    group_id = uuid4()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _group_response(str(group_id), member_states=["succeeded"])
+
+    naive_deadline = datetime.now(tz=UTC).replace(tzinfo=None) + timedelta(seconds=30)
+    transport = _make_transport(handler)
+    await transport.start()
+    try:
+        response = await poll_group_until_finished(
+            transport, group_id, initial_delay_seconds=0.0, deadline=naive_deadline
+        )
+    finally:
+        await transport.aclose()
+    assert response.all_finished is True
+
+
+def test_path_constants_have_one_declaration() -> None:
+    """Objective: the poller and the client name the same path objects.
+
+    Expected: both modules resolve their chain-detail and group-rollup paths
+    from :mod:`phantom_client.transport`, and the chain COLLECTION path stays
+    distinct from the single-chain template. ``poller`` used to declare its own
+    ``_PATH_UPLOADS = "/v1/admin/chains/{chain_id}"`` while ``client`` declared
+    ``_PATH_UPLOADS = "/v1/admin/chains"`` - one name, opposite meanings, in two
+    modules that call the same API.
+    """
+    assert poller_module.PATH_CHAIN is transport_module.PATH_CHAIN
+    assert client_module.PATH_CHAIN is transport_module.PATH_CHAIN
+    assert poller_module.PATH_GROUP_STATUS is transport_module.PATH_GROUP_STATUS
+    assert client_module.PATH_GROUP_STATUS is transport_module.PATH_GROUP_STATUS
+    assert transport_module.PATH_CHAIN == "/v1/admin/chains/{chain_id}"
+    assert transport_module.PATH_CHAINS == "/v1/admin/chains"
+    # No module re-declares a path name of its own.
+    for module in (poller_module, client_module):
+        own = {
+            name: value
+            for name, value in vars(module).items()
+            if name.startswith(("PATH_", "_PATH_"))
+        }
+        for name, value in own.items():
+            assert getattr(transport_module, name, None) is value, (
+                f"{module.__name__}.{name} is not the transport's declaration"
+            )

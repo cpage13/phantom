@@ -192,6 +192,64 @@ async def test_dangling_placeholder_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dangling_placeholder_in_a_json_body_key_rejected() -> None:
+    """SL4-7: a dangling placeholder in a JSON body KEY is refused at the door.
+
+    Objective: the executor's body renderer substitutes into dict keys as well
+    as values, so a key placeholder is a real reference. Admission's static
+    pass walked only values, so a producer typo in a key was admitted, the
+    producer got a 202 and a durable row, and the chain terminated ``failed``
+    at delivery instead.
+
+    Expected outcome: ``template_unresolved``, with the details naming the key's
+    dangling reference rather than the sibling value's resolvable one.
+    """
+    body = (
+        b'{"chain_id":"'
+        + str(uuid4()).encode()
+        + b'","idempotency_key":"k","steps":['
+        + b'{"name":"create","method":"POST","url":"https://x/new",'
+        + b'"capture":[{"name":"fid","from":"$.id"}]},'
+        + b'{"name":"put","method":"PUT","url":"https://x/put",'
+        + b'"body":{"kind":"json","value":{"{{nosuch.thing}}":"v","ok":"{{create.fid}}"}}}'
+        + b"]}"
+    )
+    with pytest.raises(ParserError) as exc_info:
+        await parse_json_request(
+            body, instance_id="primary", request_id="r", max_buffered_bytes=10_000
+        )
+    assert exc_info.value.code == "template_unresolved"
+    assert exc_info.value.details["ref_step"] == "nosuch"
+    assert exc_info.value.details["ref_name"] == "thing"
+
+
+@pytest.mark.asyncio
+async def test_resolvable_placeholder_in_a_json_body_key_admitted() -> None:
+    """SL4-7: walking keys must not start refusing keys that DO resolve.
+
+    Objective: the fix widens what admission inspects, so the companion risk
+    is over-refusal. A key placeholder naming a prior step's declared capture
+    is exactly what the executor's key renderer exists to serve.
+
+    Expected outcome: the envelope parses with no error.
+    """
+    body = (
+        b'{"chain_id":"'
+        + str(uuid4()).encode()
+        + b'","idempotency_key":"k","steps":['
+        + b'{"name":"create","method":"POST","url":"https://x/new",'
+        + b'"capture":[{"name":"fid","from":"$.id"}]},'
+        + b'{"name":"put","method":"PUT","url":"https://x/put",'
+        + b'"body":{"kind":"json","value":{"{{create.fid}}":{"nested":["{{create.fid}}"]}}}}'
+        + b"]}"
+    )
+    envelope, _ = await parse_json_request(
+        body, instance_id="primary", request_id="r", max_buffered_bytes=10_000
+    )
+    assert [step.name for step in envelope.steps] == ["create", "put"]
+
+
+@pytest.mark.asyncio
 async def test_duplicate_step_names_rejected() -> None:
     """Two steps with the same name raises envelope_invalid."""
     body = (

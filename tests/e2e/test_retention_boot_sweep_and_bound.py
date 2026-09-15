@@ -22,6 +22,33 @@ through a real boot:
   the admin ``GET /v1/admin/stats`` surface.
 
 Public e2e-light lane (§ 5.0): generic seed shapes.
+
+CONFORMANCE MARKING IS PER TEST HERE, NOT PER MODULE (review finding S12-1).
+The two tests differ in the only way the conformance gate cares about:
+
+* The boot-sweep test launches the service through ``PhantomSubprocess``, which
+  resolves its argv from the ``E2E_SERVICE_CMD`` seam, so pointing the seam at a
+  ported binary actually exercises that binary. It stays ``conformance``-marked.
+  Caveat for whoever runs the port's gate: the test SEEDS the on-disk uploads
+  table through the Python ``SqliteUploadStore`` write path before boot, so it
+  rests on the data-dir compatibility question ADR-035 explicitly DEFERS to port
+  start. If the port does not boot a Python-written data dir, this test fails
+  loudly, which is the correct signal, not a false green.
+
+* The max_rows test boots the Python service IN-PROCESS via ``boot_stack`` and
+  reads results through the live Python ``store.iter_rows()``. ADR-035 is
+  explicit that "in-process-stack tests are Python-implementation tests by
+  construction", so it CANNOT test a port: under
+  ``E2E_SERVICE_CMD=<binary> pytest -m conformance`` the Python reference is
+  what would run, and a binary that evicts newest-first, or evicts a
+  still-deliverable ``auth_expired`` row (permanent data loss), would pass the
+  gate green. The marker is therefore removed from it. The coverage is not lost
+  for Python; it is no longer CLAIMED for the port, which is the point.
+
+  To restore it for the port, this test has to be rebuilt on the subprocess
+  harness: seed before boot the way the boot-sweep test does, then read
+  survivors over HTTP and over a raw read of the on-disk uploads table rather
+  than through a live Python store object.
 """
 
 from __future__ import annotations
@@ -50,7 +77,10 @@ from tests.e2e._harness.subprocess_harness import (
 
 from .helpers.stack import E2EStack, boot_stack
 
-pytestmark = [pytest.mark.conformance, pytest.mark.e2e]
+# Module-wide: e2e only. ``conformance`` is applied PER TEST below, because
+# only one of the two runs the service under the E2E_SERVICE_CMD seam. See the
+# module docstring.
+pytestmark = [pytest.mark.e2e]
 
 _SEED_BODY: bytes = b"phantom-5D-retention-seed-body"
 _DIGEST: str = hashlib.sha256(_SEED_BODY).hexdigest()
@@ -105,8 +135,20 @@ _BOOT_SWEEP_BUDGET_SECONDS: float = 15.0
 _BOOT_SWEEP_POLL_SECONDS: float = 0.3
 
 
+@pytest.mark.conformance
 async def test_boot_time_sweep_reclaims_expired_rows(tmp_path: Path) -> None:
-    """An expired terminal row seeded on disk is reclaimed by the boot-time sweep.
+    """Objective: the reaper sweeps at boot, not only on its periodic tick.
+
+    Expected outcome: an expired terminal row seeded on disk while no process is
+    running is gone shortly after a fresh service answers health, and the service
+    serves normally afterwards.
+
+    Conformance: the service under test is launched through
+    ``PhantomSubprocess``, which honours the ``E2E_SERVICE_CMD`` seam, and every
+    assertion reads the on-disk table or the HTTP health surface. The SEED
+    however goes through the Python store's write path, so this test assumes the
+    port boots a Python-written data dir, a decision ADR-035 defers to port
+    start.
 
     Falsifier: make ``Reaper.run`` wait BEFORE its first sweep (or skip the boot sweep) ->
     the expired row lingers past the boot budget -> RED.
@@ -183,12 +225,25 @@ _BOUND_BUDGET_SECONDS: float = 15.0
 async def test_max_rows_cap_holds_oldest_terminal_first_never_undelivered(
     tmp_path: Path,
 ) -> None:
-    """The max_rows cap evicts oldest-terminal-first and never drops an undelivered row.
+    """Objective: the max_rows cap evicts oldest-terminal-first and never drops an undelivered row.
 
-    Seeds ``_TERMINAL_SEED_COUNT`` ``failed`` rows (ascending ``updated_at``) plus ONE
-    ``auth_expired`` row (still deliverable). With ``max_rows`` low, the count-cap backstop
-    drives the table to the cap by evicting the OLDEST failed rows; the auth_expired row
-    survives because durability wins over the count bound (invariant #1).
+    Expected outcome: seeding ``_TERMINAL_SEED_COUNT`` ``failed`` rows (ascending
+    ``updated_at``) plus ONE still-deliverable ``auth_expired`` row over a low
+    ``max_rows`` drives the table down to the cap by evicting the OLDEST failed
+    rows, while the ``auth_expired`` row survives, because durability wins over
+    the count bound (invariant #1).
+
+    NOT CONFORMANCE-MARKED, DELIBERATELY (finding S12-1). This test boots the
+    Python service IN-PROCESS through ``boot_stack`` and reads survivors through
+    the live Python ``store.iter_rows()``. ADR-035 records that in-process-stack
+    tests are Python-implementation tests by construction. Marked
+    ``conformance`` it would have made ``E2E_SERVICE_CMD=<binary> pytest -m
+    conformance`` report green for the Python reference while never running the
+    binary, so a port that evicted newest-first, or evicted a still-deliverable
+    ``auth_expired`` row, would pass its acceptance gate having lost data. The
+    count-cap behaviour is therefore pinned for PYTHON here and is NOT claimed
+    for the port; rebuilding it on the subprocess harness is what would restore
+    that claim (see the module docstring).
 
     Falsifier: drop the terminal-only guard in ``evict_terminal_over_limit`` so it evicts by
     age regardless of state -> the auth_expired row is evicted (lost) -> RED. Or evict

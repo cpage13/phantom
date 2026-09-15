@@ -14,8 +14,11 @@ F-Slice1D-B). Body-location surfacing in responses uses the new
 'file']`` instead of ``tier`` + ``committed``.
 
 Operator-facing filter: ``list_uploads`` accepts an optional
-``body_location`` query parameter that the underlying store filter
-respects.
+``body_location`` query parameter. The underlying store has NO such
+predicate (``sqlite_store.list_uploads`` takes no ``body_location``), so
+the route applies it while walking the store's continuation cursor; see
+:func:`_page_matching_uploads` for why the walk is what keeps the filter
+from silently emptying a page (S1-4).
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ import io
 import json
 import logging
 import tarfile
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -79,16 +82,19 @@ from phantom.models.credential import (
 from phantom.models.errors import STATUS_FOR_CODE, ErrorCode, error_response
 from phantom.models.upload import BodyLocation, UploadRow, UploadState
 from phantom.observability.metrics import MetricsRegistry
+from phantom.refresh.ad_client_credentials import AdReachability
 from phantom.routes._version import ADMIN_ROUTER_PREFIX
+from phantom.routes.health import get_degraded_instances
 from phantom.routing import host_key_for
 from phantom.runtime.reload import RELOAD_FAILURE_ERRORS, apply_reload
+from phantom.runtime.startup_checks import DegradedInstance
 from phantom.storage.errors import (
     BodyMissingError,
     ReplayBodyDiscardedError,
     ReplayRefusedAttemptingError,
 )
 from phantom.storage.integrity import (
-    list_quarantines,
+    list_quarantines_off_loop,
     load_backup_manifest,
     quarantine,
     restore_mode_switch_backup,
@@ -117,7 +123,12 @@ _STILL_MOVING_STATES: Final[frozenset[ChainState]] = frozenset({"queued", "attem
 # in-memory tar builder from runaway buffer growth without losing
 # real-world coverage. Operators needing more granular slices should use the
 # ``state`` / ``route`` filter to scope the export.
-_EXPORT_TAR_PER_INSTANCE_LIMIT = 10_000
+# Page size for the export's row walk. NOT a cap on the export: the walk
+# follows the store's continuation cursor to exhaustion, and this only bounds
+# how many rows are decoded per query. It was previously a hard per-instance
+# LIMIT whose overflow was discarded silently, which made the archive lie about
+# its own completeness.
+_EXPORT_TAR_PAGE_SIZE = 1_000
 
 
 def _admin_error(
@@ -234,6 +245,26 @@ async def get_stats(
     return await _aggregate_stats(targets)
 
 
+def _add_tally(
+    running: StateTally,
+    tallies: dict[UploadState, StateTally],
+    state: UploadState,
+) -> StateTally:
+    """Fold one instance's tally for ``state`` into a running total.
+
+    Args:
+        running: The total accumulated over the instances walked so far.
+        tallies: One instance's ``counts_by_state()`` answer. States with
+            zero rows are absent from it by contract.
+        state: The state to accumulate.
+
+    Returns:
+        The new running total.
+    """
+    this = tallies.get(state, StateTally(count=0, bytes=0))
+    return StateTally(count=running.count + this.count, bytes=running.bytes + this.bytes)
+
+
 async def _aggregate_stats(targets: list[InstanceContext]) -> StatsResponse:
     """Aggregate stats across the given instance list."""
     in_flight = TierBreakdown(count=0, bytes=0)
@@ -253,16 +284,27 @@ async def _aggregate_stats(targets: list[InstanceContext]) -> StatsResponse:
         "file": TierBreakdown(count=0, bytes=0),
     }
     auth_expired_count = 0
-    # ``stored`` is terminal, so the non-terminal loop below never sees it
-    # and ``by_state.stored`` would stay structurally zero. We add a
+    # ``stored``, ``succeeded`` and ``failed`` are terminal, so the
+    # non-terminal loop below never sees them and their three
+    # :class:`StateBreakdown` fields would stay structurally zero. We add a
     # second, read-only GROUP BY aggregate (counts_by_state) and consume
-    # ONLY its ``stored`` entry here - the non-terminal entries, in_flight,
+    # ONLY those three entries here - the non-terminal entries, in_flight,
     # and body_location keep coming from the loop, so the loop is not
-    # redundant. The two reads (auth_expired from the loop, stored from
-    # the aggregate) are eventually-consistent by design; admin stats
-    # tolerate the small skew under concurrent writes, so they are NOT
-    # forced into one transaction.
+    # redundant. The two reads (auth_expired from the loop, the terminal
+    # tallies from the aggregate) are eventually-consistent by design;
+    # admin stats tolerate the small skew under concurrent writes, so they
+    # are NOT forced into one transaction.
+    #
+    # S1-3: ``succeeded_recent`` and ``failed_recent`` were initialized to
+    # zero and written NOWHERE, while the aggregate that carries their
+    # numbers was already being fetched three lines later for ``stored``
+    # and then discarded. The name's "recent" is the retention window, not
+    # a separate clock: the reaper deletes terminal rows per
+    # ``retention.<state>_metadata_seconds``, so what remains in the table
+    # IS the recent set.
     stored_tally = StateTally(count=0, bytes=0)
+    succeeded_tally = StateTally(count=0, bytes=0)
+    failed_tally = StateTally(count=0, bytes=0)
     for ctx in targets:
         rows = await ctx.store.list_non_terminal()
         for row in rows:
@@ -284,12 +326,14 @@ async def _aggregate_stats(targets: list[InstanceContext]) -> StatsResponse:
             if row.state == "auth_expired":
                 auth_expired_count += 1
         tallies = await ctx.store.counts_by_state()
-        stored_this = tallies.get("stored", StateTally(count=0, bytes=0))
-        stored_tally = StateTally(
-            count=stored_tally.count + stored_this.count,
-            bytes=stored_tally.bytes + stored_this.bytes,
-        )
+        stored_tally = _add_tally(stored_tally, tallies, "stored")
+        succeeded_tally = _add_tally(succeeded_tally, tallies, "succeeded")
+        failed_tally = _add_tally(failed_tally, tallies, "failed")
     by_state.stored = TierBreakdown(count=stored_tally.count, bytes=stored_tally.bytes)
+    by_state.succeeded_recent = TierBreakdown(
+        count=succeeded_tally.count, bytes=succeeded_tally.bytes
+    )
+    by_state.failed_recent = TierBreakdown(count=failed_tally.count, bytes=failed_tally.bytes)
     # Parked = the operator-owned non-success backlog: ``stored`` (terminal,
     # body recoverable) plus ``auth_expired`` (waiting for a token).
     parked_total = stored_tally.count + auth_expired_count
@@ -335,6 +379,41 @@ def _service_version() -> str:
         return "unknown"
 
 
+def _aggregate_ad_reachability(
+    targets: list[InstanceContext],
+) -> Literal["reachable", "unreachable", "not_configured"]:
+    """Fold every instance's minter observation into the ADR-007 signal.
+
+    S1-7. The field used to be the hardcoded literal ``"not_configured"``
+    with no producer anywhere, so an instance could report
+    ``refresh_strategy="ad_client_credentials"`` and
+    ``ad_reachability="not_configured"`` in the same body, and an operator
+    whose app registration was unreachable got no signal from the one field
+    designed to give it.
+
+    Worst-wins, matching ``ready``: one unreachable minter makes the
+    deployment's AD unreachable. A minter that has not completed its first
+    cycle is NOT yet evidence of reachability, so it reads through as
+    ``unreachable`` rather than borrowing a healthy sibling's answer; the
+    minter mints on its first loop iteration, so that state resolves within
+    one cycle of boot.
+
+    Args:
+        targets: The live instances to fold over.
+
+    Returns:
+        ``"not_configured"`` when no instance configures ``ad_mint``, else
+        ``"reachable"`` only when every configured minter has observed a
+        successful mint.
+    """
+    observations = [ctx.minter.reachability for ctx in targets if ctx.minter is not None]
+    if not observations:
+        return "not_configured"
+    if all(seen is AdReachability.REACHABLE for seen in observations):
+        return "reachable"
+    return "unreachable"
+
+
 @router.get("/status", response_model=AdminStatusResponse)
 async def get_admin_status(
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
@@ -342,12 +421,30 @@ async def get_admin_status(
         ResolvedDefaultsSummary | None,
         Depends(get_resolved_defaults_summary),
     ],
+    degraded_instances: Annotated[
+        Sequence[DegradedInstance],
+        Depends(get_degraded_instances),
+    ],
 ) -> AdminStatusResponse:
-    """Aggregate admin status."""
+    """Aggregate admin status.
+
+    ``ready`` answers the ADR-007 question "can the caller keep sending or
+    should it back off", so it reads the SAME typed degraded set
+    ``GET /v1/readyz`` reads (seam 3, overridden by the composition root)
+    rather than the hardcoded ``True`` it used to be (S1-6). A deployment
+    whose every instance failed its storage boot answered
+    ``{"ready": true, "instances": []}`` here while ``/v1/readyz`` on the
+    same process answered false, and the operator polling this surface was
+    told to keep sending into a service that could buffer nothing.
+
+    The two surfaces now agree by construction: not ready when any instance
+    booted degraded, and not ready when no instance is live at all.
+    """
     summaries: list[InstanceSummary] = []
     total_backlog = 0
     total_disk_bytes = 0
-    for ctx in dispatcher.all_instances():
+    live = list(dispatcher.all_instances())
+    for ctx in live:
         rows = await ctx.store.list_non_terminal()
         summaries.append(
             InstanceSummary(
@@ -363,11 +460,11 @@ async def get_admin_status(
         # the two writers, so the request does no filesystem work.
         total_disk_bytes += await ctx.file_body_store.total_bytes()
     return AdminStatusResponse(
-        ready=True,
+        ready=not degraded_instances and bool(live),
         disk_usage_bytes=total_disk_bytes,
         total_backlog=total_backlog,
         instances=summaries,
-        ad_reachability="not_configured",
+        ad_reachability=_aggregate_ad_reachability(live),
         resolved_defaults=resolved_defaults,
         implementation=_IMPLEMENTATION_ID,
         service_version=_service_version(),
@@ -397,19 +494,59 @@ async def list_instances(
     return InstanceListResponse(instances=out)
 
 
+def _empty_state_breakdown() -> StateBreakdown:
+    """Build an all-zero :class:`StateBreakdown`.
+
+    Used for an instance with no open store, where every tally is zero
+    because there is nothing to read, not because the buffer is empty.
+    """
+    return StateBreakdown(
+        queued=TierBreakdown(count=0, bytes=0),
+        attempting=TierBreakdown(count=0, bytes=0),
+        auth_expired=TierBreakdown(count=0, bytes=0),
+        stored=TierBreakdown(count=0, bytes=0),
+        succeeded_recent=TierBreakdown(count=0, bytes=0),
+        failed_recent=TierBreakdown(count=0, bytes=0),
+    )
+
+
 @router.get("/instances/{instance_id}/status", response_model=InstanceStatusResponse)
 async def get_instance_status(
     instance_id: str,
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
+    degraded_instances: Annotated[
+        Sequence[DegradedInstance],
+        Depends(get_degraded_instances),
+    ],
 ) -> InstanceStatusResponse:
     """Per-instance admin status.
 
-    Raises 421 ``instance_unknown`` when the named instance is not
-    configured (plan §5.6 error table); the app-level handler converts
-    that into a canonical ``ErrorEnvelope`` response.
+    ``degraded_durability`` is read from the typed degraded set (seam 3),
+    not hardcoded ``False`` (S1-6). A degraded instance never enters the
+    dispatcher, so before this the ONLY answer this route could give for
+    one was 421 ``instance_unknown``, which reads as "you asked about an
+    instance that does not exist" for an instance that exists and cannot
+    write. It now answers for a configured-but-degraded instance with
+    ``ready=False`` and ``degraded_durability=True``; its tallies are zero
+    because there is no open store to read, which the two flags say.
+
+    Raises 421 ``instance_unknown`` only when the named instance is in
+    neither set, i.e. genuinely not configured (plan §5.6 error table);
+    the app-level handler converts that into a canonical ``ErrorEnvelope``
+    response.
     """
     ctx = dispatcher.by_id(instance_id)
     if ctx is None:
+        if any(degraded.instance_id == instance_id for degraded in degraded_instances):
+            return InstanceStatusResponse(
+                id=instance_id,
+                ready=False,
+                in_flight=TierBreakdown(count=0, bytes=0),
+                by_state=_empty_state_breakdown(),
+                auth=AuthStatus(phantom_token_expires_at=None, auth_expired_count=0),
+                disk_usage_bytes=0,
+                degraded_durability=True,
+            )
         raise UnknownInstanceError(instance_id)
     stats = await _aggregate_stats([ctx])
     return InstanceStatusResponse(
@@ -502,6 +639,97 @@ def _parse_key_value_match(raw: str) -> tuple[str, str]:
     return key, value
 
 
+@dataclass(frozen=True)
+class _UploadPageQuery:
+    """One ``GET /v1/admin/chains`` page request, as the store sees it.
+
+    Attributes:
+        state: Optional state predicate (store-side).
+        route: Optional route-name predicate (store-side).
+        multifile_id: Optional multi-file set (store-side; one-shot,
+            ``send_order`` ordered, never cursor-paginated).
+        group_id: Optional query-grouping handle (store-side).
+        since: Optional receipt-time lower bound (store-side).
+        instance: Optional instance scope (store-side).
+        limit: Maximum rows to RETURN, after the body-location filter.
+        cursor: The caller's continuation token, or ``None`` for page one.
+        body_location: Optional body-location scope. The store has no such
+            predicate, so this one is applied in Python and is why paging
+            has to keep going until the page is full.
+    """
+
+    state: UploadState | None
+    route: str | None
+    multifile_id: UUID | None
+    group_id: UUID | None
+    since: datetime | None
+    instance: str | None
+    limit: int
+    cursor: str | None
+    body_location: BodyLocation | None
+
+
+async def _page_matching_uploads(
+    ctx: InstanceContext, query: _UploadPageQuery
+) -> tuple[list[UploadRow], str | None]:
+    """Return up to ``query.limit`` MATCHING rows plus a continuation cursor.
+
+    S1-4. ``body_location`` is not a store predicate, so it has to be
+    applied after the read. Applied once, it consumed rows the store's
+    LIMIT had already spent: a page could come back empty with a non-null
+    cursor while matching rows sat further along, and the natural client
+    idiom ("stop when a page comes back empty") concluded there were none.
+
+    This walks the store's own continuation instead, and only ever returns
+    a cursor that resumes exactly after the last row it RETURNED:
+
+    * a page whose matches all fit is consumed, and the cursor moves past
+      it;
+    * a page that would overflow the caller's ``limit`` is NOT consumed,
+      and the returned cursor is that page's own start, so its matches come
+      back on the next request rather than being skipped. The first page
+      can never overflow (the store returns at most ``limit`` rows), so
+      this never stalls;
+    * an exhausted walk returns whatever matched and a null cursor, so an
+      empty answer always carries a null cursor.
+
+    With ``body_location`` unset every row matches and the loop makes
+    exactly one store call, which is the pre-existing behaviour unchanged.
+
+    Args:
+        ctx: The instance whose store is being paged.
+        query: The page request.
+
+    Returns:
+        ``(rows, next_cursor)``; ``next_cursor`` is ``None`` when the walk
+        reached the end of this instance's matching rows.
+    """
+    matched: list[UploadRow] = []
+    page_cursor = query.cursor
+    while True:
+        chunk, store_next = await ctx.store.list_uploads(
+            state=query.state,
+            route=query.route,
+            multifile_id=query.multifile_id,
+            group_id=query.group_id,
+            since=query.since,
+            limit=query.limit,
+            cursor=page_cursor,
+            instance=query.instance,
+        )
+        page_matches = [
+            row
+            for row in chunk
+            if query.body_location is None or row.body_location == query.body_location
+        ]
+        if matched and len(matched) + len(page_matches) > query.limit:
+            return matched, page_cursor
+        matched.extend(page_matches)
+        if len(matched) >= query.limit or store_next is None:
+            return matched, store_next
+        page_cursor = store_next
+
+
 @router.get("/chains", response_model=ListUploadsResponse)
 async def list_uploads(
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
@@ -537,7 +765,14 @@ async def list_uploads(
     continuation token.
 
     ``body_location`` query parameter scopes by which body store
-    currently holds the chain's bytes (``ram`` vs ``file``).
+    currently holds the chain's bytes (``ram`` vs ``file``). The store has
+    no such predicate, so the scoping is a post-filter; it is applied by
+    :func:`_page_matching_uploads`, which keeps following the store's
+    continuation until it has a full page of MATCHES or the store is
+    exhausted (S1-4). Applied naively, once, after the store had already
+    spent the LIMIT, a page came back EMPTY with a non-null ``next_cursor``
+    while matching rows sat further along, and any client using the natural
+    "stop when a page is empty" idiom concluded there were none.
 
     The ``key_value_match`` branch is a one-shot lookup (not paginated)
     because the underlying store helper returns at most ``limit`` rows
@@ -579,28 +814,27 @@ async def list_uploads(
     # (see CONTEXT.md "Topology and storage"), so the one-instance
     # path is the load-bearing one - the multi-instance fan-out
     # concatenates the per-instance pages.
+    query = _UploadPageQuery(
+        state=state,
+        route=route,
+        multifile_id=multifile_id,
+        group_id=group_id,
+        since=since,
+        instance=instance,
+        limit=limit,
+        cursor=cursor,
+        body_location=body_location,
+    )
     all_rows: list[UploadRow] = []
     next_cursor: str | None = None
     for ctx in targets:
-        chunk, store_next = await ctx.store.list_uploads(
-            state=state,
-            route=route,
-            multifile_id=multifile_id,
-            group_id=group_id,
-            since=since,
-            limit=limit,
-            cursor=cursor,
-            instance=instance,
-        )
+        chunk, store_next = await _page_matching_uploads(ctx, query)
         all_rows.extend(chunk)
         # Carry the last non-None cursor (single-instance: this is the
         # store's continuation; multi-instance: the last instance's
         # continuation, which the client uses on the next request).
         if store_next is not None:
             next_cursor = store_next
-
-    if body_location is not None:
-        all_rows = [r for r in all_rows if r.body_location == body_location]
 
     # Sort merged result for determinism across the multi-instance
     # concatenation. Default: matches the per-store ``ORDER BY
@@ -928,19 +1162,55 @@ def _refuse_incomplete_body(row: UploadRow, body: dict[str, bytes]) -> None:
         raise BodyMissingError(row.chain_id, sorted(missing))
 
 
+async def _read_whole_body(ctx: InstanceContext, row: UploadRow) -> dict[str, bytes]:
+    """Read every body_ref for ``row``, refusing a short or absent body.
+
+    S1-2. ``BodyStore.get_all`` answers a PARTIAL directory by omitting the
+    absent refs, but raises ``KeyError`` when the whole chain namespace is
+    gone. The two read surfaces caught only the first shape, so the
+    DOMINANT absence case - the sender deletes the entire body directory
+    the moment a chain succeeds at the default
+    ``retention.succeeded_body_seconds`` - escaped as a bare 500 with a
+    non-JSON body that the SDK's error decoder cannot parse. Both shapes
+    are the same fact, so both raise the same typed refusal here, which is
+    what ``_build_tar_stream`` already did for its own read.
+
+    Args:
+        ctx: The instance holding the body store.
+        row: The row whose declared ``body_hashes`` set the expectation.
+
+    Returns:
+        The complete body-ref mapping.
+
+    Raises:
+        BodyMissingError: When any declared ref is absent, whether the
+            store answered short or had no namespace at all.
+    """
+    try:
+        body = await ctx.body_store.get_all(row.chain_id)
+    except KeyError:
+        raise BodyMissingError(row.chain_id, sorted(row.body_hashes.keys())) from None
+    _refuse_incomplete_body(row, body)
+    return body
+
+
 @router.get("/chains/{chain_id}/body")
 async def get_upload_body(
     chain_id: UUID,
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
 ) -> StreamingResponse:
-    """Stream the body bytes, or refuse when any declared body_ref is absent."""
+    """Stream the body bytes, or refuse when any declared body_ref is absent.
+
+    Both absence shapes refuse with the same ``storage_corruption``
+    envelope: a short read AND a body directory that is entirely gone
+    (S1-2, :func:`_read_whole_body`).
+    """
     ctx, row = await _find_upload_with_ctx(dispatcher, chain_id)
     if row is None or ctx is None:
         raise NotFoundError(f"chain {chain_id} not found")
     # Single body store reference; HybridBodyStore
     # routes the read to the RAM or file half by RAM-presence.
-    body = await ctx.body_store.get_all(row.chain_id)
-    _refuse_incomplete_body(row, body)
+    body = await _read_whole_body(ctx, row)
     payload = b"".join(body.values())
     return StreamingResponse(_chunk_bytes(payload), media_type="application/octet-stream")
 
@@ -965,13 +1235,13 @@ async def get_upload_bundle(
     A real multipart implementation would require an SDK; the simple
     JSON envelope is sufficient for admin tooling and the v1 milestone.
     An envelope carrying fewer body_refs than the row declares is refused
-    with ``storage_corruption`` rather than returned as a 200 (N2).
+    with ``storage_corruption`` rather than returned as a 200 (N2), and so
+    is a chain whose body namespace is gone entirely (S1-2).
     """
     ctx, row = await _find_upload_with_ctx(dispatcher, chain_id)
     if row is None or ctx is None:
         raise NotFoundError(f"chain {chain_id} not found")
-    body = await ctx.body_store.get_all(row.chain_id)
-    _refuse_incomplete_body(row, body)
+    body = await _read_whole_body(ctx, row)
     bundle = {
         "metadata": json.loads(row.model_dump_json()),
         "body_refs": {name: data.hex() for name, data in body.items()},
@@ -1059,12 +1329,34 @@ async def _build_tar_stream(
                         continue
                     chunk.append(row)
             else:
-                chunk, _ = await ctx.store.list_uploads(
-                    state=filter_body.state,
-                    route=filter_body.route,
-                    since=filter_body.since,
-                    limit=_EXPORT_TAR_PER_INSTANCE_LIMIT,
-                )
+                # PAGE to exhaustion rather than taking one capped chunk.
+                # ADR-005 specifies an archive containing every buffered file's
+                # body, and the previous single call discarded the store's
+                # continuation cursor and stopped at the cap with no marker
+                # anywhere in the archive or its manifest.
+                #
+                # The default row retention is ten times that cap, and the
+                # export deliberately includes terminal states, which is where
+                # rows accumulate. So a device holding more rows than the cap
+                # answered with a 200 and a well-formed archive that was
+                # missing bodies, and the operator's recovery looked complete.
+                # The omission was also systematically biased: the listing is
+                # ordered received_at ASC, so the rows silently dropped were
+                # the MOST RECENT ones, which are precisely the ones an
+                # operator running an export during an incident wants.
+                chunk = []
+                cursor: str | None = None
+                while True:
+                    page, cursor = await ctx.store.list_uploads(
+                        state=filter_body.state,
+                        route=filter_body.route,
+                        since=filter_body.since,
+                        limit=_EXPORT_TAR_PAGE_SIZE,
+                        cursor=cursor,
+                    )
+                    chunk.extend(page)
+                    if cursor is None:
+                        break
             for row in chunk:
                 manifest.append(
                     {
@@ -1264,9 +1556,7 @@ async def cancel_upload(
     if ctx is None or row is None:
         raise NotFoundError(f"chain {chain_id} not found")
     outcome = await ctx.store.cancel(chain_id)
-    await ctx.saturation.settle(
-        SlotDelta.from_cancel(outcome, size_bytes=outcome.row.body_size_bytes)
-    )
+    await ctx.saturation.settle(SlotDelta.from_cancel(outcome, size_bytes=outcome.body_size_bytes))
     return outcome.row
 
 
@@ -1277,6 +1567,31 @@ async def delete_upload(
 ) -> Response:
     """Hard delete one chain + its body.
 
+    The BYTES go first, while the row is still live, and the row DELETE is
+    the last effect. This route is the one deletion path that needs no
+    R10-D1 re-read guard, and the ordering is why: a live row makes a
+    same-chain_id re-POST impossible for the whole window, because
+    admission's pre-check refuses it with ``chain_id_in_use``. That is a
+    structural block, not a check. The sibling paths (the reaper's eviction
+    pass and the admin bulk delete) cannot have it, because they delete
+    many rows and must fall back on re-reading the live table; here the
+    single chain lets the row itself hold the door. Pinned by
+    ``test_single_delete_blocks_readmission_by_ordering``.
+
+    A4/D3 argued for inverting this to confirm-then-act, so that a
+    ``store.delete`` raising (a WAL write lock held past the busy timeout)
+    could not strand a live ``queued`` row with no bytes. The stranding is
+    real, but inverting trades it for a worse failure: the row DELETE
+    legalizes a re-POST immediately, and any guard on the later body delete
+    is a time-of-check-to-time-of-use gap. A re-POST landing inside that
+    gap has its OWN freshly accepted bytes deleted by the old row's
+    cleanup, and that upload already answered 202. Losing bytes Phantom
+    promised to deliver is worse than a bad diagnosis on a delete the
+    operator asked for, so the ordering stays and the diagnosis is fixed
+    instead: a failed row delete now raises
+    :class:`BodyDeletedRowSurvivedError` rather than letting the row drift
+    into ``corrupted`` with ``last_error=body_missing_in_sender``.
+
     Settles the saturation gate against the removal (R8-4), using the
     accounting captured atomically with the DELETE.
     """
@@ -1284,7 +1599,17 @@ async def delete_upload(
     if ctx is None or row is None:
         raise NotFoundError(f"chain {chain_id} not found")
     await ctx.body_store.delete(chain_id)
-    accounting = await ctx.store.delete(chain_id)
+    try:
+        accounting = await ctx.store.delete(chain_id)
+    except Exception as exc:
+        logger.error(
+            "delete_upload removed the bodies for chain_id=%s and then failed to "
+            "delete the row; the row is live and undeliverable until the operator "
+            "retries: %s",
+            chain_id,
+            exc,
+        )
+        raise BodyDeletedRowSurvivedError(chain_id) from exc
     # ``accounting is None`` is a MISSING-ROW answer, not a crossing:
     # ``store.delete`` returns ``DeletedRowAccounting | None`` and no
     # adapter has a None arm, so the guard survives while the slot
@@ -1306,6 +1631,13 @@ async def bulk_delete_uploads(
     An all-None filter is refused with the 422
     ``bulk_delete_filter_empty`` envelope (ADR-004: an empty filter
     would mean "delete every row").
+
+    ``instance`` is a real filter on BOTH sides (S1-1): it narrows the
+    target instances AND is forwarded to the store, whose own empty-filter
+    guard otherwise raised an uncaught ``ValueError`` for the
+    instance-only request that this route's 422 message, ADR-017's
+    ``bulk_delete_filter_empty`` row and the SDK's ``DeleteFilter.is_empty``
+    all advertise as valid.
 
     **This endpoint is NOT idempotent.** The filter is re-evaluated against
     the LIVE table on every call, so its blast radius is not fixed to what
@@ -1338,6 +1670,7 @@ async def bulk_delete_uploads(
             state=filter_body.state,
             route=filter_body.route,
             since=filter_body.since,
+            instance=filter_body.instance,
         )
         # C1 closure: delete the corresponding body files alongside the
         # rows. Previously body files were leaked until the orphan
@@ -1388,10 +1721,31 @@ async def bulk_delete_uploads(
 async def list_tokens(
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
     endpoint: str | None = Query(None),
+    instance: str | None = Query(None),
 ) -> TokenListResponse:
-    """List token slots (NO bearer values; ADR-004)."""
+    """List token slots (NO bearer values; ADR-004).
+
+    ``instance`` scopes the listing the way every sibling list route already
+    does, through :func:`_scope_instances`. It was the one omission: the SDK
+    sent the parameter and FastAPI silently discarded it, so a multi-instance
+    operator debugging a parked row was handed the union across every instance
+    with no attribution. ``TokenSlot`` carries no instance id, so the same
+    ``(endpoint, uid)`` pair appeared N times indistinguishably, and a healthy
+    slot belonging to one instance read as proof that another had a good
+    credential.
+
+    Args:
+        dispatcher: Instance dispatcher dependency.
+        endpoint: Optional destination-host filter.
+        instance: Optional instance id. Unknown ids raise
+            :class:`UnknownInstanceError`, which the app handler renders as a
+            421, matching every other scoped route.
+
+    Returns:
+        The token slots for the scoped instances, without bearer values.
+    """
     out = []
-    for ctx in dispatcher.all_instances():
+    for ctx in _scope_instances(dispatcher, instance):
         out.extend(await ctx.token_cache.list_slots(endpoint=endpoint))
     return TokenListResponse(tokens=out)
 
@@ -1403,9 +1757,31 @@ async def push_token_one(
     body: Annotated[TokenPushRequest, Body()],
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
 ) -> Response:
-    """Push a bearer for one slot."""
+    """Push a bearer for one ``(endpoint, uid)`` slot.
+
+    The ``{endpoint}`` segment is normalized through the SAME
+    ``host_key_for`` helper the reader uses (``BearerAuthProvider``) and
+    that admission writes with, so the push key equals the lookup key BY
+    CONSTRUCTION (E2). Written raw, as it was, a push to
+    ``S3.Example.COM/u1`` INSERTED A SECOND ROW beside the lower-cased one
+    the provider reads - the DDL is ``PRIMARY KEY (endpoint, uid)`` with no
+    ``COLLATE NOCASE`` - so the provider missed, the kicker never woke the
+    parked rows, and the push still answered 204. The credential push at
+    :func:`push_credential_one` already closed this for its own key space;
+    this was the latent half.
+
+    Args:
+        endpoint: The destination-host path segment (normalized at the door).
+        uid: The credential identifier, opaque to Phantom and NOT normalized.
+        body: The bearer to cache.
+        dispatcher: The instance dispatcher.
+
+    Returns:
+        An empty ``204`` response.
+    """
+    endpoint_key = host_key_for(endpoint)
     for ctx in dispatcher.all_instances():
-        await ctx.token_cache.set(endpoint, uid, body.token, source="admin_push")
+        await ctx.token_cache.set(endpoint_key, uid, body.token, source="admin_push")
     return Response(status_code=204)
 
 
@@ -1415,10 +1791,24 @@ async def push_token_endpoint(
     body: Annotated[TokenPushRequest, Body()],
     dispatcher: Annotated[InstanceDispatcher, Depends(get_dispatcher)],
 ) -> Response:
-    """Push a bearer to every slot at an endpoint."""
+    """Push a bearer to every slot at an endpoint.
+
+    The ``{endpoint}`` segment is normalized through ``host_key_for`` (E2),
+    so the enumeration and the write both address the key space the reader
+    resolves in. See :func:`push_token_one` for what the raw segment cost.
+
+    Args:
+        endpoint: The destination-host path segment (normalized at the door).
+        body: The bearer to cache in every slot at that endpoint.
+        dispatcher: The instance dispatcher.
+
+    Returns:
+        An empty ``204`` response.
+    """
+    endpoint_key = host_key_for(endpoint)
     for ctx in dispatcher.all_instances():
-        for slot in await ctx.token_cache.list_slots(endpoint=endpoint):
-            await ctx.token_cache.set(endpoint, slot.uid, body.token, source="admin_push")
+        for slot in await ctx.token_cache.list_slots(endpoint=endpoint_key):
+            await ctx.token_cache.set(endpoint_key, slot.uid, body.token, source="admin_push")
     return Response(status_code=204)
 
 
@@ -1447,9 +1837,23 @@ async def delete_token_one(
     and an operator can see exactly which credential needs replacement.
     This route therefore flips the slot's status rather than hard-deleting
     it (R-EX3); the SDK ``invalidate_token`` contract matches.
+
+    The ``{endpoint}`` segment is normalized through ``host_key_for`` (E2)
+    for the same reason the pushes are: matched raw, an operator's
+    ``S3.Example.COM`` invalidation silently flipped nothing while
+    answering 204, and the bad credential stayed in use.
+
+    Args:
+        endpoint: The destination-host path segment (normalized at the door).
+        uid: The credential identifier, opaque to Phantom and NOT normalized.
+        dispatcher: The instance dispatcher.
+
+    Returns:
+        An empty ``204`` response.
     """
+    endpoint_key = host_key_for(endpoint)
     for ctx in dispatcher.all_instances():
-        await ctx.token_cache.mark_bad(endpoint, uid)
+        await ctx.token_cache.mark_bad(endpoint_key, uid)
     return Response(status_code=204)
 
 
@@ -1490,8 +1894,9 @@ async def push_credential_one(
     helper the executor uses for its forward-time credential lookup
     (``phantom.routing``), so the push key equals the lookup key
     ``HostCredKey(host_key_for(full_url))`` BY CONSTRUCTION: a host pushed as
-    ``S3.amazonaws.com`` resolves a request to ``s3.amazonaws.com`` (the
-    silent-miss class the token push left latent is closed here).
+    ``S3.amazonaws.com`` resolves a request to ``s3.amazonaws.com``. The
+    token push now normalizes the same way (E2); this is no longer the only
+    push surface that does.
 
     Each instance's :attr:`~phantom.instances.context.InstanceContext.signer_creds`
     store is ``set`` under that host key. ``set`` freshens the slot
@@ -1666,9 +2071,25 @@ async def get_observability_ram_pressure(
     zero for fields whose instance configuration disables them (e.g.,
     ``persist_controller_queue_depth = 0`` in all_ram / all_disk where
     no PersistController is wired).
+
+    ``ram_ceiling_bytes`` is NOT a sum (SW-5). ``_build_snapshot`` shares
+    one ``BodyStoreCfg`` by reference across every instance, so the ceiling
+    is ONE GLOBAL VALUE, and ``RamPressureWatcher`` enforces that value
+    against EACH instance's own bytes. Summed, as it was, four instances at
+    2 GiB published an 8 GiB denominator no enforcement point has ever
+    used, and an operator diagnosing constant migration churn read 31
+    percent utilisation and ruled RAM pressure out. The smallest configured
+    ceiling is reported, because that is the first one any instance
+    breaches; with the shared config object every instance reports the same
+    number anyway.
+
+    ``pending_migrations`` is the per-instance queue plus that instance's
+    in-flight set, summed (S1-5). It previously added the RUNNING TOTAL
+    queue depth on each iteration, so it over-counted quadratically and
+    showed an operator a migration backlog that did not exist.
     """
     total_bytes = 0
-    ceiling_bytes = 0
+    ceilings: list[int] = []
     pending = 0
     queue_depth = 0
     for ctx in dispatcher.all_instances():
@@ -1678,11 +2099,13 @@ async def get_observability_ram_pressure(
             total_bytes += await ram_bs.total_bytes()
         snapshot = ctx.current_settings()
         if snapshot.body_store.ram_ceiling_bytes is not None:
-            ceiling_bytes += snapshot.body_store.ram_ceiling_bytes
+            ceilings.append(snapshot.body_store.ram_ceiling_bytes)
         # PersistController exposes its internal queue size; queue + in-flight.
         if ctx.persist_controller is not None:
-            queue_depth += ctx.persist_controller._queue.qsize()
-            pending += queue_depth + len(ctx.persist_controller._in_flight)
+            this_queue = ctx.persist_controller._queue.qsize()
+            queue_depth += this_queue
+            pending += this_queue + len(ctx.persist_controller._in_flight)
+    ceiling_bytes = min(ceilings) if ceilings else 0
     return RamPressureStatusResponse(
         ram_body_store_bytes=total_bytes,
         ram_ceiling_bytes=ceiling_bytes,
@@ -1730,6 +2153,12 @@ async def get_quarantine_inventory(
     entries: list[QuarantineEntry] = []
     for ctx in targets:
         paths = instance_storage_paths(data_root, ctx.cfg)
+        # The walk is hoisted and awaited OFF the event loop (SP-4). It is a
+        # recursive rglob plus a stat per file, and run inline nothing else on
+        # the loop progressed for its whole duration: no admission, no sender
+        # attempt, no heartbeat, no kicker tick. The await cannot live inside
+        # the comprehension below, which is why this is a separate statement.
+        found = await list_quarantines_off_loop(paths.data_root)
         entries.extend(
             QuarantineEntry(
                 backup_id=e.backup_id,
@@ -1742,7 +2171,7 @@ async def get_quarantine_inventory(
                 bytes=e.bytes,
                 anomaly=e.anomaly,
             )
-            for e in list_quarantines(paths.data_root)
+            for e in found
         )
     return QuarantineInventoryResponse(quarantines=entries)
 
@@ -1905,6 +2334,29 @@ class NotFoundError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+class BodyDeletedRowSurvivedError(Exception):
+    """Raised when ``DELETE /v1/admin/chains/{id}`` loses its row delete.
+
+    The route deletes the bytes first so that a live row blocks a
+    same-chain_id re-POST for the whole window (see :func:`delete_upload`).
+    That ordering has one cost: if the row DELETE then fails, typically a WAL
+    write lock held past the busy timeout, the row survives with no bytes and
+    is undeliverable.
+
+    Before this existed the failure was silent in the worst way. The operator
+    saw a bare 500, and the sender later picked the row up, failed to load its
+    bodies, and drove it terminal ``corrupted`` with
+    ``last_error=body_missing_in_sender``, which reads as a storage fault
+    rather than as an operator delete that half-landed. Naming the state means
+    the operator is told exactly what happened and that retrying the same
+    DELETE finishes the job, which it does: the body delete is idempotent.
+    """
+
+    def __init__(self, chain_id: UUID) -> None:
+        super().__init__(f"bodies deleted but row {chain_id} survived")
+        self.chain_id = chain_id
 
 
 class RestoreNoOpError(Exception):
@@ -2078,6 +2530,15 @@ ADMIN_ERROR_SPECS: dict[type[Exception], AdminErrorSpec[Any]] = {
     NotFoundError: AdminErrorSpec[NotFoundError](
         code="not_found",
         message=lambda exc: exc.message,
+    ),
+    BodyDeletedRowSurvivedError: AdminErrorSpec[BodyDeletedRowSurvivedError](
+        code="storage_unavailable",
+        message=lambda exc: (
+            f"Deleted the bodies for chain {exc.chain_id} but the row delete "
+            f"failed, so the row is live and undeliverable. Retry this DELETE; "
+            f"the body delete is idempotent."
+        ),
+        details=lambda exc: {"chain_id": str(exc.chain_id), "bodies_deleted": True},
     ),
     RestoreNoOpError: AdminErrorSpec[RestoreNoOpError](
         code="restore_noop",
@@ -2284,6 +2745,57 @@ def register_admin_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(
         RequestValidationError,
         request_validation_exception_handler,  # type: ignore[arg-type]
+    )
+    app.add_exception_handler(Exception, _unhandled_admin_error)
+
+
+async def _unhandled_admin_error(request: Request, exc: Exception) -> Response:
+    """Render any unhandled exception as the ADR-017 ``internal_error`` envelope.
+
+    ADR-017 states that every error response carries an ``ErrorEnvelope``, and
+    it documents a 500 ``internal_error`` row. Until this handler existed that
+    was an unenforced CONVENTION: only the enumerated spec types and
+    ``RequestValidationError`` were registered, so anything else reached
+    starlette's default and returned a bare ``500 Internal Server Error`` with a
+    non-JSON body. The SDK decodes admin failures through
+    ``EXCEPTION_FOR_CODE``, so those responses did not surface as a typed
+    exception at all: the caller got a decode failure instead, exactly when it
+    most needed to know what went wrong.
+
+    The escapes were not hypothetical. A malformed pagination cursor raised a
+    base64 decoding error, a JSON decoding error, or ``ValueError`` out of the
+    listing route, depending on how it was malformed; a body read on a chain
+    whose bytes retention had already discarded raised ``KeyError``; a bulk
+    delete filtered only by instance raised ``ValueError`` from the store's
+    empty-filter guard; and a body-store failure during an
+    idempotency-collision rollback raised ``OSError``.
+
+    Patching each site is the bandaid. Registering the fallback makes the
+    envelope contract STRUCTURALLY true rather than maintained by hand, so the
+    next unhandled raise is a typed 500 the SDK can classify rather than a
+    decode error. The individual sites are still worth fixing on their own
+    merits, because a 500 is the wrong ANSWER for several of them; this handler
+    only guarantees the SHAPE.
+
+    Args:
+        request: The failing request, used for its correlation id.
+        exc: The unhandled exception.
+
+    Returns:
+        A ``500`` response carrying the canonical envelope. The
+        exception's message is deliberately NOT echoed: an unhandled error's
+        text is uncontrolled and can carry a path, a query or a credential.
+    """
+    logger.exception(
+        "unhandled admin error on %s %s",
+        request.method,
+        request.url.path,
+    )
+    return _admin_error(
+        code="internal_error",
+        message="The admin API failed to handle this request.",
+        instance_id="unrouted",
+        details={"exception_class": type(exc).__name__},
     )
 
 

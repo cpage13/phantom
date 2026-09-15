@@ -31,11 +31,13 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 from phantom.config.settings import RetentionCfg
 from phantom.instances.context import InstanceContext
 from phantom.models.upload import UploadState
 from phantom.observability.metrics import MetricsRegistry
+from phantom.storage.interface import BodyStore
 from phantom.workers.saturation import SlotDelta
 
 logger = logging.getLogger(__name__)
@@ -123,6 +125,48 @@ class Reaper:
         now = datetime.now(tz=UTC)
         for instance in self._instances:
             await self._sweep_instance(instance, now)
+
+    async def _reclaim_bodies(self, body_store: BodyStore, chain_id: UUID) -> bool:
+        """Delete one chain's bodies, absorbing a removal failure.
+
+        S8-5's second consequence lives here rather than in the store. The
+        sweep awaits the body delete inside a loop over states, and the loop
+        over instances sits above that, so a single ``EACCES``/``EPERM``/
+        ``EBUSY`` on one upload directory used to abandon the rest of the tick
+        for every remaining state AND every remaining instance, taking the
+        metadata pass, the ``max_rows`` backstop and the idempotency-index
+        trim with it. One stuck file must not stop the reaper reclaiming
+        everything else.
+
+        Absorbing it here and not in ``FileBodyStore.delete`` is deliberate.
+        Reclaiming is best-effort for the REAPER, because the body-orphan
+        janitor re-lists the tree every sweep and meets the remainder again.
+        It is not best-effort for admission, which clears this namespace
+        before writing a retry's body and must not put over a half-cleared
+        tree, nor for the idempotency-collision rollback, which turns the
+        failure into a 503 with ``Retry-After``. Swallowing inside the store
+        would have silenced the signal for those callers too.
+
+        Args:
+            body_store: The instance's body store.
+            chain_id: The chain whose bodies should be reclaimed.
+
+        Returns:
+            True when the tree came away cleanly, False when it did not. A
+            False result means the bytes actually unlinked are already
+            accounted and the janitor will retry the remainder.
+        """
+        try:
+            await body_store.delete(chain_id)
+        except OSError as exc:
+            logger.error(
+                "reaper could not reclaim the bodies for chain_id=%s; continuing the "
+                "sweep and leaving the remainder to the body-orphan janitor: %s",
+                chain_id,
+                exc,
+            )
+            return False
+        return True
 
     async def _sweep_instance(self, instance: InstanceContext, now: datetime) -> None:
         """Sweep the single persistent store for one instance."""
@@ -226,7 +270,8 @@ class Reaper:
                     await instance.saturation.settle(
                         SlotDelta.from_discard(outcome, size_bytes=outcome.body_size_bytes)
                     )
-                    await body_store.delete(chain_id)
+                    if not await self._reclaim_bodies(body_store, chain_id):
+                        continue
                     await self._reaper_actions_total.inc(label_value=_REAPER_ACTION_BODY_DISCARDED)
             # Metadata-row deletion pass.
             if metadata_seconds >= 0:
@@ -281,7 +326,7 @@ class Reaper:
                 # stays keyed on the atomically captured eviction
                 # accounting.
                 if await store.get(entry.chain_id) is None:
-                    await body_store.delete(entry.chain_id)
+                    await self._reclaim_bodies(body_store, entry.chain_id)
                 # R8-4: same rule as the metadata pass - an evicted
                 # stored row still holding its slot releases it here.
                 await instance.saturation.settle(

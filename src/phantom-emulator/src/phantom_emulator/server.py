@@ -140,19 +140,21 @@ class Server:
         self.state.resume()
 
     def expire_all_now(self) -> None:
-        """Age every issued JWT past its ``exp``.
+        """Expire every credential the emulator has issued or accepted.
 
         The in-process face of ``POST /control/expire-all-now``; both delegate
         to :meth:`EmulatorState.expire_all_now`, including its static-token
-        re-mint.
+        re-mint and the credential-ledger marking that makes the expiry
+        visible to the stateless JWT check.
         """
         self.state.expire_all_now()
 
     def revoke_tokens(self) -> None:
-        """Drop every issued JWT.
+        """Revoke every credential the emulator has issued or accepted.
 
         The in-process face of ``POST /control/revoke-tokens``; both delegate
-        to :meth:`EmulatorState.revoke_tokens`.
+        to :meth:`EmulatorState.revoke_tokens`, so a revoked bearer 401s in
+        the default ``oauth_client_credentials`` mode as well.
         """
         self.state.revoke_tokens()
 
@@ -181,8 +183,12 @@ class Server:
         self.state.set_presigned_ttl(seconds)
 
     def set_idempotency_dedup_window(self, seconds: int) -> None:
-        """Set the create-response idempotency cache lifetime for new entries."""
-        self.state.cfg.upstream.idempotency_dedup_window_seconds = seconds
+        """Set the create-response idempotency cache lifetime for new entries.
+
+        The in-process face of ``POST /control/idempotency-dedup-window``;
+        both delegate to :meth:`EmulatorState.set_idempotency_dedup_window`.
+        """
+        self.state.set_idempotency_dedup_window(seconds)
 
     def set_seed(self, seed: int) -> None:
         """Reseed the failure-injection RNG.
@@ -211,10 +217,12 @@ class Server:
         return list(self.state.upstream_events)
 
     def clear_received(self) -> None:
-        """Drop latest accepted bodies and append-only upstream events.
+        """Drop every record of what the emulator has received.
 
         The in-process face of ``POST /control/clear-received``; both delegate
-        to :meth:`EmulatorState.clear_received`.
+        to :meth:`EmulatorState.clear_received`, which owns the full list of
+        received-side stores (accepted bodies, the event log, both sinks, and
+        the idempotency cache).
         """
         self.state.clear_received()
 

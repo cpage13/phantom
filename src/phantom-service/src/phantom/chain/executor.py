@@ -16,16 +16,21 @@ owns:
    immediately, so a brace span is forwarded as content. The raw-intake
    catch-all sets that marker, because an object key may legally contain
    braces.
-3. Auth injection - looks up ``token_cache.get(endpoint, uid)`` when the
+3. Idempotency-header injection per the step's ``idempotency_header``, which
+   runs BEFORE auth so the header is inside a SigV4 signature and under the
+   same hop-by-hop strip as any other; a name that collides with a framing or
+   reserved header is refused rather than smuggled past the strip.
+4. Auth injection - looks up ``token_cache.get(endpoint, uid)`` when the
    route is ``phantom_bearer``.
-4. Idempotency-header injection per the step's ``idempotency_header``.
 5. The HTTP send through :class:`UpstreamClient`, with EXACTLY ONE framing
    mechanism on the wire: hop-by-hop, framing and connection-scoped headers
    (plus whatever ``Connection`` names) are stripped from every step, so the
    only framing is the ``Content-Length`` the transport computes over the
    bytes actually forwarded. ``Content-Encoding: aws-chunked`` and
    ``x-amz-decoded-content-length`` describe the BODY, not the hop, and are
-   forwarded.
+   forwarded. Every header Phantom itself writes goes through
+   :mod:`phantom.chain.headers`, so no name can reach the wire twice in two
+   casings.
 6. Capture extraction from the response (JSONPath, first-match).
 7. Result classification (Succeeded / 4xx / 5xx / FailedAuth /
    FailedNetwork / TemplateUnresolved / CaptureNotRenderable /
@@ -57,6 +62,7 @@ from phantom.chain.auth_providers import (
     SigV4AuthProvider,
     sanitised_host_for,
 )
+from phantom.chain.headers import has_header, set_header
 from phantom.chain.jsonpath import extract, find_placeholders, substitute, whole_placeholder
 from phantom.chain.parser import (
     InlineBodyDecodeError,
@@ -73,7 +79,7 @@ from phantom.models.chain import (
     ChainStep,
 )
 from phantom.models.upload import CapturedStepValues, CapturedValues, UploadRow
-from phantom.routing import AuthMode, ResolvedRoute, host_key_for
+from phantom.routing import AuthMode, ResolvedRoute, host_key_for, is_absolute_url
 from phantom.storage.interface import CredentialStore, TokenCache
 from phantom.transport.interface import UpstreamClient, UpstreamRequest
 
@@ -159,6 +165,38 @@ _CONTROL_CHARS = re.compile(r"[\r\n\x00]")
 """Characters that make a header value un-sendable: ``h11`` refuses them."""
 
 
+def _wire_encodable(value: str, *, site: Literal["url", "header", "body"]) -> bool:
+    """Report whether ``value`` can be encoded onto the wire at ``site``.
+
+    The two codecs the pinned httpx applies, verified against it rather than
+    recalled. A HEADER value is encoded ``ascii``, so any non-ASCII character
+    refuses. A URL (and a text body, which the executor encodes itself) is
+    encoded ``utf-8``, so only a LONE SURROGATE refuses.
+
+    Why this is a gate and not a ``try``: the failure httpx raises is
+    ``UnicodeEncodeError``, which is a ``ValueError`` and is not part of the
+    httpx exception hierarchy at all. ``HttpxUpstreamClient.send`` catches
+    ``httpx.HTTPError``, this executor catches ``httpx.HTTPError``, the sender's
+    ``_drive_one`` catches four storage and index types and ``_worker_loop``
+    catches ``sqlite3.OperationalError``, so the exception reaches the
+    supervising ``asyncio.TaskGroup``, the process drains, startup recovery
+    resets the row to ``queued``, and the next claim crashes on it again. A
+    value that cannot be encoded has to be refused before it is handed over.
+
+    Args:
+        value: The rendered text about to be spliced into the request.
+        site: Which part of the request it is going into.
+
+    Returns:
+        ``True`` when the value survives that site's encoding.
+    """
+    try:
+        value.encode("ascii" if site == "header" else "utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class Succeeded:
     """Step completed; ``captured`` is the new (or augmented) CapturedValues snapshot."""
@@ -192,10 +230,20 @@ class FailedAuth:
 
 @dataclass(frozen=True)
 class Failed4xx:
-    """Non-auth 4xx - terminal."""
+    """Non-auth 4xx - terminal.
+
+    The upstream response body is deliberately NOT carried (finding SL4-9).
+    No consumer read it: the sender's arm formats ``4xx_status_{status}`` and
+    nothing else touches the variant. Holding it was a latent disclosure
+    vector rather than dead weight alone, because a 4xx body routinely echoes
+    the request's own signature or credential identifiers and the field sat
+    one format string away from ``last_error``, which the admin API surfaces.
+    That is the hazard ``TemplateUnresolved`` and ``CaptureNotRenderable``
+    were restructured to make structurally impossible; this is the same rule
+    applied to the one variant that carried upstream bytes.
+    """
 
     status: int
-    body: bytes
 
 
 @dataclass(frozen=True)
@@ -294,7 +342,7 @@ class TemplateUnresolved:
 class CaptureNotRenderable:
     """A capture cannot be rendered into the context its placeholder sits in (F8).
 
-    Two reasons, and both are terminal. A NON-SCALAR (a captured object or
+    Three reasons, and all are terminal. A NON-SCALAR (a captured object or
     array) can only be delivered as structure, and only one position offers
     that: a JSON body node that is exactly one placeholder and is not a key.
     Anywhere else, the result has to be a string, and the old path spliced a
@@ -303,11 +351,23 @@ class CaptureNotRenderable:
     value cannot be sent at all: ``h11`` refuses to build the request, httpx
     surfaces that as an ``HTTPError``, the executor classified it
     ``FailedNetwork`` and the row burned its whole retry budget on a request
-    that could never exist.
+    that could never exist. An UNENCODABLE value is the worse sibling of that
+    one: a lone UTF-16 surrogate, which ``json.loads`` accepts and both
+    ``json.dumps`` and SQLite round-trip happily, makes httpx raise
+    ``UnicodeEncodeError`` - a ``ValueError`` that is not in the httpx
+    exception hierarchy, so nothing between here and the supervising TaskGroup
+    catches it and the process crash-loops on the row forever.
 
     Terminal ``failed`` rather than retryable, because a retry is provably
     futile: the capture is already persisted, so re-rendering it produces the
     same refusal.
+
+    Raised from TWO points. At RENDER time, when a persisted capture is about
+    to be spliced into this step's URL, header or text body. And at CAPTURE
+    time, for the ``unencodable`` reason only, when the value is extracted from
+    an upstream response - the earlier point, chosen so the landmine never
+    reaches the database at all, with the render-time gate keeping its job of
+    clearing rows that were persisted before this guard existed.
 
     Carries IDENTIFIERS ONLY, never the captured value, and that is a proven
     property rather than a hope. ``TemplateUnresolved`` carries the same rule
@@ -316,13 +376,17 @@ class CaptureNotRenderable:
     be worse. Every field below is an identifier or a closed literal.
 
     Attributes:
-        step_name: The CONSUMING step, whose template holds the placeholder.
-            Regex-constrained to ``^[a-z][a-z0-9_]*$`` by ``ChainStep``.
+        step_name: The CONSUMING step, whose template holds the placeholder,
+            or - for a capture-time refusal - the PRODUCING step whose response
+            the value came out of. Regex-constrained to ``^[a-z][a-z0-9_]*$``
+            by ``ChainStep`` either way.
         site: WHICH PART of the step refused, as a closed ``Literal``, the
-            same three members ``TemplateUnresolved`` uses.
+            same three members ``TemplateUnresolved`` uses. A capture-time
+            refusal reports ``body``, the response body it was extracted from.
         placeholder: ``producing_step.capture_name``. Both halves are bounded
             by ``_PLACEHOLDER_RE``'s ``[a-z][a-z0-9_]*`` groups, so neither
-            can carry URL or JSON text.
+            can carry URL or JSON text. A capture-time refusal names the
+            capture the same way, so the operator token reads identically.
         reason: Which rule refused, as a closed ``Literal``.
         header_name: The header whose value refused, and ``None`` for the
             ``url`` and ``body`` sites. Safe for the same reason
@@ -333,7 +397,7 @@ class CaptureNotRenderable:
     step_name: str
     site: Literal["url", "header", "body"]
     placeholder: str
-    reason: Literal["non_scalar", "control_character"]
+    reason: Literal["non_scalar", "control_character", "unencodable"]
     header_name: str | None = None
 
     def token(self) -> str:
@@ -569,7 +633,7 @@ class ChainExecutor:
         if url_refusal is not None:
             return url_refusal
         substituted_url, ok = self._substitute_or_literal(
-            step.url, row.captured_values, templated=envelope.templated
+            step.url, values, templated=envelope.templated
         )
         if not ok:
             return TemplateUnresolved(
@@ -603,7 +667,7 @@ class ChainExecutor:
             if header_refusal is not None:
                 return header_refusal
             rendered, header_ok = self._substitute_or_literal(
-                value, row.captured_values, templated=envelope.templated
+                value, values, templated=envelope.templated
             )
             if not header_ok:
                 return TemplateUnresolved(
@@ -616,7 +680,7 @@ class ChainExecutor:
 
         try:
             body_bytes, body_content_type, sub_ok, body_refusal = self._render_body(
-                step, row.captured_values, body_refs, templated=envelope.templated
+                step, values, body_refs, templated=envelope.templated
             )
         except InlineBodyDecodeError as exc:
             logger.warning(
@@ -639,19 +703,62 @@ class ChainExecutor:
                 site="body",
                 unresolved=_placeholder_names(body_template) if body_template else (),
             )
-        if body_content_type is not None and "Content-Type" not in substituted_headers:
-            substituted_headers["Content-Type"] = body_content_type
+        # A CASE-INSENSITIVE presence test. The keys of ``substituted_headers``
+        # carry the producer's original casing, which on every ASGI path is
+        # lower-case, so ``"Content-Type" not in substituted_headers`` missed an
+        # existing ``content-type: image/jpeg`` and stamped a second key beside
+        # it. ``_synthesize_envelope`` builds its ``ChainBodyRef`` with no
+        # content_type, so ``body_content_type`` takes the model default and
+        # every raw-intake upload that declared one shipped BOTH: S3 recombines
+        # them to ``image/jpeg,application/octet-stream``, answers 403
+        # SignatureDoesNotMatch, and the sender terminates the row ``failed``.
+        if body_content_type is not None and not has_header(substituted_headers, "Content-Type"):
+            set_header(substituted_headers, "Content-Type", body_content_type)
+
+        # (b2) Idempotency header, injected HERE rather than after the auth
+        # stage. The old position was after BOTH the hop-by-hop strip above and
+        # the sigv4 signer, which broke two guarantees at once. On an
+        # ``aws_sigv4`` route ``provider.prepare`` has already rebuilt the map
+        # from botocore's signed view, so a step declaring
+        # ``idempotency_header: "x-amz-meta-idempotency"`` shipped an x-amz-*
+        # header absent from ``SignedHeaders`` and S3 answered 403; the executor
+        # then marked the host's credential slot bad, parking every row for that
+        # destination. And on ANY route the name is producer-supplied and only
+        # checked for RFC 7230 token characters, so ``Host`` and
+        # ``Content-Length`` were both admissible and both bypassed the strip
+        # entirely - verified emitting ``Content-Length: 3`` over an 11-byte body
+        # and a rewritten ``Host``, on every attempt, because the header is
+        # persisted. Injecting before the auth stage puts the header inside the
+        # signature and under the same strip rule as any other.
+        self._inject_idempotency_header(step, envelope, substituted_headers, hop_by_hop)
 
         full_url = self._absolute_url(substituted_url, envelope)
 
         # Resolve the route first: it decides the auth provider at (c) below,
         # and the send-deadline gate at (a') reads its deadline.
+        #
+        # The handler must not be able to raise out of itself. It used to call
+        # ``sanitised_host_for`` on the SAME url whose parse had just raised,
+        # and the old ``sanitised_host_for`` used ``urlparse``, whose
+        # ``.hostname`` raises ``ValueError('Invalid IPv6 URL')``. Admission
+        # route-checks only the FIRST step, so a later step's URL is never
+        # validated: a step 2 URL of ``https://{{s1.host}}/obj`` with an
+        # ``s1.host`` capture of ``[bad`` renders ``https://[bad/obj``,
+        # ``_resolve_route`` raised, and the handler below raised again UNCAUGHT
+        # into a sender that catches four storage and index types and a loop
+        # that catches ``sqlite3.OperationalError``, cancelling every sender
+        # worker in the TaskGroup and stopping delivery service-wide with this
+        # row still in ``attempting`` holding its saturation slot.
+        # ``sanitised_host_for`` is now total (it swallows every parse failure
+        # into the ``<no-host>`` token), and ``resolve_route`` refuses a URL
+        # with no dialable host rather than keying it by its own path, so an
+        # unparseable or relative URL lands here as a clean ``RouteUnresolved``.
         try:
             resolved = self._resolve_route(full_url, self._instance)
         except ValueError:
             # Sanitised host for the persisted token. NOT ``host_key_for``: that
-            # helper (``phantom.routing``) returns the WHOLE INPUT when urlparse
-            # finds no host, and a step URL legitimately can be a bare path, so
+            # helper (``phantom.routing``) returns the WHOLE INPUT when it finds
+            # no host, and a step URL legitimately can be a bare path, so
             # reusing it would splice the path and its query string into
             # ``last_error``. ``sanitised_host_for`` is the form that may be
             # persisted, and both docstrings state the split.
@@ -703,10 +810,6 @@ class ChainExecutor:
         # provider hands back what it was given.
         full_url = outcome.url
 
-        # (d) Inject idempotency header.
-        if step.idempotency_header:
-            substituted_headers[step.idempotency_header] = envelope.idempotency_key
-
         # (e) Send via the transport. The resolved route may carry a
         # per-route timeout (§5.2) - pass it through; None falls back to
         # the upstream client's constructor default.
@@ -724,7 +827,23 @@ class ChainExecutor:
 
         # (f) Classify.
         if 200 <= response.status < 300:
-            new_captures = await self._extract_captures(step, response.body, row.captured_values)
+            extracted = await self._extract_captures(step, response.body, row.captured_values)
+            if isinstance(extracted, CaptureNotRenderable):
+                # The step SUCCEEDED upstream and a capture it declared cannot
+                # be encoded onto any wire. Terminal, and refused here so the
+                # value is never written to the row: persisting it is what
+                # turns one bad response into a permanent crash-loop.
+                logger.warning(
+                    "step %r of chain_id=%s returned %d but captured a value that "
+                    "cannot be encoded (%s); terminating the row rather than "
+                    "persisting it",
+                    step.name,
+                    row.chain_id,
+                    response.status,
+                    extracted.token(),
+                )
+                return extracted
+            new_captures = extracted
             # finding R7-5-B: do NOT advance on the 2xx status ALONE. A 2xx
             # with a truncated/incomplete body (D-05/D-13, a CGNAT half-close,
             # a buggy proxy that returns 2xx before the body is whole) leaves
@@ -774,10 +893,66 @@ class ChainExecutor:
                 status=response.status, observed_at=self._clock(), blocked_host=blocked
             )
         if 400 <= response.status < 500:
-            return Failed4xx(status=response.status, body=response.body)
+            return Failed4xx(status=response.status)
         if response.status >= 500:
             return Failed5xx(status=response.status)
         return FailedNetwork(error=f"Unexpected status {response.status}")
+
+    @staticmethod
+    def _inject_idempotency_header(
+        step: ChainStep,
+        envelope: ChainEnvelope,
+        headers: dict[str, str],
+        hop_by_hop: frozenset[str],
+    ) -> None:
+        """Write the step's ``idempotency_header``, refusing a name that cannot carry it.
+
+        ``idempotency_header`` is producer-supplied and admission validates only
+        that it is made of RFC 7230 token characters (``_validate_step_headers``
+        does not look at this field at all), so ``Host``, ``Content-Length``,
+        ``Transfer-Encoding``, anything the step's own ``Connection`` names, and
+        the reserved ``X-Phantom-*`` namespace are all admissible spellings.
+        Each of them is a name Phantom has already decided must not reach the
+        upstream, and a persisted one reproduced its damage on every attempt.
+
+        A colliding name is DROPPED, at WARNING, which is the same verdict the
+        loop above reaches for a hop-by-hop name in ``step.headers`` - one rule
+        for one class of header, rather than a second rule that happens to be
+        reachable through a different field. The consequence is that the step
+        sends with no idempotency header, so an upstream retry may duplicate;
+        the alternative was emitting a ``Content-Length`` that contradicts the
+        body or a ``Host`` that redirects the request, which defeats the two
+        guarantees the hop-by-hop set exists to hold. Refusing the ENVELOPE at
+        admission with a 422 is the better place for this and needs an owner of
+        ``routes/admission.py``.
+
+        The write itself goes through
+        :func:`~phantom.chain.headers.set_header`, so a step that both declares
+        ``idempotency_header: "X-Idem"`` and carries its own ``x-idem`` header
+        sends one, not two.
+
+        Args:
+            step: The step being executed.
+            envelope: The chain, for ``idempotency_key``.
+            headers: The outbound header map, mutated in place.
+            hop_by_hop: This request's hop-by-hop set, from
+                :func:`_hop_by_hop_names` (the static set plus whatever this
+                step's ``Connection`` named).
+        """
+        name = step.idempotency_header
+        if not name:
+            return
+        lowered = name.lower()
+        if lowered in hop_by_hop or lowered.startswith(_PHANTOM_RESERVED_HEADER_PREFIX):
+            logger.warning(
+                "step %r declares idempotency_header %r, which is a hop-by-hop, framing "
+                "or Phantom-reserved name; dropping it rather than letting it bypass the "
+                "strip. The step will send with no idempotency header",
+                step.name,
+                name,
+            )
+            return
+        set_header(headers, name, envelope.idempotency_key)
 
     def _auth_provider_for(self, auth_mode: AuthMode) -> AuthSlotProvider:
         """Pick this route's auth provider, exhaustively over ``auth_mode``.
@@ -894,7 +1069,7 @@ class ChainExecutor:
 
     @staticmethod
     def _substitute_or_literal(
-        template: str, captured: CapturedValues, *, templated: bool
+        template: str, values: dict[str, dict[str, Any]], *, templated: bool
     ) -> tuple[str, bool]:
         """Substitute placeholders, or pass the text through for a literal chain.
 
@@ -904,9 +1079,16 @@ class ChainExecutor:
         it as one terminated a valid upload as ``failed`` with a template error
         it never had a template for.
 
+        Takes the FLATTENED captures, like its sibling
+        :meth:`_first_unrenderable` (finding SL4-8). It used to take
+        :class:`CapturedValues` and re-flatten the whole structure on every
+        call, so one step attempt rebuilt an identical dict-of-dicts once per
+        header and once per string node of a JSON body, on the event loop,
+        while every call site already held the flattened view.
+
         Args:
             template: The raw text, which may contain ``{{step.capture}}``.
-            captured: The chain's captured values.
+            values: The flattened captures, ``step -> {capture: value}``.
             templated: The envelope's marker. ``False`` short-circuits.
 
         Returns:
@@ -914,7 +1096,7 @@ class ChainExecutor:
         """
         if not templated:
             return template, True
-        return substitute(template, ChainExecutor._captures_as_dict(captured))
+        return substitute(template, values)
 
     @staticmethod
     def _first_unrenderable(
@@ -959,11 +1141,19 @@ class ChainExecutor:
             if step_values is None or name not in step_values:
                 continue  # unresolved is TemplateUnresolved's business, not ours
             value = step_values[name]
-            reason: Literal["non_scalar", "control_character"]
+            reason: Literal["non_scalar", "control_character", "unencodable"]
             if not (value is None or isinstance(value, _TEXT_SCALARS)):
                 reason = "non_scalar"
             elif site == "header" and isinstance(value, str) and _CONTROL_CHARS.search(value):
                 reason = "control_character"
+            elif isinstance(value, str) and not _wire_encodable(value, site=site):
+                # The catch-up arm for rows already holding a poisoned capture.
+                # ``_extract_captures`` refuses an unencodable value before it
+                # is persisted, but a row admitted before that guard existed
+                # still carries one, and it is exactly that row that recovery
+                # resets to ``queued`` and re-claims on every restart. Refusing
+                # here turns the crash-loop into one terminal row.
+                reason = "unencodable"
             else:
                 continue
             return CaptureNotRenderable(
@@ -978,7 +1168,7 @@ class ChainExecutor:
     def _render_json_body(
         self,
         value: dict[str, Any],
-        captured: CapturedValues,
+        values: dict[str, dict[str, Any]],
         *,
         templated: bool,
         step_name: str,
@@ -1012,7 +1202,8 @@ class ChainExecutor:
 
         Args:
             value: The parsed JSON body from the envelope.
-            captured: The chain's captured values.
+            values: The flattened captures, ``step -> {capture: value}``,
+                computed once by the caller (SL4-8).
             templated: The envelope's ``templated`` marker (N3).
             step_name: The consuming step, for any refusal raised.
 
@@ -1022,7 +1213,6 @@ class ChainExecutor:
         if not templated:
             return value, True, None  # N3's rule, applied once to the whole body
         resolved = True
-        values = self._captures_as_dict(captured)
 
         def walk(node: Any, *, is_key: bool) -> tuple[Any, CaptureNotRenderable | None]:
             """Rebuild ``node`` with every placeholder resolved in place."""
@@ -1066,7 +1256,7 @@ class ChainExecutor:
             )
             if bad is not None:
                 return None, bad
-            rendered, ok = self._substitute_or_literal(node, captured, templated=True)
+            rendered, ok = self._substitute_or_literal(node, values, templated=True)
             if not ok:
                 resolved = False
             return rendered, None
@@ -1080,7 +1270,20 @@ class ChainExecutor:
     def _captures_as_dict(
         captured: CapturedValues,
     ) -> dict[str, dict[str, Any]]:
-        """Flatten :class:`CapturedValues` for the substitute helper."""
+        """Flatten :class:`CapturedValues` into the view every render site takes.
+
+        Called ONCE per step attempt, at the top of :meth:`execute_one_step`,
+        and threaded from there through the URL, header and body sites
+        (SL4-8). Nothing downstream re-derives it: a step attempt rebuilding
+        an identical dict-of-dicts once per header and once per string node of
+        a JSON body is pure event-loop time for byte-identical output.
+
+        Args:
+            captured: The chain's captured values.
+
+        Returns:
+            ``step -> {capture: value}``.
+        """
         return {name: dict(step.values) for name, step in captured.steps.items()}
 
     @staticmethod
@@ -1104,7 +1307,7 @@ class ChainExecutor:
     def _render_body(
         self,
         step: ChainStep,
-        captured: CapturedValues,
+        values: dict[str, dict[str, Any]],
         body_refs: dict[str, bytes],
         *,
         templated: bool,
@@ -1118,7 +1321,8 @@ class ChainExecutor:
 
         Args:
             step: The step whose body is being rendered.
-            captured: The chain's captured values.
+            values: The flattened captures, ``step -> {capture: value}``,
+                computed once by the caller (SL4-8).
             body_refs: The rehydrated body bytes, keyed by ref name.
             templated: The envelope's ``templated`` marker. ``_render_body``
                 does not receive the envelope, so the flag is passed down; a
@@ -1136,7 +1340,7 @@ class ChainExecutor:
             return b"", None, True, None
         if isinstance(step.body, ChainBodyJson):
             substituted, ok, bad = self._render_json_body(
-                step.body.value, captured, templated=templated, step_name=step.name
+                step.body.value, values, templated=templated, step_name=step.name
             )
             if bad is not None:
                 return b"", None, False, bad
@@ -1150,16 +1354,14 @@ class ChainExecutor:
         if isinstance(step.body, ChainBodyText):
             refusal = self._first_unrenderable(
                 step.body.value,
-                self._captures_as_dict(captured),
+                values,
                 templated=templated,
                 step_name=step.name,
                 site="body",
             )
             if refusal is not None:
                 return b"", None, False, refusal
-            rendered, ok = self._substitute_or_literal(
-                step.body.value, captured, templated=templated
-            )
+            rendered, ok = self._substitute_or_literal(step.body.value, values, templated=templated)
             if not ok:
                 return b"", None, False, None
             return rendered.encode("utf-8"), step.body.content_type, True, None
@@ -1182,8 +1384,21 @@ class ChainExecutor:
         return b"", None, True, None  # pragma: no cover: exhaustive above
 
     def _absolute_url(self, url: str, envelope: ChainEnvelope) -> str:
-        """Resolve ``url`` against ``envelope.default_target`` if needed."""
-        if "://" in url:
+        """Resolve ``url`` against ``envelope.default_target`` if needed.
+
+        The absolute test is :func:`~phantom.routing.is_absolute_url`, anchored
+        at position zero, and NOT the ``"://" in url`` substring search it
+        replaces - which is the identical defect
+        :func:`~phantom.routing.resolve_first_step_url` carried. A relative step
+        whose QUERY holds a URL value (``/upload?callback=https://cb.example/done``)
+        answered True, so ``default_target`` was skipped and the pathless URL
+        went on to the route gate, was keyed there as its own path-plus-query,
+        fnmatched a ``hosts: ['*']`` catch-all, collected injected auth and
+        reached httpx, which raised ``UnsupportedProtocol``. That IS an
+        ``httpx.HTTPError``, so it classified ``FailedNetwork`` and the row
+        burned its entire retry budget on a request that could never be sent.
+        """
+        if is_absolute_url(url):
             return url
         if envelope.default_target is None:
             return url
@@ -1255,7 +1470,7 @@ class ChainExecutor:
         step: ChainStep,
         body: bytes,
         existing: CapturedValues,
-    ) -> CapturedValues:
+    ) -> CapturedValues | CaptureNotRenderable:
         """Run JSONPath captures over ``body`` and merge into ``existing``.
 
         Emits a structured DEBUG log record carrying ``captures`` and
@@ -1263,6 +1478,28 @@ class ChainExecutor:
         :class:`phantom.observability.SensitiveCaptureRedactor` can redact
         values whose declaring :class:`ChainCapture` is ``sensitive=True``
         before the formatter sees them.
+
+        **Refuses an unencodable value here, before it is persisted.** A lone
+        UTF-16 surrogate survives every layer between an upstream response and
+        a later step's URL: ``json.loads`` accepts it, ``_first_unrenderable``
+        used to pass it (it is a ``str`` and ``_CONTROL_CHARS`` matches only CR,
+        LF and NUL), ``json.dumps`` and SQLite round-trip it, and then
+        ``httpx.Request`` raises ``UnicodeEncodeError`` - a ``ValueError``
+        outside the httpx exception hierarchy that nothing on the path catches,
+        so the process dies, recovery resets the row to ``queued`` and the next
+        claim dies on it again, stranding the whole backlog. Rejecting at
+        CAPTURE time rather than only at render time is the choice that keeps
+        the value out of the database entirely, so no restart can re-arm it.
+        It is applied to every captured string, not only to ones a later step
+        references: a value that cannot be encoded at all is upstream data
+        Phantom cannot represent, and keeping it because nothing happens to
+        reference it today leaves the landmine for the next envelope revision.
+
+        Returns:
+            The merged :class:`CapturedValues`, or a
+            :class:`CaptureNotRenderable` naming the first capture that cannot
+            be encoded. The caller returns the refusal, which the sender routes
+            to terminal ``failed``.
         """
         if not step.capture:
             return existing
@@ -1277,6 +1514,16 @@ class ChainExecutor:
         sensitive_names: set[str] = set()
         for capture in step.capture:
             value = extract(parsed_body, capture.from_path)
+            if isinstance(value, str) and not _wire_encodable(value, site="url"):
+                # IDENTIFIERS ONLY, exactly as at the render-time gate: the
+                # value is upstream response data and ``last_error`` reaches
+                # the admin API.
+                return CaptureNotRenderable(
+                    step_name=step.name,
+                    site="body",
+                    placeholder=f"{step.name}.{capture.name}",
+                    reason="unencodable",
+                )
             values[capture.name] = value
             if capture.ttl_seconds is not None:
                 expires_at[capture.name] = captured_at + timedelta(seconds=capture.ttl_seconds)

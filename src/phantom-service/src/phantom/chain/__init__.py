@@ -5,6 +5,10 @@ Modules:
 * :mod:`phantom.chain.jsonpath` - JSONPath compile/extract/scan helpers.
 * :mod:`phantom.chain.parser` - envelope+body_refs parser.
 * :mod:`phantom.chain.executor` - one-step execution primitive.
+* :mod:`phantom.chain.auth_providers` - the per-route prepare-or-park arms.
+* :mod:`phantom.chain.sigv4_signer` - the ``aws_sigv4`` re-signing primitive.
+* :mod:`phantom.chain.headers` - case-insensitive writes into the outbound
+  header dict, so no name reaches the wire twice in two casings.
 * :mod:`phantom.chain.query`: the byte-preserving query-string fold.
 """
 

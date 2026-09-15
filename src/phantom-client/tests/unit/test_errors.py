@@ -15,7 +15,6 @@ from phantom_client.errors import (
     PhantomNetworkError,
     PhantomNotFoundError,
     PhantomPayloadTooLargeError,
-    PhantomRateLimitedError,
     PhantomServerError,
     PhantomTimeoutError,
     PhantomTransportError,
@@ -47,7 +46,6 @@ def test_hierarchy_is_subtree() -> None:
         PhantomPayloadTooLargeError,
         PhantomUnprocessableError,
         PhantomValidationError,
-        PhantomRateLimitedError,
         PhantomServerError,
         PhantomUnavailableError,
     ):

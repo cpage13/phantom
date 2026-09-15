@@ -11,6 +11,12 @@ file, so the split keeps token reads and writes off the hot uploads
 writer lock, and a token is shared across many uploads anyway.
 
 Admin reads use :class:`TokenSlot` which has no bearer field (ADR-004).
+
+**``set``'s return value is a dead contract** (finding S9-7). All seven call
+sites across both auth stores discard it. It survives only because the
+``TokenCache`` Protocol in :mod:`phantom.storage.interface` declares it, and
+the two must change together; until then the value it returns describes the
+write it committed rather than a re-read that could report someone else's.
 """
 
 from __future__ import annotations
@@ -20,16 +26,23 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from typing import Final
 
 import aiosqlite
 
 from phantom.config.settings import SqliteCfg
 from phantom.models.admin import TokenSlot
-from phantom.models.token import TokenCacheRow, TokenSource
+from phantom.models.token import TokenCacheRow, TokenSource, TokenStatus
 from phantom.storage._connection import open_store_connection
 from phantom.storage.interface import WakeHandler
 
 logger = logging.getLogger(__name__)
+
+# The status every :meth:`SqliteTokenCache.set` forces. Named once because it
+# appears twice - in the UPSERT and in the row that call returns - and a
+# refreshed bearer un-badding the slot is what wakes parked rows, so the two
+# must not be able to drift apart.
+_FRESH_STATUS: Final[TokenStatus] = "fresh"
 
 
 def _row_to_cache_row(row: aiosqlite.Row) -> TokenCacheRow:
@@ -166,29 +179,43 @@ class SqliteTokenCache:
         bearer: str,
         *,
         source: TokenSource,
-    ) -> TokenCacheRow:
-        """Write ``bearer`` for ``(endpoint, uid)`` and fire wake handlers."""
+    ) -> None:
+        """Write ``bearer`` for ``(endpoint, uid)`` and fire wake handlers.
+
+        UPSERT forcing :data:`_FRESH_STATUS`, then fire the registered wake
+        handlers so parked rows for this slot are re-queued.
+
+        RETURNS NOTHING (finding S9-7). This used to hand back the slot it had
+        written, and none of the seven call sites ever read it. Producing it
+        also cost a second query that could contradict the write: the re-read
+        ran AFTER ``_write_txn`` released the write lock, so a ``mark_bad``
+        landing in that window made this method report ``status='bad'`` for a
+        write it had just forced to ``fresh``, a state its own transaction
+        never saw. Dropping the return removes the race, the query and an
+        unreachable error arm, on the auth-refresh hot path.
+
+        Args:
+            endpoint: The upstream host axis of the cache key (ADR-002).
+            uid: The opaque caller-supplied credential identifier.
+            bearer: The Authorization-header value to cache.
+            source: Where this bearer came from.
+        """
         conn = self._require_conn()
-        now_iso = datetime.now(tz=UTC).isoformat()
+        now = datetime.now(tz=UTC)
         async with self._write_txn(conn):
             await conn.execute(
-                """
+                f"""
                 INSERT INTO token_cache (endpoint, uid, bearer, observed_at, source, status)
-                VALUES (?, ?, ?, ?, ?, 'fresh')
+                VALUES (?, ?, ?, ?, ?, '{_FRESH_STATUS}')
                 ON CONFLICT(endpoint, uid) DO UPDATE SET
                   bearer = excluded.bearer,
                   observed_at = excluded.observed_at,
                   source = excluded.source,
-                  status = 'fresh'
+                  status = '{_FRESH_STATUS}'
                 """,
-                (endpoint, uid, bearer, now_iso, source),
+                (endpoint, uid, bearer, now.isoformat(), source),
             )
             await conn.commit()
-
-        # Re-read to return the full row.
-        fetched = await self.get(endpoint, uid)
-        if fetched is None:  # pragma: no cover - write just completed
-            raise RuntimeError("Token cache row missing after set")
 
         # Fire wake handlers. Exceptions in handlers are logged, not propagated.
         for handler in self._wake_handlers:
@@ -200,7 +227,6 @@ class SqliteTokenCache:
                     endpoint,
                     uid,
                 )
-        return fetched
 
     async def mark_bad(self, endpoint: str, uid: str) -> None:
         """ADR-003: bad tokens stay in cache, status flips to ``bad``."""

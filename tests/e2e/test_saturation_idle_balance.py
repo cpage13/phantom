@@ -62,18 +62,26 @@ def _driver_for(stack: E2EStack) -> PhantomDriver:
 
 
 async def _saturation_balance(admin_url: str) -> float:
-    """Read the live ``saturation_balance`` gauge off the admin API.
+    """Read the live ``saturation_balance`` across every instance.
 
     Wire shape (GaugesResponse): ``{"gauges": [{"name", "description",
-    "values": {"<label>": <float>}}]}``; the empty-string bucket is the
-    no-label total.
+    "values": {"<label>": <float>}}]}``.
+
+    SUMS every label bucket rather than reading one. Each instance's gate now
+    writes its own bucket keyed by instance id, because the registry is
+    process-wide and gauges are registered by bare name, so unlabelled writes
+    made the last instance to tick overwrite every other instance's value.
+    This helper wants the deployment-wide balance, which is the sum, and
+    summing is correct whether the deployment has one instance or many.
+    Reading ``values[""]`` alone, as this did, now reads a bucket nothing
+    writes and reports zero forever.
     """
     async with httpx.AsyncClient() as http:
         response = await http.get(f"{admin_url}/v1/admin/observability/gauges")
     response.raise_for_status()
     for entry in response.json()["gauges"]:
         if entry["name"] == "saturation_balance":
-            return float(entry["values"][""])
+            return float(sum(entry["values"].values()))
     raise AssertionError("saturation_balance gauge missing from the gauges response")
 
 
@@ -147,6 +155,23 @@ async def test_mixed_workload_drains_the_gate_to_zero() -> None:
             parked.append(UUID(str(result.id)))
         for chain_id in parked:
             await _await_first_attempt(pc, chain_id)
+
+        # FALSIFIABILITY GATE. Everything below asserts the ledger DRAINS, and
+        # the gauge starts at zero, so a gate that charged nothing at all would
+        # satisfy the drain poll on its first probe. That is not a hypothetical
+        # weakness: it cannot distinguish "every charge was correctly released"
+        # from "no charge was ever made", and the second removes the saturation
+        # cap entirely, which is the more dangerous of the two.
+        #
+        # Two rows are parked against a dead upstream right now, so this is the
+        # one moment in the run when the balance is provably non-zero. Pin it
+        # here, and the drain assertion below becomes falsifiable.
+        held = await _saturation_balance(stack.phantom_admin_url)
+        assert held > 0.0, (
+            "saturation_balance is zero while two rows are parked against a "
+            "dead upstream; the gate is not charging at all, so the drain "
+            "assertion below would pass vacuously"
+        )
 
         await pc.cancel(parked[0])
         await pc.delete_upload(parked[1])

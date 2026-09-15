@@ -27,7 +27,8 @@ same-second disambiguation logic exists (the prior cycle's H-1 / M-3-B bug
 class is unrepresentable, not guarded).
 
 The manifest (cycle-7 seam 2): every backup writes ONE
-:class:`BackupManifest` JSON (temp-then-rename, atomic) into the instance
+:class:`BackupManifest` JSON (temp, fsync, rename, fsync the parent - atomic
+in the name AND durable in the contents) into the instance
 data_root, named by ``backup_id``, BEFORE any artifact moves, so it declares
 intent. The manifest names both artifacts (db path, body path), which
 artifact the pair carries, the reason discriminator, and the display
@@ -56,7 +57,8 @@ Public surface (plan § 5.2.1, § 1.1, cycle-7 § 4):
   reconciliation for an interrupted backup OR restore move, keyed on
   ``backup_id``.
 * :func:`list_quarantines` - manifest-driven inventory (one entry per
-  backup plus anomaly entries).
+  backup plus anomaly entries). It WALKS THE FILESYSTEM, so every async
+  caller must reach it through :func:`list_quarantines_off_loop`.
 * :func:`load_backup_manifest` / :func:`backup_manifest_path` - manifest
   addressing for the admin restore route.
 * :class:`IntegrityChecker` - thin orchestrator that bundles the
@@ -68,6 +70,7 @@ Public surface (plan § 5.2.1, § 1.1, cycle-7 § 4):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -80,6 +83,11 @@ from uuid import UUID, uuid4
 import aiosqlite
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+# The one directory-fsync helper in the service, rather than a private second
+# copy here (S6-8). The import cannot cycle: file_body_store imports nothing
+# from phantom, which is the same reason app.py imports _makedirs_durable from
+# it.
+from phantom.storage.file_body_store import _sync_directory
 from phantom.storage.timestamps import utc_stamp
 
 logger = logging.getLogger(__name__)
@@ -294,20 +302,37 @@ class BackupMoveMarker(BaseModel):
 
 
 def _write_json_model_atomic(path: Path, model: BaseModel) -> None:
-    """Atomically write ``model`` as JSON to ``path``.
+    """Durably write ``model`` as JSON to ``path``, via a temp sibling.
 
     Writes a temp sibling then ``os.replace`` so a reader never sees a
     partial file (the rename is atomic on one filesystem). Shared by the
     manifest write and the marker write - the two on-disk records whose
     torn-write would corrupt crash recovery.
 
+    DURABILITY (S6-8): ``os.replace`` gives atomicity of the NAME, not
+    durability of the CONTENTS, and it leaves the new directory entry in the
+    parent's dirty page cache. So the temp file's bytes are fsynced BEFORE
+    the rename and the parent directory is fsynced AFTER it. Without both, a
+    power cut moments after a mode-switch backup begins can replay the
+    rename over unwritten blocks and leave a present-but-empty manifest or
+    marker: the next boot degrades the instance and the live tree stays
+    half-moved with no record naming where the bodies went, which is the
+    exact A-3 state the marker exists to prevent. This is the same contract
+    :class:`phantom.storage.file_body_store.FileBodyStore` already holds for
+    every body file, using the same directory-fsync helper rather than a
+    private second copy of it.
+
     Args:
         path: Destination path (inside the instance ``data_root``).
         model: The Pydantic model to persist.
     """
     tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(model.model_dump_json(), encoding="utf-8")
+    with tmp_path.open("wb") as fh:
+        fh.write(model.model_dump_json().encode("utf-8"))
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp_path, path)
+    _sync_directory(path.parent)
 
 
 def _read_backup_move_marker(marker_path: Path) -> BackupMoveMarker:
@@ -1206,6 +1231,31 @@ def list_quarantines(data_root: Path) -> list[QuarantineInventoryEntry]:
     return backups + anomalies
 
 
+async def list_quarantines_off_loop(data_root: Path) -> list[QuarantineInventoryEntry]:
+    """Run :func:`list_quarantines` in a worker thread.
+
+    The entry point every ASYNC caller must use. :func:`list_quarantines`
+    is a synchronous ``rglob("*")`` plus a ``stat`` per file over every
+    quarantined body tree, and a quarantined tree holds the backlog for
+    ``retention.stored_body_seconds`` (six months by default), so it can
+    be hundreds of thousands of files. Called inline from a coroutine,
+    NOTHING else runs on the event loop for the whole walk: no admission,
+    no sender attempt, no heartbeat, no kicker tick. One operator opening
+    the quarantine inventory would stall the whole service.
+
+    :class:`phantom.storage.file_body_store.FileBodyStore` already moved
+    the identical walk off the loop with ``asyncio.to_thread``; this is
+    the same treatment for its sibling.
+
+    Args:
+        data_root: The per-instance ``data_root`` to inventory.
+
+    Returns:
+        The same list :func:`list_quarantines` returns.
+    """
+    return await asyncio.to_thread(list_quarantines, data_root)
+
+
 # ---------------------------------------------------------------------
 # Class facade (plan § 5.2.2 - composition-root injection point).
 # ---------------------------------------------------------------------
@@ -1224,27 +1274,17 @@ class IntegrityChecker:
     Attributes:
         db_path: Persistent SQLite path.
         body_store_root: Body-store root directory.
-        data_root: The Phantom ``storage.data_dir`` directory. Used
-            for :meth:`list_quarantines` inventory queries.
     """
 
-    def __init__(
-        self,
-        *,
-        db_path: Path,
-        body_store_root: Path,
-        data_root: Path,
-    ) -> None:
+    def __init__(self, *, db_path: Path, body_store_root: Path) -> None:
         """Store paths; no side effects at construction.
 
         Args:
             db_path: Persistent SQLite path.
             body_store_root: Body-store root directory.
-            data_root: The Phantom ``storage.data_dir`` directory.
         """
         self._db_path = db_path
         self._body_store_root = body_store_root
-        self._data_root = data_root
 
     async def check(self) -> IntegrityCheckResult:
         """Run :func:`check_integrity` against the configured DB path."""
@@ -1261,10 +1301,6 @@ class IntegrityChecker:
         """
         return quarantine(self._db_path, self._body_store_root, timestamp)
 
-    def list_quarantines(self) -> list[QuarantineInventoryEntry]:
-        """Enumerate quarantine artifacts under the data root."""
-        return list_quarantines(self._data_root)
-
 
 __all__ = [
     "BACKUP_ID_FILENAME_TOKEN_LENGTH",
@@ -1280,6 +1316,7 @@ __all__ = [
     "check_integrity",
     "isolate_db_file",
     "list_quarantines",
+    "list_quarantines_off_loop",
     "load_backup_manifest",
     "quarantine",
     "quarantine_paths",
