@@ -18,7 +18,7 @@ The Dockerfiles live per-package (paths corrected 2026-07-15; ADR-020 consolidat
 - `src/phantom-deploy/Dockerfile` — phantom-service (see ADR-020).
 - `src/phantom-emulator/Dockerfile` — phantom-emulator (e2e/CI infrastructure; never published).
 
-Earlier Debian-slim placeholders at the repo root (`docker/Dockerfile`, `docker/docker-compose.yml`) are removed in this cycle (Phase 3 of `strategy_05_18.md`). The stub-era `tests/e2e/docker-compose.e2e.yml` was retired 2026-07-15 in favor of the live docker-marked lane (`tests/e2e/docker/compose.yml` + `test_docker_volume_replacement.py`).
+Earlier Debian-slim placeholders at the repo root (`docker/Dockerfile`, `docker/docker-compose.yml`) are removed in this cycle. The stub-era `tests/e2e/docker-compose.e2e.yml` was retired 2026-07-15 in favor of the live docker-marked lane (`tests/e2e/docker/compose.yml` + `test_docker_volume_replacement.py`).
 
 **Implementation status as of 2026-09-15.** The tag scheme above is not implemented. `.github/workflows/` contains exactly three workflows, `per_pr.yml`, `nightly_stress.yml` and `perf.yml`, and none of them builds, tags, signs or publishes an image. Nothing produces the versioned or `latest` tags this ADR describes, so there is no provenance on any artifact a consumer would pull and the image must currently be built locally. This paragraph records the gap rather than closing it; publishing is an outward-facing decision that belongs to the repository owner.
 

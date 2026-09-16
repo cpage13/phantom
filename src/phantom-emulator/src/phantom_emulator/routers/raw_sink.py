@@ -21,8 +21,9 @@ set): this router MUST be registered BEFORE the ``s3.py`` ``/{bucket}/{key:path}
 catch-all. Both templates are ``:path`` catch-alls and an upload to ``/raw/foo``
 matches BOTH; Starlette resolves by registration-order first-match, so only when
 ``raw_sink`` is registered first does ``/raw/...`` reach this auth-free sink
-(200) instead of the SigV4 validator (which 403s an unsigned upload). See
-``plan_06_22.md`` TASK 0.5 Step C.
+(200) instead of the SigV4 validator (which 403s an unsigned upload). The
+registration order is pinned by a test rather than by a pointer to a planning
+document that is not in this repository.
 """
 
 from __future__ import annotations

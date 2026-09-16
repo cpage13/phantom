@@ -51,8 +51,10 @@ lower-level methods to honor the pinned inbound value - resolving the prior
 "if Phantom ever switches… the validator must too" note (the validator
 need NOT switch its recompute; it must only enforce the header and key on it).
 
-See ``.agent/lifecycle/emulator_signing_DESIGNER.md`` §4-§5 and
-``plan_06_22.md`` Tasks 0.2-0.4.
+The reasoning above is self-contained on purpose. This docstring used to
+defer to a design note and a plan under the agent working directory, neither
+of which is in this repository or ever will be, so a reader of the published
+source had a pointer they could not follow.
 """
 
 from __future__ import annotations
