@@ -99,7 +99,7 @@ from phantom.storage.integrity import (
     quarantine,
     restore_mode_switch_backup,
 )
-from phantom.storage.interface import StateTally
+from phantom.storage.interface import TERMINAL_STATES, StateTally
 from phantom.storage.sqlite_store import PHANTOM_LOCAL_UUID_METADATA_KEY
 from phantom.workers.saturation import (
     AdmissionGranted,
@@ -275,6 +275,9 @@ async def _aggregate_stats(targets: list[InstanceContext]) -> StatsResponse:
         stored=TierBreakdown(count=0, bytes=0),
         succeeded_recent=TierBreakdown(count=0, bytes=0),
         failed_recent=TierBreakdown(count=0, bytes=0),
+        corrupted=TierBreakdown(count=0, bytes=0),
+        expired=TierBreakdown(count=0, bytes=0),
+        cancelled=TierBreakdown(count=0, bytes=0),
     )
     # Plan § 2.3.19: tier → body_location collapse.
     # Every row carries body_location ∈ {'ram', 'file'} (the source of
@@ -305,6 +308,9 @@ async def _aggregate_stats(targets: list[InstanceContext]) -> StatsResponse:
     stored_tally = StateTally(count=0, bytes=0)
     succeeded_tally = StateTally(count=0, bytes=0)
     failed_tally = StateTally(count=0, bytes=0)
+    corrupted_tally = StateTally(count=0, bytes=0)
+    expired_tally = StateTally(count=0, bytes=0)
+    cancelled_tally = StateTally(count=0, bytes=0)
     for ctx in targets:
         rows = await ctx.store.list_non_terminal()
         for row in rows:
@@ -329,11 +335,23 @@ async def _aggregate_stats(targets: list[InstanceContext]) -> StatsResponse:
         stored_tally = _add_tally(stored_tally, tallies, "stored")
         succeeded_tally = _add_tally(succeeded_tally, tallies, "succeeded")
         failed_tally = _add_tally(failed_tally, tallies, "failed")
+        # The loss states (N4). counts_by_state() already returns every state,
+        # so these were being fetched and discarded. corrupted and expired are
+        # the two that mean the bytes are gone, and they were the two the
+        # operator's summary could not show: an operator watching this endpoint
+        # after a crash saw no change at all, even though recovery had just
+        # quarantined every RAM-resident row as corrupted.
+        corrupted_tally = _add_tally(corrupted_tally, tallies, "corrupted")
+        expired_tally = _add_tally(expired_tally, tallies, "expired")
+        cancelled_tally = _add_tally(cancelled_tally, tallies, "cancelled")
     by_state.stored = TierBreakdown(count=stored_tally.count, bytes=stored_tally.bytes)
     by_state.succeeded_recent = TierBreakdown(
         count=succeeded_tally.count, bytes=succeeded_tally.bytes
     )
     by_state.failed_recent = TierBreakdown(count=failed_tally.count, bytes=failed_tally.bytes)
+    by_state.corrupted = TierBreakdown(count=corrupted_tally.count, bytes=corrupted_tally.bytes)
+    by_state.expired = TierBreakdown(count=expired_tally.count, bytes=expired_tally.bytes)
+    by_state.cancelled = TierBreakdown(count=cancelled_tally.count, bytes=cancelled_tally.bytes)
     # Parked = the operator-owned non-success backlog: ``stored`` (terminal,
     # body recoverable) plus ``auth_expired`` (waiting for a token).
     parked_total = stored_tally.count + auth_expired_count
@@ -507,6 +525,9 @@ def _empty_state_breakdown() -> StateBreakdown:
         stored=TierBreakdown(count=0, bytes=0),
         succeeded_recent=TierBreakdown(count=0, bytes=0),
         failed_recent=TierBreakdown(count=0, bytes=0),
+        corrupted=TierBreakdown(count=0, bytes=0),
+        expired=TierBreakdown(count=0, bytes=0),
+        cancelled=TierBreakdown(count=0, bytes=0),
     )
 
 
@@ -1707,6 +1728,31 @@ async def bulk_delete_uploads(
                 await ctx.body_store.delete(entry.chain_id)
             await ctx.saturation.settle(
                 SlotDelta.from_removal(entry, size_bytes=entry.body_size_bytes)
+            )
+        # SAY WHAT IT COST (N6). This filter carries NO state restriction, by
+        # design: a route-scoped or date-scoped delete of still-in-flight rows
+        # is a supported operation and the e2e suite pins it, because an
+        # operator draining a misconfigured route needs exactly that. What was
+        # missing is that the destruction of UNDELIVERED work happened in
+        # silence at arbitrary scale. Every sibling removal path either refuses
+        # to touch undeliverable work (the count-cap eviction) or names one
+        # chain (the single delete); this one can sweep thousands on a `since`
+        # bound alone, and an operator purging old rows by date would not
+        # otherwise learn that queued and parked uploads went with them.
+        undelivered = [e for e in removed if e.state not in TERMINAL_STATES]
+        if undelivered:
+            logger.warning(
+                "bulk delete removed %d UNDELIVERED upload(s) on instance %s "
+                "(states: %s). These were acknowledged with a 202 and their "
+                "buffered bodies are now gone. Filter: state=%r route=%r "
+                "since=%r instance=%r",
+                len(undelivered),
+                ctx.cfg.id,
+                sorted({e.state for e in undelivered}),
+                filter_body.state,
+                filter_body.route,
+                filter_body.since,
+                filter_body.instance,
             )
         deleted += len(removed)
     return BulkDeleteResponse(deleted=deleted)

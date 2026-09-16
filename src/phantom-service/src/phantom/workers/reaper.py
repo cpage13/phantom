@@ -341,6 +341,32 @@ class Reaper:
                     len(evicted),
                     max_rows,
                 )
+            # REPORT A CAP THAT CANNOT BE MET (N2). The store's own docstring
+            # says the shortfall is left unmet and "the caller logs the
+            # shortfall"; this is the caller, and it logged only on the
+            # success branch, so the one mechanism designed to notice said
+            # nothing. Once the ineligible population, meaning rows that are
+            # both non-terminal and still holding their payload, exceeds
+            # max_rows, the table grows without bound and no surface reports
+            # it. WARNING and not INFO because the operator's chosen ceiling
+            # is no longer being honoured and only they can act on it: raise
+            # the cap, widen a retention window, or fix whatever is parking
+            # the backlog.
+            # counts_by_state() is already on the Protocol and already used by
+            # the admin aggregation, so summing it needs no new store method
+            # and cannot break the structural test fakes.
+            remaining = sum(tally.count for tally in (await store.counts_by_state()).values())
+            if remaining > max_rows:
+                logger.warning(
+                    "max_rows=%d cannot be met on instance %s: %d row(s) remain "
+                    "after evicting %d. The excess is undelivered work that is "
+                    "deliberately not evictable, so the table will keep growing "
+                    "until the backlog drains or the configuration changes.",
+                    max_rows,
+                    instance.cfg.id,
+                    remaining,
+                    len(evicted),
+                )
 
         # Idempotency-index cleanup. Single-store collapse (plan § 2.3.6):
         # every live chain_id is in this store's ``uploads`` table, so the

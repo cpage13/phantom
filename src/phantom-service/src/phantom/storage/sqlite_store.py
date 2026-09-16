@@ -2790,10 +2790,31 @@ class SqliteUploadStore:
             overage = await self._total_row_count(conn) - max_rows
             if overage <= 0:
                 return []
-            # Oldest-DONE-first among the terminal (evictable) states only.
+            # Oldest-DONE-first among the evictable rows. Evictable means a
+            # terminal state, OR a parked row whose body has already been
+            # discarded (N1).
+            #
+            # That second arm is the fix for a row that nothing could ever
+            # reclaim. ``auth_expired`` is deliberately excluded from
+            # TERMINAL_STATES so the kickers keep sweeping it, and
+            # ``auth_expired_metadata_seconds`` defaults to -1, so the reaper's
+            # time pass never runs for it either. Once the reaper ages out such
+            # a row's BODY, the row is undeliverable by definition: the kicker
+            # skips it on the same stamp, replay refuses it, and there are no
+            # bytes left to send. It was then immortal, holding one of the
+            # ``max_rows`` slots for the life of the deployment, and measured
+            # rather than argued: fifty aged parked rows survived
+            # ``evict_terminal_over_limit(0)``, the hardest possible cap,
+            # untouched.
+            #
+            # The durability argument that keeps undelivered work out of this
+            # query does not apply to a row with no payload, which is exactly
+            # what the stamp means. A row still holding its bytes is
+            # untouched here no matter how old it is.
             select_sql = (
                 "SELECT chain_id, state, body_size_bytes, body_discarded_at "
-                f"FROM uploads WHERE state IN ({placeholders}) "
+                f"FROM uploads WHERE (state IN ({placeholders}) "
+                "OR body_discarded_at IS NOT NULL) "
                 "ORDER BY updated_at ASC LIMIT ?"
             )
             async with conn.execute(select_sql, (*TERMINAL_STATES, overage)) as cur:

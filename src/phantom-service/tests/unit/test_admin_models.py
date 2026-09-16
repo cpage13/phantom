@@ -40,6 +40,9 @@ def _state_breakdown() -> StateBreakdown:
         stored=_tier(),
         succeeded_recent=_tier(),
         failed_recent=_tier(),
+        corrupted=_tier(),
+        expired=_tier(),
+        cancelled=_tier(),
     )
 
 

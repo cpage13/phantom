@@ -184,6 +184,9 @@ def test_stats_response_basic() -> None:
                 "stored": {"count": 0, "bytes": 0},
                 "succeeded_recent": {"count": 0, "bytes": 0},
                 "failed_recent": {"count": 0, "bytes": 0},
+                "corrupted": {"count": 0, "bytes": 0},
+                "expired": {"count": 0, "bytes": 0},
+                "cancelled": {"count": 0, "bytes": 0},
             },
             "body_location": {
                 "ram": {"count": 2, "bytes": 512},

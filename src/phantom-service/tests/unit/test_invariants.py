@@ -138,7 +138,18 @@ def test_reaper_writes_only_discard_body_and_delete_terminal() -> None:
     # excluded so the allow list narrows to writers only. ``get`` is
     # the eviction pass's live-row re-read guarding its late body
     # delete (R10-D1) - a read, not a write.
-    known_reads = {"list_terminal_older_than", "list_chain_ids", "get"}
+    # ``counts_by_state`` is the count-cap shortfall report (N2): when the
+    # ineligible population exceeds ``max_rows`` the cap cannot be met, and the
+    # store's docstring says the caller logs that. It is a read, so it belongs
+    # here rather than in ``allowed``; putting it in the write allow list would
+    # widen what this gate says the reaper may WRITE, which is the one thing
+    # the gate exists to pin.
+    known_reads = {
+        "list_terminal_older_than",
+        "list_chain_ids",
+        "get",
+        "counts_by_state",
+    }
     mutations = {
         m.group(1)
         for m in re.finditer(r"\bstore\.([a-z_][a-z0-9_]*)\(", body)

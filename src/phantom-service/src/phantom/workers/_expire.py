@@ -166,4 +166,27 @@ async def expire_row(
     # delete that raises (a permission fault inside the disk half's _rm_rf)
     # would otherwise leak a slot permanently, which eventually 503s all
     # ingress; leaking bytes instead is bounded by the retention windows.
+    #
+    # ANNOUNCE IT. This is the one path in the service that deliberately
+    # destroys the payload of an upload Phantom already acknowledged with a
+    # 202, and until now it did so in total silence: the only logger call in
+    # this module was the no-op branch above, and no counter existed anywhere.
+    # An operator who was not already watching this specific chain could not
+    # learn the upload had existed, because the single remaining trace is a
+    # row in ``expired`` that ``expired_metadata_seconds`` deletes after 30
+    # days. WARNING rather than INFO because data loss is the subject, and the
+    # byte count comes from the write's own in-transaction basis rather than
+    # the caller's snapshot, which may be stale.
+    logger.warning(
+        "EXPIRED and DISCARDED the buffered payload for chain_id=%s "
+        "(route=%s, instance=%s, %d byte(s), %d attempt(s) made, reason=%s). "
+        "Phantom acknowledged this upload with a 202 and is now giving up on "
+        "it; the bytes are gone and cannot be replayed.",
+        row.chain_id,
+        row.route_name,
+        row.instance_id,
+        write.body_size_bytes,
+        row.attempts,
+        last_error,
+    )
     await body_store.delete(row.chain_id)

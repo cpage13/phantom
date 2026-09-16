@@ -298,6 +298,30 @@ class StateBreakdown(BaseModel):
         ...,
         description="Recently-failed rows still inside their retention window.",
     )
+    corrupted: TierBreakdown = Field(
+        ...,
+        description=(
+            "Rows in ``corrupted``: body verification failed at send time, or "
+            "the body was gone at restart. THE BYTES ARE NORMALLY ALREADY "
+            "LOST for these, so this is a loss tally rather than a backlog "
+            "tally. In the default hybrid mode a crash quarantines every "
+            "RAM-resident row here, which makes this the single most likely "
+            "bulk-loss event in a default deployment."
+        ),
+    )
+    expired: TierBreakdown = Field(
+        ...,
+        description=(
+            "Rows in ``expired``: a per-route send deadline elapsed, so "
+            "Phantom gave up and DISCARDED the payload at the transition "
+            "(ADR-032). Every row counted here is an upload that was "
+            "acknowledged with a 202 and will never be delivered."
+        ),
+    )
+    cancelled: TierBreakdown = Field(
+        ...,
+        description="Rows an operator cancelled through the admin API.",
+    )
 
 
 class SaturationStatus(BaseModel):
