@@ -65,6 +65,11 @@ MIGRATION_WAIT_SECONDS: float = 10.0
 # reader can see what the test is actually turning on.
 PERSIST_SIZE_THRESHOLD_BYTES: int = 1
 
+# Rungs of one second each, held open while step 3 polls for the migration.
+# Sized so the retry budget cannot exhaust into ``stored`` before the poll
+# observes the flip, even on a loaded runner.
+_RETRY_RUNGS_WHILE_OBSERVING: int = 120
+
 
 @pytest.mark.e2e
 async def test_e2e_12_size_threshold_migrates_ram_body_to_disk(tmp_path: Path) -> None:
@@ -98,6 +103,22 @@ async def test_e2e_12_size_threshold_migrates_ram_body_to_disk(tmp_path: Path) -
             "storage": {
                 "persist_trigger": {
                     "body_size_threshold_bytes": PERSIST_SIZE_THRESHOLD_BYTES,
+                },
+            },
+            # A retry ladder long enough that the row CANNOT exhaust its budget
+            # while step 3 observes the migration. The shared e2e ladder is
+            # [0, 1, 2, 5, 10], about eighteen seconds before the sender gives
+            # up and parks the row in ``stored``; on a loaded full-lane run the
+            # migration poll outlasted that, the row was terminal by the time it
+            # was read, and the undelivered-chain assertions below failed. That
+            # is a property of the WINDOW, not of the behaviour under test, so
+            # the window is widened rather than the assertions weakened. Each
+            # rung stays at one second so clearing the failure policy still lets
+            # the chain deliver promptly in step 5.
+            "retry": {
+                "default_strategy": {
+                    "type": "fixed_intervals",
+                    "intervals_seconds": [0] + [1] * _RETRY_RUNGS_WHILE_OBSERVING,
                 },
             },
         },
