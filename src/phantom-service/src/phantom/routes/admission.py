@@ -424,6 +424,19 @@ async def _encode_and_hash_bodies(
             stored_body_refs={},
             body_hashes_map={},
             stored_size=0,
+            # admit_bytes=0 is DELIBERATE and its consequence is known
+            # (finding S5-4, residual). A chain with no body_refs buffers no
+            # body bytes, so it charges nothing against max_in_flight_bytes
+            # and that cap cannot refuse it. What still bounds such a chain is
+            # max_in_flight, the COUNT cap, plus ENVELOPE_MAX_BYTES on the
+            # envelope itself. Charging the envelope here was implemented and
+            # reverted: the gate's basis is structurally UploadRow
+            # .body_size_bytes, which ADR-036 has the sender and the
+            # auth-kicker release and re-admit, and that field is documented
+            # as the sum of body_ref sizes, so charging it would redefine the
+            # field for every bodyless chain and did break a raw PUT with no
+            # content. Closing it properly needs either that redefinition or a
+            # transient in-admission charge the sender never settles.
             admit_bytes=0,
         )
     codec = instance_ctx.codec_factory()

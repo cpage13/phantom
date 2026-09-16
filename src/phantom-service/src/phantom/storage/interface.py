@@ -272,8 +272,12 @@ class CancelOutcome:
     terminalized, and therefore released, must not).
 
     Attributes:
-        row: The row as it reads AFTER the transaction commits. Its
-            ``body_size_bytes`` is the route's release basis; it is
+        row: The row as it reads AFTER the transaction commits. It is NOT
+            the release basis: read ``body_size_bytes`` below instead. The
+            reaper's discard can zero this row's size in the window between
+            the commit and the caller's read, which is exactly the leak E4
+            closed, so settling on ``row.body_size_bytes`` releases zero and
+            strands the charge for the process lifetime.
             never a slot-predicate input, because it is an
             unsynchronised later read.
         previous_state: The cancellable state the in-transaction

@@ -245,6 +245,19 @@
             "description": "While this chain is parked in ``auth_expired``: the host whose credential is blocking it, which is the host a fresh token or credential push has to name for the row to wake. On a multi-host chain this is NOT the chain's ``endpoint``, and pushing to the endpoint achieves nothing. Once the chain has left ``auth_expired`` the value is historical rather than current: it records the last credential that blocked the row, and nothing acts on it. None on a chain that has never parked on auth.",
             "title": "Auth Blocked Host"
           },
+          "body_discarded_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When this chain's buffered bytes were released, or ``None`` while they are still held. THE FIELD THAT SEPARATES RECOVERABLE FROM LOST (N5). Without it this route could not distinguish a row parked WITH its payload, which delivers the moment a credential is pushed, from one whose payload aged out, which never will; both read ``auth_expired`` with a ``body_location``. It is already on the list route's ``UploadRow``, so an operator inspecting ONE chain, which is what they do when chasing a specific upload, was the only one who could not see it.",
+            "title": "Body Discarded At"
+          },
           "body_location": {
             "description": "Which body store currently holds the chain's body bytes. 'ram' = the RAM body store; 'file' = the file body store (PersistController flipped after fsync per plan \u00a7 0.5 invariant #6). Replaces the pre-Phase-1 tier + committed pair.",
             "enum": [

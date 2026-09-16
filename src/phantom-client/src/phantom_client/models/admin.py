@@ -379,6 +379,20 @@ class ChainAdminDetail(BaseModel):
             "Replaces the pre-Phase-1 tier + committed pair."
         ),
     )
+    body_discarded_at: datetime | None = Field(
+        None,
+        description=(
+            "When this chain's buffered bytes were released, or ``None`` while "
+            "they are still held. THE FIELD THAT SEPARATES RECOVERABLE FROM "
+            "LOST (N5). Without it this route could not distinguish a row "
+            "parked WITH its payload, which delivers the moment a credential "
+            "is pushed, from one whose payload aged out, which never will; "
+            "both read ``auth_expired`` with a ``body_location``. It is "
+            "already on the list route's ``UploadRow``, so an operator "
+            "inspecting ONE chain, which is what they do when chasing a "
+            "specific upload, was the only one who could not see it."
+        ),
+    )
     last_step_completed: str | None = Field(
         None,
         description="Name of last terminal-success step; None if none yet.",

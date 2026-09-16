@@ -912,6 +912,7 @@ async def get_upload(
         multifile_id=row.multifile_id,
         send_order=row.send_order,
         body_location=row.body_location,
+        body_discarded_at=row.body_discarded_at,
         last_step_completed=row.last_step_completed,
         captured=captured,
         attempts=row.attempts,
