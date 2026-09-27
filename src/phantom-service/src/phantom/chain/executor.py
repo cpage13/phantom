@@ -888,7 +888,17 @@ class ChainExecutor:
             # Mark THIS route's slot bad so the sender knows what to do. The
             # ``none`` provider holds no slot and no-ops, which is what the
             # inline chain did by having no arm for it.
-            await provider.mark_bad(host_key=host_key_for(full_url), uid=row.uid)
+            #
+            # FENCED on the credential this request was actually sent with.
+            # The rejection arrives a full network round trip after prepare
+            # read the slot, and an operator pushes a replacement precisely when
+            # requests are failing, so without the fence the push most likely to
+            # be clobbered was the one meant to end the outage.
+            await provider.mark_bad(
+                host_key=host_key_for(full_url),
+                uid=row.uid,
+                slot_observed_at=outcome.slot_observed_at,
+            )
             return FailedAuth(
                 status=response.status, observed_at=self._clock(), blocked_host=blocked
             )

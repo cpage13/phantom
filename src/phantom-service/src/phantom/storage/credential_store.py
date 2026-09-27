@@ -369,14 +369,28 @@ class SqliteCredentialStore:
                     dest_host,
                 )
 
-    async def mark_bad(self, dest_host: HostCredKey) -> None:
-        """ADR-003: bad credentials stay in the store, status flips to ``bad``."""
+    async def mark_bad(
+        self, dest_host: HostCredKey, *, observed_at: datetime | None = None
+    ) -> None:
+        """ADR-003: bad credentials stay in the store, status flips to ``bad``.
+
+        Args:
+            dest_host: The resolved destination host whose slot to flip.
+            observed_at: The FENCE. When given, the flip applies only if the
+                slot still holds the credential whose ``observed_at`` this is,
+                so a request rejected with an old credential cannot mark bad a
+                newer one pushed while that request was in flight. ``None``
+                flips unconditionally, which is right for an operator's
+                explicit invalidation and wrong for a post-response rejection.
+        """
         conn = self._require_conn()
+        sql = "UPDATE credential_store SET status = 'bad' WHERE dest_host = ?"
+        params: tuple[str, ...] = (dest_host,)
+        if observed_at is not None:
+            sql += " AND observed_at = ?"
+            params = (*params, observed_at.isoformat())
         async with self._write_txn(conn):
-            await conn.execute(
-                "UPDATE credential_store SET status = 'bad' WHERE dest_host = ?",
-                (dest_host,),
-            )
+            await conn.execute(sql, params)
             await conn.commit()
 
     def register_wake_handler(self, handler: CredentialWakeHandler) -> None:

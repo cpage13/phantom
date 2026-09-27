@@ -170,7 +170,9 @@ class _UnusedTokenCache:
     async def set(self, endpoint: str, uid: str, bearer: str, *, source: object) -> None:
         raise AssertionError("token_cache.set must not be called on the aws_sigv4 path")
 
-    async def mark_bad(self, endpoint: str, uid: str) -> None:
+    async def mark_bad(
+        self, endpoint: str, uid: str, *, observed_at: datetime | None = None
+    ) -> None:
         raise AssertionError("token_cache.mark_bad must not be called on the aws_sigv4 path")
 
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -109,9 +110,18 @@ class AuthReady:
             SIGNED is the URL that must be SENT. Signing one URL and
             forwarding another is a canonical-query mismatch that earns a 403
             SignatureDoesNotMatch on every presigned upload.
+        slot_observed_at: The ``observed_at`` of the exact credential or token
+            this request was sent with, or ``None`` when no slot was used. It is
+            the FENCING TOKEN the caller must hand back to :meth:`mark_bad` if
+            the upstream answers 401 or 403. Without it the post-response
+            mark-bad flipped whatever the slot held by the time the response
+            arrived, and an operator pushes a new credential precisely when
+            requests are failing, so the push most likely to be clobbered was
+            the one meant to fix the outage.
     """
 
     url: str
+    slot_observed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -156,8 +166,14 @@ class AuthSlotProvider(Protocol):
         """
         ...
 
-    async def mark_bad(self, *, host_key: str, uid: str) -> None:
-        """Flip this route's slot for ``host_key`` to ``bad`` after a 401/403."""
+    async def mark_bad(self, *, host_key: str, uid: str, slot_observed_at: datetime | None) -> None:
+        """Flip this route's slot for ``host_key`` to ``bad`` after a 401/403.
+
+        ``slot_observed_at`` is :attr:`AuthReady.slot_observed_at` from the
+        ``prepare`` that produced the rejected request. The flip applies only if
+        the slot STILL holds that credential, so a newer push that landed during
+        the round trip survives the rejection of the request it did not sign.
+        """
         ...
 
 
@@ -218,11 +234,11 @@ class BearerAuthProvider:
         if slot is None or slot.status == "bad":
             return AuthParked(status=401, blocked_host=sanitised_host_for(full_url))
         set_header(headers, "Authorization", slot.bearer)
-        return AuthReady(url=full_url)
+        return AuthReady(url=full_url, slot_observed_at=slot.observed_at)
 
-    async def mark_bad(self, *, host_key: str, uid: str) -> None:
-        """Mark the token slot bad so the sender knows what to do."""
-        await self.cache.mark_bad(host_key, uid)
+    async def mark_bad(self, *, host_key: str, uid: str, slot_observed_at: datetime | None) -> None:
+        """Mark the token slot bad, but only if it still holds the rejected bearer."""
+        await self.cache.mark_bad(host_key, uid, observed_at=slot_observed_at)
 
 
 @dataclass(frozen=True)
@@ -323,18 +339,23 @@ class SigV4AuthProvider:
                 "marking slot bad and parking (auth_expired)",
                 dest_host,
             )
-            await self._mark_bad(dest_host)
+            # Fenced on the credential that failed to sign. Resolving a
+            # ProfileRefCred can take a botocore round trip, which is time for
+            # an operator's corrected push to land; that push must survive.
+            await self._mark_bad(dest_host, observed_at=row_cred.observed_at)
             return AuthParked(status=401, blocked_host=blocked)
-        return AuthReady(url=stripped)
+        return AuthReady(url=stripped, slot_observed_at=row_cred.observed_at)
 
-    async def mark_bad(self, *, host_key: str, uid: str) -> None:
+    async def mark_bad(self, *, host_key: str, uid: str, slot_observed_at: datetime | None) -> None:
         """Flip the host-keyed cred slot to ``bad`` after a 401/403.
 
         Symmetric to the bearer mark-bad: the row stays parked until a fresh
         credential re-push freshens the slot (the kicker wakes on ``fresh``).
+        Fenced on ``slot_observed_at``, so it refuses to flip a credential that
+        replaced the one this request was signed with.
         """
         del uid  # Host-keyed store (ADR-033).
-        await self._mark_bad(HostCredKey(host_key))
+        await self._mark_bad(HostCredKey(host_key), observed_at=slot_observed_at)
 
     async def _credential_for(self, dest_host: HostCredKey) -> CredCacheRow | None:
         """Return the host-keyed credential row, or ``None`` when unusable.
@@ -347,11 +368,15 @@ class SigV4AuthProvider:
             return None
         return await self.store.get(dest_host)
 
-    async def _mark_bad(self, dest_host: HostCredKey) -> None:
-        """Flip the host's credential slot to ``bad`` (a no-op without a store)."""
+    async def _mark_bad(self, dest_host: HostCredKey, *, observed_at: datetime | None) -> None:
+        """Flip the host's credential slot to ``bad`` (a no-op without a store).
+
+        ``observed_at`` fences the write to the credential that was actually
+        used; see :meth:`CredentialStore.mark_bad`.
+        """
         if self.store is None:
             return
-        await self.store.mark_bad(dest_host)
+        await self.store.mark_bad(dest_host, observed_at=observed_at)
 
 
 @dataclass(frozen=True)
@@ -372,14 +397,14 @@ class NoAuthProvider:
         del uid, method, headers, body, chain_id
         return AuthReady(url=full_url)
 
-    async def mark_bad(self, *, host_key: str, uid: str) -> None:
+    async def mark_bad(self, *, host_key: str, uid: str, slot_observed_at: datetime | None) -> None:
         """A no-op: Phantom holds no slot for this route to mark.
 
         A 401 from a route Phantom never authenticated still parks the row
         (pre-existing behaviour), and no kicker owns it. That is visible in
         ``auth_blocked_host`` rather than changed by it.
         """
-        del host_key, uid
+        del host_key, uid, slot_observed_at
 
 
 def _strip_presigned_query(url: str) -> str:

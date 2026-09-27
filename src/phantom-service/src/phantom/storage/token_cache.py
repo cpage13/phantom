@@ -228,14 +228,29 @@ class SqliteTokenCache:
                     uid,
                 )
 
-    async def mark_bad(self, endpoint: str, uid: str) -> None:
-        """ADR-003: bad tokens stay in cache, status flips to ``bad``."""
+    async def mark_bad(
+        self, endpoint: str, uid: str, *, observed_at: datetime | None = None
+    ) -> None:
+        """ADR-003: bad tokens stay in cache, status flips to ``bad``.
+
+        Args:
+            endpoint: The upstream host axis of the cache key (ADR-002).
+            uid: The opaque caller-supplied credential identifier.
+            observed_at: The FENCE. When given, the flip applies only if the
+                slot still holds the token whose ``observed_at`` this is, so a
+                request rejected with an old bearer cannot mark bad a newer one
+                pushed while that request was in flight. ``None`` flips
+                unconditionally, which is right for an operator's explicit
+                invalidation and wrong for a post-response rejection.
+        """
         conn = self._require_conn()
+        sql = "UPDATE token_cache SET status = 'bad' WHERE endpoint = ? AND uid = ?"
+        params: tuple[str, ...] = (endpoint, uid)
+        if observed_at is not None:
+            sql += " AND observed_at = ?"
+            params = (*params, observed_at.isoformat())
         async with self._write_txn(conn):
-            await conn.execute(
-                "UPDATE token_cache SET status = 'bad' WHERE endpoint = ? AND uid = ?",
-                (endpoint, uid),
-            )
+            await conn.execute(sql, params)
             await conn.commit()
 
     async def mark_all_bad(self) -> int:

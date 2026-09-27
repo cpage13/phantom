@@ -81,10 +81,14 @@ class FakeTokenCache:
         self.rows[(endpoint, uid)] = row
         return row
 
-    async def mark_bad(self, endpoint: str, uid: str) -> None:
+    async def mark_bad(
+        self, endpoint: str, uid: str, *, observed_at: datetime | None = None
+    ) -> None:
         self.marked_bad.append((endpoint, uid))
         existing = self.rows.get((endpoint, uid))
-        if existing:
+        # Honour the fence exactly as the real store does: a given
+        # ``observed_at`` must match the slot's, or the flip is refused.
+        if existing and (observed_at is None or existing.observed_at == observed_at):
             self.rows[(endpoint, uid)] = existing.model_copy(update={"status": "bad"})
 
 

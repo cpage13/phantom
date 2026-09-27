@@ -1271,8 +1271,14 @@ class TokenCache(Protocol):
         """
         ...
 
-    async def mark_bad(self, endpoint: str, uid: str) -> None:
-        """ADR-003: bad tokens stay in cache; status flips to ``bad``."""
+    async def mark_bad(
+        self, endpoint: str, uid: str, *, observed_at: datetime | None = None
+    ) -> None:
+        """ADR-003: bad tokens stay in cache; status flips to ``bad``.
+
+        ``observed_at`` fences the flip to the token actually rejected; ``None``
+        flips unconditionally, for an operator's explicit invalidation.
+        """
         ...
 
     async def mark_all_bad(self) -> int:
@@ -1329,8 +1335,14 @@ class CredentialStore(Protocol):
         """
         ...
 
-    async def mark_bad(self, dest_host: HostCredKey) -> None:
-        """ADR-003: bad credentials stay in the store; status flips to ``bad``."""
+    async def mark_bad(
+        self, dest_host: HostCredKey, *, observed_at: datetime | None = None
+    ) -> None:
+        """ADR-003: bad credentials stay in the store; status flips to ``bad``.
+
+        ``observed_at`` fences the flip to the credential actually rejected;
+        ``None`` flips unconditionally, for an operator's explicit invalidation.
+        """
         ...
 
     def register_wake_handler(self, handler: CredentialWakeHandler) -> None:

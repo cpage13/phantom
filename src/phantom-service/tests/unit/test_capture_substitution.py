@@ -90,7 +90,9 @@ class _UnusedTokenCache:
         """Fail loudly: an ``auth_mode=none`` route writes no token slot."""
         raise AssertionError("token_cache.set must not be called on an auth_mode=none route")
 
-    async def mark_bad(self, endpoint: str, uid: str) -> None:
+    async def mark_bad(
+        self, endpoint: str, uid: str, *, observed_at: datetime | None = None
+    ) -> None:
         """Fail loudly: an ``auth_mode=none`` route marks no token slot."""
         raise AssertionError("token_cache.mark_bad must not be called on an auth_mode=none route")
 
