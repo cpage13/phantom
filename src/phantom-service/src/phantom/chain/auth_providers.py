@@ -230,10 +230,12 @@ class SigV4AuthProvider:
     """``aws_sigv4``: re-sign the request from the host-keyed destination credential.
 
     The host-keyed credential slot is the refreshable slot, the analogue of the
-    ``(endpoint, uid)`` token slot. A missing or bad credential, INCLUDING
-    ``store is None`` (no store wired) and a ProfileRefCred whose botocore
-    chain yields nothing, marks the slot bad where a store exists and parks the
-    row in ``auth_expired`` (NOT terminal) to await a credential re-push.
+    ``(endpoint, uid)`` token slot. A missing or already-bad credential,
+    INCLUDING ``store is None`` (no store wired), parks the row in
+    ``auth_expired`` (NOT terminal) to await a credential re-push, and leaves
+    the slot untouched. A credential that is present but cannot sign, such as a
+    ProfileRefCred whose botocore chain yields nothing, additionally marks the
+    slot bad, because only there does the write change anything a reader sees.
     """
 
     store: CredentialStore | None
@@ -280,10 +282,26 @@ class SigV4AuthProvider:
             )
         row_cred = await self._credential_for(dest_host)
         if row_cred is None or row_cred.status == "bad":
-            # The EAGER mark-bad, which the bearer arm has no analogue of and
-            # which must not be normalised away: this leg flips the slot before
-            # parking so a stale-but-present credential cannot look fresh.
-            await self._mark_bad(dest_host)
+            # Park WITHOUT writing the slot. This leg used to mark the slot bad
+            # first, "so a stale-but-present credential cannot look fresh". It
+            # could never achieve that and it could do real harm.
+            #
+            # It could not help: an absent slot has no row, so the UPDATE matched
+            # nothing; an already-bad slot was set bad again; and an undecodable
+            # row, which is the only "stale but present" case, is invisible to
+            # every reader already, because every reader goes through
+            # ``store.get``, including the kicker's oracle, and ``get`` answers
+            # ``None`` for a row it cannot decode. Nothing consults the raw
+            # status column, so flipping it changed nothing observable.
+            #
+            # It could harm: the read above and a write here are separated by an
+            # await, so an operator's credential push could commit ``fresh`` in
+            # that gap and the write would then flip it to ``bad`` on the
+            # strength of a read the push had made stale. The push answered 204
+            # and did nothing, and every row for the host stayed parked. That is
+            # the flaky ``test_admin_sts_credential_survives_restart_and_signs_
+            # token`` failure, pinned deterministically by
+            # ``test_sigv4_mark_bad_race.py``.
             return AuthParked(status=401, blocked_host=blocked)
         try:
             # Re-sign THIS request now (fresh X-Amz-Date) over the rehydrated
