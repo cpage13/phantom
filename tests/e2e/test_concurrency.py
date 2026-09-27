@@ -402,18 +402,3 @@ async def test_two_senders_one_upstream(tmp_path: Path) -> None:
             assert str(cid) in received_uuids, f"emulator did not record upload for chain_id={cid}"
     finally:
         await stack.tear_down()
-
-
-# test_concurrent_persist_now: DELETED in Phase 1 Slice 1.F.
-# The test exercised the now-removed persist_trigger.after_attempts=0
-# admission knob and the deleted persist_now function (replaced by
-# PersistController per plan § 2.3.11). The replacement coverage is:
-#   - Slice 1.C: tests/unit/test_persist_controller.py — controller
-#     idempotency + commit-last-column ordering.
-#   - Slice 1.F: tests/integration/test_per_mode_wiring.py — per-mode
-#     happy paths including all_disk admission writing directly to
-#     file with no PersistController involvement.
-#   - Slice 1.F: tests/unit/test_sqlite_store.py — concurrent
-#     idempotency-claim race + serialization invariant.
-# See test_migration_ledger_05_25.md (Phase 1 Slice 1.F section) for
-# the deletion-to-replacement traceability.

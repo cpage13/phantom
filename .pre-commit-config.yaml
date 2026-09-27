@@ -61,11 +61,10 @@ repos:
 
       - id: mypy-strict
         name: mypy --strict (per package)
-        # Workspace-level `mypy --strict src/` collides on dual-named
-        # `tests/` and per-package source roots ("Source file found twice"
-        # per plan note 1.1.6.D). Each package runs in its own venv so its
-        # third-party stubs (httpx, fastapi, uvicorn) resolve. See plan
-        # F6 and execution_05_25.md Finding F-P0-E for the rationale.
+        # Workspace-level `mypy --strict src/` collides on the dual-named
+        # `tests/` and per-package source roots ("Source file found twice").
+        # Each package runs in its own venv so its third-party stubs (httpx,
+        # fastapi, uvicorn) resolve.
         entry: bash scripts/precommit/run_mypy_per_package.sh
         language: system
         pass_filenames: false
@@ -82,7 +81,6 @@ repos:
       # hook would have permanently conflicted with `ruff format`. The
       # form is not Python-2 syntax on Python 3.x — both `except A, B:`
       # and `except (A, B):` are equivalent tuple-of-exception-types.
-      # See execution_05_25.md Finding F-P0-D.
 
       # AST gate, replacing scripts/precommit/forbid_await_in_lock.sh, whose
       # pattern matched a BARE name (`[a-zA-Z_]+_lock:`) while every real

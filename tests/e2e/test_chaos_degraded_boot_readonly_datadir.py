@@ -39,8 +39,8 @@ SKIP NOTE: a ``chmod 0o555`` dir is bypassable by root, so the read-only fault
 would not materialize when the suite runs as uid 0 (some CI images do). The
 tests skip under root to stay deterministic.
 
-HISTORY: these tests caught a real service bug (logged in execution_06_07.md
-§ 5 Part C). A read-only ``data_dir`` makes ``aiosqlite`` raise
+HISTORY: these tests caught a real service bug.
+A read-only ``data_dir`` makes ``aiosqlite`` raise
 ``sqlite3.OperationalError("unable to open database file")``, which is NOT a
 subclass of ``OSError``; the boot-open guard's original post-isolate "substrate
 unwritable" branch caught only ``OSError``, so the ``OperationalError`` from the

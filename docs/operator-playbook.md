@@ -871,10 +871,12 @@ first step matches no route at all) the header is forwarded or superseded
 per the route's mode but is never written to the token cache, so no slot
 appears for those hosts.
 
-**Cause path 2: cached token rejected.** Upstream returned 401 to
+**Cause path 2: cached token rejected.** Upstream returned 401 or 403 to
 Phantom; sender marked the token `bad` and parked the row in
-`auth_expired`. When a fresh token lands **for the host recorded in that
-row's `auth_blocked_host`**, the bearer `Kicker` wakes the row. Check that
+`auth_expired`. Only that exact token is marked: a token you push while
+requests carrying the old one are still failing stays `fresh`. When a
+fresh token lands **for the host recorded in that row's
+`auth_blocked_host`**, the bearer `Kicker` wakes the row. Check that
 field first on a multi-step chain: the chain's `endpoint` is its FIRST
 step's host, and a later step can be blocked on a different one.
 Diagnose via:
@@ -901,9 +903,12 @@ the credential it has was rejected.
 **Cause.** An `aws_sigv4` route signs each outbound request with a host-keyed
 credential from the credential store. If none is provisioned for the
 destination host, or the stored one is marked `bad`, the sender parks the row
-in `auth_expired` and waits. When a fresh credential lands **for the host
-recorded in that row's `auth_blocked_host`**, the sigv4 `Kicker` (the SigV4
-analogue of the bearer flavour) wakes the row. On a multi-host chain that host is
+in `auth_expired` and waits. A credential is marked `bad` when it cannot sign
+or the upstream rejects it, and only that exact credential: one you push while
+requests signed with the old one are still failing stays `fresh`. When a
+fresh credential lands **for the host recorded in that row's
+`auth_blocked_host`**, the sigv4 `Kicker` (the SigV4 analogue of the bearer
+flavour) wakes the row. On a multi-host chain that host is
 not the chain's `endpoint`, so read it off
 `GET /v1/admin/chains/{chain_id}` before pushing. Provision or correct the credential with the admin push (resolved
 literals; `204 No Content`, the secret is never echoed back):

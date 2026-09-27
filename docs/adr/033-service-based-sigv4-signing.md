@@ -81,10 +81,13 @@ keyed by `HostCredKey` = the lower-cased resolved destination host alone (no
 a SigV4 forward step is synthesized by Phantom (it has no caller-supplied
 credential id), so the `uid` axis has no value to carry and is dropped. ADR-002
 is untouched: `uid` stays inert under `aws_sigv4`. The executor looks the
-credential up by `HostCredKey(host_key_for(full_url))`; a missing or failed
-credential marks the slot bad and parks the row `auth_expired` (ADR-032), which
-the sigv4-flavoured `Kicker` (the SigV4 analogue of the bearer flavour) wakes
-on a fresh push. The store is persistent at rest, surviving restart (mirrors ADR-003).
+credential up by `HostCredKey(host_key_for(full_url))`. A missing or
+already-bad credential parks the row `auth_expired` (ADR-032) and leaves the
+slot untouched; a credential that fails to sign, or that the upstream rejects,
+is also marked bad, fenced on its `observed_at` so a replacement pushed
+meanwhile survives. The sigv4-flavoured `Kicker` (the SigV4 analogue of the
+bearer flavour) wakes the row on a fresh push. The store is persistent at
+rest, surviving restart (mirrors ADR-003).
 
 ### Two provisioning routes; the secret is never echoed
 
